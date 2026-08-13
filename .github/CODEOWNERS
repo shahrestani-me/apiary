@@ -1,0 +1,8 @@
+# Every change to this repository requires review from the owner.
+#
+# Enforced by the "main branch protection" ruleset, which requires code owner
+# review on all pull requests targeting the default branch. This file only
+# takes effect from the default branch, so changing ownership rules is itself
+# a reviewed change.
+
+* @kamyarshahrestani

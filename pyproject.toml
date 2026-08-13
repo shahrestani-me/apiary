@@ -4,6 +4,22 @@ version = "0.1.0"
 description = "Local multi-agent coding swarm: LangGraph orchestrator + Ollama workers, isolated by git worktrees"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Kamyar Shahrestani", email = "61367775+kamyarshahrestani@users.noreply.github.com" },
+]
+maintainers = [
+    { name = "Kamyar Shahrestani", email = "61367775+kamyarshahrestani@users.noreply.github.com" },
+]
+keywords = ["multi-agent", "llm", "ollama", "langgraph", "local-first", "code-generation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+]
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=1.2.11",
@@ -12,6 +28,11 @@ dependencies = [
     "langchain-core>=1.5.0",
     "pydantic>=2.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shahrestani-me/apiary"
+Repository = "https://github.com/shahrestani-me/apiary"
+Issues = "https://github.com/shahrestani-me/apiary/issues"
 
 [project.scripts]
 swarm = "swarm.cli:main"
