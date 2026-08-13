@@ -1,0 +1,172 @@
+# The worker image: one container per issue, disposable by design.
+#
+# It is handed a repo URL, an issue number and a base commit, and it runs the
+# worker entrypoint - clone at the base commit, read the issue contract, edit
+# the declared files, run that issue's `## Verify` command, commit, push, open
+# a PR. Exit codes are the protocol the orchestrator reads (docs/issue-contract.md):
+# 0 = PR open, 1 = task failed, 2 = infrastructure error (attempt not consumed).
+#
+# Two things this image deliberately does NOT contain:
+#
+#   * The target repository's toolchain. No node, no jdk, no poetry, no test
+#     runner beyond what the package itself needs. The `## Verify` command
+#     installs whatever the target repo requires at run time. Baking a stack in
+#     would quietly narrow the swarm to repos that happen to use that stack, and
+#     the constraint would be invisible until a task failed for no stated reason.
+#
+#   * Credentials. GITHUB_TOKEN arrives at run time from the orchestrator (#28),
+#     never as a build argument and never as an ENV default, so `docker history`
+#     on this image and every layer in it stays clean.
+#
+# Nor does it contain Ollama, for the same reason the orchestrator image does
+# not: Docker Desktop on macOS has no Metal passthrough, so an in-container
+# Ollama drops to CPU and loses roughly an order of magnitude. Inference stays
+# on the host and is reached over host.docker.internal - see "Three constraints"
+# in docs/architecture-v2.md.
+
+FROM python:3.12-slim AS build
+
+# Same interpreter as the orchestrator image on purpose: pyproject.toml only
+# says `requires-python = ">=3.11"`, so pinning a different minor here would
+# mean a bug can reproduce in one image and not the other. Bump both together.
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /src
+# pyproject.toml names README.md and LICENSE as metadata, so the build fails
+# without them; nothing else outside src/ is build input.
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+# The whole dependency set, langgraph included - the worker does not need the
+# graph, but `apiary` declares one flat dependency list and splitting it into
+# extras is a pyproject change, not a Dockerfile one.
+RUN pip install .
+
+
+FROM python:3.12-slim AS runtime
+
+# git: the worker's entire job is a clone/branch/commit/push cycle, so a missing
+# binary here is not a subtle degradation, it is the whole task.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Reach the host's Ollama, not a container's. The orchestrator overrides the
+# host part when it spawns (#15); the point of the default is that it is never
+# "localhost". Compose spells the override APIARY_OLLAMA_HOST because Ollama
+# reuses OLLAMA_HOST for both a server bind address and a client target - see
+# the note in compose.yaml.
+ENV OLLAMA_HOST=http://host.docker.internal:11434
+
+# The worker commits, and `git commit` refuses to run without an identity. The
+# failure would otherwise land at the end of a task that had already spent
+# minutes of inference. Both are plain env vars, so the orchestrator can
+# override them per run; .invalid is reserved by RFC 2606 and can never route.
+ENV GIT_AUTHOR_NAME="apiary worker" \
+    GIT_AUTHOR_EMAIL="worker@apiary.invalid" \
+    GIT_COMMITTER_NAME="apiary worker" \
+    GIT_COMMITTER_EMAIL="worker@apiary.invalid"
+
+# Unprivileged: this container runs LLM-written code while holding a token that
+# can push. Every privilege it does not hold is one a bad generation cannot
+# spend.
+RUN useradd --create-home --uid 10001 apiary \
+ && mkdir -p /workspace \
+ && chown -R apiary:apiary /workspace /opt/venv
+
+# HOME must exist and be writable: git and pip both write under it, and an
+# unset HOME resolves to "/", which uid 10001 cannot write to.
+ENV HOME=/home/apiary
+
+# /opt/venv is owned by apiary above rather than by root, because the verify
+# command installs the target repo's dependencies at run time and would
+# otherwise hit a read-only site-packages. Handing LLM-driven code write access
+# to its own interpreter is acceptable exactly here: the container is cattle,
+# mounts nothing from the host, and is destroyed after one task.
+
+# The worker entrypoint proper is #16, landing as swarm.worker.entrypoint. This
+# shim is what lets that ticket land without editing this file - its contract
+# lists only src/swarm/worker/*, so an ENTRYPOINT hard-wired to a module that
+# does not exist yet would deadlock the two tickets against each other.
+COPY --chmod=0755 <<'PY' /usr/local/bin/apiary-worker
+#!/opt/venv/bin/python
+"""Run the worker entrypoint, or explain that it has not been written yet.
+
+Delegates to swarm.worker.entrypoint as soon as that module exists (#16),
+passing argv through untouched so the real entrypoint owns the argument
+contract. Until then it accepts the three arguments the orchestrator dispatches
+with, so `--help` documents the interface and a real invocation fails loudly.
+"""
+
+import importlib.util
+import sys
+
+
+def _entrypoint():
+    """Return swarm.worker.entrypoint.main, or None if #16 has not landed.
+
+    Existence is checked with find_spec rather than a try/except around the
+    import: once the module is there, an ImportError raised *inside* it - a
+    missing dependency, a typo - has to surface as a crash. Swallowing it would
+    silently downgrade a broken worker to the stub below, which reports an
+    infrastructure error and hands the issue straight back for a retry that
+    would fail the same way.
+    """
+    try:
+        found = importlib.util.find_spec("swarm.worker.entrypoint") is not None
+    except ModuleNotFoundError:
+        # find_spec imports the parent package, which is what is missing today.
+        found = False
+    if not found:
+        return None
+    from swarm.worker.entrypoint import main
+
+    return main
+
+
+def _not_implemented(argv):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="apiary-worker",
+        description="Run one issue to a pull request, in an isolated container.",
+    )
+    parser.add_argument("--repo", required=True, help="clone URL of the target repository")
+    parser.add_argument("--issue", type=int, required=True, help="issue number holding the task contract")
+    parser.add_argument("--base-commit", required=True, help="commit the work branch starts from")
+    parser.parse_args(argv)
+
+    print(
+        "apiary-worker: the worker entrypoint is not implemented in this image "
+        "(swarm.worker.entrypoint, issue #16)",
+        file=sys.stderr,
+    )
+    # 2 = infrastructure error: the task never ran, so it must not burn an
+    # attempt (docs/issue-contract.md, the claimed -> ready transition).
+    return 2
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    run = _entrypoint()
+    return run(argv) if run is not None else _not_implemented(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+
+USER apiary
+WORKDIR /workspace
+
+# Args from the orchestrator's container create call land on the shim's argv.
+ENTRYPOINT ["apiary-worker"]
