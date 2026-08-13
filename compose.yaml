@@ -1,0 +1,75 @@
+# One service: the orchestrator.
+#
+# There is deliberately NO ollama service here, and adding one is a regression
+# rather than an improvement. Docker Desktop on macOS has no Metal passthrough,
+# so a containerized Ollama drops to CPU and loses roughly an order of
+# magnitude. Ollama runs on the host; containers reach it over
+# host.docker.internal:11434. See "Three constraints" in docs/architecture-v2.md.
+
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: apiary-orchestrator:dev
+    # PID 1 reaps the subprocesses the graph spawns (git, the verify command).
+    init: true
+
+    # Secrets arrive at run time, from the caller's environment or a .env file
+    # that is never part of the build context. Nothing here is baked into the
+    # image - `docker history apiary-orchestrator:dev` stays clean.
+    #
+    # The token is intentionally not `:?required`: `docker compose run
+    # orchestrator --help` has to work on a machine with no token at all, and an
+    # empty one fails loudly and specifically later ("GITHUB_TOKEN is not set",
+    # from src/swarm/github/client.py) rather than as a compose interpolation
+    # error. Scope it to the single target repo, contents + PR write only.
+    #
+    # The Ollama override is spelled APIARY_OLLAMA_HOST rather than the obvious
+    # ${OLLAMA_HOST:-...}, because Ollama reuses one variable name for two
+    # different things. Letting containers reach the host server requires
+    # OLLAMA_HOST=0.0.0.0:11434 in the host environment - a *bind* address.
+    # Interpolating that would hand the container "0.0.0.0:11434" as a *client*
+    # URL, pointing it at itself where nothing listens, and would break exactly
+    # on the machines that had configured the host correctly.
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
+      OLLAMA_HOST: ${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
+
+    # Docker Desktop resolves host.docker.internal itself; this makes a Linux
+    # host behave the same way instead of failing to resolve it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Run artifacts on the host, because the container is cattle: worker logs
+    # are the main thing you want after a bad run, and they must survive
+    # disposal. #29 defines the layout under this directory. The host side sits
+    # in .swarm/ next to the checkpoints and worktrees, which is already both
+    # this project's state directory and already gitignored.
+    volumes:
+      - ./.swarm/runs:/var/apiary/runs
+
+    # --- seam for #28: the Docker socket proxy -------------------------------
+    # Dispatching workers (#21) needs the Docker API, and a bind-mounted
+    # /var/run/docker.sock is effectively host root inside a container that runs
+    # LLM-written code. The socket is therefore NOT mounted here. #28 puts a
+    # proxy with a restricted API surface in front of it and adds, to this
+    # service:
+    #
+    #     environment:
+    #       DOCKER_HOST: tcp://docker-socket-proxy:2375
+    #     depends_on:
+    #       - docker-socket-proxy
+    #
+    # and, alongside it, the proxy itself - the only container in this file that
+    # ever sees the socket, and read-only at that:
+    #
+    #   docker-socket-proxy:
+    #     image: <pinned proxy image>
+    #     environment:
+    #       CONTAINERS: 1      # create, inspect and remove workers
+    #       POST: 1            # ... which needs writes; everything else stays 0
+    #     volumes:
+    #       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # -------------------------------------------------------------------------

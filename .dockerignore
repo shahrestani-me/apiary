@@ -1,0 +1,39 @@
+# The build context is only what `pip install .` reads: pyproject.toml, src/,
+# and the README.md + LICENSE that pyproject.toml points its metadata at.
+# Everything else is excluded - a smaller context is faster, but the reason it
+# is written as "exclude by default" is that a file which never enters the
+# context can never end up in a layer.
+
+# Anything that could carry a credential. GITHUB_TOKEN reaches the container
+# through compose's environment at run time, never through the image.
+.env
+.env.*
+*.pem
+*.key
+
+# Git metadata and CI config: the package version is static, so nothing in the
+# build needs history.
+.git
+.gitignore
+.github
+
+# Host-side state from previous runs: checkpoints, worktrees, run artifacts.
+.swarm/
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Docs, tests and tooling: real inputs to the project, not to the image.
+docs/
+tests/
+scripts/
+CITATION.cff
+CONTRIBUTING.md
+SETUP.md
+
+# The build files themselves.
+Dockerfile
+compose.yaml
+.dockerignore
