@@ -149,6 +149,18 @@ that doesn't compile a meaningful fraction of the time. That is normal, and it
 is exactly why the verifier and retry loop exist. **Judge the system by what
 survives verification, never by what the model emits.**
 
+## Contributing
+
+Pull requests are welcome. `main` is protected: every change goes through a PR
+that CI must pass and the code owner must approve. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Author
+
+Kamyar Shahrestani ([@kamyarshahrestani](https://github.com/kamyarshahrestani)).
+
+If you use this work, see [CITATION.cff](CITATION.cff).
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Copyright © 2026 Kamyar Shahrestani.
