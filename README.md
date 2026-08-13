@@ -86,13 +86,33 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 |---|---|---|
 | `SWARM_REPO` | `$PWD` | Target git repo. |
 | `SWARM_VERIFY` | `python -m pytest -q` | Your quality gate. Add lint/typecheck for a stricter one. |
-| `SWARM_ORCHESTRATOR_MODEL` | `gemma4:31b` | Planning, routing, stall judgement. |
-| `SWARM_WORKER_MODEL` | `gemma4:31b` | Writes the code. Quality here dominates. |
+| `SWARM_ORCHESTRATOR_MODEL` | `gemma4:31b` | Planning, routing, stall judgement. Dense — buy quality. |
+| `SWARM_WORKER_MODEL` | `gemma4:26b` | Writes the code. MoE — buy throughput. |
 | `SWARM_MAX_PARALLEL` | `2` | Concurrent workers. Memory scales with this. |
 | `SWARM_MAX_ROUNDS` | `8` | Hard stop. |
 | `SWARM_MAX_STALLS` | `2` | No-progress rounds before **replanning** instead of retrying. |
 | `SWARM_MAX_ATTEMPTS` | `3` | Per-task retries before abandoning. |
 | `SWARM_WORKER_CTX` | `16384` | Never set this to a model's advertised 256K — the KV cache would cost more than the weights. |
+
+### Choosing the two models
+
+Split them by **architecture, not size**. On Apple Silicon, generation speed is
+roughly `bandwidth ÷ bytes-read-per-token`: a dense model reads its whole file
+per token, an MoE reads only its active experts. Measured on an M4 Max / 36 GB:
+
+| Model | Type | Size | Active | Throughput |
+|---|---|---|---|---|
+| `gemma4:31b` | dense | 19 GB | 30.7B | 17.4 tok/s |
+| `gemma4:26b` | MoE | 17 GB | 3.8B | **81.7 tok/s** (4.7×) |
+
+The orchestrator emits a few hundred tokens of schema-constrained JSON per
+round, so it can afford the dense model. The worker emits whole files, which is
+where the wall-clock actually goes, so it gets the MoE. Hence the defaults.
+
+Both together are 36 GB of weights against a ~27 GB GPU budget, so they cannot
+stay resident. Keep `OLLAMA_MAX_LOADED_MODELS=1` and let Ollama swap — a swap
+measured 6.7 s, about twice a round, against minutes saved on every worker
+call. If you'd rather have zero swapping, set both roles to `gemma4:26b`.
 
 ## Verified against
 

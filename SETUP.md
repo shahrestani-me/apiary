@@ -25,62 +25,78 @@ roughly `bandwidth ÷ bytes-read-per-token`. For a **dense** model that means th
 whole file; for an **MoE** only the active experts. This is why the model
 architecture matters more than its parameter count here:
 
-| Model | Type | Size | Active params | Est. speed on your M4 Max |
-|---|---|---|---|---|
-| `gemma4:31b` | dense | 20 GB | 30.7B | **~15 tok/s** |
-| `gemma4:26b` | MoE | 18 GB | **3.8B** | **~50–70 tok/s** |
+Measured on this machine, not estimated:
 
-Same family, similar quality (MMLU Pro 85.2 vs 82.6 — about 3 points), **3–4× the
+| Model | Type | Size | Active params | Throughput |
+|---|---|---|---|---|
+| `gemma4:31b` | dense | 19 GB | 30.7B | **17.4 tok/s** |
+| `gemma4:26b` | MoE | 17 GB | **3.8B** | **81.7 tok/s** |
+
+Same family, similar quality (MMLU Pro 85.2 vs 82.6 — about 3 points), **4.7× the
 speed**. In a swarm that makes dozens of sequential model calls per run, that is
 the difference between a 4-minute run and a 15-minute one.
 
-**You have `gemma4:31b`, and that is the configured default.** It fits comfortably
-and it is the higher-quality model. Start there.
+**You have both, and the defaults use both** — `gemma4:31b` to plan, `gemma4:26b`
+to write code. The reasoning is in §0b.
 
 ### Your memory budget, worked out
 
 ```
 GPU budget (75% of 36 GB)          ~27.0 GB
-  gemma4:31b weights (Q4_K_M)      -19.0 GB
+  gemma4:26b weights (Q4_K_M)      -17.0 GB   (worker: resident while coding)
   KV cache (16K ctx x 2 parallel,
             q8_0 quantized)         -3.0 GB
                                    =========
-  headroom for macOS + your apps     ~5.0 GB   ✓ fits
+  headroom for macOS + your apps     ~7.0 GB   ✓ fits
 ```
 
-Why **single-tier** (one model for both orchestrator and worker): adding
-`gemma4:e2b` alongside would be 19 + 7.2 = 26.2 GB of weights before any KV cache,
-which breaks the budget. And a model swap between graph nodes costs 10–30 s —
-more than the small model could ever save you. One model, always warm, wins.
+That is the budget for **one** model at a time. Both together are 19 + 17 = 36 GB
+of weights, which does not fit — so keep `OLLAMA_MAX_LOADED_MODELS=1` and let
+Ollama swap between them.
+
+Swapping is the cost of the two-model split, and it is smaller than it sounds: a
+swap measured **6.7 s** here, and the graph crosses the boundary roughly twice a
+round (plan → worker → judge). Call it ~13 s a round, against minutes saved on
+every worker call. Worth it. The `judge` node also short-circuits without a model
+call whenever arithmetic can answer, which cuts some of those crossings.
+
+If you would rather have zero swapping, set **both** roles to `gemma4:26b`. You
+lose ~3 MMLU points on the planning calls, which is the place it matters least.
 
 ### The one number to watch: output speed
 
-At ~15 tok/s, a worker rewriting a 300-line file (~4,000 tokens) takes **~4.5
-minutes** — per task, per attempt. With retries that adds up fast.
+At 17.4 tok/s, a worker rewriting a 300-line file (~4,000 tokens) takes **~4
+minutes** — per task, per attempt, and retries multiply it. At 81.7 tok/s the
+same rewrite is **~50 seconds**. That gap is the entire reason for the split.
 
-Two ways out if that bites, in order of effort:
-
-1. **Pull the MoE sibling:** `ollama pull gemma4:26b` (18 GB) and set
-   `SWARM_WORKER_MODEL=gemma4:26b`. ~4× faster for ~3 points of quality. For an
-   iterate-and-verify loop that is almost always the right trade.
-2. **Reduce output tokens.** The worker currently emits *whole files* because
-   sub-10B models can't produce reliable diffs — but a 30B-class model can. Switching
-   to search/replace block edits cuts output by 5–10× on large files. Ask and I'll
-   add that mode.
+If output speed still bites, the next lever is **fewer output tokens**. The worker
+currently emits *whole files* because sub-10B models can't produce reliable diffs
+— but a 26B-class model can. Switching to search/replace block edits cuts output
+by 5–10× on large files.
 
 ---
 
 ## 0b. Model roles
 
-One model fills both roles. The *prompts* differ, not the model:
+Split the roles by **architecture, not by size** — which is the opposite of the
+usual "small model orchestrates, big model works" advice, and it is right here
+because of how Apple Silicon generates tokens:
 
-| Role | What it does | Why one model is fine |
-|---|---|---|
-| **Orchestrator** | Plan, route, judge "are we stuck?" | Short schema-constrained JSON calls. Cheap even on a big model. |
-| **Worker** | Write the code | The expensive calls. This is where quality shows. |
+| Role | Default | What it does | Why this model |
+|---|---|---|---|
+| **Orchestrator** | `gemma4:31b` (dense) | Plan, route, judge "are we stuck?" | A few hundred tokens of schema-constrained JSON per round. Slow generation barely registers, so spend the budget on judgement quality. |
+| **Worker** | `gemma4:26b` (MoE) | Write the code | Emits whole files. This is where the wall-clock goes, so buy throughput. |
 
-If you later move to a machine with 64 GB+, split them: a small fast model as
-orchestrator, the biggest coder you can fit as worker. On 36 GB, don't.
+The usual advice assumes tokens cost money. Locally they cost *time*, and time
+is spent almost entirely in the worker — so the expensive-per-token model
+belongs on the short calls, not the long ones.
+
+Override either:
+
+```bash
+export SWARM_ORCHESTRATOR_MODEL=gemma4:31b
+export SWARM_WORKER_MODEL=gemma4:26b
+```
 
 **Alternative worth trying** if `gemma4:26b` underwhelms on real code:
 `qwen3-coder:30b` (19 GB, MoE, 3.3B active) is a *dedicated* coding model rather
@@ -98,11 +114,12 @@ brew services start ollama   # keeps the server at localhost:11434
 ollama --version
 ```
 
-You already have the model:
+You already have both models:
 
 ```bash
 ollama list
 # gemma4:31b    6316f0629137    19 GB
+# gemma4:26b    5571076f3d70    17 GB
 ```
 
 Sanity-check that tool/JSON mode works:
@@ -196,7 +213,7 @@ branch back — all with a stubbed model.
 Expected output:
 
 ```
-repo=/tmp/.../demo base_branch=main orchestrator=gemma4:31b worker=gemma4:31b
+repo=/tmp/.../demo base_branch=main orchestrator=gemma4:31b worker=gemma4:26b
 planned 1 task(s): add-sub
 [add-sub] wrote 1 file(s): calc.py
 [add-sub] PASS
@@ -216,7 +233,7 @@ plumbing. That distinction will save you days of debugging.
 ```bash
 export SWARM_REPO=~/sources/your-repo
 export SWARM_ORCHESTRATOR_MODEL=gemma4:31b
-export SWARM_WORKER_MODEL=gemma4:31b
+export SWARM_WORKER_MODEL=gemma4:26b
 export SWARM_VERIFY="python -m pytest -q"     # must match YOUR repo's test command
 export SWARM_MAX_PARALLEL=2
 
@@ -257,7 +274,7 @@ write code that doesn't compile maybe a third of the time. That is normal and
 it is exactly why the verifier + retry loop exists. Judge the *system* by
 what survives verification, never by what the model emits.
 
-With `gemma4:31b` as the worker you're starting from a decent baseline — this
+With `gemma4:26b` as the worker you're starting from a decent baseline — this
 is not a toy model. Expect it to handle single-file and small multi-file tasks
 reasonably, and to struggle when a task requires understanding code it wasn't
 shown. Curating which files each task lists is therefore doing real work.

@@ -1,14 +1,15 @@
 """Central configuration.
 
-Two model tiers, deliberately:
+Two model roles:
 
-  ORCHESTRATOR_MODEL - small, fast, cheap. Does planning, routing, progress
-                       judgement. These are short structured-output calls, so
-                       a 2-4B model is genuinely fine here.
+  ORCHESTRATOR_MODEL - planning, routing, progress judgement. Short
+                       schema-constrained JSON calls, a few hundred tokens a
+                       round. Cheap even on a large model, so buy quality here.
 
-  WORKER_MODEL       - the one that writes code. Quality here dominates the
-                       quality of the whole system. Use the biggest coding
-                       model your RAM allows.
+  WORKER_MODEL       - the one that writes code. It emits whole files, so this
+                       is where the wall-clock time goes. Buy throughput here.
+
+The two are not "big vs small" - see the note on the model fields below.
 
 Override anything via environment variables.
 """
@@ -31,12 +32,24 @@ class Settings:
     # --- Models ---------------------------------------------------------
     # Defaults tuned for Mac Studio M4 Max / 36 GB unified memory.
     #
-    # SINGLE-TIER on purpose. With a ~27 GB GPU budget you cannot keep a 20 GB
-    # worker and a second model resident without paging, and a model swap
-    # between graph nodes costs more than the small model ever saves. One
-    # model, always warm, wins.
+    # Split by ARCHITECTURE, not by size. On Apple Silicon, generation speed is
+    # roughly bandwidth / bytes-read-per-token, so a dense model reads its whole
+    # file per token while an MoE reads only its active experts. Measured here:
+    #
+    #   gemma4:31b  dense  19 GB  30.7B active   17.4 tok/s
+    #   gemma4:26b  MoE    17 GB   3.8B active   81.7 tok/s   (4.7x)
+    #
+    # The orchestrator emits a few hundred tokens of schema-constrained JSON per
+    # round; quality there is worth more than speed, so it gets the dense model.
+    # The worker emits whole files - that is where the wall-clock goes - so it
+    # gets the MoE.
+    #
+    # 19 + 17 GB of weights exceeds the ~27 GB GPU budget, so keep
+    # OLLAMA_MAX_LOADED_MODELS=1 and let Ollama swap. A swap measured 6.7 s here,
+    # roughly 2 swaps per round, against minutes saved on every worker call.
+    # Set both to gemma4:26b to eliminate swapping entirely if you prefer.
     orchestrator_model: str = field(default_factory=lambda: _env("SWARM_ORCHESTRATOR_MODEL", "gemma4:31b"))
-    worker_model: str = field(default_factory=lambda: _env("SWARM_WORKER_MODEL", "gemma4:31b"))
+    worker_model: str = field(default_factory=lambda: _env("SWARM_WORKER_MODEL", "gemma4:26b"))
 
     # Low temperature: we want obedient structure, not creativity.
     orchestrator_temperature: float = 0.0
@@ -48,9 +61,9 @@ class Settings:
     # model at 256K would need more memory than the weights themselves. Never
     # request the advertised maximum. 16-32K is plenty for one focused task,
     # and curated context beats large context on every model we tested.
-    # Keep these EQUAL when both roles use the same model. Ollama allocates a
-    # runner per (model, options) combination - different num_ctx values for
-    # the same model can spawn a second runner and double your memory use.
+    # Ollama allocates a runner per (model, options) combination, so if you set
+    # both roles to the SAME model, keep these two values equal - differing
+    # num_ctx would spawn a second runner and double your memory use.
     orchestrator_num_ctx: int = int(_env("SWARM_ORCH_CTX", "16384"))
     worker_num_ctx: int = int(_env("SWARM_WORKER_CTX", "16384"))
 
