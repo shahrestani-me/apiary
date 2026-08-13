@@ -7,8 +7,12 @@ on:
 
 jobs:
   test:
-    # The stub test uses a real git repo and real pytest, but a stubbed model,
-    # so it runs anywhere without Ollama.
+    # The default selection is hermetic by construction: the stub test uses a
+    # real git repo and a real pytest but a stubbed model, and everything that
+    # would need Docker, a network or Ollama carries a marker that is
+    # deselected unless asked for (tests/conftest.py). So this job needs none
+    # of the three, and the reporting step below says out loud how many tests
+    # that hid - a test that runs nowhere is worse than one that fails.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,4 +32,19 @@ jobs:
           git config --global user.name "ci"
 
       - name: Test
-        run: pytest -q -s
+        run: |
+          set -o pipefail
+          pytest -q -s | tee pytest.log
+
+      - name: Report gated markers
+        if: always()
+        run: |
+          {
+            echo "### Hermetic test run"
+            echo
+            echo '```'
+            grep '^apiary' pytest.log 2>/dev/null \
+              || echo "no gated-marker report - is tests/conftest.py still there?"
+            tail -n 1 pytest.log 2>/dev/null || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
