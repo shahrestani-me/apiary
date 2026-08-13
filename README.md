@@ -165,3 +165,9 @@ If you use this work, see [CITATION.cff](CITATION.cff).
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright © 2026 Kamyar Shahrestani.
+
+## Architecture
+
+v1 (this code) is a single process with git-worktree isolation. v2 moves the
+control plane onto GitHub issues and the execution plane into containers — see
+[docs/architecture-v2.md](docs/architecture-v2.md).
