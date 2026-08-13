@@ -5,6 +5,7 @@ type: software
 authors:
   - family-names: Shahrestani
     given-names: Kamyar
+    email: info@shahrestani.me
     alias: kamyarshahrestani
 repository-code: "https://github.com/shahrestani-me/apiary"
 abstract: >-

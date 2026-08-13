@@ -157,7 +157,8 @@ that CI must pass and the code owner must approve. See
 
 ## Author
 
-Kamyar Shahrestani ([@kamyarshahrestani](https://github.com/kamyarshahrestani)).
+Kamyar Shahrestani ([@kamyarshahrestani](https://github.com/kamyarshahrestani)) —
+<info@shahrestani.me>.
 
 If you use this work, see [CITATION.cff](CITATION.cff).
 
