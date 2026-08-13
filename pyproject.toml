@@ -6,10 +6,10 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-    { name = "Kamyar Shahrestani", email = "61367775+kamyarshahrestani@users.noreply.github.com" },
+    { name = "Kamyar Shahrestani", email = "info@shahrestani.me" },
 ]
 maintainers = [
-    { name = "Kamyar Shahrestani", email = "61367775+kamyarshahrestani@users.noreply.github.com" },
+    { name = "Kamyar Shahrestani", email = "info@shahrestani.me" },
 ]
 keywords = ["multi-agent", "llm", "ollama", "langgraph", "local-first", "code-generation"]
 classifiers = [
