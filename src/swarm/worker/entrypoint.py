@@ -138,13 +138,36 @@ class WorkerResult:
 # --------------------------------------------------------------------------
 
 
-def _git(cwd: Path, *args: str, timeout: int = 300) -> str:
+def _git(cwd: Path, *args: str, timeout: int = 300, env: dict[str, str] | None = None) -> str:
     proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, **env} if env else None,
     )
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed:\n{proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+def _credentials() -> tuple[list[str], dict[str, str]]:
+    """Git config and environment that authenticate a clone, or empty pair.
+
+    Imported from `pr.py` rather than restated: one credential helper, one
+    variable name, one place to get the quoting wrong. `GIT_TERMINAL_PROMPT=0`
+    regardless, so an unauthenticated private clone fails immediately instead
+    of blocking on a prompt no container can answer.
+    """
+    from .pr import CREDENTIAL_HELPER, TOKEN_ENV, TOKEN_ENV_SOURCE
+
+    env = {"GIT_TERMINAL_PROMPT": "0"}
+    token = os.environ.get(TOKEN_ENV_SOURCE)
+    if not token:
+        return [], env
+    env[TOKEN_ENV] = token
+    return ["-c", "credential.helper=", "-c", f"credential.helper={CREDENTIAL_HELPER}"], env
 
 
 def prepare_checkout(clone_url: str, dest: Path, base_commit: str, branch: str) -> Path:
@@ -164,11 +187,20 @@ def prepare_checkout(clone_url: str, dest: Path, base_commit: str, branch: str) 
     if dest.exists() and any(dest.iterdir()):
         raise InfrastructureError(f"{dest} already exists and is not empty")
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # A private repository needs credentials to *clone*, not only to push, and
+    # a worker with none fails as `could not read Username for
+    # 'https://github.com'` - which reads like a missing terminal rather than a
+    # missing token. Same credential helper #17 uses for the push, for the same
+    # reason: the token reaches git through an environment variable named on
+    # the command line, never through the URL, so it stays out of .git/config
+    # and out of every git error string.
+    config, git_env = _credentials()
     # Cloning with a token in the URL would write it into .git/config and into
     # every git error message, which is the stream #15 captures and #29 saves.
     # Authenticated clones land with #17/#28's credential handling; the URL
     # stays a plain URL here.
-    _git(dest.parent, "clone", "--quiet", clone_url, str(dest))
+    _git(dest.parent, *config, "clone", "--quiet", clone_url, str(dest), env=git_env)
     _git(dest, "switch", "--quiet", "--force-create", branch, base_commit)
     return dest
 

@@ -612,3 +612,41 @@ def test_a_command_that_runs_and_fails_is_still_the_task(
     code = main(argv(scratch_repo, workspace), client=gh, editor=editor)
 
     assert code == EXIT_TASK_FAILED
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_private_clone_carries_credentials_and_never_the_url(monkeypatch, tmp_path, scratch_repo):
+    """A private repository needs a token to clone, not only to push.
+
+    The first real worker against a private repo failed with "could not read
+    Username for 'https://github.com'", which reads like a missing terminal
+    rather than a missing credential. The token goes through the same helper
+    #17 uses for the push, so it never reaches .git/config or a git error
+    string - asserted here by scanning the argv.
+    """
+    from swarm.worker.entrypoint import _credentials
+    from swarm.worker.pr import TOKEN_ENV, TOKEN_ENV_SOURCE
+
+    monkeypatch.setenv(TOKEN_ENV_SOURCE, "github_pat_" + "c" * 40)
+    config, env = _credentials()
+
+    assert config[:2] == ["-c", "credential.helper="]
+    assert "credential.helper=" in config[3]
+    assert env[TOKEN_ENV].startswith("github_pat_")
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    # The secret is named on the command line, never spelled on it.
+    assert not any("github_pat_" in part for part in config)
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_public_clone_still_needs_no_token(monkeypatch):
+    """No credential, no helper - and prompts still disabled, so a private
+    repo fails fast rather than hanging on a prompt no container can answer."""
+    from swarm.worker.entrypoint import _credentials
+    from swarm.worker.pr import TOKEN_ENV_SOURCE
+
+    monkeypatch.delenv(TOKEN_ENV_SOURCE, raising=False)
+    config, env = _credentials()
+
+    assert config == []
+    assert env == {"GIT_TERMINAL_PROMPT": "0"}
