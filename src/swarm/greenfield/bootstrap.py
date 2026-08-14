@@ -57,7 +57,11 @@ gate today could grade an empty generation green.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -230,3 +234,226 @@ class Bootstrap:
             f"least one real assertion about the code in this project - a suite that "
             f"passes because it tests nothing is worse than no suite."
         )
+
+
+# --------------------------------------------------------------------------
+# Falsifying the gate
+# --------------------------------------------------------------------------
+#
+# `planner.py` refuses to let the model choose a verify command, because "a
+# command guessed wrong is a gate that was red before any worker touched the
+# task". Making the bootstrap model-generated reopens that: the model would
+# write both the code and the gate that judges it.
+#
+# So a proposed command is not trusted, it is *falsified* - run against a
+# deliberately broken copy of the tree and required to notice.
+
+
+#: The gate's own wall clock, separate from `SWARM_VERIFY_TIMEOUT`.
+#:
+#: Distinct because they bound different things: `verify_timeout_s` is how long
+#: a *task's* gate may take on a real repository, and this is how long a one-off
+#: probe may take on a tree with four files in it. Sharing the number would mean
+#: a repository that legitimately needs a five-minute suite also gets five
+#: minutes per falsification run, twice, at provision time.
+FALSIFY_TIMEOUT_S = 120
+
+#: Commands refused before a container is created.
+#:
+#: Belt and braces: `true` and `exit 0` would be rejected by the decision table
+#: anyway, since they pass on the mutated tree. They are named so the message a
+#: human reads says *tautological* rather than "passed the mutation", and
+#: because this is the cheapest possible check.
+TAUTOLOGIES = frozenset({"true", ":", "exit 0", "/bin/true"})
+
+
+class ProposedGate(BaseModel):
+    """The verify command the bootstrap proposes for the repository it wrote.
+
+    Separate from `WorkerOutput` on purpose: the files and the gate are two
+    answers with two different fates. The files are applied if they land inside
+    the declared set; the command is applied only if it survives falsification,
+    and a rejected command must not take the files down with it.
+    """
+
+    command: str = Field(
+        description=(
+            "one shell command whose exit code is the whole verdict. It MUST fail "
+            "when the project's source files are empty - a command that still passes "
+            "on an empty project is not testing anything"
+        )
+    )
+    reason: str = Field(default="", description="one sentence: what it runs")
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What falsification decided, and why in words a human can act on."""
+
+    command: str
+    accepted: bool
+    reason: str
+
+    def __str__(self) -> str:
+        state = "accepted" if self.accepted else "REFUSED"
+        return f"gate {state}: {self.command!r} - {self.reason}"
+
+
+def empty_declared(tree: Path, files: Sequence[str], into: Path) -> Path:
+    """The mutation: copy the tree, then truncate every declared file.
+
+    **Orchestrator-chosen and deterministic, never model-chosen.** A mutation
+    the model picked would put the same model on both sides of the test, which
+    is the failure this whole function exists to prevent.
+
+    **Emptying, not deleting**, and the difference is load-bearing.
+    `PLACEHOLDER_VERIFY` is `test -f README.md`: a falsifier that *deleted*
+    files would see it go red and admit it as a real gate. Emptying leaves the
+    file there, so `test -f` passes on the mutated tree too and the command is
+    correctly refused. It is the permanent regression case this ticket names,
+    and it stays caught only because of this choice.
+
+    Only the *declared* files are touched. Everything provisioning committed -
+    README, LICENSE, the workflow - is left alone, for the same reason.
+    """
+    shutil.copytree(tree, into, dirs_exist_ok=True)
+    for relative in files:
+        target = into / relative
+        if target.is_file():
+            target.write_text("", encoding="utf-8")
+    return into
+
+
+def falsify(
+    command: str,
+    tree: Path,
+    files: Sequence[str],
+    *,
+    mutate: Callable[[Path, Sequence[str], Path], Path] = empty_declared,
+    run: Callable[[str, Path], int] | None = None,
+    workspace: Path | None = None,
+) -> Verdict:
+    """Accept a proposed gate only if it passes clean code and fails broken code.
+
+    Two runs, and the decision is the pair:
+
+    ==========  ==========  ===============================================
+    clean       mutated     verdict
+    ==========  ==========  ===============================================
+    non-zero    -           refused: red before a worker touched it
+    zero        zero        refused: tautological, proves nothing
+    zero        non-zero    accepted
+    ==========  ==========  ===============================================
+
+    **Both dependencies are injectable and both have real defaults.** That is
+    not a testing convenience, it is the safety boundary: `run` decides *where*
+    model-proposed shell executes, and the only acceptable answer is a
+    container. Provisioning runs in the orchestrator process, which holds
+    `APIARY_PROVISION_TOKEN` - `administration` and `workflows` - and a
+    `DOCKER_HOST` pointing at a proxy with `ALLOW_START=1`.
+    `assert_unprivileged` only inspects argv that `ContainerManager.spawn`
+    built, so a one-liner calling `docker` directly bypasses it entirely. One
+    line of model-proposed shell there is host root *plus* the ability to
+    rewrite the CI it is being falsified against. On the `.venv` path it is
+    model-written shell on the developer's Mac.
+
+    ## What this does not buy, stated rather than discovered
+
+    It is a **shape** check with a known false-negative rate.
+
+    - Emptying the declared files proves the command **reads** the code. It does
+      not prove it **tests** it.
+    - It cannot detect a **narrow** gate. `npm test` whose suite asserts
+      `true === true`, or a command covering one file of nine, passes clean and
+      fails emptied, and is admitted. Narrowness is exactly what makes CI green
+      while the application is broken.
+    - **Measured, and specific:** `node --test` exits 0 on a tree whose source
+      and test files are empty *but whose `package.json` is intact*. It is
+      caught today only because `BOOTSTRAP_FILES["node"]` declares the manifest,
+      so emptying that breaks module resolution and the run goes red. That is a
+      property of the file list, not of this function - a stack whose manifest
+      were not declared would admit a vacuous gate.
+    """
+    stripped = command.strip()
+    if not stripped or stripped.casefold() in TAUTOLOGIES:
+        return Verdict(stripped, False, "tautological: it cannot fail, so it gates nothing")
+
+    execute = run if run is not None else _container_run
+    clean = execute(stripped, tree)
+    if clean != 0:
+        return Verdict(
+            stripped,
+            False,
+            f"red on the code it was written for (exit {clean}); this gate would block "
+            "every pull request before a worker touched the task",
+        )
+
+    root = Path(workspace) if workspace else Path(tempfile.mkdtemp(prefix="apiary-falsify-"))
+    broken = execute(stripped, mutate(tree, files, root / "mutated"))
+    if broken == 0:
+        return Verdict(
+            stripped,
+            False,
+            "still passes with every declared file emptied, so it is not reading the "
+            "code at all - see #88 for how a gate can be green on an empty project",
+        )
+    return Verdict(stripped, True, f"passes clean and fails emptied (exit {broken})")
+
+
+def _container_run(command: str, tree: Path) -> int:
+    """Run one proposed command in a container, and nothing else.
+
+    Deliberately the only thing in this module that executes anything, and
+    deliberately not a `subprocess` call: `test_nothing_under_greenfield_runs_a_shell`
+    asserts there is no `subprocess` import and no `shell=True` anywhere under
+    `src/swarm/greenfield/`, because this is the module a reader would most
+    reasonably add one to.
+    """
+    from ..containers.manager import ContainerManager, StackImages
+    from ..run import Run
+
+    manager = ContainerManager(
+        run=Run.start("apiary/falsify", "falsify a proposed gate"),
+        image=StackImages().for_stack(DEFAULT_STACK),
+        env={},
+        timeout_s=FALSIFY_TIMEOUT_S,
+        extra_flags=["--network", "none", "--volume", f"{Path(tree).resolve()}:/w:ro"],
+    )
+    handle = manager.spawn(
+        0, "", entrypoint="/bin/sh", command=["-c", f"cd /w && {command}"]
+    )
+    try:
+        return manager.wait(handle, timeout_s=FALSIFY_TIMEOUT_S)
+    finally:
+        manager.dispose(handle)
+
+
+def choose_gate(
+    proposed: str,
+    tree: Path,
+    files: Sequence[str],
+    *,
+    operator: str | None = None,
+    fallback: str = "",
+    **kwargs,
+) -> Verdict:
+    """Which command becomes the repository's gate.
+
+    **An explicit `--verify` skips falsification entirely.** It is the escape
+    hatch, and an escape hatch that can be refused is not one: a false rejection
+    there has no recovery path, because the operator has already told the system
+    the answer and the system would be arguing with them about their own
+    repository. `cli._target` already treats `--verify` as authoritative over
+    the scaffold's command for the same reason.
+
+    A proposed command that fails falsification does **not** fail the run. The
+    repository keeps `fallback` - the placeholder the initial commit was
+    provisioned with - and the reason is printed. Aborting would destroy a
+    generated project over a gate, and the project is the expensive part.
+    """
+    if operator:
+        return Verdict(operator.strip(), True, "chosen by the operator with --verify; not falsified")
+    verdict = falsify(proposed, tree, files, **kwargs)
+    if verdict.accepted:
+        return verdict
+    return Verdict(fallback, False, f"keeping {fallback!r}: {verdict.reason}")
