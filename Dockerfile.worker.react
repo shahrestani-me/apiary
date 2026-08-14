@@ -1,0 +1,178 @@
+# The worker image for React web tasks.
+#
+# Identical to Dockerfile.worker.node in every way that is not the React
+# toolchain: same base, same Node 22, same entrypoint shim, same uid, same
+# absence of credentials. Read Dockerfile.worker first, then that one -
+# everything they say about disposability, redaction and why Ollama is not in
+# here applies unchanged.
+#
+# **Why React does not share the Node image.** It did, and it could not work:
+# `node --test` has no JSX transform, so the shared image could run a React
+# project's files only as syntax errors. The stack needed react, react-dom, a
+# transform and a DOM before it needed anything else, and none of those are in
+# the Node image.
+#
+# **Why this needs no widened egress, which #106 was filed believing it would.**
+# The epic's plan was to reach npmjs.org from the worker, which means widening
+# the enforced allowlist and taking the exfiltration surface from GitHub-only
+# to GitHub-plus-a-registry-that-accepts-uploads. It is not necessary. The
+# argument docs/security.md already makes for the Node image - "an image with a
+# toolchain in it needs no registry at run time" - covers React too, as long as
+# the toolchain is installed *here*, at build time, where the network is
+# allowed and where SETUP.md step 4 already puts a human. Measured: the gate
+# below runs green in a container started with `--network none`.
+#
+# **The one non-obvious mechanic: NODE_PATH does not work.** Node's ESM
+# resolver ignores it - it is CJS-only - so `ENV NODE_PATH=/opt/react/node_modules`
+# fails with `ERR_MODULE_NOT_FOUND: Cannot find package '@vitejs/plugin-react'`
+# on a `"type": "module"` project, which is what a modern React project is.
+# What works is putting the dependencies at the **filesystem root**: the ESM
+# resolver walks parent directories looking for `node_modules`, so
+# `/node_modules` resolves from `/workspace/<repo>` with no symlink, no
+# environment variable, and nothing for the generated project to declare.
+#
+# **No npm cache warming, and no NPM_CONFIG_PREFER_OFFLINE.** #106 asked for
+# both, on the theory that the verify command would install. It does not - the
+# gate is `vitest run` and `tests/test_bootstrap.py` fails if any stack's gate
+# names an installer - so a cache tuned for a command that never runs would be
+# a knob describing a design that was abandoned.
+
+FROM node:22-bookworm-slim AS node
+FROM python:3.12-slim AS build
+
+# Same interpreter as Dockerfile.worker on purpose - see its note. A bug that
+# reproduces in one worker image and not the other is the thing to avoid.
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install .
+
+
+FROM python:3.12-slim AS runtime
+
+LABEL org.apiary.stack="react"
+
+# git: the worker's entire job is a clone/branch/commit/push cycle.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Node from the official image rather than from Debian's archive: bookworm
+# ships Node 18, and copying the prefix is how the pin stays a pin. The
+# generated CI workflow pins the same major (greenfield/provision.CI_SETUP), so
+# a worker-green result and a CI-green result are talking about one runtime.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+# The React toolchain, at the filesystem root - see the header note on why
+# NODE_PATH is not an option. `npm install --prefix /` does *not* produce
+# `/node_modules`; it has to be installed somewhere ordinary and moved.
+#
+# Every version here is also in `greenfield/stacks.py`'s `REACT_TOOLCHAIN` and in
+# the install step of the generated CI workflow, and
+# `tests/test_bootstrap.py::test_the_react_toolchain_is_pinned_identically_everywhere`
+# fails if the three drift. That test is the only thing keeping worker-green
+# and CI-green statements about the same versions: the worker gets its
+# toolchain from this layer and a GitHub runner cannot.
+RUN mkdir -p /tmp/deps && cd /tmp/deps \
+ && npm install --no-audit --no-fund --loglevel=error \
+      react@18 react-dom@18 vitest@2 @vitejs/plugin-react@4 jsdom@25 \
+      @testing-library/react@16 @testing-library/jest-dom@6 \
+ && mv /tmp/deps/node_modules /node_modules \
+ && rm -rf /tmp/deps
+
+COPY --from=build /opt/venv /opt/venv
+
+ENV PATH="/node_modules/.bin:/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+ENV OLLAMA_HOST=http://host.docker.internal:11434
+
+ENV GIT_AUTHOR_NAME="apiary worker" \
+    GIT_AUTHOR_EMAIL="worker@apiary.invalid" \
+    GIT_COMMITTER_NAME="apiary worker" \
+    GIT_COMMITTER_EMAIL="worker@apiary.invalid"
+
+RUN useradd --create-home --uid 10001 apiary \
+ && mkdir -p /workspace \
+ && chown -R apiary:apiary /workspace /opt/venv
+
+ENV HOME=/home/apiary
+
+# `~/.npm` for the same reason Dockerfile.worker.node has it: npm writes a
+# cache on *every* invocation, including ones that install nothing, and an
+# unwritable cache directory fails the command rather than skipping the cache.
+RUN mkdir -p /home/apiary/.npm \
+ && chown -R apiary:apiary /home/apiary
+ENV NPM_CONFIG_CACHE=/home/apiary/.npm
+
+# The same shim as Dockerfile.worker, and it must stay the same: the
+# orchestrator dispatches one argv against every worker image, so a shim that
+# drifted between them would be a stack-dependent argument contract.
+COPY --chmod=0755 <<'PY' /usr/local/bin/apiary-worker
+#!/opt/venv/bin/python
+"""Run the worker entrypoint, or explain that it has not been written yet.
+
+See Dockerfile.worker for why this is a shim and why existence is checked with
+find_spec rather than a try/except around the import.
+"""
+
+import importlib.util
+import sys
+
+
+def _entrypoint():
+    try:
+        found = importlib.util.find_spec("swarm.worker.entrypoint") is not None
+    except ModuleNotFoundError:
+        found = False
+    if not found:
+        return None
+    from swarm.worker.entrypoint import main
+
+    return main
+
+
+def _not_implemented(argv):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="apiary-worker",
+        description="Run one issue to a pull request, in an isolated container.",
+    )
+    parser.add_argument("--repo", required=True, help="clone URL of the target repository")
+    parser.add_argument("--issue", type=int, required=True, help="issue number holding the task contract")
+    parser.add_argument("--base-commit", required=True, help="commit the work branch starts from")
+    parser.parse_args(argv)
+
+    print(
+        "apiary-worker: the worker entrypoint is not implemented in this image "
+        "(swarm.worker.entrypoint, issue #16)",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    run = _entrypoint()
+    return run(argv) if run is not None else _not_implemented(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+
+USER apiary
+WORKDIR /workspace
+
+ENTRYPOINT ["apiary-worker"]

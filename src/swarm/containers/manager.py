@@ -67,13 +67,17 @@ WORKER_IMAGE = "apiary-worker"
 #: was the Python the package itself needs. Agnosticism is bought here instead:
 #: several images, one per stack, selected per task.
 #:
-#: Node and React share an image on purpose. React web needs Node and nothing
-#: else at the toolchain level, and two tags for one Dockerfile would be two
-#: things to keep built rather than one.
+#: Node and React used to share an image, on the grounds that "React web needs
+#: Node and nothing else at the toolchain level". That was wrong in the one way
+#: that mattered: `node --test` has no JSX transform, so the shared image could
+#: run a React project's files only as syntax errors. #106 gives React its own
+#: image carrying react, react-dom, vitest and a DOM - installed at build time,
+#: where the network is allowed, so the gate still needs no registry at run
+#: time. `Dockerfile.worker.react` says why that is the whole design.
 DEFAULT_STACK_IMAGES: Mapping[str, str] = {
     "python": WORKER_IMAGE,
     "node": "apiary-worker-node",
-    "react": "apiary-worker-node",
+    "react": "apiary-worker-react",
 }
 
 #: Override, as `stack=image` pairs: `APIARY_WORKER_IMAGES=node=my-node:dev`.

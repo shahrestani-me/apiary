@@ -1,4 +1,9 @@
-# The worker image for Node and React web tasks.
+# The worker image for Node tasks.
+#
+# It used to serve React web as well, and could not: `node --test` has no JSX
+# transform, so this image can read a React project's files only as syntax
+# errors. React has its own image now - see Dockerfile.worker.react, which is
+# this file plus a React toolchain at the filesystem root.
 #
 # Identical to Dockerfile.worker in every way that is not the toolchain: same
 # base, same entrypoint shim, same uid, same absence of credentials. Read that
@@ -24,11 +29,16 @@
 # generated CI workflow pins the same major (greenfield/provision.CI_SETUP), so
 # a worker-green result and a CI-green result are talking about one runtime.
 #
-# **No package manager beyond npm.** #87's first non-Python stack is Node with
-# `node --test` - stdlib since Node 18, no dependencies, no lockfile, no
-# registry - precisely so this image needs nothing the egress policy forbids.
-# Dependency-installing stacks are milestone 2 and are blocked on the egress
-# allowlist being enforceable at all, not on this file.
+# **No package manager beyond npm, and no packages.** #87's first non-Python
+# stack is Node with `node --test` - stdlib since Node 18, no dependencies, no
+# lockfile, no registry - precisely so this image needs nothing the egress
+# policy forbids.
+#
+# The epic expected the *next* stack to be blocked on making that allowlist
+# enforceable. It was not: #106 put React's dependencies in its image at build
+# time instead, so a dependency-installing stack turned out to need no run-time
+# registry either, and the allowlist was never widened. Dockerfile.worker.react
+# is the argument in full.
 
 FROM node:22-bookworm-slim AS node
 FROM python:3.12-slim AS build

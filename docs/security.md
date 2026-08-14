@@ -209,6 +209,40 @@ proxy sets `BUILD=0` and `IMAGES=0` (§4), so it can neither build nor pull one.
 `SETUP.md` step 4 is the command; `containers.manager.build_hint` is the same
 line, produced by the code that refuses.
 
+### The stack that was supposed to force a wider allowlist, and did not
+
+#87 planned React web as the ticket where this posture broke: a stack with real
+dependencies needs a package registry, so the enforced allowlist would have to
+grow from GitHub-only to GitHub-plus-npmjs, and the exfiltration surface with
+it. It is worth writing down that this **did not happen**, because the argument
+generalises.
+
+`Dockerfile.worker.react` installs react, react-dom, vitest, a JSX transform
+and a DOM at **image build time** — on the host, where the network is allowed
+and where step 4 already puts a human — and moves them to `/node_modules`, at
+the filesystem root, where Node's ESM resolver finds them from any working
+directory. The gate is then `vitest run`, and it was measured green in a
+container started with `--network none`. The allowlist in §3 is byte-for-byte
+what it was before React existed as a stack.
+
+`EgressPolicy.from_env()` and `APIARY_EGRESS_ALLOW` are therefore still what
+they were: an escape hatch with no production caller, which widens nothing
+today. That remains a real gap for a target repository whose own `## Verify`
+needs an index — but it is not React's gap, and "make the allowlist
+enforceable" is no longer a prerequisite for a dependency-carrying stack.
+
+**What this costs instead, stated rather than hidden.** A worker's toolchain
+comes from its image and a GitHub runner's cannot, so the generated workflow
+installs the same packages itself (`greenfield.provision.CI_SETUP`). `npm ci`
+is not available to close the gap: it needs a lockfile, and producing one needs
+the registry the worker is denied. So both sides install from the **same pinned
+major ranges** (`greenfield.stacks.REACT_TOOLCHAIN`, with a test failing if the
+Dockerfile and the workflow drift from it) and can still resolve different
+patch versions. Worker-green and CI-green are therefore statements about the
+same versions to a major, not to a build. Closing that properly means
+publishing the worker image to a registry so the workflow can use `container:`,
+which is a much larger change than this one.
+
 ### What this does not buy
 
 `github.com` is one host and every repository lives behind it. The egress filter
