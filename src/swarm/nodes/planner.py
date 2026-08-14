@@ -69,6 +69,8 @@ projecting the plan it just sent. Anything else would be a second ledger, and
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass
 from typing import Iterable, Literal, Mapping, Sequence
 
@@ -741,6 +743,42 @@ def _replan_prompt(existing: Mapping[str, TaskRecord]) -> str:
     return SYSTEM + REPLAN_SUFFIX.format(failures=failures, existing=tracked)
 
 
+#: How long to keep asking GitHub for issues it has just accepted. Writes are
+#: not immediately visible to the list endpoint - a plan can be created and the
+#: very next read return the ledger as it was before it - and an orchestrator
+#: that gave up there would report "the planner wrote nothing" directly beneath
+#: a line naming what it wrote. Observed on a real repository twice.
+READ_BACK_ATTEMPTS = 6
+READ_BACK_DELAY_S = 1.0
+
+
+def _read_back(client: GitHubClient, report: PlanReport, *, sleep=time.sleep) -> Ledger:
+    """Re-read the tracker until it shows the plan that was just written.
+
+    Re-reading at all is the point: `docs/architecture-v2.md` says GitHub wins
+    on any disagreement, and that only means something if nothing keeps a
+    second copy of the plan. But the read has to be able to *see* the write,
+    and two things stop it - this client's own conditional cache, dropped here,
+    and GitHub's replication, which is what the retries are for.
+
+    Bounded, and it returns whatever it has when the budget runs out rather
+    than raising: a partially visible ledger is a real state the reconciler
+    handles every cycle, and the caller decides what an empty one means.
+    """
+    expected = {action.task_id for action in report.actions if action.number is not None}
+    invalidate = getattr(client, "invalidate_cache", None)
+    ledger = Ledger()
+    for attempt in range(READ_BACK_ATTEMPTS):
+        if invalidate is not None:
+            invalidate()
+        ledger = load_ledger(client, adopt=False)
+        if expected <= set(ledger.entries):
+            return ledger
+        if attempt + 1 < READ_BACK_ATTEMPTS:
+            sleep(READ_BACK_DELAY_S)
+    return ledger
+
+
 def plan_node(
     state: SwarmState,
     *,
@@ -799,14 +837,7 @@ def plan_node(
     # disagreement, GitHub wins" is only a rule that means anything if nothing
     # keeps a second copy. `adopt=False` because the write above just adopted
     # everything it touched.
-    # Unconditional: GitHub answers a conditional re-read of a list it has just
-    # accepted writes to with a 304 for a short window, and the cached body is
-    # the ledger as it was *before* the plan. Re-reading is only worth doing if
-    # it can see what was written.
-    invalidate = getattr(client, "invalidate_cache", None)
-    if invalidate is not None:
-        invalidate()
-    ledger = load_ledger(client, adopt=False)
+    ledger = _read_back(client, report)
 
     events = [f"planned onto {report.summary()}"]
     events += [f"  · {action}" for action in report.actions]
