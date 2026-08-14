@@ -60,6 +60,7 @@ __all__ = [
     "EGRESS_ALLOWLIST",
     "WORKER_NETWORK",
     "SOCKET_PROXY_ENV",
+    "SOCKET_PROXY_HOST",
     "DOCKER_HOST_URL",
     "worker_create_flags",
     "assert_unprivileged",
@@ -214,6 +215,12 @@ EGRESS_EXTRA_ENV = "APIARY_EGRESS_ALLOW"
 EGRESS_PROXY_HOST = "egress-proxy"
 EGRESS_PROXY_PORT = 8888
 
+#: The socket proxy's name lives up here beside the other service name because
+#: `NO_PROXY_HOSTS` below needs it; the Docker API constants that use it are in
+#: section 3.
+SOCKET_PROXY_HOST = "docker-socket-proxy"
+SOCKET_PROXY_PORT = 2375
+
 #: The network a worker is created on: internal, so it has no default route,
 #: and shared with the egress proxy and nothing else. Fixed with `name:` in
 #: compose.yaml rather than left to compose's project prefix, because the
@@ -223,7 +230,19 @@ WORKER_NETWORK = "apiary-egress"
 #: Reached directly rather than through the proxy. The socket proxy is on a
 #: different internal network and asking a proxy to reach it would fail
 #: confusingly; `localhost` is the container itself.
-NO_PROXY_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", EGRESS_PROXY_HOST)
+#:
+#: `SOCKET_PROXY_HOST` is load-bearing and was missing until the orchestrator
+#: image gained a `docker` client. The CLI honours `HTTP_PROXY` for its own API
+#: calls, so `docker version` went to the egress proxy, which answered `403
+#: Filtered` - a deny-by-default egress rule refusing a request that never
+#: should have left the container. Nothing detected it earlier because there
+#: was no client in the image to make the call.
+NO_PROXY_HOSTS: tuple[str, ...] = (
+    "localhost",
+    "127.0.0.1",
+    EGRESS_PROXY_HOST,
+    SOCKET_PROXY_HOST,
+)
 
 
 @dataclass(frozen=True)
@@ -327,10 +346,10 @@ def _hostname(value: str) -> str:
 # 3. The Docker API
 # --------------------------------------------------------------------------
 
-#: The compose service name of the socket proxy, and the address the
-#: orchestrator's `docker` CLI dials instead of `/var/run/docker.sock`.
-SOCKET_PROXY_HOST = "docker-socket-proxy"
-SOCKET_PROXY_PORT = 2375
+#: The address the orchestrator's `docker` CLI dials instead of
+#: `/var/run/docker.sock`. The host and port themselves are declared in
+#: section 2, beside the other compose service name, because `NO_PROXY_HOSTS`
+#: has to name this host to keep the CLI off the egress proxy.
 DOCKER_HOST_URL = f"tcp://{SOCKET_PROXY_HOST}:{SOCKET_PROXY_PORT}"
 
 #: The proxy's API surface, as `tecnativa/docker-socket-proxy` spells it. Every

@@ -36,6 +36,16 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
+# docker: containers/manager.py drives the daemon by shelling out to the CLI
+# rather than through a Python SDK, so that DOCKER_HOST - and therefore #28's
+# socket proxy - is honoured for free. Without the client on PATH that choice
+# is silently unsatisfiable: the proxy answers, and nothing can speak to it.
+#
+# Only the client binary, never the daemon. Pinned to a major rather than the
+# rolling `cli` tag, and the API version is negotiated, so a 29.x daemon is not
+# a requirement.
+COPY --from=docker:29-cli /usr/local/bin/docker /usr/local/bin/docker
+
 COPY --from=build /opt/venv /opt/venv
 
 ENV PATH="/opt/venv/bin:$PATH" \
