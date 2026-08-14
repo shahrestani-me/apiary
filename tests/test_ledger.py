@@ -26,10 +26,12 @@ import pytest
 from swarm.github import ledger as ledger_module
 from swarm.github.ledger import (
     DEFAULT_STACK,
+    GENERATED_FILES,
     KNOWN_STACKS,
     LABEL_PRECEDENCE,
     REQUIRED_SECTIONS,
     STATUS_BY_LABEL,
+    generated_for,
     ContractError,
     DuplicateTaskIdError,
     load_ledger,
@@ -812,3 +814,78 @@ def test_every_generatable_stack_is_a_declarable_one():
     from swarm.greenfield.scaffold import STACKS
 
     assert set(STACKS) <= KNOWN_STACKS
+
+
+# --------------------------------------------------------------------------
+# Files the gate generates (#105)
+# --------------------------------------------------------------------------
+
+
+def test_python_generates_nothing():
+    """Every task that exists today, and its behaviour must not change."""
+    assert generated_for("python") == ()
+    assert generated_for(DEFAULT_STACK) == ()
+
+
+def test_a_node_task_may_commit_its_lockfile():
+    assert "package-lock.json" in generated_for("node")
+    assert generated_for("react") == generated_for("node")
+
+
+def test_an_unknown_stack_generates_nothing_rather_than_raising():
+    """An unknown stack is already a `ContractError` at parse time, and this is
+    also called on an entry whose stack was defaulted - where "nothing is
+    generated" is the correct and safe answer."""
+    assert generated_for("rust") == ()
+    assert generated_for("") == ()
+
+
+def test_every_generated_path_is_one_the_files_rules_would_accept():
+    """The constants are ours, which is a reason to check cheaply rather than a
+    reason not to check: these become `git add` arguments."""
+    for stack, paths in GENERATED_FILES.items():
+        for path in paths:
+            assert not path.startswith("/"), (stack, path)
+            assert ".." not in path, (stack, path)
+            assert not any(char in path for char in "*?[]{}"), (stack, path)
+            assert not path.startswith("node_modules/"), (stack, path)
+            assert not path.startswith(".git/"), (stack, path)
+
+
+def test_every_declarable_stack_has_a_generated_entry():
+    """An empty tuple says "considered"; a missing key says "forgotten", and
+    the difference matters the day a stack is added."""
+    assert set(GENERATED_FILES) == KNOWN_STACKS
+
+
+def test_a_task_may_not_declare_a_file_the_gate_generates():
+    """The two sets are disjoint. A model that lists `package-lock.json` under
+    `## Files` has declared it will author 180k tokens of SHA-512 hashes, and
+    the attempt burns on a truncated generation rather than on the task."""
+    body = contract_body(files="- package.json\n- package-lock.json", stack="node")
+
+    with pytest.raises(ContractError) as raised:
+        parse_contract(7, body)
+
+    assert raised.value.section == "Files"
+    assert "package-lock.json" in str(raised.value)
+    # And it says what to do, because "remove it" is not obvious when the file
+    # genuinely does need to be in the PR.
+    assert "committed if it appears" in str(raised.value)
+
+
+def test_the_same_path_is_fine_on_a_stack_that_does_not_generate_it():
+    """`package-lock.json` in a Python task's `## Files` is a strange thing to
+    write and not a contract violation - nothing generates it there, so a task
+    that declares it really is claiming to author it."""
+    body = contract_body(files="- package-lock.json")
+
+    assert parse_contract(7, body).files == ("package-lock.json",)
+
+
+def test_the_entry_carries_its_stacks_generated_set():
+    client = FakeClient([issue(7, contract_body(stack="node"))])
+
+    entry = load_ledger(client).entries["add-retry-logic"]
+
+    assert entry.generated == ("package-lock.json",)
