@@ -667,7 +667,7 @@ def judge(
             satisfied=False,
             progress=False,
             in_loop=False,
-            reason=f"judgement failed: {exc}",
+            reason=f"judgement failed: {type(exc).__name__}: {exc}",
             stalls=stalls,
             consulted=True,
             unresolved=True,

@@ -285,16 +285,34 @@ def test_a_goal_quoting_a_section_heading_round_trips(github):
     assert ledger.entries["later"].blocked_by == (ledger.entries["readiness"].number,)
 
 
-def test_a_multi_line_goal_is_collapsed_onto_one_line(github):
+def test_a_heading_inside_a_goal_cannot_open_a_section(github):
+    """The safety property, which outlived the collapse that used to provide it.
+
+    Goals are multi-line now - they are the worker's whole brief - so they can
+    no longer be flattened to keep a stray `## Files` from sectioning the body.
+    The heading is defused on the way in instead, and the task keeps the files
+    it was planned with. This is issue #11's trap approached from inside the
+    Goal section.
+    """
     client, store, _ = github()
 
     write(client, task("wrapped", goal="first line\n## Files\nsecond line"))
 
     ledger = load_ledger(client)
-    # Collapsed, so the stray heading cannot open a section and the task keeps
-    # the files it was planned with.
-    assert ledger.entries["wrapped"].goal == "first line ## Files second line"
+    assert ledger.entries["wrapped"].goal == "first line\nFiles\nsecond line"
     assert ledger.entries["wrapped"].files == ("src/swarm/wrapped.py",)
+
+
+def test_a_fence_inside_a_goal_cannot_swallow_the_contract(github):
+    """The other half of the same trap: `_scan` treats a fence as opaque, so an
+    unclosed one in a goal would hide every section after it."""
+    client, store, _ = github()
+
+    write(client, task("fenced", goal="first line\n```python\nsecond line"))
+
+    ledger = load_ledger(client)
+    assert ledger.entries["fenced"].files == ("src/swarm/fenced.py",)
+    assert "```" not in ledger.entries["fenced"].goal
 
 
 def test_a_task_with_no_dependencies_says_so_in_words(github):

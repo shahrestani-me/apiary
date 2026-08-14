@@ -105,6 +105,29 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `SWARM_WORKER_CTX` | `16384` | Never set this to a model's advertised 256K — the KV cache would cost more than the weights. |
 | `SWARM_WORKER_TIMEOUT` | `1200` | Wall clock for a whole worker container: clone, inference, verify, commit, push, PR. |
 | `SWARM_VERIFY_TIMEOUT` | `300` | Wall clock for `SWARM_VERIFY` alone, **inside** the above. Raising this without raising the outer one buys nothing — the container dies at the outer cap first, and the attempt is recorded against the container rather than the gate. `swarm doctor` refuses an inverted pair and `swarm run` will not start on one. |
+| `APIARY_CAPTURE` | unset (off) | Record every model call — the prompt, the raw response, Ollama's own load/total durations, and the real exception when one ends it. Off by default because a prompt carries whole file bodies from the repo under test. `swarm run` prints one line when it is on. `swarm console` turns it on for itself. |
+| `APIARY_CAPTURE_MAX_CHARS` | `8192` | Per-field truncation for captures written during a run. The SHA-256 always covers the full text, so a truncated record still answers "did the prompt change between attempt 1 and attempt 3?". Console captures are never truncated. |
+| `APIARY_CONSOLE_DIR` | `.swarm/console` | Where `swarm console` writes its captures. A sibling of the artifacts root with its own variable — moving runs does not silently move these. |
+
+## Seeing what the model was asked
+
+```bash
+swarm console
+```
+
+One page on `http://127.0.0.1:8117`. Type the human turn of a prompt, fire it at
+the same local Ollama a run uses, and read the schema-constrained answer, the raw
+response, the timings, and — when it breaks — the real exception beside the prompt
+that caused it. No GitHub token, no Docker, no repository, no nine-minute run.
+
+Two call sites are exposed: `propose_edits`, the worker's whole-file generation,
+and `choose_stack`, which answers in seconds and is the cheapest way to prove the
+wiring. Prompts come from the same `prompt_for` production calls, so what you read
+is what a run would send.
+
+Loopback only, and it refuses to bind anything else: a capture holds whole files
+from the repository under test, and a worker container can reach any port on the
+host gateway.
 
 ## Running v2 locally
 

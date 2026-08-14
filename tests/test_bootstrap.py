@@ -114,8 +114,33 @@ def test_an_unreachable_model_falls_back_rather_than_failing_the_run():
     assert choose_stack("anything", llm=Unreachable()) == DEFAULT_STACK
 
 
+def test_the_fallback_says_why_it_fell_back(capsys):
+    """The control on the test above, and the whole point of this pair.
+
+    The fallback was silent, and the `except` did not even bind the exception -
+    so an operator who typed a React brief and got a Python scaffold could not
+    tell a refused socket from a model that genuinely answered "python". The
+    behaviour is unchanged; only the diagnosis is new.
+    """
+    choose_stack("a dashboard", llm=Unreachable())
+
+    reported = capsys.readouterr().err
+    assert "RuntimeError" in reported, "the exception type is what distinguishes the two cases"
+    assert "connection refused" in reported
+
+
 def test_an_answer_outside_the_vocabulary_falls_back():
     assert choose_stack("anything", llm=Nonsense()) == DEFAULT_STACK
+
+
+def test_an_out_of_vocabulary_answer_reads_differently_from_an_unreachable_one(capsys):
+    """Two fallbacks, two faults. This one says something about the model;
+    the other says something about the host."""
+    choose_stack("anything", llm=Nonsense())
+
+    reported = capsys.readouterr().err
+    assert "haskell" in reported
+    assert "RuntimeError" not in reported
 
 
 def test_an_explicit_stack_is_not_a_question_for_the_model():

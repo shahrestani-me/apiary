@@ -90,10 +90,12 @@ from .worker.result import (
 
 __all__ = [
     "ARTIFACTS_ROOT_ENV",
+    "CONSOLE_ROOT_ENV",
     "CONTAINER_LOGGED",
     "CYCLE_FINISHED",
     "CYCLE_STARTED",
     "DEFAULT_ARTIFACTS_ROOT",
+    "DEFAULT_CONSOLE_ROOT",
     "EVENT_LOG_NAME",
     "LOGS_DIR_NAME",
     "RESULTS_DIR_NAME",
@@ -109,8 +111,10 @@ __all__ = [
     "RunMetrics",
     "RunView",
     "artifacts_root",
+    "console_root",
     "HOST_ROOT_ENV",
     "host_path",
+    "write_json",
     "list_runs",
     "load_run",
     "read_events",
@@ -132,6 +136,17 @@ SCHEMA_VERSION = 1
 #: everything the swarm leaves on a developer's disk.
 ARTIFACTS_ROOT_ENV = "APIARY_ARTIFACTS_DIR"
 DEFAULT_ARTIFACTS_ROOT = ".swarm/runs"
+
+#: Where console sessions live. A **sibling** of the artifacts root with its own
+#: variable, deriving nothing from it: a console capture is not a run, and
+#: `list_runs` skips directory names that are not well-formed run ids, so
+#: nesting these under `.swarm/runs` would make them either invisible or
+#: malformed. Deriving the path as `artifacts_root().parent / "console"` would
+#: have been tidier to write and wrong to operate - an operator who moves runs
+#: to `/var/apiary/runs` has said nothing about where console sessions go, and
+#: silently relocating them is how a capture ends up somewhere nothing audits.
+CONSOLE_ROOT_ENV = "APIARY_CONSOLE_DIR"
+DEFAULT_CONSOLE_ROOT = ".swarm/console"
 
 #: The four names inside a run directory. Constants rather than literals because
 #: `swarm show` reads what the orchestrator wrote, and a typo in one of two
@@ -246,6 +261,15 @@ def artifacts_root(default: str | Path | None = None) -> Path:
     return Path(os.environ.get(ARTIFACTS_ROOT_ENV) or default or DEFAULT_ARTIFACTS_ROOT)
 
 
+def console_root(default: str | Path | None = None) -> Path:
+    """The directory console sessions live in. Environment first.
+
+    Same shape as `artifacts_root`, and deliberately not defined in terms of it
+    - see `CONSOLE_ROOT_ENV`.
+    """
+    return Path(os.environ.get(CONSOLE_ROOT_ENV) or default or DEFAULT_CONSOLE_ROOT)
+
+
 def run_dir(run: Run | str, root: str | Path | None = None) -> Path:
     """This run's directory. Accepts a `Run` or an id that arrived from a human.
 
@@ -295,6 +319,41 @@ def _redacted(value: Any, redact: Callable[[str], str]) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return redact(str(value))
+
+
+def write_json(
+    target: Path,
+    payload: Mapping[str, Any],
+    *,
+    redact: Callable[[str], str] = _identity,
+    indent: int = 2,
+) -> Path:
+    """Write one JSON document atomically, redacting every string on the way in.
+
+    Module-level because redaction in this file is **per writer, not per
+    directory** - `EventLog.emit`, `RunArtifacts._write_json` and
+    `container_log` redact, and `worker/result.py` writes into the same tree
+    without redacting at all (`tests/test_artifacts.py` asserts that gap). A
+    fourth writer that hand-rolled `json.dumps` would inherit the gap rather
+    than the guarantee, so there is one function to reach for and it takes the
+    redactor as an argument rather than defaulting to something safe-looking.
+
+    `ensure_ascii` is left at its default `True` on purpose: a model response
+    containing U+2028 would otherwise reach the file as a raw line break, which
+    `read_events` would split into two unparseable halves.
+    """
+    body = json.dumps(_redacted(dict(payload), redact), indent=indent, default=str) + "\n"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=str(target.parent), prefix=f"{target.stem}.", suffix=".tmp", delete=False
+        ) as handle:
+            handle.write(body)
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+    except OSError as exc:
+        raise ArtifactsError(f"writing {target}: {exc}") from exc
+    return target
 
 
 # --------------------------------------------------------------------------
@@ -933,19 +992,12 @@ class RunArtifacts:
         Temporary file then `os.replace`, because the process writing a run's
         summary is the one shutting down, and half a JSON object is worse than
         none - a reader cannot tell it from a file somebody corrupted.
+
+        The mechanism moved to the module-level `write_json` when `capture.py`
+        needed the same guarantee; this stays as the method that knows which
+        redactor to hand it.
         """
-        body = json.dumps(_redacted(dict(payload), self.redact), indent=2, default=str) + "\n"
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "w", dir=str(target.parent), prefix=f"{target.stem}.", suffix=".tmp", delete=False
-            ) as handle:
-                handle.write(body)
-                temporary = Path(handle.name)
-            os.replace(temporary, target)
-        except OSError as exc:
-            raise ArtifactsError(f"writing {target}: {exc}") from exc
-        return target
+        return write_json(target, payload, redact=self.redact)
 
 
 def _log_name(handle: Handle) -> str:
