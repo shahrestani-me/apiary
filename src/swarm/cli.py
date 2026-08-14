@@ -61,7 +61,7 @@ from .github.ledger import LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.provision import provision
 from .greenfield.scaffold import ScaffoldedPlan
-from .security import worker_create_flags
+from .security import EgressPolicy, worker_create_flags
 from .artifacts import RunArtifacts
 from .nodes.planner import plan_node
 from .run import Attachment, RunError, start_run
@@ -239,9 +239,14 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     # workers with no token and no model host. The first worker to actually
     # start said "GITHUB_TOKEN is not set" and recorded it.
     inherited = {name: os.environ[name] for name in INHERITED_ENV if os.environ.get(name)}
+    # A worker sits on an `internal: true` network with no default route - that
+    # is the containment, not an accident - so it reaches GitHub only through
+    # the egress proxy, and only if its HTTP client is told to. `proxy_env()`
+    # exists for exactly this and nothing called it: the first worker with a
+    # token still died on "Temporary failure in name resolution".
     fleet = ContainerManager(
         run=run,
-        env={**inherited, **artifacts.worker_env()},
+        env={**inherited, **EgressPolicy().proxy_env(), **artifacts.worker_env()},
         extra_flags=[*artifacts.mount_flags(), *worker_create_flags()],
     )
     # `sink` is what puts a disposed container's logs in the run directory.

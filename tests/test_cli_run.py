@@ -788,7 +788,11 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
         raise StopHere
 
     monkeypatch.setattr("swarm.orchestrator.reconcile.Reconciler", spy_reconciler)
-    monkeypatch.setattr("swarm.containers.manager.ContainerManager", lambda **k: SimpleNamespace(docker=None))
+    def spy_fleet(**kwargs):
+        seen["fleet_env"] = kwargs["env"]
+        return SimpleNamespace(docker=None)
+
+    monkeypatch.setattr("swarm.containers.manager.ContainerManager", spy_fleet)
     monkeypatch.setattr("swarm.containers.reaper.Reaper", lambda **k: SimpleNamespace())
     monkeypatch.setattr(cli.RunArtifacts, "open", classmethod(
         lambda cls, run: SimpleNamespace(
@@ -808,3 +812,9 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
         cli._loop(args, attachment, source=client)
 
     assert seen["reconciler"] is seen["recovery"] is client
+    # And the fleet gets what a worker needs to reach anything at all: a token,
+    # a model host, somewhere to write, and the proxy that is its only route
+    # off an internal network.
+    env = seen["fleet_env"]
+    assert "HTTP_PROXY" in env and "http_proxy" in env
+    assert "NO_PROXY" in env
