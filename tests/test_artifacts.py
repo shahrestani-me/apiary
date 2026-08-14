@@ -604,3 +604,142 @@ def test_a_path_outside_the_artifacts_root_is_left_alone(monkeypatch):
     """This translates one mount. Guessing about others would be worse."""
     monkeypatch.setenv(HOST_ROOT_ENV, "/Users/someone/runs")
     assert host_path("/etc/hosts", root="/var/apiary/runs") == Path("/etc/hosts")
+
+
+# --------------------------------------------------------------------------
+# What produced this result (#97)
+# --------------------------------------------------------------------------
+#
+# #87's success signal is a query over `.swarm/runs/*/summary.json` returning a
+# non-Python run with merged PRs and its objective met. That query could not be
+# written: `run.json` held `{schema, run_id, repo, objective, started_at}` and
+# `summary.json` held outcome counts. Neither recorded the stack or the gate.
+
+
+def test_run_json_records_the_stack_and_the_gate(root):
+    artifacts = RunArtifacts.open(a_run(), root=root, stack="node", verify="npm test")
+
+    written = json.loads((artifacts.path / "run.json").read_text())
+
+    assert written["stack"] == "node"
+    assert written["verify"] == "npm test"
+
+
+def test_summary_json_records_them_too(root):
+    """Repeated rather than cross-referenced: this is the file people grep, and
+    a query that has to open two files to answer one question is a query nobody
+    writes."""
+    artifacts = RunArtifacts.open(a_run(), root=root, stack="node", verify="npm test")
+
+    artifacts.finish()
+    written = json.loads((artifacts.path / "summary.json").read_text())
+
+    assert written["stack"] == "node"
+    assert written["verify"] == "npm test"
+
+
+def test_the_epic_success_query_can_now_be_written(root):
+    """The signal itself, as a test: find the non-Python runs.
+
+    Stated this way because "the fields are present" is not the claim - the
+    claim is that a `jq` over the summaries can separate a React run from a
+    Python one, which is what nobody could do before.
+    """
+    for run_id, stack in (
+        ("apiary-20260814-140000-aaaaaa", "python"),
+        ("apiary-20260814-150000-bbbbbb", "node"),
+    ):
+        RunArtifacts.open(
+            a_run(run_id=run_id), root=root, stack=stack, verify="x"
+        ).finish()
+
+    non_python = [view.run_id for view in list_runs(root) if view.stack != "python"]
+
+    assert non_python == ["apiary-20260814-150000-bbbbbb"]
+
+
+def test_a_run_recorded_before_this_field_existed_still_reads(root):
+    """Additive: an older directory reads back with empty strings rather than
+    failing to load, and `show_text` prints "(unrecorded)" rather than a blank
+    column that looks like a bug."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+    artifacts.finish()
+
+    view = read_run(artifacts.path)
+
+    assert view.stack == "" and view.verify == ""
+    assert "(unrecorded)" in show_text(view)
+
+
+def test_show_prints_the_stack_and_the_gate(root):
+    artifacts = RunArtifacts.open(a_run(), root=root, stack="react", verify="npm test")
+
+    text = show_text(artifacts.finish())
+
+    assert "react" in text
+    assert "npm test" in text
+
+
+def test_a_zero_merge_run_says_what_the_gate_actually_printed(root):
+    """The criterion this ticket exists for.
+
+    For a run with zero merges the entire user-visible answer used to be the
+    string "the verify command failed", repeated - so "the model wrote bad
+    React" and "npm was unreachable" were byte-identically labelled, while
+    `verify_output` sat on disk with no code path printing it.
+    """
+    artifacts = RunArtifacts.open(a_run(), root=root, stack="node", verify="npm test")
+    write_result(
+        a_record(
+            issue=7,
+            exit_code=1,
+            reason="the verify command failed",
+            verify_command="npm test",
+            verify_output="FAIL src/calc.test.js\n  ● adds numbers\n  expected 3 to be 4",
+        ),
+        artifacts.results_dir,
+    )
+    write_result(
+        a_record(
+            issue=8,
+            exit_code=2,
+            reason="the verify command was denied the network",
+            verify_command="npm test",
+            verify_output="npm error code E403\nnpm error 403 Filtered",
+        ),
+        artifacts.results_dir,
+    )
+
+    text = show_text(artifacts.finish())
+
+    # Both needed a human. The point is that they no longer read the same.
+    assert "#7" in text and "#8" in text
+    assert "expected 3 to be 4" in text
+    assert "403 Filtered" in text
+    assert "gate: npm test" in text
+
+
+def test_the_shown_output_is_bounded_and_says_when_it_elided(root):
+    """A summary, not a log. The full tail is in the result file two lines
+    below it, and an unbounded dump would bury the run it is summarising."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+    write_result(
+        a_record(issue=7, exit_code=1, verify_output="x" * 4_000), artifacts.results_dir
+    )
+
+    text = show_text(artifacts.finish())
+
+    assert "earlier characters elided" in text
+    assert len(text) < 4_000
+
+
+def test_the_image_reaches_the_run_view(root):
+    """#99 makes the image vary per task, at which point "which image produced
+    this result" stops being answerable from anything else in the directory."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+    write_result(
+        a_record(issue=7, exit_code=1, image="apiary-worker-node:latest"),
+        artifacts.results_dir,
+    )
+
+    assert "apiary-worker-node:latest" in show_text(artifacts.finish())

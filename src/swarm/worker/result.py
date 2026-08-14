@@ -127,6 +127,10 @@ class Container(Protocol):
     id: str
     run_id: str
     issue: int | None
+    #: Which image this container was created from. `Handle` already carries
+    #: it, so nothing had to grow a field - it simply was not recorded, and
+    #: once #99 picks the image per task it is the only place the answer lives.
+    image: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -157,6 +161,12 @@ class ResultRecord:
     branch: str = ""
     commit: str | None = None
     written: tuple[str, ...] = ()
+    #: The container image this attempt ran in. Additive with a default, so no
+    #: schema bump: a record written before this field existed reads back as
+    #: `ResultRecord(image="")` rather than failing to load, and #99 makes the
+    #: image vary per task - at which point "which image produced this result"
+    #: stops being answerable from anything else in the directory.
+    image: str = ""
     started_at: dt.datetime | None = None
     finished_at: dt.datetime | None = None
     synthesised: bool = False
@@ -233,6 +243,7 @@ class ResultRecord:
             "verify_command": self.verify_command,
             "verify_output": self.verify_output,
             "written": list(self.written),
+            "image": self.image,
             "commit": self.commit,
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
@@ -257,6 +268,10 @@ class ResultRecord:
                 branch=str(payload.get("branch", "")),
                 commit=payload.get("commit") or None,
                 written=tuple(payload.get("written") or ()),
+                # Additive, so absent is empty rather than an error: a record
+                # written before this field existed must still load, which is
+                # what "no schema bump" means in practice.
+                image=str(payload.get("image", "")),
                 started_at=_parse(payload.get("started_at")),
                 finished_at=_parse(payload.get("finished_at")),
                 synthesised=bool(payload.get("synthesised", False)),
@@ -293,6 +308,7 @@ def from_worker(
     finished_at: dt.datetime | None = None,
     exit_code: int | None = None,
     reason: str | None = None,
+    image: str = "",
 ) -> ResultRecord:
     """The worker's own testimony, which is the authoritative kind.
 
@@ -314,6 +330,7 @@ def from_worker(
         branch=result.branch,
         commit=result.commit,
         written=result.written,
+        image=image,
         started_at=started_at,
         finished_at=finished_at or dt.datetime.now(dt.timezone.utc),
     )
@@ -365,6 +382,7 @@ def synthesise(
         reason=reason,
         task_id=task_id,
         repo=repo,
+        image=getattr(container, "image", "") or "",
         started_at=started_at,
         finished_at=finished_at or dt.datetime.now(dt.timezone.utc),
         synthesised=True,
@@ -502,6 +520,7 @@ def report(
     started_at: dt.datetime | None = None,
     finished_at: dt.datetime | None = None,
     exit_code: int | None = None,
+    image: str = "",
 ) -> Path:
     """Build the worker's record and write it. One call, because it is one act.
 
@@ -517,6 +536,7 @@ def report(
         started_at=started_at,
         finished_at=finished_at,
         exit_code=exit_code,
+        image=image,
     )
     return write_result(record, directory)
 

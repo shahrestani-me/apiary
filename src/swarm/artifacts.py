@@ -82,8 +82,10 @@ from .security import Leak, scan_artifacts
 from .worker.result import (
     DEFAULT_RESULT_DIR,
     RESULT_DIR_ENV,
+    ResultRecord,
     RunSummary,
     summarise_dir,
+    tail,
 )
 
 __all__ = [
@@ -629,6 +631,10 @@ class RunArtifacts:
     run: Run
     root: Path
     redact: Callable[[str], str] = _identity
+    #: What `open` recorded into `run.json`, kept so `finish` can repeat it into
+    #: `summary.json` without re-reading the file it just wrote.
+    stack: str = ""
+    verify: str = ""
     _cycles: list[CycleMetrics] = field(default_factory=list, repr=False)
     _loaded_model: str = field(default="", repr=False)
 
@@ -640,16 +646,28 @@ class RunArtifacts:
         root: str | Path | None = None,
         redact: Callable[[str], str] | None = None,
         env: Mapping[str, str] | None = None,
+        stack: str = "",
+        verify: str = "",
     ) -> RunArtifacts:
         """Create the directory, record who this run is, and say it started.
 
         `run.json` is written at startup rather than at the end because the run
         that most needs identifying is the one that never reached its end.
+
+        `stack` and `verify` are recorded here rather than on `Run` because
+        `run.py` is deliberately "small and inert" - an identity, not a
+        description of the work - and because both are facts about *this
+        directory's* run that a reader has no other way to recover. #87's
+        success signal is a query over `.swarm/runs/*/summary.json` returning a
+        non-Python run with merged PRs, and that query cannot be written
+        against a file that records neither.
         """
         artifacts = cls(
             run=run,
             root=artifacts_root() if root is None else Path(root),
             redact=redact if redact is not None else _default_redactor(env),
+            stack=stack,
+            verify=verify,
         )
         for directory in (artifacts.path, artifacts.results_dir, artifacts.logs_dir):
             try:
@@ -664,9 +682,11 @@ class RunArtifacts:
                 "repo": run.repo,
                 "objective": run.objective,
                 "started_at": _iso(run.started_at),
+                "stack": stack,
+                "verify": verify,
             },
         )
-        artifacts.event(RUN_STARTED, repo=run.repo, objective=run.objective)
+        artifacts.event(RUN_STARTED, repo=run.repo, objective=run.objective, stack=stack)
         return artifacts
 
     # --- layout ---------------------------------------------------------
@@ -836,6 +856,11 @@ class RunArtifacts:
                 "objective": self.run.objective,
                 "started_at": _iso(self.run.started_at),
                 "finished_at": _iso(moment),
+                # Repeated from `run.json` rather than cross-referenced: this
+                # is the file people grep, and a query that has to open two
+                # files to answer one question is a query nobody writes.
+                "stack": self.stack,
+                "verify": self.verify,
                 "note": note,
                 "metrics": self.metrics().to_dict(),
                 # Derived from `results/` and never read back - the files are the
@@ -959,6 +984,11 @@ class RunView:
     started_at: dt.datetime | None = None
     finished_at: dt.datetime | None = None
     note: str = ""
+    #: Which stack this run targeted and the repo-wide gate it ran. Empty for a
+    #: run recorded before either was written down, which is why `show_text`
+    #: prints "(unrecorded)" rather than an empty column.
+    stack: str = ""
+    verify: str = ""
     metrics: RunMetrics = RunMetrics()
     results: RunSummary = RunSummary(run_id="", records=())
     container_logs: tuple[Path, ...] = ()
@@ -1026,6 +1056,8 @@ def read_run(path: str | Path) -> RunView:
         started_at=_parse(summary.get("started_at") or identity.get("started_at")),
         finished_at=_parse(summary.get("finished_at")),
         note=str(summary.get("note") or ""),
+        stack=str(summary.get("stack") or identity.get("stack") or ""),
+        verify=str(summary.get("verify") or identity.get("verify") or ""),
         metrics=metrics,
         results=summarise_dir(directory / RESULTS_DIR_NAME, run_id=run_id),
         container_logs=tuple(sorted((directory / LOGS_DIR_NAME).glob(LOG_GLOB))),
@@ -1092,6 +1124,42 @@ def runs_text(views: Sequence[RunView]) -> str:
     return "\n".join(lines)
 
 
+#: How much of one attempt's verify output `swarm show` prints per issue.
+#: Small on purpose: this is a summary, and the full tail is in the result file
+#: two lines below it. Enough to tell a stack trace from a 403.
+SHOWN_OUTPUT_CHARS = 800
+
+
+def _needed_a_human(issue: int, record: ResultRecord) -> list[str]:
+    """One issue's account of why it stopped, and what the gate actually said.
+
+    Printing `record.reason` alone is what this used to do, and for a run with
+    zero merges the entire user-visible answer was the string "the verify
+    command failed", repeated - so "the model wrote bad React" and "npm was
+    unreachable" were byte-identically labelled. `verify_output` was on disk
+    the whole time and no code path printed it.
+
+    The command is printed beside the output because a gate that never opened
+    is diagnosed from the command far more often than from what it printed:
+    `npm test` in a repository with no `package.json` says everything.
+
+    **Safe to print only because #90 landed.** Result files are the one
+    artifact written without passing through the redactor, and the verify
+    subprocess used to inherit `GITHUB_TOKEN`; printing this before the scrub
+    would have risked putting a credential on a terminal.
+    """
+    lines = [f"  #{issue}: {record.reason or record.outcome}"]
+    if record.verify_command:
+        lines.append(f"      gate: {record.verify_command}")
+    if record.image:
+        lines.append(f"      image: {record.image}")
+    output = (record.verify_output or "").strip()
+    if output:
+        shown = tail(output, SHOWN_OUTPUT_CHARS)
+        lines += [f"      | {line}" for line in shown.splitlines()]
+    return lines
+
+
 def show_text(view: RunView) -> str:
     """`swarm show <run-id>`: one run, in the order the questions get asked.
 
@@ -1103,6 +1171,8 @@ def show_text(view: RunView) -> str:
         f"run {view.run_id}",
         f"  repo       {view.repo or '(unknown)'}",
         f"  objective  {view.objective or '(unrecorded)'}",
+        f"  stack      {view.stack or '(unrecorded)'}",
+        f"  verify     {view.verify or '(unrecorded)'}",
         f"  started    {_iso(view.started_at) or '(unrecorded)'}",
         f"  finished   {_iso(view.finished_at) or '(never - this run did not reach its end)'}",
     ]
@@ -1113,8 +1183,7 @@ def show_text(view: RunView) -> str:
     if view.needs_human:
         lines.append("needed a human: " + ", ".join(f"#{issue}" for issue in view.needs_human))
         for issue in view.needs_human:
-            record = view.results.latest[issue]
-            lines.append(f"  #{issue}: {record.reason or record.outcome}")
+            lines += _needed_a_human(issue, view.results.latest[issue])
     else:
         lines.append("needed a human: nothing")
 

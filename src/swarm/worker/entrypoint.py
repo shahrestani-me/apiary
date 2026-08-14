@@ -160,12 +160,50 @@ VERIFY_ENV_REQUIRED = (
 #: #29 writes it to disk, and neither wants a megabyte of pytest chatter.
 OUTPUT_TAIL_CHARS = 4_000
 
+#: The image this container was created from, if the spawner said so. A worker
+#: cannot ask the daemon - it has no socket and no `docker` binary, which is the
+#: containment working - so the only way it can name its own image is to be
+#: told. The orchestrator-side record (`result.synthesise`) reads it off the
+#: `Handle` instead and needs no variable; this is the seam #99 fills so the
+#: worker's own testimony can answer the same question.
+IMAGE_ENV = "APIARY_WORKER_IMAGE"
+
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
 _REMOTE_RE = re.compile(r"[:/](?P<owner>[A-Za-z0-9_.\-]+)/(?P<name>[A-Za-z0-9_.\-]+?)(?:\.git)?/?$")
 
 
 class InfrastructureError(RuntimeError):
-    """Something outside the task broke. Exit 2, attempt not consumed."""
+    """Something outside the task broke. Exit 2, attempt not consumed.
+
+    Carries what the attempt had already established when it died, because the
+    record built from it is written on exactly the path where that matters
+    most. "The clone failed" and "the gate passed and the push failed" are both
+    exit 2, and only one of them has a command and a file list to report.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        verify_command: str = "",
+        written: Sequence[str] = (),
+        task_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.verify_command = verify_command
+        self.written = tuple(written)
+        self.task_id = task_id
+
+    def learned(self, *, verify_command: str, written: Sequence[str], task_id: str) -> None:
+        """Fill in context the raiser did not have. Mutates and does not re-raise.
+
+        `run_verify` cannot know which files were written and `commit_edits`
+        cannot know the gate command, so the context is attached by the frame
+        that has both rather than threaded through every raise site.
+        """
+        self.verify_command = self.verify_command or verify_command
+        self.written = self.written or tuple(written)
+        self.task_id = self.task_id or task_id
 
 
 @dataclass(frozen=True)
@@ -462,15 +500,23 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
         # The shell itself could not be started. Nothing ran.
         raise InfrastructureError(f"could not run the verify command: {exc}") from exc
 
-    output = f"{proc.stdout}\n{proc.stderr}".strip()
+    # Imported here, not at module scope, for `_record`'s reason: `result.py`
+    # depends on this module for `WorkerResult` and the exit codes. It has to be
+    # *that* function rather than a local slice, or the record and the worker's
+    # own output would disagree about what a truncated log looks like.
+    from .result import tail
+
+    output = tail(f"{proc.stdout}\n{proc.stderr}".strip(), OUTPUT_TAIL_CHARS)
     verdict = classify_verify(
         proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started
     )
     if verdict.infrastructure:
-        raise InfrastructureError(
-            f"{verdict.reason}: {command!r}\n{output[-OUTPUT_TAIL_CHARS:]}"
-        )
-    return verdict.passed, output[-OUTPUT_TAIL_CHARS:]
+        raise InfrastructureError(f"{verdict.reason}: {command!r}\n{output}")
+    # `result.tail` rather than a bare slice: a complete 3KB log and the last
+    # 4KB of a 400KB npm log used to be indistinguishable, and the difference
+    # is the difference between "this is the failure" and "the failure is
+    # somewhere above this".
+    return verdict.passed, output
 
 
 # --------------------------------------------------------------------------
@@ -543,15 +589,24 @@ def run_worker(
 
     print(f"  · wrote {', '.join(applied.written)}")
     print(f"  · verifying: {contract.verify}")
-    passed, verify_output = run_verify(root, contract.verify)
+    # From here on the attempt knows what its gate is and what it wrote, so an
+    # infrastructure failure carries both rather than reporting an empty
+    # command for a run that had already got as far as a green suite.
+    try:
+        passed, verify_output = run_verify(root, contract.verify)
 
-    commit = None
-    if passed:
-        subject = f"swarm[{task_id}]: {(title or contract.goal)[:60]}"
-        try:
-            commit = commit_edits(root, subject, applied.written)
-        except GitError as exc:
-            raise InfrastructureError(f"committing issue #{issue}: {exc}") from exc
+        commit = None
+        if passed:
+            subject = f"swarm[{task_id}]: {(title or contract.goal)[:60]}"
+            try:
+                commit = commit_edits(root, subject, applied.written)
+            except GitError as exc:
+                raise InfrastructureError(f"committing issue #{issue}: {exc}") from exc
+    except InfrastructureError as exc:
+        exc.learned(
+            verify_command=contract.verify, written=applied.written, task_id=task_id
+        )
+        raise
 
     return WorkerResult(
         issue=issue,
@@ -673,6 +728,7 @@ def _record(result: WorkerResult, exit_code: int) -> None:
             run_id=os.environ.get(RUN_ID_ENV, "unattached"),
             attempt=result.attempt,
             exit_code=exit_code,
+            image=os.environ.get(IMAGE_ENV, ""),
         )
     except OSError as exc:
         print(f"! could not write the result record: {exc}", file=sys.stderr)
@@ -680,17 +736,34 @@ def _record(result: WorkerResult, exit_code: int) -> None:
         print(f"  · recorded {path.name}")
 
 
-def _unrun(issue: int, repo: str, reason: str) -> WorkerResult:
-    """A result for an attempt that never got as far as a verify command."""
+def _unrun(
+    issue: int,
+    repo: str,
+    reason: str,
+    *,
+    verify_command: str = "",
+    written: tuple[str, ...] = (),
+    task_id: str = "",
+) -> WorkerResult:
+    """A result for an attempt that never got as far as a verify command.
+
+    It used to blank `verify_command` and `written` unconditionally, which is
+    exactly backwards: this is the *infrastructure* path, and the two questions
+    a human asks about an attempt that died here are "what was it about to run"
+    and "had it written anything first". A clone that failed genuinely has
+    neither; a push that failed after a green gate has both, and reporting an
+    empty command for it is a record that actively misleads.
+    """
     return WorkerResult(
         issue=issue,
         repo=repo,
-        task_id="",
+        task_id=task_id,
         branch=f"swarm/issue-{issue}",
         root=Path("."),
-        verify_command="",
+        verify_command=verify_command,
         verify_output=reason,
         passed=False,
+        written=written,
     )
 
 
@@ -730,7 +803,17 @@ def main(
         print(f"! {exc}", file=sys.stderr)
         # Exit 2 is the code the reconciler must see to leave the attempt
         # budget alone, and it can only see it in a record.
-        _record(_unrun(args.issue, slug, str(exc)), EXIT_INFRASTRUCTURE)
+        _record(
+            _unrun(
+                args.issue,
+                slug,
+                str(exc),
+                verify_command=getattr(exc, "verify_command", ""),
+                written=tuple(getattr(exc, "written", ())),
+                task_id=getattr(exc, "task_id", ""),
+            ),
+            EXIT_INFRASTRUCTURE,
+        )
         return EXIT_INFRASTRUCTURE
 
     print(f"» {result.summary()}")
