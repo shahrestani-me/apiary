@@ -264,6 +264,19 @@ All via environment variables — see `src/swarm/config.py`.
 | `SWARM_MAX_ATTEMPTS` | 3 | Per-task retries before abandoning it. |
 | `SWARM_VERIFY` | `python -m pytest -q` | Your quality gate. Add lint/typecheck: `ruff check . && mypy . && pytest -q` |
 | `SWARM_WORKER_CTX` | 16384 | Worker context window. **Never set this to gemma4's advertised 256K** — the KV cache at that size costs more memory than the 20 GB of weights. Lower to 8192 if you're memory-constrained. |
+| `SWARM_WORKER_TIMEOUT` | 1200 | Wall clock for a whole worker container: clone, one inference call, the verify run, the commit, the push, the PR. |
+| `SWARM_VERIFY_TIMEOUT` | 300 | Wall clock for `SWARM_VERIFY` alone, **inside** the above. |
+
+**These two are one setting with two numbers.** The verify command runs inside
+the container, so `SWARM_VERIFY_TIMEOUT` is only reachable if
+`SWARM_WORKER_TIMEOUT` is comfortably larger — the outer clock has to cover the
+clone and a whole-file inference call at ~83 tok/s before the gate even starts.
+
+Raising the verify budget on its own buys **nothing**: the container is killed
+at the outer cap, and the attempt is recorded against *the container*, with a
+reason naming a timeout that has nothing to do with your tests. That is why the
+default that moved is the outer one. `swarm doctor` refuses an inverted pair,
+and `swarm run` will not start on one.
 
 ---
 

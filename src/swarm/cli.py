@@ -68,7 +68,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .config import SETTINGS
+from .config import SETTINGS, ConfigError
 from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .github.client import GitHubClient, GitHubError
@@ -270,6 +270,16 @@ def _show(args: argparse.Namespace) -> int:
 def _run(
     args: argparse.Namespace, parser: argparse.ArgumentParser, *, client: GitHubClient | None
 ) -> int:
+    # Before the repository is resolved, and long before one is *created*: an
+    # inverted timeout pair makes every container in the run die at the outer
+    # cap with a reason naming the container rather than the gate, and there is
+    # no point discovering that after `--new` has provisioned a repo. A
+    # `ConfigError` is a `ValueError`, so `main`'s handler already renders it as
+    # one line and exit 1. `swarm doctor` deliberately does not refuse - it is
+    # the command that explains this one, with a fix hint.
+    if conflict := SETTINGS.clock_conflict():
+        raise ConfigError(conflict)
+
     repo, objective, verify = _target(args, parser, client=client)
 
     attachment = start_run(

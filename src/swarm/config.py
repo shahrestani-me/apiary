@@ -455,11 +455,56 @@ class Settings:
     max_rounds: int = int(_env("SWARM_MAX_ROUNDS", "8"))
     max_stalls: int = int(_env("SWARM_MAX_STALLS", "2"))
     max_attempts_per_task: int = int(_env("SWARM_MAX_ATTEMPTS", "3"))
-    worker_timeout_s: int = int(_env("SWARM_WORKER_TIMEOUT", "600"))
+    # Two clocks, one inside the other, and only the outer one was ever the
+    # binding constraint. `verify_timeout_s` bounds the gate; `worker_timeout_s`
+    # bounds the whole container, which is the clone, one whole-file inference
+    # call at a measured ~83 tok/s, the verify run, the commit, the push and the
+    # pull request. At 600 the inner 300 was not reachable in practice: the
+    # container hit the outer cap first and the failure was recorded against
+    # *the container*, naming a timeout that had nothing to do with the gate.
+    #
+    # So the outer one moves and the inner one does not. Measured worst case for
+    # a verify run is 59s cold and 6s warm, so 300 has ample headroom and
+    # raising it would buy nothing at all - which is the point of this pair
+    # being written down together rather than tuned one at a time.
+    worker_timeout_s: int = int(_env("SWARM_WORKER_TIMEOUT", "1200"))
     verify_timeout_s: int = int(_env("SWARM_VERIFY_TIMEOUT", "300"))
 
     # --- Persistence ----------------------------------------------------
     checkpoint_db: str = field(default_factory=lambda: _env("SWARM_CHECKPOINTS", ".swarm/checkpoints.sqlite"))
+
+    def clock_conflict(self) -> str:
+        """Why this timeout pair cannot be honoured, or `""` if it can.
+
+        A sentence rather than a bool, because the two numbers are meaningless
+        apart and an operator who set one of them was reasoning about one of
+        them. Returned rather than raised so `swarm doctor` can *report* the
+        problem with a fix hint instead of dying of it - `doctor.py` is the
+        module an operator runs when they have least confidence that anything
+        is configured right, and a traceback there moves the hour of confusion
+        rather than removing it.
+        """
+        if self.verify_timeout_s < self.worker_timeout_s:
+            return ""
+        return (
+            f"SWARM_VERIFY_TIMEOUT={self.verify_timeout_s} is not inside "
+            f"SWARM_WORKER_TIMEOUT={self.worker_timeout_s}: the verify command runs "
+            "inside the worker container, so the outer clock must also cover the "
+            "clone, one whole-file inference call and the push. Raise "
+            "SWARM_WORKER_TIMEOUT well above SWARM_VERIFY_TIMEOUT, or lower the "
+            "verify budget."
+        )
+
+
+class ConfigError(ValueError):
+    """A setting, or a pair of settings, that cannot be honoured as written.
+
+    A `ValueError` so that `cli.main`'s existing handler renders it as one `!`
+    line and exit 1, like every other refusal an operator can fix by editing
+    their environment. Nothing here raises at import time: `SETTINGS` is
+    constructed at module scope, and a `Settings` that could refuse to exist
+    would take `swarm doctor` down with it.
+    """
 
 
 SETTINGS = Settings()

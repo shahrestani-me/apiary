@@ -102,6 +102,8 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `APIARY_MAX_UPDATE_ROUNDS` | `3` | How many times one PR may be dragged forward onto a moving base before the starvation is called and a human is asked. |
 | `APIARY_MERGES_PER_CYCLE` | `1` | Merges are serialised under a strict status-check policy, because each one invalidates its siblings. |
 | `SWARM_WORKER_CTX` | `16384` | Never set this to a model's advertised 256K — the KV cache would cost more than the weights. |
+| `SWARM_WORKER_TIMEOUT` | `1200` | Wall clock for a whole worker container: clone, inference, verify, commit, push, PR. |
+| `SWARM_VERIFY_TIMEOUT` | `300` | Wall clock for `SWARM_VERIFY` alone, **inside** the above. Raising this without raising the outer one buys nothing — the container dies at the outer cap first, and the attempt is recorded against the container rather than the gate. `swarm doctor` refuses an inverted pair and `swarm run` will not start on one. |
 
 ## Running v2 locally
 
@@ -195,10 +197,11 @@ swarm doctor owner/name
 
 (`python -m swarm.doctor owner/name` is the same command and still works.)
 
-Eleven checks, each naming the command that fixes it: Ollama's client target
+Thirteen checks, each naming the command that fixes it: Ollama's client target
 and reachability, both models present, **schema-forced JSON actually honoured**,
-token shape and scope, repo readable, `swarm:*` labels present, CI configured,
-Docker CLI and daemon, worker image built. Every one of these fails in a way
+token shape and scope, boot key distinct from the work key, repo readable,
+`swarm:*` labels present, CI configured, the two timeouts consistent with each
+other, Docker CLI and daemon, worker image built. Every one of these fails in a way
 that looks like something else — an absent model looks like a planning bug, a
 token missing a scope looks like a permissions bug three modules away.
 

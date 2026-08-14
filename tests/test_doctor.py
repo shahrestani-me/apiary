@@ -11,7 +11,7 @@ shows the check can see at all.
 
 **Every failure names the fix.** Asserted structurally (`Check` refuses to be
 constructed failing-without-a-fix) *and* over the real corpus: `test_every_
-failure_names_a_command` provokes all eleven failures and requires each fix to
+failure_names_a_command` provokes one failure per check and requires each fix to
 contain something executable, because "check your configuration" satisfies a
 non-empty string and helps nobody.
 
@@ -56,6 +56,7 @@ from swarm.doctor import (
     CHECK_OLLAMA_TARGET,
     CHECK_BOOT_TOKEN,
     CHECK_REPO,
+    CHECK_TIMEOUTS,
     CHECK_TOKEN,
     CHECK_WORKER_IMAGE,
     FAIL,
@@ -101,6 +102,11 @@ def settings(**overrides: Any) -> Settings:
         ollama_base_url=GOOD_URL,
         orchestrator_model=ORCHESTRATOR_MODEL,
         worker_model=WORKER_MODEL,
+        # `config.timeouts` reads these two, and a shell that exported either
+        # would decide this file's healthy case. Pinned for the same reason as
+        # `OLLAMA_HOST` above.
+        worker_timeout_s=1200,
+        verify_timeout_s=300,
     )
     return Settings(**{**base, **overrides})
 
@@ -321,6 +327,7 @@ def test_a_healthy_environment_passes_every_check(doctor):
         CHECK_REPO,
         CHECK_LABELS,
         CHECK_CI,
+        CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI,
         CHECK_DOCKER_DAEMON,
         CHECK_WORKER_IMAGE,
@@ -349,7 +356,7 @@ def test_the_report_is_readable(doctor):
     subject, _, _, _ = doctor()
     report = subject.run().report()
 
-    assert "all 12 preconditions met" in report
+    assert "all 13 preconditions met" in report
     for name in (CHECK_OLLAMA_SCHEMA, CHECK_TOKEN, CHECK_WORKER_IMAGE):
         assert name in report
 
@@ -685,6 +692,7 @@ def provoked_failures(doctor) -> list[Check]:
         (CHECK_REPO, {"script": github_script(issues=response(404, {"message": "Not Found"}))}),
         (CHECK_LABELS, {"script": github_script(labels=label_page(missing=["swarm:ready"]))}),
         (CHECK_CI, {"script": github_script(ci=check_runs())}),
+        (CHECK_TIMEOUTS, {"settings": settings(verify_timeout_s=1800)}),
         (CHECK_DOCKER_CLI, {"which": lambda name: None}),
         (CHECK_DOCKER_DAEMON, {"runner": DeadRunner()}),
         (CHECK_WORKER_IMAGE, {"runner": RecordingRunner(images=())}),
@@ -700,9 +708,9 @@ def provoked_failures(doctor) -> list[Check]:
 
 
 def test_every_check_can_be_provoked_to_fail(doctor):
-    """The first clause of the ticket's "done when", for all eleven checks."""
+    """The first clause of the ticket's "done when", for every check."""
     names = [check.name for check in provoked_failures(doctor)]
-    assert len(names) == len(set(names)) == 11
+    assert len(names) == len(set(names)) == 12
 
 
 def test_every_failure_names_a_command(doctor):
@@ -726,7 +734,7 @@ def test_every_failure_names_a_command(doctor):
 def test_main_exits_non_zero_when_something_is_wrong(doctor, capsys):
     healthy, _, _, _ = doctor()
     assert main([REPO], doctor=healthy) == 0
-    assert "all 12 preconditions met" in capsys.readouterr().out
+    assert "all 13 preconditions met" in capsys.readouterr().out
 
     broken, _, _, _ = doctor(runner=RecordingRunner(images=()))
     assert main([REPO], doctor=broken) == 1
@@ -781,3 +789,86 @@ def test_live_docker_checks_run_against_the_real_daemon():
     assert image.status in (OK, FAIL, SKIP)
     if image.status == FAIL:
         assert "docker build" in image.fix
+
+
+# --------------------------------------------------------------------------
+# The two clocks
+# --------------------------------------------------------------------------
+#
+# `verify_timeout_s` runs *inside* `worker_timeout_s`, and the outer one has to
+# cover the clone, one whole-file inference call at a measured ~83 tok/s, the
+# verify run, the commit, the push and the pull request. At the old 600 the
+# inner 300 was not reachable in practice, and the failure that produced named
+# the container rather than the gate - so raising the verify budget in response
+# bought nothing and looked like a different bug.
+
+
+def test_the_default_pair_leaves_the_verify_budget_reachable():
+    """The outer clock was the binding one, so the outer clock is what moved.
+
+    Measured worst case for a verify run is 59s cold and 6s warm, so 300s has
+    ample headroom and raising it would buy nothing.
+    """
+    defaults = Settings()
+
+    assert defaults.worker_timeout_s == 1200
+    assert defaults.verify_timeout_s == 300
+    assert defaults.clock_conflict() == ""
+
+
+@pytest.mark.parametrize(
+    "worker, verify",
+    [
+        (600, 600),  # equal: the inner clock can never fire first
+        (600, 900),  # inverted outright
+        (300, 300),
+    ],
+)
+def test_an_inverted_pair_is_refused(doctor, worker, verify):
+    subject, _, _, _ = doctor(
+        settings=settings(worker_timeout_s=worker, verify_timeout_s=verify)
+    )
+
+    verdict = subject.run().by_name(CHECK_TIMEOUTS)
+
+    assert verdict.status == FAIL
+    # Both variables, because either one of them could be the one that is
+    # wrong and the operator set only one of them.
+    assert "SWARM_WORKER_TIMEOUT" in verdict.detail
+    assert "SWARM_VERIFY_TIMEOUT" in verdict.detail
+
+
+def test_the_fix_says_why_the_outer_clock_must_be_bigger(doctor):
+    """`Check.__post_init__` enforces that a fix exists; this is about it being
+    a fix rather than a restatement. "Raise the timeout" would not tell anyone
+    which of the two, or by how much, or what the extra budget is for."""
+    subject, _, _, _ = doctor(settings=settings(worker_timeout_s=600, verify_timeout_s=900))
+
+    verdict = subject.run().by_name(CHECK_TIMEOUTS)
+
+    assert "export SWARM_WORKER_TIMEOUT=" in verdict.fix
+    assert "SWARM_VERIFY_TIMEOUT" in verdict.fix
+    for cause in ("clone", "inference", "push"):
+        assert cause in verdict.fix
+
+
+def test_a_healthy_pair_reports_both_numbers(doctor):
+    subject, _, _, _ = doctor(settings=settings(worker_timeout_s=1200, verify_timeout_s=300))
+
+    verdict = subject.run().by_name(CHECK_TIMEOUTS)
+
+    assert verdict.status == OK
+    assert "300" in verdict.detail and "1200" in verdict.detail
+
+
+def test_the_timeout_check_probes_nothing(doctor):
+    """Arithmetic over two variables. It must not need a daemon, a token or a
+    model to answer - it is the cheapest check in the module and it stays that
+    way."""
+    subject, transport, runner, _ = doctor(settings=settings(verify_timeout_s=9000))
+    before = (len(transport.calls), len(runner.calls))
+
+    verdict = subject.check_timeouts()
+
+    assert verdict.status == FAIL
+    assert (len(transport.calls), len(runner.calls)) == before
