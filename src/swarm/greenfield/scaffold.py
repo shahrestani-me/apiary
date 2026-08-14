@@ -29,15 +29,36 @@ no network. Note `python3` and not `python` - the generated CI workflow has no
 `setup-python` step, and the interpreter that is guaranteed to be on PATH both
 on a GitHub runner and in `python:3.12-slim` is spelled `python3`.
 
-**Only stacks the worker image can already run are supported, and today that is
-Python.** The obvious generosity - detect "a React dashboard", emit a
-`package.json`, set verify to `npm ci && npm test` - buys a scaffold that
-violates the rule above on its first run. So `choose_stack` recognises a prompt
-that names another stack and **refuses**, naming what is missing. Refusing is
-the honest failure: quietly substituting a language nobody asked for produces a
-repository the requester did not want, and the swarm then plans a whole backlog
-against it. The `STACKS` registry is the seam for a second entry, on the day the
-worker image grows a toolchain to justify one.
+**Only stacks this host has an image for are supported, and it is the host that
+decides.** This used to be a 26-entry list of technology names, and all three
+arguments holding it up have since been measured and found wrong:
+
+- *"A dependency install costs four minutes on every attempt forever"* was the
+  load-bearing figure. Measured under the real worker limits (`--cpus 2
+  --memory 4g`): a cold Vite React+TS `npm install` is **19s**, Expo is **59s**,
+  a warm cache is **6s**. An order of magnitude out.
+- *"The `## Verify` command installs whatever the repo requires at run time"* is
+  not possible at all. A worker sits on an `internal: true` network whose only
+  route out is the egress proxy, whose allowlist is a static block in
+  `compose.yaml`, so an install is *denied* in under a second - #90's
+  `DENIED_EGRESS_SIGNATURES` exists because of it.
+- *"`STACKS` is the seam for a second entry"* was decorative while
+  `choose_stack` returned `DEFAULT_STACK` unconditionally.
+
+The deeper point: the no-toolchain rule's stated purpose was
+stack-agnosticism - baking one in "would quietly narrow the swarm to repos that
+happen to use that stack". Baking in *none* narrowed it to Python instead,
+because the one toolchain every image did carry was the Python the package
+itself needs. #99 buys agnosticism with several images selected per task, and
+this module now asks which of them exist.
+
+**The refusal was inverted, never deleted.** Deleting the word list while the
+resolver still returned Python unconditionally would have been strictly worse
+than the list: "a React dashboard" would silently produce a Python package,
+after a real repository, a branch ruleset and a backlog already existed. So
+`choose_stack` still raises `UnsupportedStack`, still before anything
+irreversible - it just asks the machine instead of the prompt, and its message
+names the missing image and the `docker build` line rather than a language.
 
 **Flat layout, not `src/`.** apiary itself uses `src/swarm`, which is the better
 layout for a package that is installed before it is tested. This one is never
@@ -68,7 +89,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .provision import ProvisionPlan, slugify
+from ..containers.manager import ContainerError, StackImages, build_hint
+from .provision import PLACEHOLDER_VERIFY, ProvisionPlan, slugify
 
 # The verify command written into every generated Python repository. See the
 # module docstring: stdlib only, no install, and `python3` rather than `python`
@@ -142,9 +164,29 @@ def _python_files(scaffold: "Scaffold") -> dict[str, str]:
 
 PYTHON = Stack(id="python", verify_command=PYTHON_VERIFY, build=_python_files)
 
-# The registry, and the seam. A second entry means a second toolchain in the
-# worker image; see the module docstring before adding one.
-STACKS: dict[str, Stack] = {PYTHON.id: PYTHON}
+
+def _generated_elsewhere(scaffold: "Scaffold") -> dict[str, str]:
+    """No template files at all: the model writes this stack's project.
+
+    #101 made the project bootstrap the first *issue* of the plan rather than a
+    set of f-strings, executed by a worker with a checkout. So for every stack
+    but Python there is nothing to emit here: the initial commit carries the
+    README, the LICENSE and the workflow, `PLACEHOLDER_VERIFY` is green on it,
+    and the bootstrap's pull request replaces both the files and the gate.
+
+    Python still has templates only because deleting them is #104's job, kept
+    separate to keep that diff readable.
+    """
+    return {}
+
+
+NODE = Stack(id="node", verify_command=PLACEHOLDER_VERIFY, build=_generated_elsewhere)
+REACT = Stack(id="react", verify_command=PLACEHOLDER_VERIFY, build=_generated_elsewhere)
+
+# The registry. It stopped being a seam with one entry when #99 gave the host
+# an image per stack: what may be generated is now a fact about this machine,
+# and `choose_stack` asks it rather than consulting a word list.
+STACKS: dict[str, Stack] = {stack.id: stack for stack in (PYTHON, NODE, REACT)}
 DEFAULT_STACK = PYTHON
 
 # Stack names that are unmistakable in prose: nobody writes "typescript" or
@@ -195,23 +237,58 @@ _QUALIFIER_RE = re.compile(
 )
 
 
-def choose_stack(prompt: str) -> Stack:
-    """Pick the stack to generate, or refuse to guess.
+def choose_stack(
+    prompt: str,
+    *,
+    stack: str | None = None,
+    images: StackImages | None = None,
+    present: Callable[[str], bool] | None = None,
+) -> Stack:
+    """Pick the stack to generate, or refuse because **this host cannot run it**.
 
-    Python is the default rather than a detection result: it is the only stack
-    the worker image can run without an install, so a prompt that names no
-    stack gets the one that works. A prompt that names a *different* one is a
-    refusal, not a fallback - see the module docstring.
+    The signature and `UnsupportedStack` are unchanged. What changed is the
+    predicate, and that is the whole ticket: it used to consult a 26-entry word
+    list and it now asks the machine.
+
+    `stack` is the resolved id - `swarm run --stack`, or #101's model
+    classification. `None` keeps the old behaviour of defaulting to Python,
+    because a caller that did not resolve one has not asked a question this
+    function can answer.
+
+    Two refusals, and the message says which:
+
+    - **no image is configured** for that stack, which is a fact about the
+      allowlist and is fixed with `APIARY_WORKER_IMAGES`;
+    - **the image is configured but not built here**, which is fixed with one
+      `docker build` line, printed.
+
+    Both are raised *before anything irreversible*. That ordering is the reason
+    this ticket is last in the epic: a refusal that arrives after provisioning
+    is a repository, a branch ruleset and a backlog that a human has to delete.
     """
-    named = _foreign_stack(prompt)
-    if named is not None:
+    if stack is None:
+        return DEFAULT_STACK
+    chosen = stack.strip().casefold()
+    known = STACKS.get(chosen)
+    if known is None:
         raise UnsupportedStack(
-            f"the prompt asks for {named}, which the worker image cannot run: it bakes in "
-            f"no toolchain on purpose (#14), so a {named} test suite would have to install "
-            "one on every task. Generate this project outside the swarm, or add the "
-            "toolchain to the worker image and register the stack in STACKS."
+            f"there is no scaffold for stack {chosen!r}; this build knows "
+            f"{', '.join(sorted(STACKS))}"
         )
-    return DEFAULT_STACK
+    try:
+        image = (images or StackImages()).for_stack(chosen)
+    except ContainerError as exc:
+        # The allowlist, not the host: no image is *configured* for this stack.
+        raise UnsupportedStack(str(exc)) from exc
+    if present is not None and not present(image):
+        # The host, not the allowlist. The orchestrator can neither build nor
+        # pull (`BUILD=0`, `IMAGES=0`), so the remedy is a human's and the
+        # message is the command.
+        raise UnsupportedStack(
+            f"stack {chosen!r} needs image {image}, which is not on this host. "
+            f"{build_hint(image)}"
+        )
+    return known
 
 
 def _foreign_stack(prompt: str) -> str | None:
@@ -500,13 +577,20 @@ class ScaffoldedPlan(ProvisionPlan):
 
     @classmethod
     def for_prompt(cls, prompt: str, **overrides) -> "ScaffoldedPlan":
-        # Chosen before anything is created, so an unsupported stack refuses at
-        # planning time rather than after the repository exists.
-        overrides.setdefault("verify_command", choose_stack(prompt).verify_command)
+        # Chosen before anything is created, so a stack this host cannot run
+        # refuses at planning time rather than after the repository exists -
+        # which is the ordering the whole of #103 is about.
+        chosen = choose_stack(
+            prompt,
+            stack=overrides.get("stack"),
+            present=overrides.pop("image_present", None),
+        )
+        overrides.setdefault("verify_command", chosen.verify_command)
+        overrides.setdefault("stack", chosen.id)
         return super().for_prompt(prompt, **overrides)  # type: ignore[return-value]
 
     def scaffold(self) -> Scaffold:
-        return scaffold_for(self.prompt, name=self.name)
+        return scaffold_for(self.prompt, name=self.name, stack=STACKS.get(self.stack, DEFAULT_STACK))
 
     def files(self) -> dict[str, str]:
         provisioned = super().files()

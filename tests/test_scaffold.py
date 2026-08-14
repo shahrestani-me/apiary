@@ -36,6 +36,7 @@ from swarm.greenfield.provision import (
     ProvisionPlan,
 )
 from swarm.greenfield.scaffold import (
+    ScaffoldError,
     INITIAL_VERSION,
     PYTHON,
     PYTHON_VERIFY,
@@ -166,40 +167,65 @@ def test_the_scaffold_replaces_the_placeholder_command():
 # --------------------------------------------------------------------------
 # Choosing a stack
 # --------------------------------------------------------------------------
+#
+# The predicate was a 26-entry deny list of technology names - a curated
+# blessed-stack registry wearing a deny list's clothes, which is exactly what
+# "any technology the model can generate" rules out. #103 inverts it: the
+# question is now whether *this host* has an image for the stack, and the
+# refusal is a fact about the machine rather than a word in the prompt.
+#
+# The refusal is inverted, never deleted. Deleting the list while the resolver
+# still returned Python unconditionally would be strictly worse than the word
+# list: "a React dashboard" would silently produce a Python package, after a
+# real repository, a branch ruleset and a backlog already existed.
 
 
-def test_a_prompt_that_names_no_stack_gets_the_one_that_runs_for_free():
+def test_a_caller_that_resolved_no_stack_still_gets_python():
+    # Not a detection result: a caller that did not resolve a stack has not
+    # asked a question this function can answer, and Python is the stack whose
+    # image this host has always had.
     assert choose_stack(PROMPT) is PYTHON
     assert choose_stack("a service that summarises log files") is PYTHON
 
 
-def test_python_is_the_only_registered_stack():
-    # Not an oversight: a second entry means a second toolchain in the worker
-    # image, which #14 rules out on purpose.
-    assert list(STACKS) == ["python"]
+@pytest.mark.parametrize("stack", ["python", "node", "react"])
+def test_every_stack_with_an_image_is_accepted(stack: str):
+    assert choose_stack(PROMPT, stack=stack).id == stack
 
 
-@pytest.mark.parametrize(
-    "prompt, named",
-    [
-        ("a React dashboard for build metrics", "React"),
-        ("a TypeScript library for parsing dates", "TypeScript"),
-        ("a small tool written in Go", "Go"),
-        ("a crate in Rust for diffing JSON", "Rust"),
-        ("an API in C#", "C#"),
-    ],
-)
-def test_a_prompt_naming_another_stack_is_refused_not_quietly_substituted(prompt: str, named: str):
-    # Emitting a Python project for a prompt that asked for Go produces a
-    # repository nobody wanted, and the swarm then plans a whole backlog
-    # against it. Refusing says what is missing instead.
-    with pytest.raises(UnsupportedStack, match=re.escape(named)):
-        choose_stack(prompt)
+def test_a_stack_the_host_has_no_image_for_is_refused():
+    """The inverted predicate. A fact about the machine, not about the prompt."""
+    with pytest.raises(UnsupportedStack) as raised:
+        choose_stack(PROMPT, stack="node", present=lambda image: False)
+
+    assert "apiary-worker-node" in str(raised.value)
+    assert "docker build -f Dockerfile.worker.node" in str(raised.value)
 
 
-def test_the_refusal_says_what_would_have_to_change():
-    with pytest.raises(UnsupportedStack, match="worker image"):
-        choose_stack("a CLI in Rust")
+def test_a_stack_with_no_configured_image_says_so_differently():
+    """Two refusals, and the message says which. This one is the allowlist -
+    fixed with an environment variable - and the other is the host, fixed with
+    one `docker build`. Sending an operator to the wrong one costs an hour."""
+    from swarm.containers.manager import StackImages
+
+    with pytest.raises(UnsupportedStack) as raised:
+        choose_stack(PROMPT, stack="python", images=StackImages(images={}))
+
+    assert "APIARY_WORKER_IMAGES" in str(raised.value)
+    assert "docker build" not in str(raised.value)
+
+
+def test_a_stack_this_build_has_no_scaffold_for_is_refused():
+    with pytest.raises(UnsupportedStack) as raised:
+        choose_stack(PROMPT, stack="haskell")
+
+    assert "haskell" in str(raised.value)
+
+
+def test_the_refusal_type_survived_the_inversion():
+    # The ticket's first criterion: only the predicate changes. A caller
+    # catching `UnsupportedStack` still catches it.
+    assert issubclass(UnsupportedStack, ScaffoldError)
 
 
 @pytest.mark.parametrize(
@@ -208,11 +234,19 @@ def test_the_refusal_says_what_would_have_to_change():
         "a tool to go through log files",
         "a service that lets users go back to an earlier version",
         "a c compiler explainer for beginners",
+        "a rust-proofing planner for classic cars",
+        "a react-ion time trainer for chemistry students",
+        "a tool for node maintenance on a rail network",
     ],
 )
 def test_ordinary_english_is_not_mistaken_for_a_stack(prompt: str):
-    # "go" and "c" are words before they are languages. Refusing these would be
-    # worse than useless.
+    """Kept and expanded, and the stakes went up rather than down.
+
+    Under the word list a mis-resolution was a free pre-provision error. Now it
+    is a real repository with the wrong toolchain, so the last three rows are
+    added: "rust", "react" and "node" all appear inside ordinary English words,
+    and nothing in this module may treat them as stack names.
+    """
     assert choose_stack(prompt) is PYTHON
 
 
@@ -221,7 +255,6 @@ def test_an_explicit_stack_overrides_the_prompt():
     assert scaffold_for("a dashboard in TypeScript", name="dash", stack=PYTHON).stack is PYTHON
 
 
-# --------------------------------------------------------------------------
 # The generated skeleton
 # --------------------------------------------------------------------------
 
@@ -405,11 +438,33 @@ def test_correcting_the_default_branch_keeps_the_scaffold():
     assert f"{PACKAGE}/__init__.py" in plan.files()
 
 
-def test_an_unsupported_stack_refuses_before_the_repository_exists():
-    # Planning is the last moment a refusal is free; afterwards there is a real
-    # repository with a URL somebody may already have seen.
-    with pytest.raises(UnsupportedStack):
-        ScaffoldedPlan.for_prompt("a dashboard in TypeScript", owner=OWNER)
+def test_a_stack_this_host_cannot_run_refuses_before_the_repository_exists():
+    """The ordering that makes #103 last in the epic. Planning is the last
+    moment a refusal is free; afterwards there is a real repository with a URL
+    somebody may already have seen, a branch ruleset and a backlog.
+
+    The prompt no longer decides this - the host does - so the stack is passed
+    explicitly and the image probe is the thing that says no.
+    """
+    with pytest.raises(UnsupportedStack) as raised:
+        ScaffoldedPlan.for_prompt(
+            PROMPT, owner=OWNER, stack="node", image_present=lambda image: False
+        )
+
+    assert "docker build" in str(raised.value)
+
+
+def test_a_stack_this_host_can_run_is_provisioned():
+    plan = ScaffoldedPlan.for_prompt(
+        PROMPT, owner=OWNER, stack="node", image_present=lambda image: True
+    )
+
+    assert plan.stack == "node"
+    # No template files: #101's bootstrap writes this stack's project as the
+    # first issue of the plan, so the initial commit is README, LICENSE and the
+    # workflow, with the placeholder green on it.
+    assert set(plan.files()) == {"README.md", "LICENSE", CI_WORKFLOW_PATH}
+    assert plan.verify_command == PLACEHOLDER_VERIFY
 
 
 # --------------------------------------------------------------------------
@@ -435,9 +490,17 @@ def test_the_command_refuses_rather_than_overwriting(tmp_path: Path, capsys):
     assert "refusing to overwrite" in capsys.readouterr().err
 
 
-def test_the_command_reports_an_unsupported_stack_instead_of_raising(tmp_path: Path, capsys):
-    code = main(["a dashboard in TypeScript", "--into", str(tmp_path)])
+def test_the_command_reports_a_scaffold_error_instead_of_raising(tmp_path: Path, capsys):
+    """The property this test has always protected: the command reports and
+    exits 1 rather than raising a traceback at an operator.
+
+    Its old trigger - a prompt naming another stack - is gone, because that is
+    now a fact about the host and this command spawns no containers. A name no
+    module can be derived from still raises `ScaffoldError`, so the property is
+    asserted through what remains rather than deleted with the trigger.
+    """
+    code = main([PROMPT, "--into", str(tmp_path), "--name", "!!!"])
 
     assert code == 1
-    assert "TypeScript" in capsys.readouterr().err
+    assert capsys.readouterr().err
     assert not list(tmp_path.iterdir())

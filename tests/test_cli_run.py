@@ -689,23 +689,81 @@ def test_an_explicit_verify_command_overrides_the_scaffolds(monkeypatch):
     assert workflow_command(provisioning.plan.files()[CI_WORKFLOW_PATH]) == "make check"
 
 
-def test_a_prompt_naming_another_stack_is_refused_before_anything_is_created(
+def test_a_stack_this_host_cannot_run_is_refused_before_anything_is_created(
     monkeypatch, capsys
 ):
-    # `choose_stack` declines rather than silently generating Python, and the
-    # decision is taken while a refusal is still free - afterwards there is a
-    # real repository with a URL somebody may already have seen.
+    """#103 inverted this: the refusal is a fact about the machine, not a word
+    in the prompt. What did not change is *when* it happens - while a refusal
+    is still free, before a real repository with a URL somebody may already
+    have seen.
+
+    The autouse `no_image_preflight` fixture is overridden here, because the
+    preflight is the thing under test.
+    """
+    monkeypatch.undo()  # drop the autouse preflight stub for this test only
+    monkeypatch.setattr(
+        "swarm.greenfield.bootstrap.choose_stack", lambda prompt, llm=None: "react"
+    )
     provisioning = Provisioning()
     monkeypatch.setattr("swarm.cli.provision", provisioning)
+    monkeypatch.setattr(
+        cli, "preflight", lambda stacks, **kw: _Diagnosis(tuple(stacks))
+    )
 
     code = main(
-        ["run", "--new", "a dashboard in TypeScript", "--owner", "me", "--yes"],
+        ["run", "--new", "a dashboard for build metrics", "--owner", "me", "--yes"],
         client=FakeClient([]),
     )
 
     assert code == 1
     assert provisioning.calls == []
-    assert "TypeScript" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "react" in err
+
+
+@dataclass
+class _Diagnosis:
+    """A preflight that fails for whatever stacks it was asked about."""
+
+    stacks: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return False
+
+    @property
+    def failures(self):
+        from swarm.doctor import Check, stack_check
+
+        return tuple(
+            Check.failed(
+                stack_check(stack),
+                f"no image for {stack}",
+                fix="docker build -f Dockerfile.worker.node -t apiary-worker-node .",
+            )
+            for stack in self.stacks
+        )
+
+
+def test_a_stack_this_host_can_run_is_provisioned(monkeypatch):
+    """The other half, and the one the epic is actually for: a React prompt
+    now reaches provisioning instead of being refused by a word list."""
+    monkeypatch.setattr(
+        "swarm.greenfield.bootstrap.choose_stack", lambda prompt, llm=None: "react"
+    )
+    provisioning = Provisioning()
+    monkeypatch.setattr("swarm.cli.provision", provisioning)
+    planning = Planning(FakeClient([]))
+    monkeypatch.setattr("swarm.cli.plan_node", planning)
+
+    main(
+        ["run", "--new", "a dashboard for build metrics", "--owner", "me", "--yes",
+         "--plan-only"],
+        client=planning.client,
+    )
+
+    assert provisioning.calls
+    assert provisioning.plan.stack == "react"
 
 
 @pytest.mark.parametrize(

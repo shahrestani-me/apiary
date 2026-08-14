@@ -203,10 +203,41 @@ restartable at any point and holds no irreplaceable state.
 against the code that is there.
 
 **Greenfield.** Given only a prompt, the orchestrator creates the repository,
-applies license/CI/ruleset/labels, generates a minimal scaffold, then plans
-issues against that scaffold. This is the "prompt in, project out" path; the
-scaffold exists so the first worker has something to verify against, since an
-empty repo has no test command and therefore no quality gate.
+applies license/CI/ruleset/labels, and plans issues against it — the first of
+which **is the project**. This is the "prompt in, project out" path.
+
+The initial commit carries a README, a LICENSE and a workflow whose gate is
+`test -f README.md`, which is the only command that passes on an empty
+repository. The bootstrap issue (#101) then generates the project in a worker
+container like any other task, and its pull request replaces both the files and
+the gate — the latter only after the proposed command has been observed to fail
+on deliberately broken code (#102).
+
+### Which stacks, and who decides
+
+**The host decides, not the prompt.** #99 gives each stack a worker image, and
+`swarm run --new` accepts any stack an image exists for and refuses the rest by
+naming the missing image and the `docker build` line.
+
+This replaced a 26-word deny list whose three justifications were all measured
+and found wrong:
+
+| claim | measured |
+|---|---|
+| "a dependency install costs four minutes on every attempt forever" | cold Vite React+TS `npm install` **19s**, Expo **59s**, warm cache **6s**, under the real `--cpus 2 --memory 4g` limits |
+| "the `## Verify` command installs what the repo needs at run time" | it cannot — a worker's only route out is the egress proxy's static allowlist, so an install is *denied* in under a second |
+| "the registry is the seam for a second entry" | decorative: the resolver returned Python unconditionally |
+
+The no-toolchain rule's stated purpose was stack-agnosticism. Baking in *none*
+narrowed the swarm to Python instead, because the one toolchain every image
+carried was the Python the package itself needs. Agnosticism is bought by
+several images selected per task.
+
+**A green gate is not a rendered UI.** A React project whose suite passes can
+render a blank page. The exit-code invariant is the only authority this system
+has, and it cannot see pixels — so "the swarm can build a React app" means its
+tests pass, not that anyone has looked at it. Anything stronger needs a human
+or a different kind of check, and neither is in v2.
 
 ## What v1 code survives
 
@@ -228,3 +259,6 @@ empty repo has no test command and therefore no quality gate.
 - Workers reviewing each other's PRs. The verifier and CI are the gate; adding
   LLM review reintroduces exactly the "model judges correctness" failure this
   project exists to avoid.
+- Judging whether a generated UI *looks* right. See "a green gate is not a
+  rendered UI" above.
+- Polyglot repositories. One repo, one stack.
