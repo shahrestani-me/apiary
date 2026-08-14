@@ -804,16 +804,20 @@ def test_a_stack_is_read_case_insensitively_and_unbackticked():
 def test_every_generatable_stack_is_a_declarable_one():
     """The drift pin.
 
-    `KNOWN_STACKS` deliberately does not import `greenfield.scaffold.STACKS` -
-    that registry is about generating a project, this vocabulary is about what
-    an issue may declare, and `github/` depending on `greenfield/` would be the
-    wrong way round. Two lists mean drift unless something notices, and a stack
-    the scaffolder can emit but the parser refuses is a repository whose own
-    planner cannot write an issue for it.
-    """
-    from swarm.greenfield.scaffold import STACKS
+    `KNOWN_STACKS` deliberately does not import the image map - that is about
+    what this *host* can run, this vocabulary is about what an issue may
+    declare, and `github/` depending on `containers/` would be the wrong way
+    round. Two lists mean drift unless something notices, and a stack the host
+    can run but the parser refuses is a repository whose own planner cannot
+    write an issue for it.
 
-    assert set(STACKS) <= KNOWN_STACKS
+    #104 deleted `greenfield.scaffold.STACKS`, which this used to check
+    against; the image map is what replaced it as the answer to "what can be
+    generated".
+    """
+    from swarm.containers.manager import DEFAULT_STACK_IMAGES
+
+    assert set(DEFAULT_STACK_IMAGES) <= KNOWN_STACKS
 
 
 # --------------------------------------------------------------------------

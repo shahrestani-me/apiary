@@ -101,7 +101,7 @@ CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 # required check would block the first PR.
 #
 # Nothing the swarm creates uses this any more: `cli` provisions a
-# `ScaffoldedPlan` (#26), whose verify command runs the generated test suite and
+# a plan carrying the stack the prompt implies (#101/#103), whose command is
 # is what the planner writes into every issue's `## Verify`. It remains the
 # default of a bare `ProvisionPlan` because a plan with no scaffold in it has
 # nothing else that could pass, and `python -m swarm.greenfield.provision` can
