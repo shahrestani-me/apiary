@@ -63,6 +63,7 @@ Manual dry run against a real repo - reads only, spawns nothing:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Protocol
 
@@ -78,6 +79,39 @@ from ..run import TERMINAL_LABELS
 #: imported rather than respelled because readiness (#11) owns that string; no
 #: module owns the other two, and `ledger.LABEL_PRECEDENCE` has the full six.
 CLAIMED = "swarm:claimed"
+
+#: The daemon is not there at all, as opposed to this one spawn going wrong.
+#:
+#: Matching the message is unpleasant, and it is the same trade `is_missing`
+#: already makes for the same reason: the CLI gives no other signal, and both
+#: cases arrive as `ContainerError`. The set is kept **narrow on purpose**.
+#: Everything unrecognised is treated as this issue's problem and the cycle
+#: continues, because that is the cheaper way to be wrong: a fleet-wide outage
+#: misread as per-issue costs one ready→claimed→ready label round-trip per
+#: issue and no attempts, whereas one missing image misread as fleet-wide halts
+#: every cycle - which is the bug this ticket exists to fix.
+#:
+#: `is not on PATH` is here because `DockerCLI._run` raises a bare
+#: `ContainerError` for it rather than a `DockerError`: no binary means no
+#: daemon for any issue, and it is the failure the orchestrator image actually
+#: shipped with.
+DAEMON_DOWN_RE = re.compile(
+    r"cannot connect to the docker daemon"
+    r"|is the docker daemon running"
+    r"|error during connect"
+    r"|is not on PATH",
+    re.I,
+)
+
+
+def daemon_is_down(error: ContainerError) -> bool:
+    """Is this failure about the daemon rather than about one issue?
+
+    `DockerError.__str__` folds the argv, the exit code and the captured output
+    into one string, so searching the rendered error covers both it and the
+    plain `ContainerError` that a missing binary raises.
+    """
+    return bool(DAEMON_DOWN_RE.search(str(error)))
 REVIEW = "swarm:review"
 
 #: Issues whose `## Files` are spoken for. `swarm:claimed` is the obvious half -
@@ -238,6 +272,14 @@ class Spawner(Protocol):
     """
 
     def spawn(self, issue: int, base_commit: str) -> Handle: ...
+
+    #: The safe-release probe. A spawn that raised may still have left a
+    #: container running - `docker start` can fail this process's read after
+    #: the daemon acted - and releasing a claim on that reading buys the issue
+    #: a second worker next cycle. So the claim is only given back when the
+    #: daemon says there is nothing there. This is the same question #35's
+    #: recovery asks before it releases anything, asked one cycle earlier.
+    def find(self, *, issue: int | None = None) -> list[Handle]: ...
 
 
 # --------------------------------------------------------------------------
@@ -423,10 +465,17 @@ class DispatchFailure:
     number: int
     reason: str
     claimed: bool = False
+    #: Did this failure end the cycle? True for a daemon that is not there at
+    #: all, false for one issue's spawn going wrong. The distinction is the
+    #: whole point of #94 and it has to survive into the log, because the two
+    #: read identically at a glance and want opposite responses: restart Docker,
+    #: versus look at what is wrong with that one issue.
+    fatal: bool = False
 
     def __str__(self) -> str:
         state = "claimed, no container" if self.claimed else "not claimed"
-        return f"#{self.number}: {self.reason} ({state})"
+        scope = "daemon-level, cycle stopped" if self.fatal else "this issue only"
+        return f"#{self.number}: {self.reason} ({state}; {scope})"
 
 
 @dataclass(frozen=True)
@@ -475,6 +524,39 @@ def claim(client: Labeller, entry: LedgerEntry) -> None:
     client.remove_label(entry.number, READY)
 
 
+def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
+    """Undo one claim, `claimed -> ready`, and say whether it was undone.
+
+    **Only when the daemon says nothing is running under that issue.** A
+    `docker start` that failed *this process's* read may still have started a
+    container, and an issue put back to `swarm:ready` on that reading gets a
+    second container next cycle - two workers, one file set, one of the two
+    pushes lost. That risk is what kept the claim in the first place; `find` is
+    what removes it, by asking the question #35's recovery already asks instead
+    of assuming the answer.
+
+    Label order is `claim`'s, inverted, and load-bearing for the same reason:
+    §3's precedence ranks `claimed` above `ready`, so a crash between the two
+    calls leaves the conservative reading in place and recovery sweeps it.
+
+    Every failure here answers False, and False is safe: the caller records the
+    issue as still claimed, which is exactly what #35 was built to sweep.
+    """
+    try:
+        if manager.find(issue=entry.number):
+            return False
+    except ContainerError:
+        # The probe itself could not answer. "Do not release" is the reading
+        # that cannot produce two workers.
+        return False
+    try:
+        client.add_labels(entry.number, [READY])
+        client.remove_label(entry.number, CLAIMED)
+    except GitHubError:
+        return False
+    return True
+
+
 def dispatch(
     client: Labeller,
     manager: Spawner,
@@ -490,18 +572,34 @@ def dispatch(
     One at a time is not an accident of the loop shape. The claim and the spawn
     are interleaved per issue so that an outage strands one issue rather than
     the whole cycle: everything not yet reached is still `swarm:ready` and the
-    next cycle picks it up untouched. The first failure therefore stops the
-    cycle - if the daemon is down, the second spawn fails exactly like the
-    first, and each attempt would burn one more claim.
+    next cycle picks it up untouched.
 
-    **A failed spawn keeps its claim.** Releasing it looks tidier and is wrong:
-    a `docker start` that failed *this* process's read may still have started a
-    container, and an issue put back to `swarm:ready` on that reading gets a
-    second container next cycle - two workers, one file set, one of the two
-    pushes lost. #35 already resolves the ambiguity properly, by looking for a
-    live container before it releases anything. `ContainerManager.spawn`
-    disposes what it created before raising, so the common case leaves nothing
-    behind but the label.
+    **A failed spawn defers its own issue; the cycle continues.** This used to
+    `break`, and the argument for it was that a spawn failure means the daemon
+    is down, so the second spawn would fail exactly like the first. That held
+    while there was one image. It stops holding the moment the image is chosen
+    per task (#99): a single missing image would halt every cycle and burn
+    attempts across the whole ledger, on issues with nothing wrong with them.
+
+    So the two cases are now told apart. `daemon_is_down` recognises a daemon
+    that is not there, and only that still stops the cycle - it is the case the
+    `break` was right about, and retrying eighteen issues against a dead socket
+    helps nobody. Everything else defers one issue and moves on. The recognised
+    set is deliberately narrow and the unrecognised default is "keep going",
+    because being wrong that way costs label churn and being wrong the other way
+    is the bug being fixed.
+
+    **A deferred issue gives its claim back, when that is provably safe.**
+    `release` asks the daemon whether a container exists for that issue before
+    it writes anything, so the "the start failed my read but succeeded" case
+    keeps its claim and goes to #35's recovery, as before. What changes is that
+    the ordinary case - `docker create` refused, nothing exists - no longer
+    leaves a claim for recovery to sweep and an attempt for it to burn.
+
+    A **claim** that fails still stops the cycle. It is a GitHub write, and the
+    things that break GitHub writes for one issue - the token, the rate limit,
+    the network - break them for all of them. That one is unchanged and out of
+    this ticket's scope.
 
     `dry_run=True` returns the plan and writes nothing at all.
     """
@@ -517,14 +615,26 @@ def dispatch(
         except GitHubError as exc:
             # Nothing was spawned and the label may or may not have landed; the
             # issue is either still ready or carries two labels, and §3's
-            # precedence repairs the second case.
-            failed.append(DispatchFailure(entry.number, f"claim failed: {exc}"))
+            # precedence repairs the second case. Fatal because whatever breaks
+            # one issue's label write breaks the next one's too.
+            failed.append(DispatchFailure(entry.number, f"claim failed: {exc}", fatal=True))
             break
         try:
             handle = manager.spawn(entry.number, base_commit)
         except ContainerError as exc:
-            failed.append(DispatchFailure(entry.number, f"spawn failed: {exc}", claimed=True))
-            break
+            fatal = daemon_is_down(exc)
+            # Only worth asking when the cycle is going to continue: if the
+            # daemon is unreachable then `find` cannot answer either, and the
+            # claim stays for #35 exactly as it did before.
+            claimed = True if fatal else not release(client, manager, entry)
+            failed.append(
+                DispatchFailure(
+                    entry.number, f"spawn failed: {exc}", claimed=claimed, fatal=fatal
+                )
+            )
+            if fatal:
+                break
+            continue
         dispatched.append(Dispatched(entry=entry, handle=handle))
 
     return DispatchReport(plan=plan, dispatched=tuple(dispatched), failed=tuple(failed))
