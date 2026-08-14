@@ -27,6 +27,7 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
+from swarm.config import SETTINGS
 from swarm.github.ledger import load_ledger, render_marker
 from swarm.nodes import planner
 from swarm.nodes.planner import (
@@ -614,6 +615,42 @@ def test_plan_node_returns_what_the_loader_says_and_not_what_it_sent(github, mon
     assert tasks["leaf"]["depends_on"] == ["root"]
     assert tasks["leaf"]["status"] == "pending"
     assert any("created" in event for event in result["events"])
+
+
+def test_plan_node_writes_the_verify_command_it_was_given(github, monkeypatch):
+    """The caller knows the repository; the planner and the model do not.
+
+    A greenfield run's command is whatever the scaffold committed, and it is
+    passed down rather than defaulted here, because the alternative - the v1
+    `SETTINGS.verify_command` - is a pytest invocation the generated repository
+    has no way to run. That is the live failure this parameter closes.
+    """
+    client, store, _ = github()
+    _stub_model(monkeypatch, plan(task("root")))
+
+    result = plan_node(
+        {"objective": "make it work"},
+        source=client,
+        verify="python3 -m unittest discover -q",
+    )
+
+    assert result["tasks"]["root"]["status"] == "pending"
+    # Read back through the loader, which is the only thing that says what an
+    # issue means.
+    entry = load_ledger(client, adopt=False).entries["root"]
+    assert entry.verify == "python3 -m unittest discover -q"
+    assert store.issues[1]["body"].count("## Verify") == 1
+
+
+def test_plan_node_falls_back_to_the_setting_when_nobody_says(github, monkeypatch):
+    # v1's default, and the only answer available to a graph run with no CLI
+    # behind it to resolve one.
+    client, _, _ = github()
+    _stub_model(monkeypatch, plan(task("root")))
+
+    plan_node({"objective": "make it work"}, source=client)
+
+    assert load_ledger(client, adopt=False).entries["root"].verify == SETTINGS.verify_command
 
 
 def test_plan_node_without_a_target_keeps_the_v1_in_memory_ledger(monkeypatch):

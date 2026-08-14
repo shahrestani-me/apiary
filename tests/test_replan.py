@@ -840,6 +840,32 @@ def test_a_ring_in_the_proposed_plan_leaves_the_tracker_alone(tracker):
     assert len(store.issues) == 1 and store.issues[1]["state"] == "open"
 
 
+def test_a_rewritten_issue_keeps_the_runs_own_verify_command(tracker):
+    """A stall must not re-point the whole tracker at a command it cannot run.
+
+    The command belongs to the repository - the scaffold's, in a generated one -
+    and the run resolved it once at the top. Defaulting it here instead would
+    hand every rewritten issue `SETTINGS.verify_command`, which is v1's pytest
+    invocation and exactly the gate that was already red.
+    """
+    client, store = tracker()
+    store.add(body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY))
+    scaffolded = "python3 -m unittest discover -q"
+
+    report = replan(
+        client,
+        load_ledger(client, adopt=False),
+        OBJECTIVE,
+        stalled(),
+        verify=scaffolded,
+        proposer=Proposal(Plan(tasks=[task("existing"), task("second", files=["src/swarm/b.py"])])),
+    )
+
+    assert report.replanned
+    after = load_ledger(client, adopt=False)
+    assert {entry.verify for entry in after.entries.values()} == {scaffolded}
+
+
 # --------------------------------------------------------------------------
 # The acceptance criteria, end to end
 # --------------------------------------------------------------------------

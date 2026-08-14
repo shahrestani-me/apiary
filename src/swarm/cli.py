@@ -25,6 +25,22 @@ mints a new run id and adopts the issues the dead process left behind - see
 `run.py`, which records why the id is new rather than reused. Nothing needs to
 be remembered locally between invocations for that to work, which is the point.
 
+**The verify command is decided here, and every issue inherits it.** A task's
+`## Verify` is the repo-wide command, and this is the only place that knows
+which repository is being worked in: `--new` takes the string the scaffold just
+committed - the same one the generated workflow's required check runs - and
+`--repo` takes `--verify`, falling back to `SETTINGS.verify_command`
+(`SWARM_VERIFY`). It is passed down to `plan_node` explicitly rather than left
+to default there, so the command in the CI workflow and the command in every
+issue are one string that came from one place.
+
+Nothing infers it by reading the target repository's CI. A workflow with a
+matrix, four setup steps and a cache has no single line to lift, and a command
+inferred wrong is a gate that was red before a worker touched the task - which
+is exactly the failure this wiring exists to prevent. An existing repository
+whose command is not the default says so with `--verify`, which is a sentence
+the operator writes rather than one the swarm guesses.
+
 What this command does today is mint the identity, attach to the ledger and run
 the one reconcile step that exists (readiness, #11). Dispatch is #21 and
 planning onto GitHub is #10; until those land it says so on stderr rather than
@@ -38,10 +54,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .config import SETTINGS
 from .github.client import GitHubClient, GitHubError
 from .github.ledger import LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
-from .greenfield.provision import ProvisionPlan, provision
+from .greenfield.provision import provision
+from .greenfield.scaffold import ScaffoldedPlan
 from .security import worker_create_flags
 from .artifacts import RunArtifacts
 from .nodes.planner import plan_node
@@ -72,6 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--public", action="store_true", help="create --new public (default: private)"
     )
     run.add_argument("--yes", action="store_true", help="create --new without asking")
+    run.add_argument(
+        "--verify",
+        default=None,
+        help=(
+            "command every planned issue carries as its ## Verify "
+            f"(default: the scaffold's for --new, else {SETTINGS.verify_command!r}); "
+            "with --new it is also what the generated CI workflow runs, which means "
+            "it replaces the scaffold's own test suite as the gate"
+        ),
+    )
     run.add_argument(
         "--dry-run",
         action="store_true",
@@ -122,7 +150,7 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
 def _run(
     args: argparse.Namespace, parser: argparse.ArgumentParser, *, client: GitHubClient | None
 ) -> int:
-    repo, objective = _target(args, parser, client=client)
+    repo, objective, verify = _target(args, parser, client=client)
 
     attachment = start_run(
         repo,
@@ -142,9 +170,12 @@ def _run(
         if args.dry_run:
             print("! nothing to attach to; --dry-run writes no plan", file=sys.stderr)
             return 0
-        print("» planning from the objective")
+        # The command is on this line because it is the one thing about a plan
+        # that is chosen before the model is asked, and the one thing whose
+        # being wrong makes every issue in the plan unrunnable.
+        print(f"» planning from the objective; every task verifies with: {verify}")
         try:
-            planned = plan_node({"objective": objective}, source=source)
+            planned = plan_node({"objective": objective}, source=source, verify=verify)
         except Exception as exc:  # noqa: BLE001 - local model failures are varied
             print(f"! planning failed: {exc}", file=sys.stderr)
             return 1
@@ -260,11 +291,17 @@ def _target(
     parser: argparse.ArgumentParser,
     *,
     client: GitHubClient | None,
-) -> tuple[str, str]:
-    """Resolve the two modes down to one `(repo, objective)` pair.
+) -> tuple[str, str, str]:
+    """Resolve the two modes down to one `(repo, objective, verify)` triple.
 
     The greenfield branch creates a repository, so every way of asking for it
     ambiguously is refused *before* that happens rather than after.
+
+    The verify command is resolved here and nowhere else, for the reasons in
+    the module docstring. `--repo` has no scaffold to read it off, so it is
+    `--verify` or v1's `SETTINGS.verify_command`; being wrong about an existing
+    repository costs a red gate on every issue, which is loud, whereas
+    inferring one from its CI would be wrong quietly.
     """
     args.new = _text(args.new, "--new", parser)
     args.objective = _text(args.objective, "--objective", parser)
@@ -277,7 +314,7 @@ def _target(
     if not args.new:
         if not args.objective:
             parser.error("--repo needs an --objective")
-        return args.repo, args.objective
+        return args.repo, args.objective, args.verify or SETTINGS.verify_command
 
     if args.objective:
         # The prompt *is* the objective for a greenfield run, and two of them
@@ -289,17 +326,31 @@ def _target(
     if args.dry_run:
         parser.error("--dry-run cannot create a repository; drop --new or --dry-run")
 
-    plan = ProvisionPlan.for_prompt(
+    # `ScaffoldedPlan`, not `ProvisionPlan`: it carries a generated project into
+    # the *initial* commit, so the repository the first worker clones has a real
+    # test suite and its workflow's required check runs that suite rather than
+    # `test -f README.md`. A plain plan produces a repo with nothing to verify,
+    # and then hands the planner a command with nothing to run.
+    #
+    # It also chooses the stack, which is what declines a prompt naming a
+    # toolchain the worker image does not carry - at this point, before anything
+    # irreversible has happened.
+    plan = ScaffoldedPlan.for_prompt(
         args.new,
         owner=args.owner,
         name=args.name,
         private=not args.public,
+        # Only when asked: `for_prompt` defaults this to the stack's command,
+        # and passing None would override it with nothing.
+        **({"verify_command": args.verify} if args.verify else {}),
     )
     report = provision(plan, client, assume_yes=args.yes)
     print()
     print(report.summary())
     print()
-    return report.repo, args.new
+    # The report's, not the plan's. What the issues must agree with is the
+    # command in the commit that now exists.
+    return report.repo, args.new, report.verify_command
 
 
 def _report_run(attachment: Attachment, *, dry_run: bool) -> None:

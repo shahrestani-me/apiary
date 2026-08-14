@@ -5,13 +5,19 @@ against code that is already there; greenfield mode has to build the ground
 first, because an empty repository has no test command, therefore no quality
 gate, therefore no way to judge the first worker's output.
 
-Two steps, in this order:
+Two modules, and deliberately not two steps:
 
 - `provision` creates the repository, the initial commit, the labels and the
   branch protection - the outward-facing, irreversible half, which is why it
   asks before it acts;
-- `scaffold` (#26) fills it with a minimal skeleton whose tests actually run,
-  so the first planned task has something to verify against.
+- `scaffold` (#26) generates the minimal skeleton whose tests actually run, and
+  `ScaffoldedPlan` hands it to `provision` as part of that same first commit.
+
+The composition is the point. A scaffold committed second would leave the first
+commit - the one the required status check first reports on, and the one a
+worker branches from - with no tests and a placeholder command. So `cli`
+provisions a `ScaffoldedPlan`, and the command that plan declares is the one
+string the workflow runs and every planned issue carries as its `## Verify`.
 """
 
 from __future__ import annotations

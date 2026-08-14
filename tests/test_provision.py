@@ -366,6 +366,17 @@ def test_the_readme_records_the_prompt_and_the_verify_command():
     readme = plan_for().files()["README.md"]
     assert PROMPT in readme
     assert PLACEHOLDER_VERIFY in readme
+    assert "placeholder" in readme
+
+
+def test_the_readme_of_a_scaffolded_repo_does_not_call_its_command_a_placeholder():
+    # The placeholder wording is true of a repo with nothing in it and a lie
+    # about one whose command runs a real suite - and a generated file is the
+    # first thing a reader trusts and the last thing anyone re-checks.
+    readme = plan_for(verify_command="python3 -m unittest discover -q").files()["README.md"]
+
+    assert "placeholder" not in readme
+    assert "`## Verify`" in readme
 
 
 def test_the_readme_says_which_protection_shape_was_chosen_and_why():
@@ -559,6 +570,21 @@ def test_the_accounts_own_default_branch_name_is_respected():
     assert report.default_branch == "trunk"
     assert list(fake.refs) == ["refs/heads/trunk"]
     assert "`trunk` is protected" in fake.files()["README.md"]
+
+
+def test_the_report_carries_the_command_the_committed_workflow_runs():
+    # The caller's next act is to plan issues whose `## Verify` must be this
+    # exact string. Reporting it means the caller never has to re-derive it
+    # from its own copy of the plan, which is one more place it could differ
+    # from what is actually in the repository.
+    fake = FakeGitHub()
+    plan = plan_for(verify_command="python3 -m unittest discover -q")
+
+    report = provision_into(fake, plan)
+
+    assert report.verify_command == plan.verify_command
+    assert f"run: {report.verify_command}" in fake.files()[CI_WORKFLOW_PATH]
+    assert report.verify_command in report.summary()
 
 
 def test_the_swarm_labels_are_provisioned():

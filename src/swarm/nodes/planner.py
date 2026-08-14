@@ -535,10 +535,16 @@ def write_plan(
 
     `ledger` is the read the caller already made - `start_run` holds one, and
     re-listing the issues to hand this function one would double the
-    rate-limit cost of a cycle's first act. `verify` overrides the repo-wide
-    verify command that every issue's `## Verify` carries; the planner does not
-    invent a per-task command, because a command it guessed wrong is a gate
-    that was red before any worker touched the task.
+    rate-limit cost of a cycle's first act.
+
+    `verify` is the repo-wide command every issue's `## Verify` carries, and it
+    belongs to the caller because the caller is what knows the repository:
+    `cli._target` reads it off the scaffold it just committed, or off
+    `--verify`. The planner invents no per-task command and lets the model
+    choose none, because a command guessed wrong is a gate that was red before
+    any worker touched the task. `None` falls back to `SETTINGS.verify_command`
+    - v1's `SWARM_VERIFY`, and the right answer only for a repository that
+    really is verified that way.
 
     Raises `PlanError` - having written nothing - when the plan's own
     dependency graph has a ring in it.
@@ -735,7 +741,12 @@ def _replan_prompt(existing: Mapping[str, TaskRecord]) -> str:
     return SYSTEM + REPLAN_SUFFIX.format(failures=failures, existing=tracked)
 
 
-def plan_node(state: SwarmState, *, source: GitHubClient | str | None = None) -> dict:
+def plan_node(
+    state: SwarmState,
+    *,
+    source: GitHubClient | str | None = None,
+    verify: str | None = None,
+) -> dict:
     """Plan (or replan) the objective, and write the result to the ledger.
 
     Returns the v1-shaped `tasks` dict either way. With a target repository
@@ -746,6 +757,11 @@ def plan_node(state: SwarmState, *, source: GitHubClient | str | None = None) ->
     Without one it falls back to v1's in-memory ledger and says so in the
     events, because a planner that silently wrote nothing reads as a planner
     that did nothing.
+
+    `verify` is `write_plan`'s, passed straight through: the graph's node
+    signature is the only reason it has to be named here at all, and defaulting
+    it in this function instead of forwarding it would put a second answer next
+    to the one the caller was holding.
     """
     objective = state["objective"]
     existing = state.get("tasks") or {}
@@ -778,7 +794,7 @@ def plan_node(state: SwarmState, *, source: GitHubClient | str | None = None) ->
         }
 
     client = _as_client(target)
-    report = write_plan(client, plan)
+    report = write_plan(client, plan, verify=verify)
     # Re-read rather than project: `docs/architecture-v2.md`'s "on any
     # disagreement, GitHub wins" is only a rule that means anything if nothing
     # keeps a second copy. `adopt=False` because the write above just adopted

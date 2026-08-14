@@ -98,9 +98,14 @@ CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 # It has to pass on the initial commit - that is the acceptance criterion - and
 # the obvious `python -m pytest -q` does not: pytest exits 5 when it collects no
 # tests, so the first CI run of every generated repo would be red and the
-# required check would block the first PR. #26's scaffold replaces this with a
-# command that runs a real test suite, and the swarm's planner then inherits
-# *that* as the default `## Verify`.
+# required check would block the first PR.
+#
+# Nothing the swarm creates uses this any more: `cli` provisions a
+# `ScaffoldedPlan` (#26), whose verify command runs the generated test suite and
+# is what the planner writes into every issue's `## Verify`. It remains the
+# default of a bare `ProvisionPlan` because a plan with no scaffold in it has
+# nothing else that could pass, and `python -m swarm.greenfield.provision` can
+# still be asked for one.
 PLACEHOLDER_VERIFY = "test -f README.md"
 
 # GitHub's own rule for a repository name.
@@ -367,12 +372,19 @@ class ProvisionReport:
     commit_sha: str
     labels: LabelReport
     protection: tuple[str, ...]
+    #: The command the workflow in that commit actually runs. Reported rather
+    #: than left for the caller to re-derive from its own copy of the plan: the
+    #: planner writes this same string into every issue's `## Verify`, and a
+    #: `## Verify` that disagrees with the required status check is a task whose
+    #: gate was red before a worker touched it.
+    verify_command: str = PLACEHOLDER_VERIFY
 
     def summary(self) -> str:
         return (
             f"{self.repo}: created at {self.html_url}\n"
             f"  {self.default_branch} @ {self.commit_sha[:7]}, "
             f"protected by {', '.join(self.protection) or 'nothing'}\n"
+            f"  verified by {self.verify_command}\n"
             f"  {self.labels.summary()}"
         )
 
@@ -452,6 +464,7 @@ def provision(
         commit_sha=commit_sha,
         labels=labels,
         protection=protection,
+        verify_command=plan.verify_command,
     )
 
 
@@ -685,6 +698,26 @@ about the consequence: an unattended swarm has nobody to approve its PRs, so
 from that moment nothing merges without a person.
 """
     )
+    # Which of the two this repository got is a fact about it, so the README
+    # states the one that is true here rather than describing both. A generated
+    # file that documents a command the workflow does not run is the first thing
+    # a reader trusts and the last thing anyone re-checks.
+    verify_note = (
+        """\
+CI runs exactly this command and only its exit code is believed. It is a
+placeholder: there is no code here to test yet, and it passes on the initial
+commit so the required check has something to report. Whoever writes the first
+test replaces it here and in the workflow.
+"""
+        if plan.verify_command == PLACEHOLDER_VERIFY
+        else """\
+CI runs exactly this command and only its exit code is believed, and every task
+the swarm plans carries the same command as its own `## Verify`. It is one
+string in three places - this file, the workflow, and each issue - because
+three that can disagree is a repository where the answer depends on which one
+you happened to read.
+"""
+    )
     return f"""\
 # {plan.name}
 
@@ -701,11 +734,7 @@ conditions the swarm works against, not a finished project.
 {plan.verify_command}
 ```
 
-CI runs exactly this command and only its exit code is believed. It is a
-placeholder that passes on the initial commit; the generated scaffold replaces
-it with a command that runs a real test suite, and planned tasks inherit that
-command as their `## Verify`.
-
+{verify_note}
 ## Branch protection
 
 `{plan.default_branch}` is protected by a repository ruleset named `{RULESET_NAME}`:
