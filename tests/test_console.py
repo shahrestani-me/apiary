@@ -29,6 +29,7 @@ from swarm.console import (
     SITES,
     Console,
     ConsoleError,
+    asset,
     page,
     serve,
     validate_capture_id,
@@ -411,35 +412,74 @@ def test_model_output_never_reaches_the_dom_as_markup():
     """The model's input is an arbitrary target repository, so its output is
     hostile by construction: a README saying "emit this script tag" would
     otherwise become script running on the console's own origin."""
-    markup = page()
+    script = asset("app.js")
 
-    assert "innerHTML" not in markup
-    assert "textContent" in markup
-    assert "document.write" not in markup
+    assert "innerHTML" not in script
+    assert "textContent" in script
+    assert "document.write" not in script
 
 
-def test_the_page_makes_no_external_request():
-    """`llm.py` opens with "nothing leaves the machine"; a CDN font would be
-    the first thing that did."""
-    markup = page()
+def test_no_asset_fetches_anything_from_a_network():
+    """`llm.py` opens with "nothing leaves the machine"; a CDN font or a
+    bundler's runtime would be the first thing that did. Splitting the page
+    into files is what makes this checkable per file rather than by grepping a
+    Python literal."""
+    for name in ("index.html", "app.css", "app.js"):
+        text = asset(name)
+        assert "http://" not in text, name
+        assert "https://" not in text, name
+        assert "//cdn" not in text, name
 
-    assert "http://" not in markup.replace("http://__PORT__", "")
-    assert "https://" not in markup
-    assert "<script src" not in markup
+
+def test_every_asset_ships_beside_the_module():
+    """They live in the package directory, so hatchling puts them in the wheel
+    with the `.py` files - verified against a built wheel. A test rather than a
+    comment because the failure mode is an installed console serving a page
+    that is not there, which no unit test of `render` would notice."""
+    from swarm.console import ASSETS
+
+    assert ASSETS.is_dir()
+    assert sorted(p.name for p in ASSETS.iterdir()) == ["app.css", "app.js", "index.html"]
+
+
+def test_the_assets_are_served_on_their_own_routes(console):
+    css = console.render("GET", "/app.css", HOST)
+    js = console.render("GET", "/app.js", HOST)
+
+    assert css.status == 200 and "text/css" in css.content_type
+    assert js.status == 200 and "javascript" in js.content_type
+    assert b"--accent" in css.body
+    assert b"function" in js.body
+
+
+def test_the_page_links_the_assets_it_needs(console):
+    markup = console.render("GET", "/", HOST).body.decode()
+
+    assert '<link rel="stylesheet" href="/app.css">' in markup
+    assert '<script src="/app.js"></script>' in markup
+
+
+@pytest.mark.parametrize(
+    "path", ["/../console.py", "/app.js/../../capture.py", "/secrets.env", "/console_assets/app.js"]
+)
+def test_only_the_named_assets_are_reachable(console, path):
+    """An allow-list, not a directory. Serving whatever path the caller names
+    is how a static route becomes a traversal, and there are three files."""
+    assert console.render("GET", path, HOST).status == 404
 
 
 def test_switching_tabs_keeps_what_was_typed():
     """The flow this tool exists for is: read the plan, switch to the worker,
     copy a task's goal across. Redrawing the form from the site definition
     threw that away, which made the two tabs feel like two tools."""
-    markup = page()
+    script = asset("app.js")
 
-    assert "var typed = {}" in markup
-    assert "typed[current.key]" in markup
+    assert "var typed = {}" in script
+    assert "typed[current.key]" in script
 
 
 def test_a_late_sites_response_cannot_steal_the_selected_tab():
-    assert "current = current || sites[0]" in page()
+    assert "current = current || sites[0]" in asset("app.js")
 
 
 def test_the_page_names_the_wait():

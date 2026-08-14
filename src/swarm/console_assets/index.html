@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apiary console</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>apiary console</h1>
+  <span class="meta" id="models"></span>
+</header>
+<main>
+  <section class="card">
+    <div class="tabs" id="tabs" role="tablist"></div>
+    <p class="blurb" id="blurb"></p>
+    <form id="form" autocomplete="off"></form>
+    <div class="row">
+      <button class="go" id="go">Fire</button>
+      <button class="ghost" id="peek" title="Render the prompt without calling the model">Prompt</button>
+    </div>
+    <p class="blurb" id="hint" style="margin-top:12px"></p>
+  </section>
+  <section class="stack" id="out">
+    <div class="card empty" id="idle">
+      Pick a site, fill it in, and fire. <strong>Prompt</strong> renders exactly what would be
+      sent without calling the model — worth reading while a cold model loads.
+    </div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
