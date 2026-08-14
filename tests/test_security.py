@@ -49,6 +49,7 @@ from swarm.security import (
     FORBIDDEN_PERMISSIONS,
     REQUIRED_PERMISSIONS,
     SOCKET_PROXY_ENV,
+    SOCKET_PROXY_HOST,
     WORKER_NETWORK,
     CredentialError,
     EgressPolicy,
@@ -263,6 +264,23 @@ def test_the_proxy_environment_is_set_in_both_cases() -> None:
     assert env["HTTP_PROXY"] == env["http_proxy"] == "http://egress-proxy:8888"
     assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://egress-proxy:8888"
     assert "egress-proxy" in env["NO_PROXY"] == env["no_proxy"]
+
+
+def test_the_docker_socket_proxy_is_never_reached_through_the_egress_proxy() -> None:
+    """The `docker` CLI honours HTTP_PROXY for its own API calls.
+
+    Without the socket proxy in NO_PROXY, `docker version` is sent to the
+    egress proxy, which refuses it - `403 Filtered` from tinyproxy, a
+    deny-by-default egress rule rejecting traffic that should never have left
+    the container. It presents as "the daemon did not answer", which points at
+    the socket proxy rather than at the egress one.
+    """
+    env = EgressPolicy().proxy_env()
+    for spelling in ("NO_PROXY", "no_proxy"):
+        assert SOCKET_PROXY_HOST in env[spelling].split(",")
+
+    # DOCKER_HOST names the same host, so the two cannot drift apart.
+    assert SOCKET_PROXY_HOST in DOCKER_HOST_URL
 
 
 # --------------------------------------------------------------------------
