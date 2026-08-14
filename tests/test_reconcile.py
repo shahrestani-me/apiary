@@ -35,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
+from types import SimpleNamespace
+
 import pytest
 
 from fixtures.github import SentRequest, not_modified, page, response
@@ -920,3 +922,30 @@ def test_a_client_that_cannot_list_pull_requests_still_cannot():
     with pytest.raises(AttributeError):
         getattr(snapshot, PULLS_METHOD)
     assert snapshot.open_branches() is None
+
+
+def test_recovery_is_handed_containers_not_issue_numbers(fake_github):
+    """`_handles()` is a mapping keyed by issue number.
+
+    Passing it straight to `Recovery.sweep` iterates the *keys*, so
+    `recovery.holders` asked an int for its `.issue` and the whole run died on
+    an AttributeError in the first cycle. Caught only by running it: every CLI
+    test used --plan-only, so the loop this sits in had no coverage at all.
+    """
+    seen: dict = {}
+
+    class SpyRecovery:
+        def sweep(self, ledger, *, containers=None, states=None, open_branches=None):
+            seen["containers"] = list(containers or ())
+            return SimpleNamespace(result=SimpleNamespace(applied=()))
+
+    gh, _, _ = fake_github(handler=scripted_repo(1))
+    subject = reconciler(gh)
+    subject.recovery = SpyRecovery()
+
+    subject.cycle()
+
+    assert "containers" in seen, "recovery was never swept"
+    assert all(not isinstance(c, int) for c in seen["containers"]), (
+        f"recovery received issue numbers, not handles: {seen['containers']}"
+    )
