@@ -113,6 +113,44 @@ CONTEXT_SKIP_DIRS = frozenset(
     {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build", ".mypy_cache"}
 )
 
+#: Files that are *generated* rather than written, and enormous. A lockfile
+#: pins a resolved dependency graph; it teaches a model nothing that the
+#: manifest beside it does not teach better, and it is routinely three orders
+#: of magnitude larger.
+#:
+#: The cost is not hypothetical and it is not once. `MAX_FILE_CHARS` is 20,000
+#: and `CONTEXT_BUDGET_CHARS` is 24,000, so **one** truncated lockfile spends
+#: 83% of the readable budget - and `package-lock.json` sorts before
+#: `package.json`, so it spends it first, on every task in that repository
+#: forever. A measured Expo lockfile is 16,347 lines.
+#:
+#: Two of these leak today and the rest are pre-emptive, which is deliberate:
+#: `CONTEXT_SUFFIXES` is an allow-list, so only `package-lock.json` (`.json`)
+#: and `pnpm-lock.yaml` (`.yaml`) are reachable right now. `.lock` and `.sum`
+#: are not readable suffixes *yet*. Naming all of them here means adding
+#: `.lock` to the allow-list later cannot silently reopen this, and it puts the
+#: reason in one place instead of splitting it across two constants.
+#:
+#: This skip is **ambient only**. A lockfile named in a task's `## Files` is
+#: read in full by `read_writable`, which does not consult this set - a task
+#: told to work on a file must be shown it.
+CONTEXT_SKIP_FILES = frozenset(
+    {
+        "package-lock.json",  # npm; `.json`, so reachable today
+        "npm-shrinkwrap.json",  # npm, publishable variant of the above
+        "pnpm-lock.yaml",  # pnpm; `.yaml`, so reachable today
+        "yarn.lock",  # yarn
+        "bun.lock",  # bun, text form
+        "Cargo.lock",  # cargo
+        "go.sum",  # go module checksums
+        "poetry.lock",  # poetry
+        "uv.lock",  # uv
+        "Pipfile.lock",  # pipenv
+        "Gemfile.lock",  # bundler
+        "composer.lock",  # composer
+    }
+)
+
 
 class EditError(RuntimeError):
     """The model never produced usable output.
@@ -190,6 +228,10 @@ def gather_context(
     Deterministic - sorted, budgeted, and identical for two runs of the same
     task against the same commit. A context set that varied between attempts
     would make a flaky task impossible to tell from a flaky model.
+
+    `CONTEXT_SKIP_FILES` is consulted here and only here, which is what makes
+    the skip ambient: `read_writable` reads a declared `## Files` entry whatever
+    its name, so a task told to work on a lockfile is still shown it.
     """
     root = root.resolve()
     claimed = {_normalise(path) for path in writable}
@@ -205,6 +247,8 @@ def gather_context(
             continue
         for child in sorted(folder.iterdir(), key=lambda path: path.name):
             if not child.is_file() or child.name.startswith("."):
+                continue
+            if child.name in CONTEXT_SKIP_FILES:
                 continue
             if child.suffix not in CONTEXT_SUFFIXES:
                 continue
