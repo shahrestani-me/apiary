@@ -220,6 +220,9 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     from .orchestrator.reconcile import Reconciler
 
     run = attachment.run
+    # A context manager, and used as one: leaving through an exception is
+    # recorded rather than swallowed, and the run summary is written on the way
+    # out however the loop ends.
     artifacts = RunArtifacts.open(run)
     fleet = ContainerManager(
         run=run,
@@ -237,7 +240,7 @@ def _loop(args, attachment: Attachment, *, source) -> int:
         dry_run=args.dry_run,
     )
 
-    with reaper.guard():
+    with reaper.guard(), artifacts:
         # Containers a previous process left behind hold clones and disk, and
         # their run ids would otherwise be counted against this run's cap.
         swept = reaper.startup()
@@ -248,8 +251,6 @@ def _loop(args, attachment: Attachment, *, source) -> int:
         except KeyboardInterrupt:
             print("\n! interrupted; containers are being disposed", file=sys.stderr)
             return 130
-        finally:
-            artifacts.close()
 
     for report in reports:
         print(f"  · cycle {report.index}: {report.summary()}")

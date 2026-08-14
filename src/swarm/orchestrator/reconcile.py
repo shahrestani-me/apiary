@@ -966,7 +966,10 @@ class Reconciler:
         if self.recovery is not None:
             recovered = self.recovery.sweep(
                 ledger,
-                containers=handles,
+                # `.values()`, because `_handles()` is keyed by issue number and
+                # iterating the mapping yields the keys - `holders` would then
+                # ask an int for its `.issue`.
+                containers=handles.values(),
                 states=snapshot.states(),
                 open_branches=snapshot.open_branches(),
             )
