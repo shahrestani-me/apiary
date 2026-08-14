@@ -102,6 +102,17 @@ def already_exists() -> Any:
     )
 
 
+def no_open_pulls():
+    """`GET /pulls?state=open` finding nothing.
+
+    Every publish now begins with this: `find_open_pull_request` asks the
+    client for the open PRs on this head, and since `GitHubClient` grew
+    `list_pull_requests` the question actually reaches the transport instead of
+    being skipped. A script that omits it is asserting the old behaviour.
+    """
+    return response(200, [])
+
+
 def can_list_pulls(client: Any, *pulls: dict[str, Any]) -> Any:
     """Give a client the public listing method `GitHubClient` does not have yet.
 
@@ -206,7 +217,7 @@ def result_at(root: Path, **overrides: Any) -> WorkerResult:
 
 @pytest.mark.usefixtures("worker_env")
 def test_publish_pushes_the_branch_and_opens_one_pr(fake_github, scratch_repo, finished):
-    gh, transport, _ = fake_github(response(201, pull()), response(200, [{"name": REVIEW_LABEL}]))
+    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, [{"name": REVIEW_LABEL}]))
 
     published = publish(finished, client=gh)
 
@@ -215,6 +226,7 @@ def test_publish_pushes_the_branch_and_opens_one_pr(fake_github, scratch_repo, f
     assert published.created and published.number == 42
     assert published.url.endswith("/pull/42")
     assert transport.calls == [
+        ("GET", f"/repos/{REPO}/pulls"),
         ("POST", f"/repos/{REPO}/pulls"),
         ("POST", f"/repos/{REPO}/issues/{ISSUE}/labels"),
     ]
@@ -222,11 +234,12 @@ def test_publish_pushes_the_branch_and_opens_one_pr(fake_github, scratch_repo, f
 
 @pytest.mark.usefixtures("worker_env")
 def test_the_pr_states_the_gate_and_closes_the_issue(fake_github, finished):
-    gh, transport, _ = fake_github(response(201, pull()), response(200, []))
+    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
 
     publish(finished, client=gh)
 
-    sent = transport.sent[0].json()
+    # [0] is the lookup for an existing PR; [1] is the create.
+    sent = transport.sent[1].json()
     assert sent["head"] == BRANCH
     # The base is the branch the clone came from: read from the checkout, not
     # guessed and not a second API call.
@@ -268,7 +281,7 @@ def test_refused_edits_are_reported_to_the_reviewer(tmp_path):
 @pytest.mark.usefixtures("worker_env")
 def test_a_second_run_updates_the_pr_it_can_find(fake_github, scratch_repo, tmp_path, finished):
     """The whole point of #17: one issue, one PR, however many attempts."""
-    first, _, _ = fake_github(response(201, pull()), response(200, []))
+    first, _, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
     publish(finished, client=first)
 
     second = attempt(scratch_repo, tmp_path / "attempt-2", GOOD_CALC, "swarm[add-sub]: retry")
@@ -297,11 +310,15 @@ def test_a_second_run_opens_no_second_pr_without_the_listing_method(
     one, so the retry path leans on the API refusing a second PR for a head
     branch that already has one. The push has already moved the open PR's head.
     """
-    first, _, _ = fake_github(response(201, pull()), response(200, []))
+    first, _, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
     publish(finished, client=first)
 
     second = attempt(scratch_repo, tmp_path / "attempt-2", GOOD_CALC, "swarm[add-sub]: retry")
     gh, transport, _ = fake_github(already_exists(), response(200, []))
+    # `GitHubClient` now has the listing method, so the "cannot look" path has
+    # to be asked for. It is still a real path - a client stubbed by a caller,
+    # or a listing that 403s - and the 422 is what keeps the invariant then.
+    gh.list_pull_requests = None
 
     published = publish(second, client=gh)
 
@@ -320,6 +337,7 @@ def test_a_second_run_opens_no_second_pr_without_the_listing_method(
 def test_any_other_422_is_a_failure(fake_github, finished):
     """"No commits between main and the branch" must not read as success."""
     gh, _, _ = fake_github(
+        no_open_pulls(),
         response(
             422,
             {
@@ -350,7 +368,7 @@ def test_the_push_refuses_to_clobber_a_branch_that_moved(
     here - this worker's clone is taken *before* the other push, which is the
     only situation in which a lease has anything to say.
     """
-    first, _, _ = fake_github(response(201, pull()), response(200, []))
+    first, _, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
     publish(finished, client=first)
 
     second = attempt(scratch_repo, tmp_path / "attempt-2", GOOD_CALC, "swarm[add-sub]: retry")
@@ -386,7 +404,7 @@ def test_the_token_is_in_the_environment_and_not_in_the_argv():
 
 @pytest.mark.usefixtures("worker_env")
 def test_the_token_reaches_no_file_in_the_checkout(fake_github, scratch_repo, finished):
-    gh, _, _ = fake_github(response(201, pull()), response(200, []))
+    gh, _, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
 
     publish(finished, client=gh, token=TOKEN)
 
@@ -464,7 +482,7 @@ def test_the_credential_helper_actually_answers(tmp_path, monkeypatch):
 @pytest.mark.usefixtures("worker_env")
 def test_the_worker_writes_only_the_review_label(fake_github, finished):
     """`docs/issue-contract.md` §4: one label, and `swarm:claimed` is not touched."""
-    gh, transport, _ = fake_github(response(201, pull()), response(200, []))
+    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
 
     published = publish(finished, client=gh)
 
@@ -482,7 +500,7 @@ def test_a_label_that_does_not_stick_does_not_undo_the_pr(fake_github, finished,
     Recovery (#35) can put `swarm:review` back by looking at the PR; nothing
     can put back a PR that was never reported as opened.
     """
-    gh, _, _ = fake_github(response(201, pull()), response(403, {"message": "Forbidden"}))
+    gh, _, _ = fake_github(no_open_pulls(), response(201, pull()), response(403, {"message": "Forbidden"}))
 
     published = publish(finished, client=gh)
 
@@ -525,7 +543,10 @@ def test_the_entrypoint_finds_and_calls_publish(fake_github, scratch_repo, tmp_p
     """
     workspace = tmp_path / "workspace"
     gh, transport, _ = fake_github(
-        issue_response(), response(201, pull()), response(200, [{"name": REVIEW_LABEL}])
+        issue_response(),
+        no_open_pulls(),
+        response(201, pull()),
+        response(200, [{"name": REVIEW_LABEL}]),
     )
     editor = FakeEditor(WorkerOutput(edits=[FileEdit(path="calc.py", content=GOOD_CALC)]))
 
@@ -539,11 +560,12 @@ def test_the_entrypoint_finds_and_calls_publish(fake_github, scratch_repo, tmp_p
     assert code == EXIT_OK
     assert transport.calls == [
         ("GET", f"/repos/{REPO}/issues/{ISSUE}"),
+        ("GET", f"/repos/{REPO}/pulls"),
         ("POST", f"/repos/{REPO}/pulls"),
         ("POST", f"/repos/{REPO}/issues/{ISSUE}/labels"),
     ]
     assert BRANCH in scratch_repo.remote_branches()
-    assert f"Closes #{ISSUE}" in transport.sent[1].json()["body"]
+    assert f"Closes #{ISSUE}" in transport.sent[2].json()["body"]
 
 
 @pytest.mark.usefixtures("worker_env")

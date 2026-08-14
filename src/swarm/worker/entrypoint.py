@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -65,6 +66,7 @@ from ..github.ledger import ContractError, TaskContract, parse_contract
 # GitError says "a git command failed" and means it in both v1's worktrees and
 # v2's clones; a second error class for the same fact would only make callers
 # catch both.
+from ..run import RUN_ID_ENV
 from ..worktree import GitError
 from .edit import Applied, EditError, apply_edits, gather_context, propose_edits, read_writable
 
@@ -108,6 +110,12 @@ class WorkerResult:
     commit: str | None = None
     written: tuple[str, ...] = ()
     refused: tuple[tuple[str, str], ...] = ()
+    #: The attempt this run is, taken from the contract's identity marker. The
+    #: worker is the only process that reads that marker before doing the work,
+    #: so carrying it here is cheaper than threading a counter through
+    #: `spawn` - and it keeps `result.py`'s one-file-per-attempt naming honest
+    #: when a retry lands.
+    attempt: int = 0
 
     @property
     def exit_code(self) -> int:
@@ -276,6 +284,7 @@ def run_worker(
             verify_output="the model produced no edit inside the declared file set",
             passed=False,
             refused=applied.refused,
+            attempt=contract.attempt,
         )
 
     print(f"  · wrote {', '.join(applied.written)}")
@@ -302,6 +311,7 @@ def run_worker(
         commit=commit,
         written=applied.written,
         refused=applied.refused,
+        attempt=contract.attempt,
     )
 
 
@@ -387,6 +397,49 @@ def split_repo(value: str) -> tuple[str | None, str]:
     return None, value
 
 
+def _record(result: WorkerResult, exit_code: int) -> None:
+    """Write this attempt's result file. Never raises.
+
+    The orchestrator reads exit codes from these records rather than blocking
+    on `docker wait`, which is what lets it restart mid-run - so a worker that
+    finishes without writing one is indistinguishable from a worker that
+    crashed. It is best-effort by design: an unwritable artifacts directory is
+    a reason to lose the record, never a reason to change the exit code the
+    task actually earned.
+    """
+    # Imported here, not at module scope: `result.py` depends on this module
+    # for `WorkerResult` and the exit codes, so the top-level import would be a
+    # cycle. The dependency points that way on purpose - the record is built
+    # from the worker's own vocabulary.
+    from .result import report as write_worker_result
+
+    try:
+        path = write_worker_result(
+            result,
+            run_id=os.environ.get(RUN_ID_ENV, "unattached"),
+            attempt=result.attempt,
+            exit_code=exit_code,
+        )
+    except OSError as exc:
+        print(f"! could not write the result record: {exc}", file=sys.stderr)
+    else:
+        print(f"  · recorded {path.name}")
+
+
+def _unrun(issue: int, repo: str, reason: str) -> WorkerResult:
+    """A result for an attempt that never got as far as a verify command."""
+    return WorkerResult(
+        issue=issue,
+        repo=repo,
+        task_id="",
+        branch=f"swarm/issue-{issue}",
+        root=Path("."),
+        verify_command="",
+        verify_output=reason,
+        passed=False,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -417,9 +470,13 @@ def main(
         # Task failure, not infrastructure: this body will not parse any better
         # on a second attempt (see the module docstring).
         print(f"! {exc}", file=sys.stderr)
+        _record(_unrun(args.issue, slug, str(exc)), EXIT_TASK_FAILED)
         return EXIT_TASK_FAILED
     except (InfrastructureError, EditError, GitError, GitHubError, OSError) as exc:
         print(f"! {exc}", file=sys.stderr)
+        # Exit 2 is the code the reconciler must see to leave the attempt
+        # budget alone, and it can only see it in a record.
+        _record(_unrun(args.issue, slug, str(exc)), EXIT_INFRASTRUCTURE)
         return EXIT_INFRASTRUCTURE
 
     print(f"» {result.summary()}")
@@ -437,7 +494,10 @@ def main(
             _publish(result, client if client is not None else GitHubClient.from_env(slug))
         except GitHubError as exc:
             print(f"! {exc}", file=sys.stderr)
+            _record(result, EXIT_INFRASTRUCTURE)
             return EXIT_INFRASTRUCTURE
+
+    _record(result, result.exit_code)
 
     if result.exit_code != EXIT_OK and not args.keep:
         # The container is cattle and its filesystem dies with it, so this only

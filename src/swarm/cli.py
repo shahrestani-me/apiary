@@ -41,6 +41,9 @@ from .github.client import GitHubClient, GitHubError
 from .github.ledger import LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.provision import ProvisionPlan, provision
+from .security import worker_create_flags
+from .artifacts import RunArtifacts
+from .nodes.planner import plan_node
 from .run import Attachment, RunError, start_run
 
 
@@ -72,6 +75,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="read the ledger and report; write nothing to GitHub",
+    )
+    run.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="plan and compute readiness, then stop before dispatching anything",
+    )
+    run.add_argument(
+        "--base-commit",
+        default="",
+        help="commit workers branch from (default: the base branch's head)",
+    )
+    run.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="stop after this many reconcile cycles (default: until the ledger finishes)",
+    )
+    run.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="open pull requests but never merge them; leave the review queue to a human",
     )
     return parser
 
@@ -107,27 +131,93 @@ def _run(
     )
     _report_run(attachment, dry_run=args.dry_run)
 
+    source = client if client is not None else repo
+    ledger = attachment.ledger
+
     if not attachment.resumed:
-        # An empty ledger is where the planner (#10) writes issues. It does not
-        # exist yet, and saying so is the only honest thing to print - a run
-        # that silently does nothing on a fresh repo reads as a bug in GitHub.
-        print("! nothing to attach to, and planning onto GitHub is not wired yet (#10)",
-              file=sys.stderr)
+        # An empty ledger is where the planner writes issues. A dry run must not
+        # write them, and saying so beats a run that silently does nothing on a
+        # fresh repo - which reads as a bug in GitHub rather than as a choice.
+        if args.dry_run:
+            print("! nothing to attach to; --dry-run writes no plan", file=sys.stderr)
+            return 0
+        print("» planning from the objective")
+        try:
+            planned = plan_node({"objective": objective}, source=source)
+        except Exception as exc:  # noqa: BLE001 - local model failures are varied
+            print(f"! planning failed: {exc}", file=sys.stderr)
+            return 1
+        for line in planned.get("events", ()):
+            print(f"  · {line}")
+        if not planned.get("tasks"):
+            print("! the planner produced nothing to write", file=sys.stderr)
+            return 1
+        # `plan_node` already re-read the tracker after writing - "on any
+        # disagreement, GitHub wins" only means something if nothing keeps a
+        # second copy - so re-attach and take the ledger from that read.
+        attachment = start_run(repo, objective, source=source, adopt=True)
+        ledger = attachment.ledger
+
+    if args.plan_only:
+        plan = apply_readiness(source, ledger=ledger, dry_run=args.dry_run)
+        for verdict in plan.verdicts:
+            print(f"  · {verdict}")
+        print()
+        print(f"» {plan.summary()}")
         return 0
 
-    plan = apply_readiness(
-        client if client is not None else repo,
-        ledger=attachment.ledger,
+    return _loop(args, attachment, source=source)
+
+
+def _loop(args, attachment: Attachment, *, source) -> int:
+    """Run cycles until the ledger finishes, the cap is hit, or Ctrl-C.
+
+    Everything the loop needs is built here rather than inside `Reconciler`,
+    because these are the objects with a lifetime: the fleet holds this run's
+    containers, the reaper owns the signal handlers, and both have to be torn
+    down whatever ends the run.
+    """
+    from .containers.manager import ContainerManager
+    from .containers.reaper import Reaper
+    from .orchestrator.recovery import Recovery
+    from .orchestrator.reconcile import Reconciler
+
+    run = attachment.run
+    artifacts = RunArtifacts.open(run)
+    fleet = ContainerManager(
+        run=run,
+        env={**artifacts.worker_env()},
+        extra_flags=[*artifacts.mount_flags(), *worker_create_flags()],
+    )
+    reaper = Reaper(run=run, docker=fleet.docker)
+    reconciler = Reconciler(
+        run=run,
+        client=source if not isinstance(source, str) else GitHubClient.from_env(source),
+        base_commit=args.base_commit or "",
+        fleet=fleet,
+        recovery=Recovery(client=source, run=run, dry_run=args.dry_run),
+        merge_gate=not args.no_merge,
         dry_run=args.dry_run,
     )
-    for verdict in plan.verdicts:
-        print(f"  · {verdict}")
-    for problem in plan.errors:
-        print(f"  ! {problem}", file=sys.stderr)
 
+    with reaper.guard():
+        # Containers a previous process left behind hold clones and disk, and
+        # their run ids would otherwise be counted against this run's cap.
+        swept = reaper.startup()
+        if swept.reaped:
+            print(f"» reaped {len(swept.reaped)} orphaned container(s)")
+        try:
+            reports = reconciler.loop(cycles=args.max_cycles)
+        except KeyboardInterrupt:
+            print("\n! interrupted; containers are being disposed", file=sys.stderr)
+            return 130
+        finally:
+            artifacts.close()
+
+    for report in reports:
+        print(f"  · cycle {report.index}: {report.summary()}")
     print()
-    print(f"» {plan.summary()}")
-    print("! dispatch is not wired yet (#21); no containers were started", file=sys.stderr)
+    print(f"» artifacts in {artifacts.directory}")
     return 0
 
 

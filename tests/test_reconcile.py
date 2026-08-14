@@ -834,6 +834,14 @@ def scripted_repo(count: int) -> Callable[[SentRequest], Any]:
             if request.header("If-None-Match") == '"ledger-v1"':
                 return not_modified()
             return page(payloads, ETag='"ledger-v1"')
+        if request.method == "GET" and request.path.endswith("/pulls"):
+            # The second of the cycle's two reads. It appeared when
+            # `GitHubClient` grew `list_pull_requests`: before that the
+            # reconciler was blind to PRs and deliberately decided nothing
+            # about them. Two constant reads per cycle is still O(cycles),
+            # which is what this section is about - the failure it guards
+            # against is a read *per issue*.
+            return page([], ETag='"pulls-v1"')
         raise AssertionError(f"unbudgeted request: {request.method} {request.path}")
 
     return handle
@@ -846,10 +854,13 @@ def test_a_run_of_n_cycles_costs_o_n_requests_not_o_n_times_issues(fake_github, 
     reports = reconciler(gh).loop(cycles=3, until=lambda report: False)
 
     # #22's second acceptance criterion. Six times the issues, the same number
-    # of requests: one listing per cycle, shared by every collaborator in it.
+    # of requests: two listings per cycle - issues and pulls - each shared by
+    # every collaborator in that cycle. The claim is that the count follows
+    # the number of cycles and not the size of the ledger, so it is asserted
+    # as a multiple of the cycles rather than as a constant.
     assert len(reports) == 3
-    assert len(transport.sent) == 3
-    assert transport.sent[1].header("If-None-Match") == '"ledger-v1"'
+    assert len(transport.sent) == 3 * 2
+    assert transport.sent[2].header("If-None-Match") == '"ledger-v1"'
 
 
 def test_the_repeat_read_is_a_304_and_still_produces_the_whole_ledger(fake_github):
@@ -883,6 +894,29 @@ def test_the_snapshot_falls_through_to_the_client_for_anything_it_does_not_shape
     # own answer. A wrapper that answered for it would turn a method that is
     # merely missing into one that can never be found.
     assert snapshot.open_branches() == frozenset({"swarm/issue-4"})
-    assert getattr(snapshot, PULLS_METHOD) == client.list_pull_requests
     with pytest.raises(AttributeError):
         getattr(snapshot, COMMENT_METHOD)
+
+    # The listing is wrapped rather than delegated, so a cycle's collaborators
+    # share one read - but the wrapper exists only because this client does
+    # have the method, and it answers with the client's own data.
+    assert [p["head"]["ref"] for p in getattr(snapshot, PULLS_METHOD)()] == ["swarm/issue-4"]
+
+
+def test_a_client_that_cannot_list_pull_requests_still_cannot():
+    """The cached wrapper must not invent a capability.
+
+    `Snapshot.pull_requests` tells "this client cannot look" from "nothing is
+    open" by probing for the method, and `open_branches` turns the first into
+    `None` - which is what stops a cycle relabelling the entire review queue.
+    A wrapper that existed unconditionally would answer `[]` and erase that
+    distinction.
+    """
+    class Blind:
+        def list_issues(self, **kwargs: Any) -> list[dict[str, Any]]:
+            return [issue_payload(4)]
+
+    snapshot = Snapshot(Blind())
+    with pytest.raises(AttributeError):
+        getattr(snapshot, PULLS_METHOD)
+    assert snapshot.open_branches() is None
