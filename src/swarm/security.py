@@ -101,6 +101,16 @@ REQUIRED_PERMISSIONS: dict[str, str] = {
     "contents": "write",
     "pull_requests": "write",
     "issues": "write",
+    # Read-only, and it is the whole merge gate: `checks.py` decides whether a
+    # PR may merge by reading its check runs, and GitHub files those under
+    # `checks` rather than under `actions` or `contents`. Missing, the run
+    # cannot tell a green PR from a red one - `doctor` caught it as a 403 on
+    # `github.ci` against a repository whose other four permissions were fine.
+    #
+    # Never write: a worker that can *create* a check run can report its own
+    # work as passing, which is the same failure as being able to edit the
+    # workflow, reached by a different door.
+    "checks": "read",
     "metadata": "read",
 }
 

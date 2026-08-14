@@ -138,7 +138,7 @@ So they are two credentials, not one widened credential:
 | | Work key (`GITHUB_TOKEN`) | Boot key (`APIARY_PROVISION_TOKEN`) |
 |---|---|---|
 | Job | The whole run | Create the repository, once |
-| Permissions | contents, pull_requests, issues, metadata | administration, contents, workflows, issues, metadata |
+| Permissions | contents, pull_requests, issues, checks (read), metadata | administration, contents, workflows, issues, metadata |
 | Lives | In every worker container | In the orchestrator, for seconds |
 | Sees model output | Yes | Never — it runs before any container exists |
 
