@@ -45,6 +45,19 @@ What this command does today is mint the identity, attach to the ledger and run
 the one reconcile step that exists (readiness, #11). Dispatch is #21 and
 planning onto GitHub is #10; until those land it says so on stderr rather than
 implying a swarm ran.
+
+**Three more subcommands, and no logic behind any of them.** `swarm doctor`,
+`swarm runs` and `swarm show <run-id>` are the preflight and the two artifact
+readers, which existed as functions long before they were reachable by typing.
+`doctor.py:62-64` and `artifacts.py:57-61` both say so and both left the wiring
+here deliberately, because it is the module that owns the parser.
+
+So the rule this file follows for them is: **decide nothing.** `doctor.main`
+stays the only place that knows what a failed preflight prints and what it
+exits with; `runs_text` and `show_text` stay the only places that know what a
+run looks like written down. What is added here is argument parsing, one
+`reversed()` - `list_runs` is documented oldest-first and a human asking "what
+have I run" means the last one - and dispatch.
 """
 
 from __future__ import annotations
@@ -56,13 +69,22 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import SETTINGS
+from .doctor import DEFAULT_CI_REF
+from .doctor import main as doctor_main
 from .github.client import GitHubClient, GitHubError
 from .github.ledger import LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.provision import provision
 from .greenfield.scaffold import ScaffoldedPlan
 from .security import EgressPolicy, worker_create_flags
-from .artifacts import RunArtifacts
+from .artifacts import (
+    ArtifactsError,
+    RunArtifacts,
+    list_runs,
+    load_run,
+    runs_text,
+    show_text,
+)
 from .nodes.planner import plan_node
 from .run import Attachment, RunError, start_run
 
@@ -135,14 +157,62 @@ def build_parser() -> argparse.ArgumentParser:
             "was met; the run does exactly the tasks that were planned and no more"
         ),
     )
+
+    # `doctor`'s options mirror `doctor.build_parser` deliberately, and
+    # `test_the_doctor_subcommand_accepts_every_option_doctor_itself_does` pins
+    # that they stay mirrored - a flag added there and not here would leave
+    # `python -m swarm.doctor` and `swarm doctor` quietly different commands.
+    doctor = sub.add_parser("doctor", help="check every precondition; read-only")
+    doctor.add_argument(
+        "repo",
+        nargs="?",
+        default=None,
+        help="target repository as owner/name (default: $GITHUB_REPOSITORY)",
+    )
+    doctor.add_argument(
+        "--ci-ref",
+        default=DEFAULT_CI_REF,
+        help=f"ref whose check runs prove CI exists (default: {DEFAULT_CI_REF})",
+    )
+    doctor.add_argument(
+        "--skip-schema",
+        action="store_true",
+        help="do not invoke the models; skips the only check that costs inference",
+    )
+
+    runs = sub.add_parser("runs", help="list recorded runs, newest first")
+    runs.add_argument(
+        "--root",
+        default=None,
+        help="artifacts directory to read (default: $APIARY_ARTIFACTS, else .swarm/runs)",
+    )
+
+    show = sub.add_parser("show", help="print one run's summary")
+    show.add_argument("run_id", help="the run to print, as printed by `swarm runs`")
+    show.add_argument(
+        "--root",
+        default=None,
+        help="artifacts directory to read (default: $APIARY_ARTIFACTS, else .swarm/runs)",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = None) -> int:
-    """`client` is the test seam, exactly as `provision`'s `target` is."""
+    """`client` is the test seam, exactly as `provision`'s `target` is.
+
+    The error handling below is shared by every subcommand on purpose: `show`
+    of an id nobody ever ran is a typo, and a typo deserves one line naming
+    what was not found rather than an `ArtifactsError` traceback.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "doctor":
+            return _doctor(args)
+        if args.command == "runs":
+            return _runs(args)
+        if args.command == "show":
+            return _show(args)
         return _run(args, parser, client=client)
     except DependencyCycleError as exc:
         # Its own branch because the fix is different from every other error
@@ -151,9 +221,50 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
         print(f"! {exc}", file=sys.stderr)
         print("  break the cycle by editing one issue's ## Blocked by", file=sys.stderr)
         return 1
-    except (RunError, GitHubError, LedgerError, ReadinessError, ValueError) as exc:
+    except (
+        ArtifactsError,
+        RunError,
+        GitHubError,
+        LedgerError,
+        ReadinessError,
+        ValueError,
+    ) as exc:
         print(f"! {exc}", file=sys.stderr)
         return 1
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    """Hand the arguments straight back to `doctor.main`, which owns the verdict.
+
+    Re-serialising a namespace into an argv is not the prettiest thing in this
+    file, and it is still the right shape: what a failed preflight prints, and
+    what it exits with, is a decision `doctor.py` already made and documented,
+    and the one thing this ticket must not do is make a second copy of it that
+    can drift. Everything here is transport.
+    """
+    argv = [args.repo] if args.repo else []
+    argv += ["--ci-ref", args.ci_ref]
+    if args.skip_schema:
+        argv.append("--skip-schema")
+    return doctor_main(argv)
+
+
+def _runs(args: argparse.Namespace) -> int:
+    """Newest first.
+
+    `list_runs` is documented oldest-first and stays that way - a human asking
+    "what have I run" means the last one, and a chronological list is the right
+    thing for every caller that is not a terminal. The reversal is this
+    subcommand's opinion, so it lives at this call site.
+    """
+    print(runs_text(tuple(reversed(list_runs(args.root)))))
+    return 0
+
+
+def _show(args: argparse.Namespace) -> int:
+    """One run. An id with no directory raises `ArtifactsError` naming it."""
+    print(show_text(load_run(args.run_id, args.root)))
+    return 0
 
 
 def _run(
