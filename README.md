@@ -190,8 +190,10 @@ anyway (see below).
 ### Check the machine before involving any model
 
 ```bash
-python -m swarm.doctor owner/name
+swarm doctor owner/name
 ```
+
+(`python -m swarm.doctor owner/name` is the same command and still works.)
 
 Eleven checks, each naming the command that fixes it: Ollama's client target
 and reachability, both models present, **schema-forced JSON actually honoured**,
@@ -245,6 +247,21 @@ One piece is still not reachable: the CI failure that `checks.write_feedback`
 persists onto an issue is not yet read back into the next attempt's prompt
 (`worker/entrypoint.py`), so a retry sees the same context the first attempt
 did. It is on the issue for a human either way.
+
+### Reading a run afterwards
+
+Every run writes a directory under `.swarm/runs/<run-id>/` — what was planned,
+what each container printed, what each worker's gate said, and where the run
+needed a person. Two commands read it back:
+
+```bash
+swarm runs                  # every recorded run, newest first, grouped by repo
+swarm show <run-id>         # one run: outcome, cost, and what needed a human
+```
+
+Both are read-only and neither needs a token — the directory is the whole
+input. `--root` points them at an artifacts directory other than the default
+(`$APIARY_ARTIFACTS`, else `.swarm/runs`).
 
 ### Concurrency is bounded by inference, not memory
 

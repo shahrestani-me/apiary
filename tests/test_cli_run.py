@@ -22,6 +22,7 @@ fixture here. #31 will lift the double into the shared fixture set.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import re
 import subprocess
@@ -874,3 +875,143 @@ def test_a_run_the_cap_ended_is_not_a_failure(capsys):
 
     assert code == 0
     assert "2 live issue(s)" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# The three subcommands that were functions before they were commands
+# --------------------------------------------------------------------------
+#
+# `doctor.py:62-64` and `artifacts.py:57-61` both left this wiring to `cli.py`
+# and said so. So the tests here are about *dispatch and transport* - that the
+# right callable is reached with the right arguments and that its exit code
+# survives - and not about what any of them prints. What they print is tested
+# where it is decided, in `test_doctor.py` and `test_artifacts.py`, and #97
+# changes it there.
+
+
+import swarm.doctor as doctor_module
+from swarm.artifacts import RunArtifacts
+from swarm.run import Run
+
+
+def test_swarm_with_no_subcommand_still_errors(capsys):
+    """`required=True` predates this ticket and outlives it: `swarm` alone is
+    not a synonym for `swarm run`, and quietly making it one would mean a typo'd
+    subcommand starting a swarm."""
+    with pytest.raises(SystemExit) as exit_info:
+        main([])
+
+    assert exit_info.value.code == 2
+    assert "required" in capsys.readouterr().err
+
+
+def test_swarm_doctor_runs_the_preflight_and_passes_its_exit_code_through(monkeypatch):
+    """Zero and non-zero both come from `doctor.main`. This command adds no
+    verdict of its own - the preflight already has one."""
+    seen: list[list[str]] = []
+
+    def fake_doctor_main(argv):
+        seen.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(cli, "doctor_main", fake_doctor_main)
+    assert main(["doctor", REPO]) == 0
+    assert seen == [[REPO, "--ci-ref", "main"]]
+
+
+def test_swarm_doctor_exits_non_zero_when_a_check_fails(monkeypatch):
+    monkeypatch.setattr(cli, "doctor_main", lambda argv: 1)
+
+    assert main(["doctor", REPO]) == 1
+
+
+def test_swarm_doctor_forwards_every_argument_it_was_given(monkeypatch):
+    """Including the ones with defaults, and *excluding* a repo that was
+    omitted - `doctor` falls back to $GITHUB_REPOSITORY for that, and forwarding
+    an empty string would defeat it."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "doctor_main", lambda argv: seen.append(list(argv)) or 0)
+
+    main(["doctor", "--ci-ref", "develop", "--skip-schema"])
+
+    assert seen == [["--ci-ref", "develop", "--skip-schema"]]
+
+
+def test_the_doctor_subcommand_accepts_every_option_doctor_itself_does():
+    """The drift pin.
+
+    `swarm doctor` re-declares its options rather than sharing a parent parser,
+    because `doctor.build_parser` sets its own `prog` and is a complete parser.
+    Re-declaration is only safe while something notices a flag added on one side
+    and not the other - two commands with the same name and different options is
+    the worst of both.
+    """
+    subparsers = [
+        action for action in cli.build_parser()._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ][0]
+    wired = {action.dest for action in subparsers.choices["doctor"]._actions}
+    own = {action.dest for action in doctor_module.build_parser()._actions}
+
+    assert own <= wired
+
+
+def test_swarm_runs_lists_newest_first(tmp_path, capsys):
+    """The opposite order to `list_runs`, which is documented oldest-first and
+    stays that way. A human typing `swarm runs` wants the one they just ran."""
+    root = tmp_path / "runs"
+    for run_id, clock in (
+        ("apiary-20260814-142530-k3f9qz", "14:25:30"),
+        ("apiary-20260814-150000-bbbbbb", "15:00:00"),
+    ):
+        RunArtifacts.open(
+            Run.start(REPO, OBJECTIVE, run_id=run_id, now=_utc_at(clock)), root=root
+        ).finish()
+
+    assert main(["runs", "--root", str(root)]) == 0
+
+    out = capsys.readouterr().out
+    assert out.index("150000-bbbbbb") < out.index("142530-k3f9qz")
+
+
+def test_swarm_runs_says_so_when_there_are_none(tmp_path, capsys):
+    assert main(["runs", "--root", str(tmp_path / "never-used")]) == 0
+    assert "no runs recorded" in capsys.readouterr().out
+
+
+def test_swarm_show_prints_the_run_summary(tmp_path, capsys):
+    root = tmp_path / "runs"
+    run_id = "apiary-20260814-142530-k3f9qz"
+    RunArtifacts.open(
+        Run.start(REPO, OBJECTIVE, run_id=run_id, now=_utc_at("14:25:30")), root=root
+    ).finish()
+
+    assert main(["show", run_id, "--root", str(root)]) == 0
+
+    out = capsys.readouterr().out
+    assert run_id in out
+    assert OBJECTIVE in out
+
+
+def test_swarm_show_of_an_unknown_id_names_it_rather_than_raising(tmp_path, capsys):
+    """A run id is a string a human types back in from a previous line of
+    output, so getting it wrong is the common case, not the exotic one."""
+    unknown = "apiary-20260814-999999-zzzzzz"
+
+    assert main(["show", unknown, "--root", str(tmp_path)]) == 1
+
+    err = capsys.readouterr().err
+    assert unknown in err
+    assert "Traceback" not in err
+
+
+def test_swarm_show_of_a_malformed_id_is_refused_before_it_becomes_a_path(tmp_path, capsys):
+    """`load_run` validates first. This asserts the refusal reaches the operator
+    as a line rather than as a `RunError` traceback."""
+    assert main(["show", "../../etc", "--root", str(tmp_path)]) == 1
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def _utc_at(clock: str) -> dt.datetime:
+    hour, minute, second = (int(part) for part in clock.split(":"))
+    return dt.datetime(2026, 8, 14, hour, minute, second, tzinfo=dt.timezone.utc)
