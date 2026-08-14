@@ -60,7 +60,12 @@ ENV OLLAMA_HOST=http://host.docker.internal:11434
 # directory so they outlive a container that is disposable by design. #29 owns
 # what actually goes in here. SWARM_ prefix to match every other setting the
 # package reads (src/swarm/config.py).
-ENV SWARM_RUN_ARTIFACTS=/var/apiary/runs
+# The name `artifacts.py` actually reads. This image originally set
+# SWARM_RUN_ARTIFACTS, chosen before #29 existed and picked its own spelling,
+# so nothing read it: the orchestrator wrote its logs and summaries to
+# /workspace/.swarm/runs *inside the container*, which is destroyed with it,
+# while the bind mount below stayed empty. The run looked fine and kept nothing.
+ENV APIARY_ARTIFACTS_DIR=/var/apiary/runs
 
 # Unprivileged. This process drives the Docker API through a proxy (#28); every
 # privilege it does not hold is one an LLM-driven run cannot spend.

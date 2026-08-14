@@ -107,6 +107,8 @@ __all__ = [
     "RunMetrics",
     "RunView",
     "artifacts_root",
+    "HOST_ROOT_ENV",
+    "host_path",
     "list_runs",
     "load_run",
     "read_events",
@@ -196,6 +198,40 @@ def _parse(value: Any) -> dt.datetime | None:
 # --------------------------------------------------------------------------
 # Layout
 # --------------------------------------------------------------------------
+
+
+#: The artifacts root **as the Docker daemon sees it**, when those are not the
+#: same path. They are not the same path whenever the orchestrator is itself a
+#: container: it reaches the daemon through a socket, so every `--volume` source
+#: it names is resolved on the *host*, not inside itself. `/var/apiary/runs` is
+#: real inside the orchestrator and absent on the host, so the daemon would
+#: silently create an empty directory there and the worker's result file would
+#: land somewhere nothing ever reads - a run that looks healthy and learns
+#: nothing about what its workers did.
+#:
+#: Unset when the orchestrator runs on the host, where one filesystem serves
+#: both and the translation is the identity.
+HOST_ROOT_ENV = "APIARY_ARTIFACTS_HOST_ROOT"
+
+
+def host_path(path: str | Path, *, root: str | Path | None = None) -> Path:
+    """Rewrite a path under the artifacts root into the daemon's view of it.
+
+    The identity when `APIARY_ARTIFACTS_HOST_ROOT` is unset, which is the host
+    case. A path that is not under the artifacts root is returned unchanged:
+    this translates one mount, and guessing about others would be worse than
+    not trying.
+    """
+    inside = Path(path)
+    host_root = os.environ.get(HOST_ROOT_ENV)
+    if not host_root:
+        return inside
+    base = Path(root) if root is not None else artifacts_root()
+    try:
+        relative = inside.relative_to(base)
+    except ValueError:
+        return inside
+    return Path(host_root) / relative
 
 
 def artifacts_root(default: str | Path | None = None) -> Path:
@@ -671,8 +707,14 @@ class RunArtifacts:
         spawn call site owns the argv - the dispatcher (#21) - and this is the
         value it needs; `security.assert_unprivileged` passes it, because the
         source is a run directory rather than the socket or the host root.
+
+        The source is translated through `host_path`, because the daemon
+        resolves it. When the orchestrator is a container those are different
+        filesystems, and naming its own path would mount an empty directory
+        the host happened to create.
         """
-        return ["--volume", f"{self.results_dir}:{DEFAULT_RESULT_DIR}"]
+        source = host_path(self.results_dir, root=self.root)
+        return ["--volume", f"{source}:{DEFAULT_RESULT_DIR}"]
 
     def worker_env(self) -> dict[str, str]:
         """The other half of the same wiring: where the worker writes inside.
