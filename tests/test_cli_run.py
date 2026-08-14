@@ -799,14 +799,23 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
             worker_env=lambda: {},
             mount_flags=lambda: [],
             log_sink=lambda handle: None,
+            # Where the workers' records land. `_loop` hands it to the
+            # reconciler, because a reconciler without it never observes a
+            # worker's exit code.
+            results_dir="/var/apiary/results",
+            event=lambda name, **fields: {},
         )))
 
     client = FakeClient([issue(1, marker="task-one", labels=("swarm:ready",))])
     # `_loop` resolves the base commit through the client now, because a
     # worker clones at a commit and an empty one sent it nowhere.
     client.head_sha = lambda ref=None: "a" * 40
-    args = SimpleNamespace(base_commit="", no_merge=True, dry_run=False, max_cycles=1)
-    attachment = SimpleNamespace(run=SimpleNamespace(id="r", repo=REPO))
+    args = SimpleNamespace(
+        base_commit="", no_merge=True, no_goal_check=False, dry_run=False, max_cycles=1
+    )
+    attachment = SimpleNamespace(
+        run=SimpleNamespace(id="r", repo=REPO, objective="make the thing work")
+    )
 
     with pytest.raises(StopHere):
         cli._loop(args, attachment, source=client)
@@ -818,3 +827,50 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
     env = seen["fleet_env"]
     assert "HTTP_PROXY" in env and "http_proxy" in env
     assert "NO_PROXY" in env
+
+
+# --------------------------------------------------------------------------
+# What the command's exit code means
+# --------------------------------------------------------------------------
+
+
+import swarm.cli as cli
+
+
+def _cycle(goal=None, *, live: int = 0, index: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(index=index, live=live, goal=goal)
+
+
+def _goal(met: bool, *, missing: tuple[str, ...] = (), summary: str = "s") -> SimpleNamespace:
+    return SimpleNamespace(
+        met=met,
+        summary=lambda: summary,
+        assessment=SimpleNamespace(missing=missing),
+    )
+
+
+def test_a_run_that_met_its_objective_exits_zero(capsys):
+    assert cli._report_outcome([_cycle(_goal(True, summary="objective met"))]) == 0
+    assert "objective met" in capsys.readouterr().out
+
+
+def test_a_run_that_stopped_short_exits_non_zero_and_says_what_is_missing(capsys):
+    """A shell script chaining `swarm run` must not read "I abandoned one of the
+    three things you asked for and stopped" as success."""
+    report = _goal(False, missing=("there is no CLI",), summary="stopping without meeting it")
+
+    code = cli._report_outcome([_cycle(report)])
+
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "stopping without meeting it" in out
+    assert "still missing: there is no CLI" in out
+
+
+def test_a_run_the_cap_ended_is_not_a_failure(capsys):
+    """`--max-cycles` stopping a healthy run says nothing about the objective,
+    and the next invocation attaches to whatever is still open."""
+    code = cli._report_outcome([_cycle(None, live=2)])
+
+    assert code == 0
+    assert "2 live issue(s)" in capsys.readouterr().out

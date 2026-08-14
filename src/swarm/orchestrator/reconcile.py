@@ -43,6 +43,24 @@ state, so no rule that needs it fires. Degrading is safe; guessing is not - a
 `swarm:review` issue whose PR merely could not be listed must never be read as
 a PR that was closed.
 
+**Step 5 of the loop - judge, and act on the judgement - lives here too, and
+is the half that decides when a run may stop.** A cycle that changed nothing
+while nothing is in flight is the only cycle worth a model swap
+(`CycleReport.needs_judgement`), and the judge's answer feeds two different
+consumers. A *stall* goes to `replan.py`, which rewrites the backlog. An
+*exhausted ledger* goes to `goal.py`, which asks whether the objective was met
+and appends follow-up tasks when it was not. Without the second one the loop
+stops at plan exhaustion, which is a statement about the planner's first guess
+rather than about the objective, and the operator gets a repository that is
+missing whatever the planner did not think of and a run that reports success.
+
+The three counters this needs - the previous observation, the stall count and
+the rounds already spent - are held on the `Reconciler` for the length of the
+run, exactly as `update_budget` is and for the same stated reason: "did it move"
+is a question about two readings, GitHub only ever shows the current one, and a
+restart granting a fresh budget is the safe direction. Nothing durable is keyed
+to them.
+
 **What this module deliberately does not decide.** Check runs, the merge and
 the retry-with-failure-in-context are #23; stale `swarm:claimed` labels with no
 container behind them are #35; `claimed -> review` belongs to the worker (#17),
@@ -834,6 +852,13 @@ class CycleReport:
     checks: Any | None = None
     #: Claims released this cycle because nothing was running behind them.
     recovered: Any | None = None
+    #: Step 5. `verdict` is `judge.Verdict` on the cycles that earned one and
+    #: `None` on the cycles the arithmetic settled without asking; `replanned`
+    #: is `replan.ReplanReport` on the cycles that acted on a stall.
+    verdict: Any | None = None
+    replanned: Any | None = None
+    #: `goal.GoalReport`, set only on the cycle where the ledger ran dry.
+    goal: Any | None = None
     #: A `DependencyCycleError` - the one readiness failure that aborts a pass
     #: rather than joining its errors. Recorded rather than raised so the loop
     #: reports it every cycle until a human breaks the ring, instead of the run
@@ -857,9 +882,26 @@ class CycleReport:
         )
 
     @property
-    def finished(self) -> bool:
-        """Nothing left that is not `swarm:done` or `swarm:failed`."""
+    def exhausted(self) -> bool:
+        """Nothing left that is not `swarm:done` or `swarm:failed`.
+
+        The plan is finished. Whether the *objective* is finished is `goal.py`'s
+        question, and `finished` below is the answer to that one.
+        """
         return self.live == 0
+
+    @property
+    def finished(self) -> bool:
+        """May the loop stop after this cycle?
+
+        An exhausted ledger that the goal gate then extended is not finished:
+        there are new issues on the tracker and the next cycle dispatches them.
+        A cycle that never reached the gate - because the ledger still had live
+        work - is not finished either.
+        """
+        if not self.exhausted:
+            return False
+        return self.goal is None or self.goal.done
 
     @property
     def needs_judgement(self) -> bool:
@@ -868,8 +910,12 @@ class CycleReport:
         The dispatcher's own answer, narrowed: a cycle that reconciled something
         learned plenty without a model, so a swap would buy news the arithmetic
         already had (`dispatcher.DispatchReport.needs_judgement`).
+
+        An exhausted ledger is excluded because it has its own question and its
+        own model call: the goal gate. Judging it as well would spend two swaps
+        to be told twice that there is nothing left to move.
         """
-        if self.changed or self.finished:
+        if self.changed or self.exhausted:
             return False
         return self.dispatched is None or self.dispatched.needs_judgement
 
@@ -879,6 +925,14 @@ class CycleReport:
             parts.append(self.readiness.summary())
         if self.dispatched is not None:
             parts.append(self.dispatched.summary())
+        if self.checks is not None:
+            parts.append(self.checks.summary())
+        if self.verdict is not None:
+            parts.append(f"judged: {self.verdict.summary()}")
+        if self.replanned is not None:
+            parts.append(self.replanned.summary())
+        if self.goal is not None:
+            parts.append(self.goal.summary())
         if self.cycle_error:
             parts.append(f"error: {self.cycle_error}")
         parts.append(f"{self.live} live issue(s)")
@@ -900,6 +954,10 @@ class Reconciler:
     client: GitHubClient
     base_commit: str = ""
     fleet: Fleet | None = None
+    #: Where the workers' result records land - `RunArtifacts.results_dir`, not
+    #: the run directory: `worker.result.load_results` globs the directory it is
+    #: given. `None` means this reconciler never observes a worker's exit code,
+    #: which disables §4's retry rows entirely, so a real run must pass it.
     artifacts: str | Path | None = None
     capacity: Capacity | None = None
     interval_s: float = DEFAULT_INTERVAL_S
@@ -919,12 +977,51 @@ class Reconciler:
     #: which is what a run wants when a human is doing the merging.
     merge_gate: bool = True
 
+    #: `checks.MergePolicy` and `mergeability.UpdatePolicy`. Typed loosely for
+    #: the same reason they are imported inside `cycle`: both modules import
+    #: this one. `None` takes each module's own default, which merges on green
+    #: - the environment's answer belongs to whoever started the run, and
+    #: `cli._loop` reads it there so that one line can report what it bypasses.
+    merge_policy: "Any | None" = None
+    update_policy: "Any | None" = None
+
     #: Carried across cycles so an unlucky PR cannot be updated forever. It is
     #: in-process by design: a restart grants a fresh budget, which is the
     #: right failure for a counter whose whole job is bounding one run.
     update_budget: "Any | None" = None
 
+    #: Step 5. The objective is what the goal gate assesses against, so a
+    #: reconciler without one cannot close its own loop and says so rather than
+    #: assessing against an empty string; `verify` is the run's repo-wide
+    #: command, carried so a replanned or followed-up issue inherits the gate
+    #: the original carried rather than `SETTINGS.verify_command`.
+    objective: str = ""
+    verify: str = ""
+    #: Off makes the loop stop at plan exhaustion, which is what `--no-goal-check`
+    #: asks for: a run that does exactly the plan a human read and approved.
+    goal_gate: bool = True
+    #: The three model seams step 5 owns, `None` meaning "the real one". They
+    #: exist for `replan.replan`'s stated reason and one more: a reconcile test
+    #: that reached Ollama would be a test whose result depends on which model
+    #: is pulled, and - because this host has one running - would silently spend
+    #: a 31B inference per quiet cycle in a suite that is meant to be hermetic.
+    #: `tests/test_reconcile.py` passes an oracle that raises, so an unintended
+    #: model call is a failure rather than a slow pass.
+    oracle: "Any | None" = None
+    assessor: "Any | None" = None
+    proposer: "Any | None" = None
+    #: Called with every finished `CycleReport`, before the loop paces itself.
+    #: The seam `cli` prints through: a run whose cycles are only reported at
+    #: the end is a run nobody can watch, and it is also how the merge gate's
+    #: verdicts reach the operator while there is still time to act on them.
+    on_cycle: Callable[[CycleReport], None] | None = None
+
     _cycles: int = field(default=0, repr=False)
+    #: The progress ledger, run-scoped. See the module docstring.
+    _previous: "Any | None" = field(default=None, repr=False)
+    _stalls: int = field(default=0, repr=False)
+    _replans: int = field(default=0, repr=False)
+    _goal_rounds: int = field(default=0, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -943,11 +1040,16 @@ class Reconciler:
         ledger = load_ledger(snapshot, adopt=not self.dry_run)
 
         handles = self._handles()
+        # Read once and shared with step 5: the judge's observation carries each
+        # task's latest failure text, and that text is what a replan is written
+        # from (`replan.brief`). A second read here would be a second directory
+        # listing for facts this cycle already has.
+        results = self._results()
         plan = plan_reconcile(
             ledger,
             states=snapshot.states(),
             open_branches=snapshot.open_branches(),
-            results=self._results(),
+            results=results,
             running=tuple(handles),
             labels=snapshot.labels(),
             max_attempts=self.max_attempts,
@@ -1000,6 +1102,11 @@ class Reconciler:
                 ledger,
                 pulls=pulls,
                 checks=check_runs,
+                # Without this the whole `MergePolicy` is whatever the dataclass
+                # defaults to, and `APIARY_MERGE_ADMIN_OVERRIDE=0` - the one
+                # setting that decides whether a human presses merge - silently
+                # does nothing.
+                policy=self.merge_policy,
                 max_attempts=self.max_attempts,
             )
             mergeability = run_mergeability(
@@ -1007,6 +1114,7 @@ class Reconciler:
                 ledger,
                 checks_plan,
                 pulls=pulls,
+                policy=self.update_policy,
                 budget=self.update_budget,
                 max_attempts=self.max_attempts,
                 dry_run=self.dry_run,
@@ -1036,7 +1144,7 @@ class Reconciler:
                     dry_run=self.dry_run,
                 )
 
-        return CycleReport(
+        report = CycleReport(
             index=index,
             ledger=ledger,
             result=result,
@@ -1048,6 +1156,111 @@ class Reconciler:
             cycle_error=cycle_error,
             live=len(live_entries(ledger)),
         )
+        return self._judge(snapshot, report, results=results)
+
+    # --- step 5 ----------------------------------------------------------
+
+    def _judge(
+        self, client: Any, report: CycleReport, *, results: Mapping[int, ResultRecord]
+    ) -> CycleReport:
+        """Judge this cycle, and act on the judgement. Returns the report, grown.
+
+        Three outcomes, and the order is the priority:
+
+        1. **The ledger ran dry.** The goal gate asks whether the objective was
+           met and appends follow-up work if it was not (`goal.py`). This runs
+           *before* the stall rules, because an exhausted ledger trivially
+           satisfies "nothing moved" and would otherwise be replanned - which
+           would rewrite a backlog whose every task merged.
+        2. **The cycle earned a judgement.** Nothing changed, nothing is in
+           flight; `judge.judge` answers, from arithmetic where it can.
+        3. **The judgement says the run is stuck.** `replan.replan` decides
+           whether that has been true for long enough to be worth rewriting the
+           plan, and refuses on its own five grounds.
+
+        Nothing here runs on a dry run: the gate and the replan both write
+        issues, and a command that promised to change nothing must not.
+        """
+        if self.dry_run:
+            return report
+
+        from ..nodes.judge import Observation, judge
+
+        observation = Observation.of(report.ledger, results=results)
+
+        if report.exhausted:
+            # The observation is still recorded: a follow-up round leaves the
+            # ledger non-empty again, and the next stall check needs a previous
+            # reading that includes the issues this gate just wrote.
+            self._previous = observation
+            return replace(report, goal=self._close(client, report))
+
+        verdict = None
+        replanned = None
+        if report.needs_judgement:
+            verdict = judge(
+                observation,
+                self._previous,
+                objective=self.objective,
+                stalls=self._stalls,
+                round_index=report.index,
+                oracle=self.oracle,
+            )
+            self._stalls = verdict.stalls
+            if verdict.stalled:
+                replanned = self._replan(client, report, verdict)
+        self._previous = observation
+        return replace(report, verdict=verdict, replanned=replanned)
+
+    def _close(self, client: Any, report: CycleReport) -> Any:
+        """The goal gate. Local import for `checks`' reason - `goal` imports the
+        planner, which is a heavier graph than a cycle that never ends should
+        pay for on every import of this module."""
+        from .goal import close_the_loop
+
+        # `None`, not a negative report: an exhausted ledger that was never
+        # assessed must read as "the plan is done" rather than as "the objective
+        # was missed", because the caller's exit code is the difference between
+        # those two and a run nobody asked to assess has not failed at anything.
+        if not self.goal_gate:
+            return None
+        if not self.objective.strip():
+            # Assessing against an empty objective asks a model whether nothing
+            # was delivered, which it cannot answer and which would extend the
+            # plan from the answer it invented.
+            print("! this run carries no objective; the goal gate is skipped", file=sys.stderr)
+            return None
+        goal = close_the_loop(
+            client,
+            report.ledger,
+            self.objective,
+            rounds=self._goal_rounds,
+            verify=self.verify or None,
+            oracle=self.assessor,
+            proposer=self.proposer,
+        )
+        self._goal_rounds = goal.rounds
+        return goal
+
+    def _replan(self, client: Any, report: CycleReport, verdict: Any) -> Any:
+        from .replan import replan
+
+        result = replan(
+            client,
+            report.ledger,
+            self.objective,
+            verdict,
+            replans=self._replans,
+            verify=self.verify or None,
+            proposer=self.proposer,
+        )
+        if result.replanned:
+            # `replan` zeroes the stall count on a successful rewrite, because
+            # the run that follows is a different plan and its progress is not
+            # this one's.
+            self._replans = result.replans
+            self._stalls = 0
+        return result
 
     # --- the loop --------------------------------------------------------
 
@@ -1057,7 +1270,14 @@ class Reconciler:
         cycles: int | None = None,
         until: Callable[[CycleReport], bool] | None = None,
     ) -> tuple[CycleReport, ...]:
-        """Run cycles until the ledger is finished, `until` says so, or `cycles` run out.
+        """Run cycles until the run is finished, `until` says so, or `cycles` run out.
+
+        **Finished means the objective, not the plan.** `CycleReport.finished`
+        is false on a cycle whose goal gate appended follow-up work, so the loop
+        carries straight on and dispatches it - which is the whole point of the
+        gate, and the difference between a swarm that stops when its first plan
+        runs out and one that stops when the objective is met or it has run out
+        of ways to get there.
 
         The interval is a floor between cycle *starts*: a cycle that took longer
         than `interval_s` starts the next one immediately rather than sleeping
@@ -1070,6 +1290,8 @@ class Reconciler:
             started = self.clock()
             report = self.cycle()
             reports.append(report)
+            if self.on_cycle is not None:
+                self.on_cycle(report)
             if remaining is not None:
                 remaining -= 1
             done = report.finished if until is None else until(report)

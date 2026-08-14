@@ -120,12 +120,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-cycles",
         type=int,
         default=None,
-        help="stop after this many reconcile cycles (default: until the ledger finishes)",
+        help="stop after this many reconcile cycles (default: until the objective is met)",
     )
     run.add_argument(
         "--no-merge",
         action="store_true",
         help="open pull requests but never merge them; leave the review queue to a human",
+    )
+    run.add_argument(
+        "--no-goal-check",
+        action="store_true",
+        help=(
+            "stop when the plan is exhausted rather than asking whether the objective "
+            "was met; the run does exactly the tasks that were planned and no more"
+        ),
     )
     return parser
 
@@ -204,19 +212,28 @@ def _run(
         print(f"» {plan.summary()}")
         return 0
 
-    return _loop(args, attachment, source=source)
+    return _loop(args, attachment, source=source, verify=verify)
 
 
-def _loop(args, attachment: Attachment, *, source) -> int:
-    """Run cycles until the ledger finishes, the cap is hit, or Ctrl-C.
+def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
+    """Run cycles until the objective is met, the cap is hit, or Ctrl-C.
 
     Everything the loop needs is built here rather than inside `Reconciler`,
     because these are the objects with a lifetime: the fleet holds this run's
     containers, the reaper owns the signal handlers, and both have to be torn
     down whatever ends the run.
+
+    **The policies are read here and nowhere else.** `MergePolicy.from_env` and
+    `UpdatePolicy.from_env` both exist to be read once at the call site that
+    starts a run - that is what their own docstrings say - and reading them here
+    is also what lets the run *print* what it is about to do before it does it.
+    A merge policy the operator cannot see is one they cannot have chosen, and
+    the admin override's whole justification is that it is explicit.
     """
     from .containers.manager import INHERITED_ENV, ContainerManager
     from .containers.reaper import Reaper
+    from .orchestrator.checks import MergePolicy
+    from .orchestrator.mergeability import UpdateBudget, UpdatePolicy
     from .orchestrator.recovery import Recovery
     from .orchestrator.reconcile import Reconciler
 
@@ -255,6 +272,17 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     # first real dispatch produced: a container spawned, disposed, and nothing
     # to say why it had finished in seconds.
     reaper = Reaper(run=run, docker=fleet.docker, sink=artifacts.log_sink)
+
+    merge_policy = MergePolicy.from_env()
+    update_policy = UpdatePolicy.from_env()
+    if args.no_merge:
+        print("» merge policy: --no-merge; every pull request waits for a human")
+    else:
+        print(f"» {merge_policy.summary()}")
+        print(f"» {update_policy.summary()}")
+    if args.no_goal_check:
+        print("» goal gate: off; the run stops when the plan is exhausted")
+
     reconciler = Reconciler(
         run=run,
         client=github,
@@ -263,8 +291,24 @@ def _loop(args, attachment: Attachment, *, source) -> int:
         # here meant the worker was dispatched with no base at all.
         base_commit=args.base_commit or github.head_sha(),
         fleet=fleet,
+        # The *results* directory, which is the one a worker writes into and the
+        # one `load_results` globs. Without it the reconciler never sees a
+        # worker's exit code, and §4's retry rows - exit 1 costs an attempt,
+        # exit 2 does not - never fire in a real run however well they are
+        # tested.
+        artifacts=artifacts.results_dir,
         recovery=Recovery(client=github, run=run, dry_run=args.dry_run),
         merge_gate=not args.no_merge,
+        merge_policy=merge_policy,
+        update_policy=update_policy,
+        # Held here, so the per-pull-request update cap bounds the run rather
+        # than the cycle: a budget constructed inside the cycle starts over
+        # every fifteen seconds and therefore bounds nothing.
+        update_budget=UpdateBudget(cap=update_policy.max_update_rounds),
+        objective=run.objective,
+        verify=verify,
+        goal_gate=not args.no_goal_check,
+        on_cycle=_report_cycle(artifacts),
         dry_run=args.dry_run,
     )
 
@@ -280,11 +324,79 @@ def _loop(args, attachment: Attachment, *, source) -> int:
             print("\n! interrupted; containers are being disposed", file=sys.stderr)
             return 130
 
-    for report in reports:
-        print(f"  · cycle {report.index}: {report.summary()}")
     print()
     print(f"» artifacts in {artifacts.path}")
-    return 0
+    return _report_outcome(reports)
+
+
+def _report_cycle(artifacts: RunArtifacts):
+    """Print each cycle as it happens, and file what the gates decided.
+
+    Printing at the end of the run - which is what this used to do - means an
+    operator watching a five-minute cycle sees nothing at all until it is over,
+    and the decisions worth watching are exactly the ones that are still
+    reversible: a pull request sitting at "no check runs yet, 120s into a 300s
+    grace", an issue one attempt from `swarm:failed`, a merge GitHub refused.
+
+    The same detail goes to `events.jsonl`, because the run directory is the
+    only account that survives the terminal, and a merge that did not happen
+    leaves no other trace: `RunArtifacts` records what the workers wrote and
+    what the containers printed, and until now recorded nothing whatsoever
+    about the orchestrator's own decisions.
+    """
+
+    def report(cycle) -> None:
+        print(f"  · {cycle.summary()}")
+        # One line per review issue: the check verdict, the mergeability
+        # verdict, and what the gate did about it.
+        if cycle.checks is not None:
+            for outcome in cycle.checks.plan.outcomes:
+                print(f"      {outcome}")
+            for failure in cycle.checks.failures:
+                print(f"    ! merge refused - {failure}", file=sys.stderr)
+        if cycle.mergeability is not None:
+            for failure in cycle.mergeability.failures:
+                print(f"    ! {failure}", file=sys.stderr)
+        artifacts.event(
+            "cycle.reconciled",
+            cycle=cycle.index,
+            live=cycle.live,
+            summary=cycle.summary(),
+            merged=list(cycle.checks.merged) if cycle.checks is not None else [],
+            gate=[str(o) for o in cycle.checks.plan.outcomes] if cycle.checks is not None else [],
+            failures=(
+                [str(f) for f in cycle.checks.failures] if cycle.checks is not None else []
+            ),
+            verdict=cycle.verdict.summary() if cycle.verdict is not None else "",
+            goal=cycle.goal.summary() if cycle.goal is not None else "",
+        )
+
+    return report
+
+
+def _report_outcome(reports) -> int:
+    """The last word: was the objective met, and what is left if it was not.
+
+    Non-zero when the run stopped short, because a swarm that gave up is a
+    failed command - a shell script chaining `swarm run` must not read "I
+    planned three things, abandoned one and stopped" as success. An empty run
+    (`--max-cycles 0`) is neither met nor failed and reports nothing.
+    """
+    if not reports:
+        return 0
+    last = reports[-1]
+    goal = last.goal
+    if goal is None:
+        # The cap or `until` ended this, not the ledger. Whatever is still open
+        # is still open, and the next invocation attaches to it.
+        print(f"» stopped after {len(reports)} cycle(s) with {last.live} live issue(s)")
+        return 0
+    print(f"» {goal.summary()}")
+    if goal.met:
+        return 0
+    for line in goal.assessment.missing:
+        print(f"  · still missing: {line}")
+    return 1
 
 
 
