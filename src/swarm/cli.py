@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from .github.client import GitHubClient, GitHubError
@@ -56,16 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run the swarm against a repository")
     run.add_argument("--repo", default=None, help="target repository, as owner/name")
-    run.add_argument("--objective", default=None, help="what the swarm should accomplish")
+    run.add_argument("--objective", default=None, help="what the swarm should accomplish; @path reads it from a file")
     run.add_argument(
         "--new",
         default=None,
         metavar="PROMPT",
-        help="create a repository from this prompt first, then run against it",
+        help="create a repository from this brief first, then run against it; @path reads it from a file",
     )
     run.add_argument("--owner", default=None, help="account to create --new under")
     run.add_argument(
-        "--name", default=None, help="repository name for --new (default: from the prompt)"
+        "--name", default=None, help="repository name for --new (default: slugified from the brief, which is rarely what you want once the brief is more than a phrase)"
     )
     run.add_argument(
         "--public", action="store_true", help="create --new public (default: private)"
@@ -221,6 +222,34 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     return 0
 
 
+
+#: Prefix that reads the value from a file instead of the command line.
+#: A good objective is paragraphs, not a phrase - the planner decomposes it,
+#: and "a trip planner" gives a 31B model nothing to decompose. Multi-paragraph
+#: shell arguments are miserable to quote and impossible to keep in version
+#: control, so both text-carrying flags accept `@path` as well as a literal.
+FILE_PREFIX = "@"
+
+
+def _text(value: str | None, flag: str, parser: argparse.ArgumentParser) -> str | None:
+    """Resolve `@path` to the file's contents; pass anything else through.
+
+    Errors through `parser` rather than raising, because a missing brief is a
+    typo at the command line, and the greenfield path would otherwise discover
+    it only after creating a repository.
+    """
+    if not value or not value.startswith(FILE_PREFIX):
+        return value
+    path = Path(value[len(FILE_PREFIX):]).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        parser.error(f"{flag} {value}: {exc}")
+    if not text:
+        parser.error(f"{flag} {value}: the file is empty")
+    return text
+
+
 def _target(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -232,6 +261,9 @@ def _target(
     The greenfield branch creates a repository, so every way of asking for it
     ambiguously is refused *before* that happens rather than after.
     """
+    args.new = _text(args.new, "--new", parser)
+    args.objective = _text(args.objective, "--objective", parser)
+
     if args.new and args.repo:
         parser.error("--new creates a repository; it cannot also target --repo")
     if not args.new and not args.repo:

@@ -544,3 +544,48 @@ def test_resume_is_no_longer_a_flag():
         main(["run", "--repo", REPO, "--objective", OBJECTIVE, "--resume", "1a2b3c4d"])
 
     assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------
+# A brief long enough to plan from
+# --------------------------------------------------------------------------
+
+
+def test_an_objective_can_be_read_from_a_file(tmp_path, capsys):
+    """`--objective "a trip planner"` gives the planner nothing to decompose.
+
+    A useful objective is paragraphs - constraints, the shape of the thing,
+    what done looks like - and that is miserable to quote on a command line and
+    impossible to keep in version control. `@path` reads it from a file.
+    """
+    brief = tmp_path / "brief.md"
+    brief.write_text(
+        "Build a trip planner.\n\n"
+        "It stores trips, each with a destination and dates, and warns when two\n"
+        "trips overlap. Persistence is a JSON file; no database.\n",
+        encoding="utf-8",
+    )
+    client = FakeClient([issue(1, marker="task-one", labels=("swarm:ready",))])
+
+    code = main(
+        ["run", "--repo", REPO, "--objective", f"@{brief}", "--plan-only"],
+        client=client,
+    )
+
+    assert code == 0
+    assert "trips overlap" in brief.read_text()
+
+
+def test_a_missing_brief_is_a_command_line_error_not_a_created_repository(tmp_path):
+    """The greenfield path would otherwise find the typo after creating a repo."""
+    with pytest.raises(SystemExit) as caught:
+        main(["run", "--new", f"@{tmp_path / 'nope.md'}", "--owner", "me", "--yes"])
+    assert caught.value.code == 2
+
+
+def test_an_empty_brief_is_refused(tmp_path):
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n", encoding="utf-8")
+    with pytest.raises(SystemExit) as caught:
+        main(["run", "--repo", REPO, "--objective", f"@{empty}"])
+    assert caught.value.code == 2
