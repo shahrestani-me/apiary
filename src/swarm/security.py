@@ -150,6 +150,15 @@ PROVISION_PERMISSIONS: dict[str, str] = {
     "administration": "write",
     "contents": "write",
     "workflows": "write",
+    # Labels are part of GitHub's `issues` permission, and provisioning applies
+    # the six `swarm:*` state labels as its last step - a repository without
+    # them cannot host the swarm at all. Found the hard way: the repository and
+    # its first commit were created, and then `GET /labels` answered 403.
+    #
+    # This is the one permission the two keys share, and it is not the
+    # dangerous kind: the work key holds it too, and nothing about writing a
+    # label lets generated code touch the machinery that judges it.
+    "issues": "write",
     "metadata": "read",
 }
 

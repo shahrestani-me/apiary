@@ -533,13 +533,23 @@ def test_no_service_is_declared_privileged(compose_text: str) -> None:
 def test_the_boot_key_needs_exactly_what_the_work_key_must_never_have():
     """The two permission sets are disjoint where it matters.
 
-    This is the whole argument for a second credential in one assertion: every
-    permission provisioning needs is one `FORBIDDEN_PERMISSIONS` refuses a
-    worker, so no single token can do both jobs safely.
+    This is the whole argument for a second credential in one assertion: the
+    boot key needs two permissions `FORBIDDEN_PERMISSIONS` refuses a worker, so
+    no single token can do both jobs safely.
+
+    The overlap the other way is fine and expected - both keys write labels -
+    so the claim is about the dangerous permissions specifically, not about the
+    two sets being disjoint.
     """
     dangerous = set(PROVISION_PERMISSIONS) & set(FORBIDDEN_PERMISSIONS)
     assert dangerous == {"administration", "workflows"}
     assert not dangerous & set(REQUIRED_PERMISSIONS)
+
+    # Shared, and harmless: nothing about writing a label lets generated code
+    # reach the machinery that judges it.
+    assert set(PROVISION_PERMISSIONS) & set(REQUIRED_PERMISSIONS) == {
+        "issues", "contents", "metadata"
+    }
 
 
 def test_a_missing_boot_key_names_the_variable_and_the_reason():
