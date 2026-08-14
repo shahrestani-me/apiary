@@ -79,6 +79,7 @@ from typing import Any, Callable, Sequence
 from ..github.client import GitHubClient, GitHubError, GitHubHTTPError
 from ..security import PROVISION_TOKEN_ENV, assert_provision_token
 from ..github.labels import SWARM_LABELS, LabelReport, ensure_labels
+from .stacks import REACT_TOOLCHAIN
 
 # The ruleset this module writes. Named, so a second run can recognise its own
 # work rather than stacking a duplicate ruleset beside it.
@@ -654,10 +655,34 @@ def _explain(exc: GitHubHTTPError) -> str:
 #: step at all - and the steps list it produces after this change is the one it
 #: produced before, unchanged.
 #:
-#: Node is the second entry because it is #87's first non-Python stack, and it
-#: is where the caching matters: `cache: npm` keys on the lockfile and turns a
-#: cold install into a warm one. `ubuntu-latest` ships a Node too, but not a
-#: pinned one, and an unpinned runtime is a gate that changes under the repo.
+#: Node is the second entry because it is #87's first non-Python stack.
+#: `ubuntu-latest` ships a Node too, but not a pinned one, and an unpinned
+#: runtime is a gate that changes under the repository.
+#:
+#: **`cache: npm` is gone from both, and it was never going to work.**
+#: `actions/setup-node` resolves that option by hashing a lockfile, and fails
+#: the step outright - "Dependencies lock file is not found" - when there is
+#: none. Neither generated stack has one: Node's gate installs nothing so
+#: nothing ever writes one, and React's cannot, because writing a lockfile
+#: needs the registry a worker is denied (docs/security.md §3). It was a cache
+#: key for a file the design cannot produce, and the cost of it was the whole
+#: job, red, on every push.
+#:
+#: **React's install step is the seam between two worlds.** A worker gets its
+#: toolchain from `Dockerfile.worker.react`; a GitHub runner has no such image
+#: and must install. `npm install <pinned specs>` rather than a bare
+#: `npm install`, so CI's tree is the image's toolchain plus whatever the
+#: project declared, rather than only what a model remembered to put in
+#: `package.json` - and the specs are `stacks.REACT_TOOLCHAIN`, with a test
+#: failing if the two drift. Without a lockfile the resolved patch versions can
+#: still differ from the image's; that residual is documented in
+#: docs/security.md rather than papered over.
+#:
+#: The `GITHUB_PATH` line is what lets the gate be the same bytes in both
+#: places. `run:` steps do not put `node_modules/.bin` on `PATH`, the worker
+#: image does, and `STACK_VERIFY["react"]` is a bare `vitest run` - so without
+#: this the identical command is "not found" on the runner and green in the
+#: worker.
 #:
 #: A stack with no entry gets no setup step rather than an error. The refusal
 #: for a stack this host cannot run belongs to #103, at planning time, before a
@@ -669,13 +694,15 @@ CI_SETUP: dict[str, tuple[str, ...]] = {
         "- uses: actions/setup-node@v4",
         "  with:",
         "    node-version: '22'",
-        "    cache: npm",
     ),
     "react": (
         "- uses: actions/setup-node@v4",
         "  with:",
         "    node-version: '22'",
-        "    cache: npm",
+        "- name: react toolchain",
+        f"  run: npm install --no-audit --no-fund {' '.join(REACT_TOOLCHAIN)}",
+        "- name: react toolchain on PATH",
+        '  run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"',
     ),
 }
 

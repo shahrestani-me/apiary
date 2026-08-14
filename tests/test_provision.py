@@ -38,8 +38,10 @@ import pytest
 
 from swarm.github.client import GitHubClient, Response
 from swarm.github.labels import SWARM_LABELS
+from swarm.greenfield.stacks import REACT_TOOLCHAIN
 from swarm.greenfield.provision import (
     CHECK_NAME,
+    CI_SETUP,
     CI_WORKFLOW_PATH,
     PLACEHOLDER_VERIFY,
     RULESET_NAME,
@@ -430,7 +432,7 @@ def test_python_generates_no_setup_step():
     assert [step.get("uses") for step in steps] == ["actions/checkout@v4", None]
 
 
-def test_node_sets_up_its_toolchain_and_caches_it():
+def test_node_sets_up_a_pinned_toolchain():
     """Not because `ubuntu-latest` lacks Node, but because it lacks a *pinned*
     Node - and an unpinned runtime is a gate that changes under the repo."""
     yaml = pytest.importorskip("yaml")
@@ -440,12 +442,56 @@ def test_node_sets_up_its_toolchain_and_caches_it():
     setup = steps[1]
 
     assert setup["uses"] == "actions/setup-node@v4"
-    assert setup["with"]["cache"] == "npm"
     assert setup["with"]["node-version"]
     # Parsed, not grepped: `test_provision` already prefers this, and a
     # substring assertion cannot catch a setup step indented one space wrong -
     # which is valid YAML that GitHub reads as part of the previous step.
     assert steps[0]["uses"] == "actions/checkout@v4"
+
+
+@pytest.mark.parametrize("stack", sorted(CI_SETUP))
+def test_no_generated_workflow_asks_to_cache_a_lockfile_it_cannot_produce(stack: str):
+    """`cache: npm` fails the *step*, not just the cache.
+
+    `actions/setup-node` resolves that option by hashing a lockfile and errors
+    with "Dependencies lock file is not found" when there is none - so the job
+    goes red before the gate runs. Neither JS stack has one: Node's gate
+    installs nothing, so nothing ever writes a lockfile, and React's cannot,
+    because writing one needs the registry a worker is denied. It was a cache
+    key for a file this design cannot produce.
+    """
+    yaml = pytest.importorskip("yaml")
+    plan = dataclasses.replace(plan_for(verify_command="true"), stack=stack)
+
+    steps = yaml.safe_load(plan.files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+
+    assert not any("cache" in (step.get("with") or {}) for step in steps), stack
+
+
+def test_react_installs_the_image_toolchain_and_puts_it_on_the_path():
+    """The seam between two worlds: a worker gets its toolchain from
+    `Dockerfile.worker.react`, a GitHub runner has no such image.
+
+    The `GITHUB_PATH` step is what keeps the gate one command rather than two.
+    `run:` steps do not put `node_modules/.bin` on `PATH`, the worker image
+    does, and `STACK_VERIFY["react"]` is a bare `vitest run` - so without it the
+    identical command is "not found" on the runner and green in the worker.
+    """
+    yaml = pytest.importorskip("yaml")
+    plan = dataclasses.replace(plan_for(verify_command="vitest run"), stack="react")
+
+    steps = yaml.safe_load(plan.files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+
+    assert steps[0]["uses"] == "actions/checkout@v4"
+    assert steps[1]["uses"] == "actions/setup-node@v4"
+    install = steps[2]["run"]
+    assert install.startswith("npm install ")
+    for spec in REACT_TOOLCHAIN:
+        assert f" {spec}" in install, spec
+    assert "node_modules/.bin" in steps[3]["run"]
+    assert "$GITHUB_PATH" in steps[3]["run"]
+    # And the gate itself is still the last step, unchanged by any of it.
+    assert steps[-1]["run"].strip() == "vitest run"
 
 
 def test_a_stack_with_no_entry_emits_no_setup_step_rather_than_failing():

@@ -209,6 +209,72 @@ proxy sets `BUILD=0` and `IMAGES=0` (§4), so it can neither build nor pull one.
 `SETUP.md` step 4 is the command; `containers.manager.build_hint` is the same
 line, produced by the code that refuses.
 
+### The stack that was supposed to force a wider allowlist, and did not
+
+#87 planned React web as the ticket where this posture broke: a stack with real
+dependencies needs a package registry, so the enforced allowlist would have to
+grow from GitHub-only to GitHub-plus-npmjs, and the exfiltration surface with
+it. It is worth writing down that this **did not happen**, because the argument
+generalises.
+
+`Dockerfile.worker.react` installs react, react-dom, vitest, a JSX transform
+and a DOM at **image build time** — on the host, where the network is allowed
+and where step 4 already puts a human — and moves them to `/node_modules`, at
+the filesystem root, where Node's ESM resolver finds them from any working
+directory. The gate is then `vitest run`, and it was measured green in a
+container started with `--network none`. The allowlist in §3 is byte-for-byte
+what it was before React existed as a stack.
+
+`EgressPolicy.from_env()` and `APIARY_EGRESS_ALLOW` are therefore still what
+they were: **an escape hatch with no production caller, which widens nothing
+today** — "The knob, and its cost" above describes the design, not the
+behaviour, and `compose.yaml`'s "widen it with `APIARY_EGRESS_ALLOW`" says the
+same thing with the same caveat missing. Setting that variable has no effect on
+the enforced allowlist; the enforced list is the static block in `compose.yaml`
+and nothing reads the environment into it. That remains a real gap for a target
+repository whose own `## Verify` needs an index — but it is not React's gap, and
+"make the allowlist enforceable" is no longer a prerequisite for a
+dependency-carrying stack.
+
+**What moved instead: the build-time trust set.** The *run-time* surface is
+unchanged, and that is the narrower claim than it sounds. Before React, an
+image was trusted to the Debian archive, this repository's own Python package
+and the official Node image. `Dockerfile.worker.react` adds roughly 170 npm
+packages resolved at build time, and the honest description of that is a new
+supply-chain dependency, not an absence of one. What bounds it:
+
+- lifecycle scripts are **not** run (`--ignore-scripts`), so installing a
+  package does not execute its code;
+- the resolution happens in a **throwaway build stage** as that image's
+  unprivileged `node` user, and the runtime stage takes only the resulting
+  directory with `COPY`, which executes nothing;
+- `/node_modules/.bin` is **last** on `PATH`, so a package shipping a `bin`
+  called `git` cannot get between the worker and the real one;
+- `/node_modules` is root-owned and the worker runs as uid 10001, so the gate
+  reads the toolchain and cannot change it.
+
+What does **not** bound it: there is no lockfile and no integrity pinning below
+the major version, so the exact set differs between two builds of the same
+Dockerfile and cannot be audited after the fact. An operator who needs that
+should generate a lockfile on the host and switch the `deps` stage to `npm ci`.
+
+**And the cost to the gate's meaning.** A worker's toolchain comes from its
+image and a GitHub runner's cannot, so the generated workflow installs the same
+packages itself (`greenfield.provision.CI_SETUP`). `npm ci` is not available to
+close that either: it needs a lockfile, and producing one needs the registry
+the worker is denied. Two things follow, and the second is the sharper one:
+
+- both sides install from the same pinned **major** ranges
+  (`greenfield.stacks.REACT_TOOLCHAIN`) and can still resolve different patch
+  versions;
+- CI's `npm install` also resolves whatever the generated `package.json`
+  declares, and the worker's gate installs nothing, so it never validates that
+  list. A model that writes a package name no source file imports is
+  **worker-green and CI-red** — a set divergence, not a version one.
+
+Closing this properly means publishing the worker image to a registry so the
+workflow can use `container:`, which is a much larger change than this one.
+
 ### What this does not buy
 
 `github.com` is one host and every repository lives behind it. The egress filter

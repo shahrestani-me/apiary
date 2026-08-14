@@ -237,8 +237,9 @@ it reaches is behind a proxy with `BUILD=0` and `IMAGES=0`
 designed rather than a gap. So the images are a human's to build, once.
 
 ```bash
-docker build -f Dockerfile.worker      -t apiary-worker      .
-docker build -f Dockerfile.worker.node -t apiary-worker-node .
+docker build -f Dockerfile.worker       -t apiary-worker       .
+docker build -f Dockerfile.worker.node  -t apiary-worker-node  .
+docker build -f Dockerfile.worker.react -t apiary-worker-react .
 ```
 
 One image per stack, chosen per task from the issue's `## Stack` section:
@@ -247,7 +248,13 @@ One image per stack, chosen per task from the issue's `## Stack` section:
 |---|---|---|
 | `python` | `apiary-worker` | git, Python 3.12 |
 | `node` | `apiary-worker-node` | git, Python 3.12, Node 22, npm |
-| `react` | `apiary-worker-node` | the same — React web needs Node and nothing else |
+| `react` | `apiary-worker-react` | the same, plus the React toolchain at `/node_modules` |
+
+The React image is the slow one — roughly two minutes and about 1.1 GB, most
+of it the `npm install` in the build. That install is deliberately here rather
+than in the worker: a worker has no route to a registry, so the toolchain has
+to arrive with the image, and this is the step where the network is allowed.
+Nothing about it widens what a *running* container can reach.
 
 Build only the ones you will use; a task whose stack has no image is refused
 before it is claimed, with the build line in the message. `APIARY_WORKER_IMAGES`

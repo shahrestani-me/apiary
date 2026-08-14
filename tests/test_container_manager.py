@@ -708,12 +708,17 @@ def test_the_default_mapping_covers_every_declarable_stack():
     assert set(DEFAULT_STACK_IMAGES) == KNOWN_STACKS
 
 
-def test_node_and_react_share_an_image():
-    """React web needs Node and nothing else at the toolchain level. Two tags
-    for one Dockerfile would be two things to keep built."""
+def test_react_does_not_share_the_node_image():
+    """It did, on the grounds that "React web needs Node and nothing else at
+    the toolchain level", and that was wrong in the one way that mattered:
+    `node --test` has no JSX transform, so the shared image could read a React
+    project's files only as syntax errors. #106 gives React its own image;
+    `test_the_build_hint_names_the_dockerfile_that_exists` is what pins the
+    tag to a file in this repository."""
     images = StackImages()
 
-    assert images.for_stack("react") == images.for_stack("node")
+    assert images.for_stack("react") == "apiary-worker-react"
+    assert images.for_stack("react") != images.for_stack("node")
 
 
 def test_a_stack_is_resolved_case_insensitively():

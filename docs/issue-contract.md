@@ -496,6 +496,14 @@ Without this, a PR that adds a dependency carries the manifest and no lock, CI
 re-runs the command on neutral ground, and `npm ci` fails. "Add a dependency"
 is unimplementable.
 
+**Note, since #106: the generated stacks do not exercise this yet.** A worker
+has no route to a registry, so nothing a generated project's gate runs can
+*produce* a lockfile in the first place — React's toolchain arrives in the
+image and the generated workflow uses `npm install`, never `npm ci`. So both
+JS rows above are a permission held open for a repository that brings its own
+installing gate, not a description of what a bootstrapped repo commits today.
+See `greenfield/stacks.py` and `docs/security.md` §3.
+
 ---
 
 ## 7. Test corpus

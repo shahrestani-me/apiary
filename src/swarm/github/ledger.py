@@ -98,6 +98,11 @@ GENERATED_FILES: Mapping[str, tuple[str, ...]] = {
     # entry is here because the moment a Node task adds one, this is where the
     # lockfile has to be named, and an empty tuple says "considered" where a
     # missing key says "forgotten".
+    # Both JS rows are a permission, not a prediction. Since #106 nothing a
+    # *generated* project's gate runs can produce a lockfile - a worker reaches
+    # no registry, React's toolchain comes from its image, and the generated
+    # workflow uses `npm install` rather than `npm ci`. The entries stay for a
+    # repository that brings its own installing gate.
     "node": ("package-lock.json",),
     "react": ("package-lock.json",),
 }
