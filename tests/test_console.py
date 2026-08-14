@@ -187,6 +187,32 @@ def test_the_planner_is_told_the_stack_so_it_stops_inventing_one():
     assert "existing stack" in system_prompt()
 
 
+def test_a_task_cannot_be_planned_without_files():
+    """`normalise` rejects a task listing no files, and `files` used to carry a
+    default - so a model that stopped emitting the field produced a plan that
+    silently lost those tasks. Observed: nine of ten. Without a default the
+    schema-constrained decoder cannot omit it."""
+    import pydantic
+
+    from swarm.state import PlannedTask
+
+    with pytest.raises(pydantic.ValidationError):
+        PlannedTask(id="a-task", goal="do the thing")
+
+    assert PlannedTask(id="a-task", goal="do it", files=["app/a.py"]).files == ["app/a.py"]
+
+
+def test_the_planner_prompt_names_no_task_counts():
+    """Granularity is a property of the work, not a number someone picked. Every
+    count that was in this prompt - "prefer 2-4", then "eight to twelve", then
+    "about three files" - was an arbitrary anchor the model obeyed instead of
+    reasoning about the objective."""
+    prompt = system_prompt()
+
+    for anchor in ("2-4", "2 to 4", "eight to twelve", "three files", "at most", "at least one task"):
+        assert anchor not in prompt, f"a task-count anchor came back: {anchor!r}"
+
+
 def test_the_planner_is_told_a_task_must_pass_the_gate_alone():
     """The other half: file-disjointness was the only rule about shape, so the
     model cut by layer. The first recorded run split implementation from tests,

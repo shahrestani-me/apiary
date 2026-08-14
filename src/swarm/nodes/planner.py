@@ -142,14 +142,18 @@ Constraints:
 - Every path must be plausible for {stack}. Do not invent a stack the project
   does not use.
 - Use depends_on only when a task literally cannot start before another finishes.
-- There is no target number of tasks and no maximum. Emit as many as the
-  objective has slices.
-- But a task is worked by ONE model call that writes every one of its files in
-  full, in one pass. A task spanning several subsystems does not come back
-  half-done, it comes back truncated mid-file. So: every distinct capability
-  the objective names is at least one task, and a task that would need more
-  than about three files or more than one subsystem must be split until it
-  does not. One coherent slice, its test, and nothing else.
+- There is no target number of tasks, no minimum and no maximum. The count is
+  whatever falls out of the rule below.
+- One task is ONE behaviour: a single thing the tests can assert, described
+  without using "and". If a task's requirements read as a list of independent
+  assertions, that is a list of tasks. Creating a record, editing it, listing
+  it and searching it are four behaviours, not one "management" task.
+- A task is worked by ONE model call that writes every one of its files in
+  full, in a single answer. If you would not expect one answer to contain all
+  of that code, the task is too big and does not come back half-done - it comes
+  back truncated mid-file. Split until each task fits in one answer.
+- Every task must list the files it creates or modifies. A worker may only
+  write what its task declares, so a task that declares nothing can do nothing.
 
 Each goal is the entire brief the worker gets. It sees the goal, the files, and
 nothing else - not this objective, not the other tasks, not your reasoning. So

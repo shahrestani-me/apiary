@@ -42,9 +42,18 @@ class PlannedTask(BaseModel):
             "assert. The worker sees only this and the file list."
         )
     )
+    # Required, with no default. `normalise` rejects a task that lists no files
+    # - a worker may only write what its task declares, so a task with none can
+    # do nothing - and a default made that rejection silent: the model, asked
+    # for detailed goals, spent its answer on prose and simply stopped emitting
+    # this field. Nine of ten tasks in one observed plan had no files, and the
+    # plan reached the reconciler as a single task with no error anywhere.
+    # Without a default the schema-constrained decoder cannot leave it out.
     files: list[str] = Field(
-        default_factory=list,
-        description="repo-relative paths this task may modify. Must not overlap other tasks.",
+        description=(
+            "repo-relative paths this task creates or modifies, at least one. "
+            "Must not overlap any other task's files."
+        ),
     )
     depends_on: list[str] = Field(
         default_factory=list, description="ids of tasks that must finish first"
