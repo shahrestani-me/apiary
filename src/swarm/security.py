@@ -54,6 +54,10 @@ __all__ = [
     "PolicyError",
     "REQUIRED_PERMISSIONS",
     "FORBIDDEN_PERMISSIONS",
+    "PROVISION_TOKEN_ENV",
+    "PROVISION_PERMISSIONS",
+    "assert_provision_token",
+    "assert_no_provision_token",
     "classify_token",
     "assert_scoped_token",
     "EgressPolicy",
@@ -119,6 +123,37 @@ FORBIDDEN_PERMISSIONS: tuple[str, ...] = (
     "organization_administration",
 )
 
+# --------------------------------------------------------------------------
+# 1b. The boot key
+# --------------------------------------------------------------------------
+#
+# Creating a repository and pushing a CI workflow into its first commit need
+# `administration` and `workflows` - the two permissions `FORBIDDEN_PERMISSIONS`
+# names first, because a worker holding `workflows` can rewrite the very file
+# that independently re-runs its verify command. The model would be editing its
+# own exam, and every gate downstream would become decoration.
+#
+# So the credential that boots a project and the credential workers hold are
+# not the same credential. The split is a *lifetime* as much as a scope: the
+# boot key is used by the orchestrator before any container exists and is never
+# put into one. `assert_no_provision_token` is the check that keeps that true
+# even if somebody wires an environment through by accident.
+
+#: Where the boot key lives. Deliberately not `GITHUB_TOKEN`: the work key
+#: already owns that name, and a single name for two credentials is how the
+#: broad one ends up in a container.
+PROVISION_TOKEN_ENV = "APIARY_PROVISION_TOKEN"
+
+#: What the boot key needs, and nothing beyond it. `contents` is here because
+#: the initial commit is written through the git data API.
+PROVISION_PERMISSIONS: dict[str, str] = {
+    "administration": "write",
+    "contents": "write",
+    "workflows": "write",
+    "metadata": "read",
+}
+
+
 #: Fine-grained PATs. The only shape a human should be minting for this.
 FINE_GRAINED_PREFIX = "github_pat_"
 
@@ -151,6 +186,57 @@ def classify_token(token: str | None) -> str:
     if token.startswith(ACCOUNT_WIDE_PREFIXES):
         return "account-wide"
     return "unrecognised"
+
+
+def assert_provision_token(token: str | None, *, allow_unrecognised: bool = False) -> str:
+    """Refuse a boot key that cannot be repo-scoped. Returns its kind.
+
+    Same shape rule as the work key - it is still a credential, and a classic
+    PAT here would reach every repository the account owns while holding
+    `administration`, which is the worst combination in this file. What differs
+    is only what it is *for* and how long it lives.
+    """
+    if not token:
+        raise CredentialError(
+            f"{PROVISION_TOKEN_ENV} is not set, and creating a repository needs it. "
+            f"The work key deliberately cannot do this: it is held by containers "
+            f"running model-written code, and "
+            f"{', '.join(sorted(PROVISION_PERMISSIONS))} are permissions that code "
+            f"must never have. Mint a second fine-grained token with "
+            f"{', '.join(f'{k}:{v}' for k, v in sorted(PROVISION_PERMISSIONS.items()))} "
+            f"and export it as {PROVISION_TOKEN_ENV} - see docs/security.md"
+        )
+    return assert_scoped_token(token, allow_unrecognised=allow_unrecognised)
+
+
+def assert_no_provision_token(env: Mapping[str, str] | None) -> None:
+    """Raise if a container's environment carries the boot key.
+
+    The separation is only worth something if it is enforced somewhere other
+    than in prose. `ContainerManager` runs every environment it is about to
+    hand a worker through here, so the failure is a refusal to start rather
+    than a container that quietly holds `administration` and `workflows` while
+    executing whatever the model just wrote.
+
+    Both the name and the value are checked: renaming the variable on the way
+    in would defeat a name-only check, and the value is what actually grants
+    the permissions.
+    """
+    if not env:
+        return
+    secret = os.environ.get(PROVISION_TOKEN_ENV)
+    for name, value in env.items():
+        if name == PROVISION_TOKEN_ENV:
+            raise PolicyError(
+                f"{PROVISION_TOKEN_ENV} must never reach a worker: it carries "
+                f"{', '.join(sorted(PROVISION_PERMISSIONS))}, and a worker holding "
+                f"`workflows` can rewrite the CI that judges its own work"
+            )
+        if secret and value == secret:
+            raise PolicyError(
+                f"the value of {PROVISION_TOKEN_ENV} is being passed to a worker as "
+                f"{name!r}; renaming it does not narrow what it can do"
+            )
 
 
 def assert_scoped_token(token: str | None, *, allow_unrecognised: bool = False) -> str:

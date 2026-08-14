@@ -48,12 +48,16 @@ from swarm.security import (
     EGRESS_ALLOWLIST,
     FORBIDDEN_PERMISSIONS,
     REQUIRED_PERMISSIONS,
+    PROVISION_PERMISSIONS,
+    PROVISION_TOKEN_ENV,
     SOCKET_PROXY_ENV,
     SOCKET_PROXY_HOST,
     WORKER_NETWORK,
     CredentialError,
     EgressPolicy,
     PolicyError,
+    assert_no_provision_token,
+    assert_provision_token,
     assert_scoped_token,
     assert_unprivileged,
     classify_token,
@@ -519,3 +523,60 @@ def test_the_worker_network_has_no_route_off_the_host(compose_text: str) -> None
 
 def test_no_service_is_declared_privileged(compose_text: str) -> None:
     assert "privileged:" not in compose_text
+
+
+# --------------------------------------------------------------------------
+# 1b. The boot key
+# --------------------------------------------------------------------------
+
+
+def test_the_boot_key_needs_exactly_what_the_work_key_must_never_have():
+    """The two permission sets are disjoint where it matters.
+
+    This is the whole argument for a second credential in one assertion: every
+    permission provisioning needs is one `FORBIDDEN_PERMISSIONS` refuses a
+    worker, so no single token can do both jobs safely.
+    """
+    dangerous = set(PROVISION_PERMISSIONS) & set(FORBIDDEN_PERMISSIONS)
+    assert dangerous == {"administration", "workflows"}
+    assert not dangerous & set(REQUIRED_PERMISSIONS)
+
+
+def test_a_missing_boot_key_names_the_variable_and_the_reason():
+    with pytest.raises(CredentialError) as caught:
+        assert_provision_token(None)
+    message = str(caught.value)
+    assert PROVISION_TOKEN_ENV in message
+    assert "administration" in message and "workflows" in message
+
+
+def test_a_boot_key_is_held_to_the_same_shape_rule():
+    """An account-wide token here is the worst combination in the module."""
+    with pytest.raises(CredentialError):
+        assert_provision_token("ghp_" + "a" * 36)
+    assert assert_provision_token("github_pat_" + "b" * 40) == "fine-grained"
+
+
+def test_the_boot_key_is_refused_by_name_in_a_worker_environment():
+    with pytest.raises(PolicyError) as caught:
+        assert_no_provision_token({PROVISION_TOKEN_ENV: "github_pat_" + "c" * 40})
+    assert "workflows" in str(caught.value)
+
+
+def test_renaming_the_boot_key_does_not_smuggle_it_into_a_worker(monkeypatch):
+    """A name-only check is defeated by one assignment.
+
+    The value is what grants the permissions, so the value is what is matched.
+    """
+    secret = "github_pat_" + "d" * 40
+    monkeypatch.setenv(PROVISION_TOKEN_ENV, secret)
+    with pytest.raises(PolicyError) as caught:
+        assert_no_provision_token({"GITHUB_TOKEN": secret})
+    assert "renaming it does not narrow" in str(caught.value)
+
+
+def test_an_ordinary_worker_environment_passes(monkeypatch):
+    monkeypatch.setenv(PROVISION_TOKEN_ENV, "github_pat_" + "e" * 40)
+    assert_no_provision_token({"GITHUB_TOKEN": "github_pat_" + "f" * 40})
+    assert_no_provision_token({})
+    assert_no_provision_token(None)
