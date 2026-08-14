@@ -46,6 +46,10 @@ from swarm.github.ledger import ContractError, LabelRepair, Ledger, LedgerEntry,
 from swarm.github.readiness import IssueState
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity
 from swarm.orchestrator.reconcile import (
+    DEFAULT_INFRASTRUCTURE_CAP,
+    INFRASTRUCTURE_CAP_ENV,
+    InfrastructurePolicy,
+    infrastructure_streaks,
     COMMENT_METHOD,
     PULLS_METHOD,
     DONE,
@@ -1116,3 +1120,170 @@ def test_the_merge_policy_reaches_the_check_gate(monkeypatch):
     reconciler(client, FakeFleet(), merge_policy=policy).cycle()
 
     assert seen["policy"] is policy
+
+
+# --------------------------------------------------------------------------
+# A task that only ever fails as infrastructure (#91)
+# --------------------------------------------------------------------------
+#
+# Exit 2 not consuming an attempt is right and unchanged (§4): a broken host
+# must not burn every issue's retry budget before a human notices. This is the
+# ceiling on it. Without one, a purely mechanical fault retries for free
+# forever - and #90 widened what counts as mechanical.
+#
+# The only backstop before this was round-based stall detection, which routes
+# to the *replanner*: a model, handed a broken socket as though it were a
+# planning problem.
+
+
+def infra(number: int = 4, *, reason: str = "docker: no such image") -> dict:
+    return {number: record(number, 2, attempt=1, reason=reason)}
+
+
+def test_an_infrastructure_failure_below_the_cap_still_re_readies():
+    """The rule this ticket adds a ceiling to, asserted at the boundary rather
+    than only at zero."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=1)),
+        results=infra(),
+        max_attempts=3,
+        infrastructure={4: 1},
+        infrastructure_policy=InfrastructurePolicy(cap=3),
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.to_label, transition.attempt) == (READY, None)
+    assert transition.infrastructure
+
+
+def test_the_nth_consecutive_infrastructure_failure_reaches_a_human():
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=1)),
+        results=infra(reason="docker: no such image apiary-worker-node"),
+        max_attempts=3,
+        infrastructure={4: 2},
+        infrastructure_policy=InfrastructurePolicy(cap=3),
+    )
+
+    transition = plan.transitions[0]
+    assert transition.to_label == FAILED
+    # The reason names the repeated verdict, not just a count: "3 failures" on
+    # its own sends a human to the wrong place.
+    assert "3 consecutive infrastructure failures" in transition.reason
+    assert "no such image apiary-worker-node" in transition.reason
+    assert transition.comment
+
+
+def test_escalating_does_not_backdate_the_attempt_counter():
+    """The attempts were never consumed, and writing one now would rewrite
+    history to make this look like an exhausted budget rather than a machine
+    fault - which is the diagnosis the whole exit-2 rule exists to protect."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=1)),
+        results=infra(),
+        max_attempts=3,
+        infrastructure={4: 2},
+        infrastructure_policy=InfrastructurePolicy(cap=3),
+    )
+
+    assert plan.transitions[0].attempt is None
+
+
+def test_a_real_task_failure_resets_the_streak():
+    """The machine recovered and the run is back to arguing about code. Carrying
+    the old streak over would escalate a task on the strength of a fault that is
+    no longer happening."""
+    before = {4: 2}
+
+    after = infrastructure_streaks(
+        before,
+        [Transition(number=4, from_label=CLAIMED, to_label=READY, reason="worker exit 1")],
+    )
+
+    assert 4 not in after
+
+
+def test_consecutive_infrastructure_transitions_accumulate():
+    streaks: dict[int, int] = {}
+    for _ in range(3):
+        streaks = infrastructure_streaks(
+            streaks,
+            [
+                Transition(
+                    number=4,
+                    from_label=CLAIMED,
+                    to_label=READY,
+                    reason="infrastructure failure",
+                    infrastructure=True,
+                )
+            ],
+        )
+
+    assert streaks == {4: 3}
+
+
+def test_one_issues_streak_is_not_another_issues():
+    streaks = infrastructure_streaks(
+        {4: 2},
+        [
+            Transition(
+                number=5,
+                from_label=CLAIMED,
+                to_label=READY,
+                reason="infrastructure failure",
+                infrastructure=True,
+            )
+        ],
+    )
+
+    assert streaks == {4: 2, 5: 1}
+
+
+def test_a_cycle_that_moved_nothing_counts_nothing():
+    """The reason transitions are counted rather than result records.
+
+    A result file is one per *attempt*, and an infrastructure verdict does not
+    bump the attempt - so two mechanical failures in a row write the same
+    filename. Re-reading an unchanged results directory must not look like a
+    fourth failure.
+    """
+    assert infrastructure_streaks({4: 2}, []) == {4: 2}
+
+
+def test_the_cap_is_configurable_and_loud_on_garbage(monkeypatch):
+    monkeypatch.delenv(INFRASTRUCTURE_CAP_ENV, raising=False)
+    assert InfrastructurePolicy.from_env().cap == DEFAULT_INFRASTRUCTURE_CAP
+
+    monkeypatch.setenv(INFRASTRUCTURE_CAP_ENV, "5")
+    assert InfrastructurePolicy.from_env().cap == 5
+
+    # A mistyped cap that silently fell back would leave a run looping on a
+    # machine fault while somebody believed they had bounded it.
+    monkeypatch.setenv(INFRASTRUCTURE_CAP_ENV, "three")
+    with pytest.raises(ValueError):
+        InfrastructurePolicy.from_env()
+
+
+def test_a_cap_of_zero_or_less_is_honoured_as_written():
+    """"Never escalate" is a legitimate thing to ask for while debugging a
+    host, and the summary says out loud what it costs."""
+    policy = InfrastructurePolicy(cap=0)
+
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=1)),
+        results=infra(),
+        max_attempts=3,
+        infrastructure={4: 99},
+        infrastructure_policy=policy,
+    )
+
+    assert plan.transitions[0].to_label == FAILED  # cap 0 means the first one escalates
+    assert "no ceiling" in InfrastructurePolicy(cap=-1).summary()
+
+
+def test_the_escalation_needs_no_model_no_daemon_and_no_github():
+    """"Pure arithmetic in the orchestrator, so invariant 2 holds. Keep it that
+    way." - the ticket's own note, as an assertion."""
+    referenced = set(infrastructure_streaks.__code__.co_names)
+
+    assert not referenced & {"structured", "orchestrator_llm", "GitHubClient", "DockerCLI"}

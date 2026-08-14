@@ -101,6 +101,7 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `APIARY_MERGE_METHOD` | `squash` | How it merges. Must be a method the target repo allows. |
 | `APIARY_MAX_UPDATE_ROUNDS` | `3` | How many times one PR may be dragged forward onto a moving base before the starvation is called and a human is asked. |
 | `APIARY_MERGES_PER_CYCLE` | `1` | Merges are serialised under a strict status-check policy, because each one invalidates its siblings. |
+| `APIARY_MAX_INFRASTRUCTURE` | `3` | Consecutive **infrastructure** failures before a task reaches a human. Exit 2 does not consume an attempt, so without a ceiling a missing image or a denied registry retries for free forever. Separate from `SWARM_MAX_ATTEMPTS`: these are the failures that never cost an attempt. |
 | `SWARM_WORKER_CTX` | `16384` | Never set this to a model's advertised 256K — the KV cache would cost more than the weights. |
 | `SWARM_WORKER_TIMEOUT` | `1200` | Wall clock for a whole worker container: clone, inference, verify, commit, push, PR. |
 | `SWARM_VERIFY_TIMEOUT` | `300` | Wall clock for `SWARM_VERIFY` alone, **inside** the above. Raising this without raising the outer one buys nothing — the container dies at the outer cap first, and the attempt is recorded against the container rather than the gate. `swarm doctor` refuses an inverted pair and `swarm run` will not start on one. |

@@ -84,6 +84,7 @@ Manual dry run against a real repo - reads only, writes nothing, spawns nothing:
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -136,6 +137,18 @@ DEFAULT_INTERVAL_S = 15.0
 #: and because grepping for either name should find this line.
 COMMENT_METHOD = "create_issue_comment"
 PULLS_METHOD = "list_pull_requests"
+
+#: How many consecutive infrastructure verdicts one task may collect before it
+#: stops being free and reaches a human instead.
+#:
+#: Three, matching `SWARM_MAX_ATTEMPTS`, and for a similar reason: one is a data
+#: point, two could be a restarting daemon, and the third having the identical
+#: shape is the evidence. It is not the *same* number - these are the failures
+#: that never consumed an attempt, so the two budgets are independent - but a
+#: task that has burned six containers on one machine fault has told a human
+#: everything a seventh would.
+DEFAULT_INFRASTRUCTURE_CAP = 3
+INFRASTRUCTURE_CAP_ENV = "APIARY_MAX_INFRASTRUCTURE"
 
 
 # --------------------------------------------------------------------------
@@ -329,10 +342,89 @@ class Transition:
     task_id: str = ""
     attempt: int | None = None
     comment: str = ""
+    #: This move was caused by an infrastructure verdict (exit 2), whether it
+    #: re-readied the issue or escalated it at the cap. Carried as a flag
+    #: rather than sniffed back out of `reason`, because `infrastructure_streaks`
+    #: counts these and a counter keyed on prose is a counter that stops
+    #: counting the day somebody rewords a sentence.
+    infrastructure: bool = False
 
     def __str__(self) -> str:
         counter = "" if self.attempt is None else f", attempt {self.attempt}"
         return f"#{self.number}: {self.from_label} -> {self.to_label}{counter} ({self.reason})"
+
+
+@dataclass(frozen=True)
+class InfrastructurePolicy:
+    """When a task that only ever fails mechanically stops being free.
+
+    `docs/issue-contract.md` §4 makes exit 2 not consume an attempt, so a
+    broken host cannot burn every issue's retry budget before a human notices.
+    That rule is right and unchanged; this is the ceiling on it. Without one, a
+    purely mechanical fault - a missing worker image, a denied registry -
+    retries forever at no cost, and #90 widened what counts as mechanical.
+
+    The only backstop before this was round-based stall detection, which routes
+    to the **replanner**: a model, handed a broken socket as though it were a
+    planning problem.
+    """
+
+    cap: int = DEFAULT_INFRASTRUCTURE_CAP
+
+    @classmethod
+    def from_env(cls) -> InfrastructurePolicy:
+        """The policy this process was started with. Read once, at the call site."""
+        raw = os.environ.get(INFRASTRUCTURE_CAP_ENV)
+        if raw is None or not raw.strip():
+            return cls()
+        try:
+            cap = int(raw)
+        except ValueError as exc:
+            # Loud on garbage, like `dispatcher._env_int` and `checks._env_flag`.
+            # A mistyped cap that silently fell back would leave a run looping
+            # on a machine fault while somebody believed they had bounded it.
+            raise ValueError(f"{INFRASTRUCTURE_CAP_ENV}={raw!r} is not an integer") from exc
+        return cls(cap=cap)
+
+    def summary(self) -> str:
+        if self.cap <= 0:
+            return (
+                "infrastructure policy: no ceiling; a task failing mechanically "
+                f"retries forever ({INFRASTRUCTURE_CAP_ENV}={self.cap})"
+            )
+        return (
+            f"infrastructure policy: {self.cap} consecutive infrastructure failures "
+            f"escalate to a human ({INFRASTRUCTURE_CAP_ENV})"
+        )
+
+
+def infrastructure_streaks(
+    previous: Mapping[int, int], transitions: Iterable[Transition]
+) -> dict[int, int]:
+    """The streak map after a cycle, folded forward from the one before it.
+
+    Pure arithmetic, so the ceiling is testable as data and invariant 2 holds -
+    nothing here reaches a model, a daemon or GitHub.
+
+    **Counting transitions rather than results is what makes this correct.** A
+    result file is one per *attempt*, and an infrastructure verdict does not
+    bump the attempt - so two mechanical failures in a row write the same
+    filename and the artifacts cannot tell them apart. A transition, by
+    contrast, only fires when a claimed issue has a finished container to
+    account for, so one infrastructure transition is exactly one infrastructure
+    verdict, and re-reading an unchanged results directory produces none.
+
+    Any other transition on an issue clears its streak: a real task failure
+    after a mechanical one means the machine recovered and the run is back to
+    arguing about code, which is the case the counter must not carry over.
+    """
+    streaks = dict(previous)
+    for transition in transitions:
+        if transition.infrastructure:
+            streaks[transition.number] = streaks.get(transition.number, 0) + 1
+        else:
+            streaks.pop(transition.number, None)
+    return streaks
 
 
 @dataclass(frozen=True)
@@ -443,6 +535,8 @@ def plan_reconcile(
     running: Collection[int] = (),
     labels: Mapping[int, frozenset[str]] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
+    infrastructure: Mapping[int, int] | None = None,
+    infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
 ) -> ReconcilePlan:
     """Compare desired state with actual state. Pure - no API call, no daemon.
 
@@ -459,6 +553,12 @@ def plan_reconcile(
     states = states or {}
     results = results or {}
     labels = labels or {}
+    # How many infrastructure verdicts each issue has collected in a row. Cross-
+    # attempt state, so it cannot live in the worker - that container is one
+    # attempt and then exits - and it is passed in rather than held here,
+    # because this function stays pure. `infrastructure_streaks` folds the
+    # answer forward and `Reconciler` carries it between cycles.
+    infrastructure = infrastructure or {}
     live = set(running)
 
     transitions: list[Transition] = []
@@ -502,7 +602,13 @@ def plan_reconcile(
         record = results.get(entry.number)
         finished = record is not None and record.attempt >= entry.attempt
         if entry.state_label == CLAIMED and finished and record is not None:
-            transition, disposal = _observe(entry, record, max_attempts)
+            transition, disposal = _observe(
+                entry,
+                record,
+                max_attempts,
+                infrastructure_streak=infrastructure.get(entry.number, 0),
+                policy=infrastructure_policy,
+            )
             if transition is not None:
                 transitions.append(transition)
             if entry.number in live:
@@ -570,7 +676,12 @@ def plan_reconcile(
 
 
 def _observe(
-    entry: LedgerEntry, record: ResultRecord, max_attempts: int
+    entry: LedgerEntry,
+    record: ResultRecord,
+    max_attempts: int,
+    *,
+    infrastructure_streak: int = 0,
+    policy: InfrastructurePolicy = InfrastructurePolicy(),
 ) -> tuple[Transition | None, Disposal]:
     """Turn one finished worker's exit code into a label move (§4).
 
@@ -591,6 +702,41 @@ def _observe(
     # Exit 2. The task never really ran, so the attempt is not consumed - a
     # broken Ollama would otherwise burn every task's budget before anyone
     # noticed (`docs/issue-contract.md` §4).
+    #
+    # That rule is unchanged, and this is the ceiling on it. Not consuming an
+    # attempt means a purely mechanical fault - a missing image, a denied
+    # registry - retries for free, forever, and #90 widened what counts as
+    # mechanical. The only backstop before this was round-based stall
+    # detection, which routes to the *replanner*: a model, handed a broken
+    # socket as though it were a planning problem.
+    streak = infrastructure_streak + 1
+    if streak >= policy.cap:
+        return (
+            Transition(
+                number=entry.number,
+                from_label=entry.state_label,
+                to_label=FAILED,
+                # The counter is deliberately left alone. The attempts were
+                # never consumed and saying otherwise now would rewrite history
+                # to make the escalation look like an exhausted budget.
+                reason=(
+                    f"{streak} consecutive infrastructure failures, most recently "
+                    f"{detail!r}; this is not a coding problem and no attempt was "
+                    f"ever consumed for it ({INFRASTRUCTURE_CAP_ENV} to change)"
+                ),
+                task_id=entry.task_id,
+                comment=(
+                    f"Escalated after {streak} consecutive infrastructure failures.\n\n"
+                    f"The last one was: {detail}\n\n"
+                    "An infrastructure verdict means the task never really ran, so no "
+                    "attempt was consumed for any of them - which is why this issue "
+                    "would otherwise retry forever. Fix the host, then move this back "
+                    f"to `{READY}`."
+                ),
+                infrastructure=True,
+            ),
+            Disposal(entry.number, f"worker exit 2 x{streak} (infrastructure, escalated)"),
+        )
     return (
         Transition(
             number=entry.number,
@@ -598,6 +744,7 @@ def _observe(
             to_label=READY,
             reason=f"infrastructure failure: {detail}; the attempt was not consumed",
             task_id=entry.task_id,
+            infrastructure=True,
         ),
         Disposal(entry.number, "worker exit 2 (infrastructure)"),
     )
@@ -990,6 +1137,11 @@ class Reconciler:
     #: right failure for a counter whose whole job is bounding one run.
     update_budget: "Any | None" = None
 
+    #: When a task that only ever fails mechanically stops being free. Read at
+    #: the call site like the other two policies, so the line that reports it at
+    #: startup is the same line that chose it.
+    infrastructure_policy: InfrastructurePolicy = field(default_factory=InfrastructurePolicy)
+
     #: Step 5. The objective is what the goal gate assesses against, so a
     #: reconciler without one cannot close its own loop and says so rather than
     #: assessing against an empty string; `verify` is the run's repo-wide
@@ -1022,6 +1174,12 @@ class Reconciler:
     _stalls: int = field(default=0, repr=False)
     _replans: int = field(default=0, repr=False)
     _goal_rounds: int = field(default=0, repr=False)
+    #: Consecutive infrastructure verdicts per issue number. In-process for the
+    #: same reason `update_budget` and `_stalls` are: it is a question about a
+    #: sequence, GitHub only ever shows the current state, and a restart
+    #: granting a clean slate is the safe direction for a counter whose job is
+    #: bounding one run.
+    _infrastructure: dict[int, int] = field(default_factory=dict, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1053,11 +1211,18 @@ class Reconciler:
             running=tuple(handles),
             labels=snapshot.labels(),
             max_attempts=self.max_attempts,
+            infrastructure=self._infrastructure,
+            infrastructure_policy=self.infrastructure_policy,
         )
         result = apply_plan(
             snapshot, plan, fleet=self.fleet, handles=handles, dry_run=self.dry_run
         )
         ledger = fold(ledger, result.applied)
+        # Folded from what actually **landed**, not from what was planned: a
+        # label write GitHub refused left the issue where it was, so counting
+        # it would escalate a task on the strength of a move that never
+        # happened. Same rule `fold` follows one line up, for the same reason.
+        self._infrastructure = infrastructure_streaks(self._infrastructure, result.applied)
 
         # A claim with no container behind it is undispatchable forever, and the
         # window that produces one is the dispatcher's own claim-then-spawn gap.

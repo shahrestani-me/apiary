@@ -356,7 +356,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     from .orchestrator.checks import MergePolicy
     from .orchestrator.mergeability import UpdateBudget, UpdatePolicy
     from .orchestrator.recovery import Recovery
-    from .orchestrator.reconcile import Reconciler
+    from .orchestrator.reconcile import InfrastructurePolicy, Reconciler
 
     run = attachment.run
     # Resolved once, and every collaborator gets the same object. `source` is a
@@ -396,11 +396,13 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
 
     merge_policy = MergePolicy.from_env()
     update_policy = UpdatePolicy.from_env()
+    infrastructure_policy = InfrastructurePolicy.from_env()
     if args.no_merge:
         print("» merge policy: --no-merge; every pull request waits for a human")
     else:
         print(f"» {merge_policy.summary()}")
         print(f"» {update_policy.summary()}")
+    print(f"» {infrastructure_policy.summary()}")
     if args.no_goal_check:
         print("» goal gate: off; the run stops when the plan is exhausted")
 
@@ -426,6 +428,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         # than the cycle: a budget constructed inside the cycle starts over
         # every fifteen seconds and therefore bounds nothing.
         update_budget=UpdateBudget(cap=update_policy.max_update_rounds),
+        infrastructure_policy=infrastructure_policy,
         objective=run.objective,
         verify=verify,
         goal_gate=not args.no_goal_check,
