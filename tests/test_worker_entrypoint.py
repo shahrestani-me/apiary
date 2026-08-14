@@ -34,10 +34,19 @@ from swarm.worker.entrypoint import (
     EXIT_INFRASTRUCTURE,
     EXIT_OK,
     EXIT_TASK_FAILED,
+    INFRASTRUCTURE,
+    PASSED,
+    TASK_FAILED,
+    UNRUNNABLE_EXIT_CODES,
+    VERIFY_ENV_REQUIRED,
+    InfrastructureError,
     WorkerResult,
+    classify_verify,
     main,
+    run_verify,
     run_worker,
     split_repo,
+    verify_env,
 )
 
 ISSUE = 7
@@ -734,3 +743,210 @@ def test_a_public_clone_still_needs_no_token(monkeypatch):
 
     assert config == []
     assert env == {"GIT_TERMINAL_PROMPT": "0"}
+
+
+# --------------------------------------------------------------------------
+# Telling a gate that never opened from a task that failed (#90)
+# --------------------------------------------------------------------------
+#
+# Every test below is **unit, bare CI and unmarked**, deliberately.
+# `.github/workflows/ci.yml` deselects the `docker` marker, so a regression
+# test carrying it is a regression test that never runs - and the bug this
+# section is about shipped once already with a green suite.
+#
+# `UNRUNNABLE_EXIT_CODES` is a *shell*-level signal: it fires only when the
+# binary is absent. Every modern toolchain catches its own errors and
+# normalises to exit 1, so commit c015e4f's fix held for 127 and reopened for
+# every stack that installs anything.
+
+
+def denied_npm() -> tuple[int, str, str]:
+    """A denied `npm install`, as measured through the real egress tinyproxy.
+
+    Exit **1**, in under a second. That is the whole problem in one line.
+    """
+    return 1, "", "npm error code E403\nnpm error 403 Filtered by the proxy"
+
+
+def test_a_command_that_passed_is_passed():
+    assert edit_module and classify_verify(0, "1 passed", "", 3.2).outcome == PASSED
+
+
+@pytest.mark.parametrize("code", sorted(UNRUNNABLE_EXIT_CODES))
+def test_a_shell_that_could_not_run_it_is_infrastructure(code):
+    """Today's behaviour, preserved. 127 is not there, 126 may not be executed."""
+    verdict = classify_verify(code, "", "pytest: command not found", 0.01)
+
+    assert verdict.outcome == INFRASTRUCTURE
+    assert str(code) in verdict.reason
+
+
+def test_a_denied_install_is_infrastructure_even_though_it_exited_one():
+    """The reopened half of c015e4f, and the reason this ticket exists.
+
+    Three attempts burned in ~3 seconds and then `swarm:failed`, for a task
+    whose code was never the problem.
+    """
+    verdict = classify_verify(*denied_npm(), 0.8)
+
+    assert verdict.outcome == INFRASTRUCTURE
+    assert "network" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "npm error code E403",
+        "ERROR: 403 Filtered",
+        "fatal: unable to access 'https://github.com/': Could not resolve host: github.com",
+        "curl: (5) Could not resolve proxy: apiary-egress",
+        "Temporary failure in name resolution",
+    ],
+)
+def test_every_denial_signature_is_recognised(stderr):
+    assert classify_verify(1, "", stderr, 0.4).outcome == INFRASTRUCTURE
+
+
+def test_a_denial_on_stdout_counts_too():
+    """npm splits its own error output across both streams depending on
+    version and TTY, so looking at one of them is looking at half of them."""
+    assert classify_verify(1, "npm error code E403", "", 0.4).outcome == INFRASTRUCTURE
+
+
+def test_an_out_of_memory_kill_is_infrastructure_and_says_so():
+    """The VM is 7.65 GiB and two workers at `--memory 4g` overcommit it.
+    Python used ~100MB so nobody ever saw this; a toolchain will."""
+    verdict = classify_verify(137, "", "", 41.0)
+
+    assert verdict.outcome == INFRASTRUCTURE
+    assert "memory" in verdict.reason
+
+
+def test_an_ordinary_test_failure_is_the_tasks_fault():
+    verdict = classify_verify(1, "1 failed, 3 passed\nassert 3 == 4", "", 12.0)
+
+    assert verdict.outcome == TASK_FAILED
+    assert not verdict.infrastructure
+
+
+@pytest.mark.parametrize("code", [2, 3, 5, 139, 255])
+def test_an_unrecognised_failure_fails_closed(code):
+    """Fail closed. The two errors are not symmetric: a task failure misread as
+    infrastructure never consumes an attempt, so it retries forever.
+
+    139 is a native segfault and is deliberately *not* infrastructure - the
+    generated code is as likely a cause as the host is.
+    """
+    assert classify_verify(code, "", "boom", 1.0).outcome == TASK_FAILED
+
+
+def test_the_classifier_needs_no_subprocess_no_docker_and_no_model():
+    """Stated as a test because it is the point of extracting the function.
+
+    The decision used to live inline around a `subprocess.run`, which is why
+    the only rule it ever grew was the one a shell hands you for free. Purity
+    is what puts the truth table above in bare CI.
+
+    Asserted over the bytecode's name table rather than over the source text,
+    because the source text includes the docstring and the docstring is
+    *about* subprocesses.
+    """
+    referenced = set(classify_verify.__code__.co_names)
+
+    assert not referenced & {"subprocess", "run", "os", "environ", "SETTINGS", "Path"}
+
+
+# --- the environment the gate can see ---------------------------------------
+
+
+def test_the_verify_environment_carries_no_credential():
+    environ = {
+        "PATH": "/usr/bin",
+        "HOME": "/workspace",
+        "GITHUB_TOKEN": "github_pat_" + "a" * 30,
+        "APIARY_PUSH_TOKEN": "github_pat_" + "b" * 30,
+    }
+
+    env = verify_env(environ)
+
+    assert "GITHUB_TOKEN" not in env
+    assert "APIARY_PUSH_TOKEN" not in env
+
+
+@pytest.mark.parametrize("name", VERIFY_ENV_REQUIRED)
+def test_every_load_bearing_variable_survives(name):
+    """Dropping `HTTPS_PROXY` does not make a verify command fail, it makes it
+    **hang**: a worker has no default route, so a request with nowhere to go
+    waits until the outer container clock kills it several hundred seconds
+    later, with a reason naming the container."""
+    environ = {var: f"value-of-{var}" for var in VERIFY_ENV_REQUIRED}
+
+    env = verify_env(environ)
+
+    assert env[name] == f"value-of-{name}"
+
+
+def test_the_environment_is_filtered_rather_than_rebuilt():
+    """A fresh dict is how this goes wrong. Anything the target repository's
+    own suite needs - `PYTHONPATH`, `NODE_ENV`, a database URL - is not
+    something this module can enumerate, and an allow-list would break it in a
+    way that looks like a bug in its own tests."""
+    environ = {"PATH": "/usr/bin", "PYTHONPATH": "/src", "NODE_ENV": "test", "LANG": "C"}
+
+    assert verify_env(environ) == environ
+
+
+def test_a_credential_nobody_named_is_still_dropped():
+    """The shape test is `containers.manager.SECRET_NAME_RE`, reused rather
+    than restated - the same regex that already enrols a container's variables
+    for redaction."""
+    environ = {"PATH": "/usr/bin", "STRIPE_SECRET": "x", "MY_API_KEY": "y", "DB_PASSWORD": "z"}
+
+    assert set(verify_env(environ)) == {"PATH"}
+
+
+def test_a_verify_command_that_prints_its_environment_sees_no_token(
+    tmp_path, monkeypatch
+):
+    """End to end through the real `run_verify`, with a scripted double for the
+    command - the repo's own idiom. No Docker, no marker, so CI runs it."""
+    monkeypatch.setenv("GITHUB_TOKEN", "github_pat_" + "a" * 30)
+    monkeypatch.setenv("APIARY_PUSH_TOKEN", "github_pat_" + "b" * 30)
+    # Every required name but `PATH`, which has to stay real: the verify
+    # command is run through a shell, and a shell with a made-up `PATH` cannot
+    # find `env` to print anything at all. That failure mode is itself the
+    # point of `VERIFY_ENV_REQUIRED`.
+    pinned = [name for name in VERIFY_ENV_REQUIRED if name != "PATH"]
+    for name in pinned:
+        monkeypatch.setenv(name, f"value-of-{name}")
+
+    # Filtered rather than dumped whole: `run_verify` keeps only the last
+    # `OUTPUT_TAIL_CHARS`, and a full `env` on a developer's machine overflows
+    # that and cuts off the very lines under assertion.
+    passed, output = run_verify(
+        tmp_path, "env | grep -E 'TOKEN|PROXY|proxy|^PATH=|^HOME='"
+    )
+
+    assert passed
+    assert "GITHUB_TOKEN" not in output
+    assert "APIARY_PUSH_TOKEN" not in output
+    assert "PATH=" in output
+    for name in pinned:
+        assert f"{name}=value-of-{name}" in output
+
+
+def test_a_denied_command_never_consumes_the_attempt(tmp_path):
+    """Through `run_verify`, so the wiring is asserted and not just the
+    classifier. Reproduced with a scripted double, as `test_worker_entrypoint`
+    already does at :207, :266 and :297."""
+    with pytest.raises(InfrastructureError) as raised:
+        run_verify(tmp_path, 'sh -c \'echo "npm error code E403" >&2; exit 1\'')
+
+    assert "network" in str(raised.value)
+
+
+def test_an_ordinary_failure_still_returns_rather_than_raising(tmp_path):
+    passed, output = run_verify(tmp_path, 'sh -c \'echo "1 failed"; exit 1\'')
+
+    assert not passed
+    assert "1 failed" in output
