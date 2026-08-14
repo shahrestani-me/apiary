@@ -54,11 +54,11 @@ OPTIONAL_SECTIONS = ("Stack",)
 KNOWN_SECTIONS = REQUIRED_SECTIONS + OPTIONAL_SECTIONS
 
 #: Stack ids a `## Stack` section may name. The contract's vocabulary, which is
-#: not the same list as `greenfield.scaffold.STACKS` and must not import it:
-#: that registry is about *generating* a project, this is about what an issue
-#: may declare, and `github/` depending on `greenfield/` would be the wrong way
-#: round. `test_every_generatable_stack_is_a_declarable_one` pins that this set
-#: covers that registry, so the two cannot drift apart silently.
+#: not the same list as `containers.manager.DEFAULT_STACK_IMAGES` and must not
+#: import it: that map is about what *this host* can run, this is about what an
+#: issue may declare, and `github/` depending on `containers/` would be the
+#: wrong way round. `test_every_generatable_stack_is_a_declarable_one` pins that
+#: this set covers that map, so the two cannot drift apart silently.
 #:
 #: An id outside this set is a `ContractError`, never a silent default. A task
 #: declaring `## Stack` `rust` in a repository with no Rust image should fail

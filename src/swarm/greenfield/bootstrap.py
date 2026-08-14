@@ -8,7 +8,7 @@ template.
 ## Why this is a phase and not a `Stack.build` implementation
 
 The obvious change is to swap `Stack.build` for a model call. It cannot be
-done. `ScaffoldedPlan.files()` runs in the **orchestrator** process, which:
+done. A plan's `files()` runs in the **orchestrator** process, which:
 
 - has no checkout and cannot get one, so there is nowhere for generated files
   to be written, verified or committed;
@@ -118,6 +118,34 @@ BOOTSTRAP_FILES: dict[str, tuple[str, ...]] = {
         "src/App.jsx",
         "test/App.test.jsx",
     ),
+}
+
+#: The gate each stack falls back to, and what the model is shown as an example.
+#:
+#: **Every one of these must install nothing.** The command is not run once: it
+#: runs in every worker container, on every attempt, and again in CI on every
+#: push, so an install step in it is an install step on the price of every task
+#: in the repository forever. It is also *impossible* - a worker's only route
+#: out is the egress proxy's static allowlist, so an install is denied in under
+#: a second (#90's `DENIED_EGRESS_SIGNATURES`). This was the sharpest statement
+#: of the cost tension in the old scaffold and it survives here as a per-stack
+#: rule.
+#:
+#: `python3` and not `python`: the generated workflow has a setup step only for
+#: stacks that need one, and the interpreter guaranteed on a bare runner and in
+#: `python:3.12-slim` is spelled `python3`.
+#:
+#: **The Node command is compound on purpose, and #88 measured why.**
+#: `node --test` alone exits **0 on a repository with no tests in it** - so it
+#: would grade an empty or partial generation green, and no flag fixes it. The
+#: `test -n` guard is what makes the gate fail when there is nothing to run.
+STACK_VERIFY: dict[str, str] = {
+    "python": "python3 -m unittest discover -q",
+    "node": 'test -n "$(ls test/*.test.js 2>/dev/null)" && node --test',
+    # React web needs a transform `node --test` does not have, so its real gate
+    # arrives with #106. Until then it inherits the placeholder rather than
+    # claiming a command that cannot run.
+    "react": "",
 }
 
 SYSTEM = """You choose which technology stack a software project should be built in.

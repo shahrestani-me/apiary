@@ -76,8 +76,8 @@ from .github.client import GitHubClient, GitHubError
 from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.bootstrap import Bootstrap
-from .greenfield.provision import provision
-from .greenfield.scaffold import ScaffoldedPlan
+from .greenfield.provision import ProvisionPlan, provision
+from .greenfield.scaffold import UnsupportedStack
 from .security import EgressPolicy, worker_create_flags
 from .artifacts import (
     ArtifactsError,
@@ -651,36 +651,33 @@ def _target(
     if args.dry_run:
         parser.error("--dry-run cannot create a repository; drop --new or --dry-run")
 
-    # `ScaffoldedPlan`, not `ProvisionPlan`: it carries a generated project into
-    # the *initial* commit, so the repository the first worker clones has a real
-    # test suite and its workflow's required check runs that suite rather than
-    # `test -f README.md`. A plain plan produces a repo with nothing to verify,
-    # and then hands the planner a command with nothing to run.
-    #
-    # It also chooses the stack, which is what declines a prompt naming a
-    # toolchain the worker image does not carry - at this point, before anything
-    # irreversible has happened.
-    # Which stack the prompt implies, decided before anything is created - the
+    # Which stack the prompt implies, decided before anything is created: the
     # generated CI workflow needs it (#96) and so does the image the first
-    # worker runs in (#99). `--stack` is the operator overriding the model,
-    # which is the right precedence: they know what the repository is for.
+    # worker runs in (#99). `--stack` is the operator overriding the model.
     bootstrap = Bootstrap.for_prompt(args.new, stack=args.stack)
-    # The refusal, inverted: this host either has an image for the stack the
-    # prompt implies or it does not, and the answer is checked here - the last
-    # moment it is free. Afterwards there is a real repository with a URL, a
-    # branch ruleset and a backlog, and a refusal is something a human has to
-    # delete rather than something they read.
+    # The refusal, inverted (#103): this host either has an image for that
+    # stack or it does not, and the answer is checked here - the last moment it
+    # is free. Afterwards there is a real repository with a URL, a ruleset and a
+    # backlog, and a refusal is something a human has to delete.
     _refuse_unrunnable_stacks(bootstrap.stack)
-    plan = ScaffoldedPlan.for_prompt(
+
+    # A plain `ProvisionPlan`: there is nothing to scaffold any more. #101 made
+    # the project the first *issue* of the plan, so the initial commit is the
+    # README, the LICENSE and a workflow whose gate is the placeholder - the
+    # only command that passes on a repository with no code in it, which it has
+    # to be, because the required status check reports on that commit before
+    # any worker exists.
+    plan = ProvisionPlan.for_prompt(
         args.new,
         owner=args.owner,
         name=args.name,
         private=not args.public,
-        # So the generated workflow sets up the right toolchain (#96). The
-        # scaffold's own stack choice is still Python-only; #104 deletes it.
+        # So the generated workflow sets up the right toolchain (#96) and the
+        # first worker runs in the right image (#99).
         stack=bootstrap.stack,
-        # Only when asked: `for_prompt` defaults this to the stack's command,
-        # and passing None would override it with nothing.
+        # `--verify` is the operator's, and it is authoritative: #102 does not
+        # falsify a command they chose, because an escape hatch that can be
+        # refused is not one.
         **({"verify_command": args.verify} if args.verify else {}),
     )
     report = provision(plan, client, assume_yes=args.yes)

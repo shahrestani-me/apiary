@@ -29,6 +29,7 @@ from swarm.config import SETTINGS
 from swarm.greenfield.provision import PLACEHOLDER_VERIFY
 from swarm.greenfield.bootstrap import (
     BOOTSTRAP_FILES,
+    STACK_VERIFY,
     FALSIFY_TIMEOUT_S,
     ProposedGate,
     Verdict,
@@ -540,3 +541,60 @@ def test_an_accepted_gate_replaces_the_placeholder(tmp_path):
 
     assert verdict.accepted
     assert verdict.command == "pytest -q"
+
+
+# --------------------------------------------------------------------------
+# The per-stack gate rule, inherited from the deleted scaffold (#104)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stack", sorted(STACK_VERIFY))
+def test_no_stacks_gate_installs_anything(stack: str):
+    """`test_the_verify_command_installs_nothing`, kept as a per-stack rule.
+
+    It was the sharpest statement of the cost tension in the old scaffold and
+    it survives the templates' deletion. The command is not run once: it runs
+    in every worker container, on every attempt, and again in CI on every push,
+    so an install step in it is an install step on the price of every task in
+    the repository forever.
+
+    It is also *impossible*: a worker's only route out is the egress proxy's
+    static allowlist, so an install is denied in under a second - which is why
+    #90 has `DENIED_EGRESS_SIGNATURES` at all.
+    """
+    command = STACK_VERIFY[stack]
+
+    assert not {"pip", "install", "npm", "poetry", "uv", "curl", "wget"} & set(command.split())
+
+
+@pytest.mark.parametrize("stack", sorted(STACK_VERIFY))
+def test_every_stacks_gate_is_a_single_line_a_contract_will_accept(stack: str):
+    """`docs/issue-contract.md` §1.3: one command, and only its exit code is
+    believed. "Run these in order, stopping on failure" is semantics nobody
+    agreed to - write `&&`."""
+    assert len(STACK_VERIFY[stack].splitlines()) <= 1
+
+
+def test_the_python_gate_says_python3_not_python():
+    """The generated workflow emits no setup step for Python, so the spelling
+    guaranteed on a bare runner and in `python:3.12-slim` is `python3`."""
+    assert STACK_VERIFY["python"].startswith("python3 ")
+
+
+def test_the_node_gate_cannot_pass_on_a_project_with_no_tests():
+    """#88 measured `node --test` exiting **0** on a repository with no tests
+    in it, and no flag fixes it - so the bare command would grade an empty or
+    partial generation green. The guard is what makes the gate able to fail."""
+    command = STACK_VERIFY["node"]
+
+    assert "node --test" in command
+    assert command != "node --test"
+    assert "test -n" in command
+
+
+def test_every_declarable_stack_has_a_gate_entry():
+    """Empty says "considered"; missing says "forgotten". React's is empty on
+    purpose - `node --test` cannot run JSX without a transform, so it inherits
+    the placeholder until #106 rather than claiming a command that cannot run."""
+    assert set(STACK_VERIFY) == KNOWN_STACKS
+    assert STACK_VERIFY["react"] == ""

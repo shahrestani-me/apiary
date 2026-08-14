@@ -11,12 +11,13 @@ Two modules, and deliberately not two steps:
   branch protection - the outward-facing, irreversible half, which is why it
   asks before it acts;
 - `scaffold` (#26) generates the minimal skeleton whose tests actually run, and
-  `ScaffoldedPlan` hands it to `provision` as part of that same first commit.
+  the bootstrap issue generates it in a worker, and its pull request replaces
+  the placeholder gate the initial commit was provisioned with.
 
 The composition is the point. A scaffold committed second would leave the first
 commit - the one the required status check first reports on, and the one a
 worker branches from - with no tests and a placeholder command. So `cli`
-provisions a `ScaffoldedPlan`, and the command that plan declares is the one
+provisions a plain plan carrying the resolved stack, and the command it declares is the one
 string the workflow runs and every planned issue carries as its `## Verify`.
 """
 
