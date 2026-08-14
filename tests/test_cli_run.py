@@ -40,6 +40,7 @@ from swarm.config import SETTINGS
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import load_ledger, render_marker
 from swarm.greenfield.provision import (
+    CHECK_NAME,
     CI_WORKFLOW_PATH,
     PLACEHOLDER_VERIFY,
     ProvisionReport,
@@ -58,6 +59,19 @@ from swarm.run import (
     start_run,
     validate_run_id,
 )
+
+
+def workflow_command(workflow: str) -> str:
+    """The command the generated workflow actually runs, read back through YAML.
+
+    A helper rather than a substring check, because #96 made the command a
+    block scalar: `run: <command>` no longer appears in the text, and a
+    substring assertion could not catch the indent bug the block scalar exists
+    to prevent either.
+    """
+    yaml = pytest.importorskip("yaml")
+    steps = yaml.safe_load(workflow)["jobs"][CHECK_NAME]["steps"]
+    return str(steps[-1]["run"]).strip()
 
 REPO = "shahrestani-me/apiary"
 OBJECTIVE = "add retry with exponential backoff to the http client"
@@ -589,7 +603,7 @@ def test_the_workflow_and_every_issue_carry_the_same_one_command(monkeypatch):
 
     assert code == 0
     verify = provisioning.plan.verify_command
-    assert f"run: {verify}" in provisioning.plan.files()[CI_WORKFLOW_PATH]
+    assert workflow_command(provisioning.plan.files()[CI_WORKFLOW_PATH]) == verify
     assert verify in provisioning.plan.files()["README.md"]
     assert planning.verify == verify
 
@@ -626,7 +640,7 @@ def test_an_explicit_verify_command_overrides_the_scaffolds(monkeypatch):
 
     assert code == 0
     assert planning.verify == "make check"
-    assert "run: make check" in provisioning.plan.files()[CI_WORKFLOW_PATH]
+    assert workflow_command(provisioning.plan.files()[CI_WORKFLOW_PATH]) == "make check"
 
 
 def test_a_prompt_naming_another_stack_is_refused_before_anything_is_created(
