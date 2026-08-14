@@ -467,8 +467,24 @@ def read_checks(client: Any, ref: str) -> CheckSet:
     """
     try:
         return summarise_checks(client.list_check_runs(ref))
-    except GitHubError as exc:
-        print(f"! check runs for {ref} could not be read: {exc}", file=sys.stderr)
+    except GitHubError as check_error:
+        # A fine-grained PAT cannot read check runs: the `checks` permission is
+        # not offered when minting one, so this is 403 for every least-privilege
+        # token rather than a rare failure. Actions runs carry the same three
+        # fields the fold needs and `actions:read` is grantable, so the gate is
+        # readable after all - just not by the obvious call.
+        lister = getattr(client, "list_workflow_runs", None)
+        if lister is not None:
+            try:
+                return summarise_checks(lister(ref))
+            except GitHubError as actions_error:
+                print(
+                    f"! neither check runs nor workflow runs for {ref} could be read: "
+                    f"{actions_error}",
+                    file=sys.stderr,
+                )
+                return CheckSet(unreadable=True)
+        print(f"! check runs for {ref} could not be read: {check_error}", file=sys.stderr)
         return CheckSet(unreadable=True)
 
 
