@@ -1,10 +1,20 @@
-# One service: the orchestrator.
+# One service you run, and two that make it safe to run.
+#
+# `docker compose run orchestrator ...` is still the whole interface. The other
+# two services exist because of the third of docs/architecture-v2.md's "Three
+# constraints": this system executes LLM-generated code while holding a token
+# that can push, so the orchestrator gets a *narrowed* Docker API instead of the
+# raw socket, and containers get a *filtered* route off the host instead of the
+# daemon's default one. docs/security.md is the prose version of this file;
+# src/swarm/security.py is the machine-readable one, and tests/test_security.py
+# asserts that the three agree.
 #
 # There is deliberately NO ollama service here, and adding one is a regression
 # rather than an improvement. Docker Desktop on macOS has no Metal passthrough,
 # so a containerized Ollama drops to CPU and loses roughly an order of
 # magnitude. Ollama runs on the host; containers reach it over
-# host.docker.internal:11434. See "Three constraints" in docs/architecture-v2.md.
+# host.docker.internal:11434 - now through the egress proxy, which is the only
+# service in this file with a route to the host gateway.
 
 services:
   orchestrator:
@@ -23,7 +33,10 @@ services:
     # orchestrator --help` has to work on a machine with no token at all, and an
     # empty one fails loudly and specifically later ("GITHUB_TOKEN is not set",
     # from src/swarm/github/client.py) rather than as a compose interpolation
-    # error. Scope it to the single target repo, contents + PR write only.
+    # error. It must be a FINE-GRAINED PAT on the single target repository with
+    # contents:write, pull_requests:write, issues:write, metadata:read and
+    # nothing else; `swarm.security.assert_scoped_token` refuses the classic and
+    # OAuth shapes, and docs/security.md says how to mint and rotate one.
     #
     # The Ollama override is spelled APIARY_OLLAMA_HOST rather than the obvious
     # ${OLLAMA_HOST:-...}, because Ollama reuses one variable name for two
@@ -32,44 +45,218 @@ services:
     # Interpolating that would hand the container "0.0.0.0:11434" as a *client*
     # URL, pointing it at itself where nothing listens, and would break exactly
     # on the machines that had configured the host correctly.
+    #
+    # DOCKER_HOST is what makes the socket proxy real: the docker CLI that
+    # src/swarm/containers/manager.py shells out to honours it, so that module
+    # reaches the narrowed API without knowing the proxy exists.
+    #
+    # The proxy variables are set in both cases because different clients read
+    # different ones - urllib lowercases what it finds, git reads the lowercase
+    # spelling, other runtimes read only the uppercase. Keep them in step with
+    # EgressPolicy.proxy_env().
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
       OLLAMA_HOST: ${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      HTTP_PROXY: http://egress-proxy:8888
+      HTTPS_PROXY: http://egress-proxy:8888
+      http_proxy: http://egress-proxy:8888
+      https_proxy: http://egress-proxy:8888
+      NO_PROXY: localhost,127.0.0.1,egress-proxy
+      no_proxy: localhost,127.0.0.1,egress-proxy
 
-    # Docker Desktop resolves host.docker.internal itself; this makes a Linux
-    # host behave the same way instead of failing to resolve it.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # Two internal networks, not one. The orchestrator needs both the Docker API
+    # and the outside world; a worker needs only the second, and putting them on
+    # one network would put the Docker API one DNS lookup away from a container
+    # running generated code. Neither network has a default route, so anything
+    # not named here is unreachable rather than merely discouraged.
+    #
+    # `host.docker.internal` is no longer resolved here - an internal network has
+    # no host gateway to resolve it to. The egress proxy dials it on this
+    # service's behalf, which is what an HTTP proxy does with a hostname.
+    networks:
+      - apiary-control
+      - apiary-egress
+
+    depends_on:
+      - docker-socket-proxy
+      - egress-proxy
 
     # Run artifacts on the host, because the container is cattle: worker logs
     # are the main thing you want after a bad run, and they must survive
     # disposal. #29 defines the layout under this directory. The host side sits
     # in .swarm/ next to the checkpoints and worktrees, which is already both
     # this project's state directory and already gitignored.
+    #
+    # This is also the directory `swarm.security.scan_artifacts` is pointed at:
+    # it is kept forever, so a token that reaches it is a token that leaked
+    # forever, however tightly it was scoped.
     volumes:
       - ./.swarm/runs:/var/apiary/runs
 
-    # --- seam for #28: the Docker socket proxy -------------------------------
-    # Dispatching workers (#21) needs the Docker API, and a bind-mounted
-    # /var/run/docker.sock is effectively host root inside a container that runs
-    # LLM-written code. The socket is therefore NOT mounted here. #28 puts a
-    # proxy with a restricted API surface in front of it and adds, to this
-    # service:
-    #
-    #     environment:
-    #       DOCKER_HOST: tcp://docker-socket-proxy:2375
-    #     depends_on:
-    #       - docker-socket-proxy
-    #
-    # and, alongside it, the proxy itself - the only container in this file that
-    # ever sees the socket, and read-only at that:
-    #
-    #   docker-socket-proxy:
-    #     image: <pinned proxy image>
-    #     environment:
-    #       CONTAINERS: 1      # create, inspect and remove workers
-    #       POST: 1            # ... which needs writes; everything else stays 0
-    #     volumes:
-    #       - /var/run/docker.sock:/var/run/docker.sock:ro
-    # -------------------------------------------------------------------------
+  # --- the narrowed Docker API ---------------------------------------------
+  # The only container in this file that sees the socket. Dispatching workers
+  # (#21) needs the Docker API, and a bind-mounted /var/run/docker.sock inside
+  # the orchestrator is host root held by the process that runs model output.
+  #
+  # `:ro` on the mount is worth having and is NOT what makes this safe - a unix
+  # socket is bidirectional whatever the mount says, and a read-only socket
+  # still accepts `POST /containers/create`. The narrowing is the environment
+  # below: this proxy routes on method and path, and every path it is not told
+  # to allow returns 403.
+  #
+  # Keep the variables in step with swarm.security.SOCKET_PROXY_ENV, which
+  # explains each one and which the suite compares against this block. The short
+  # version: /containers and the /version handshake, nothing else. Not EXEC,
+  # which turns any running container into a shell; not BUILD, which is
+  # arbitrary code with a filesystem; not IMAGES, so the orchestrator can only
+  # run images already built on this host.
+  #
+  # What it cannot do is inspect a request body, so it cannot stop a
+  # `--privileged` create on the one POST it must allow. That is
+  # `swarm.security.assert_unprivileged`'s job, and docs/security.md says where
+  # it is called.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    init: true
+    environment:
+      CONTAINERS: 1
+      POST: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      PING: 1
+      VERSION: 1
+      ALLOW_RESTARTS: 0
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EXEC: 0
+      IMAGES: 0
+      INFO: 0
+      NETWORKS: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VOLUMES: 0
+    security_opt:
+      - no-new-privileges:true
+    # On apiary-control only: a worker container must never be able to route to
+    # this service, and Docker isolates user-defined bridge networks from each
+    # other by default.
+    networks:
+      - apiary-control
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # --- the filtered route off the host -------------------------------------
+  # The one service on apiary-uplink, which is the one network here that has a
+  # default route. Everything else reaches the world by asking this proxy, and
+  # this proxy answers only for the hosts in the allowlist below.
+  #
+  # Built from a two-line Dockerfile rather than pulled, because the alternative
+  # is trusting a third party's image with every byte the swarm sends anywhere.
+  # tinyproxy is a forward proxy with a deny-by-default host filter, which is
+  # the whole requirement; swap in squid or an mitm proxy if you need per-path
+  # rules, and keep the allowlist generated from EgressPolicy either way.
+  egress-proxy:
+    build:
+      dockerfile_inline: |
+        FROM alpine:3.20
+        RUN apk add --no-cache tinyproxy
+    image: apiary-egress-proxy:dev
+    init: true
+    command: ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+    configs:
+      - source: tinyproxy-conf
+        target: /etc/tinyproxy/tinyproxy.conf
+      - source: egress-allowlist
+        target: /etc/tinyproxy/allowlist
+    # The one place host.docker.internal is resolved. Docker Desktop does it
+    # itself; this makes a Linux host behave the same way instead of failing to
+    # resolve it. The host's Ollama is behind that name, and reaching it is the
+    # reason a worker is allowed off its network at all.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - apiary-egress
+      - apiary-uplink
+
+# The allowlist is generated by EgressPolicy.filter_lines() and pasted here;
+# tests/test_security.py fails if the two drift. Anchored at both ends, because
+# an unanchored `github\.com` also matches `github.com.attacker.net`.
+#
+# The trailing `$` is a regex anchor and stays one: compose interpolates `$`
+# only when a name or a `{` follows it, and here a newline does. Spelling it
+# `$$` would deliver the same byte and make this block stop matching the
+# generated form, which is the thing being checked.
+#
+# Widen it with APIARY_EGRESS_ALLOW rather than by editing this block: a
+# `## Verify` command that runs `pip install` needs pypi.org and
+# files.pythonhosted.org, and a package index that accepts uploads is an
+# exfiltration channel. That is a decision to make per target repository, out
+# loud. See docs/security.md.
+configs:
+  egress-allowlist:
+    content: |
+      ^(.*\.)?github\.com$
+      ^(.*\.)?api\.github\.com$
+      ^(.*\.)?codeload\.github\.com$
+      ^(.*\.)?host\.docker\.internal$
+
+  tinyproxy-conf:
+    content: |
+      User tinyproxy
+      Group tinyproxy
+      Port 8888
+      Listen 0.0.0.0
+      Timeout 600
+      MaxClients 64
+      LogLevel Info
+      DisableViaHeader Yes
+
+      # Who may use the proxy. Only the internal networks can route here at all;
+      # this is the second fence, not the first.
+      Allow 10.0.0.0/8
+      Allow 172.16.0.0/12
+      Allow 192.168.0.0/16
+
+      # CONNECT, i.e. HTTPS, to 443 and nothing else. Plain HTTP is proxied
+      # normally, which is how the host's Ollama on 11434 is reached.
+      ConnectPort 443
+
+      # Deny by default; the file below is the entire set of exceptions.
+      Filter "/etc/tinyproxy/allowlist"
+      FilterDefaultDeny Yes
+      FilterExtended On
+      FilterCaseSensitive No
+      FilterURLs No
+
+# `name:` on each, because compose would otherwise prefix them with the project
+# directory's name and the dispatcher passes `apiary-egress` verbatim to
+# `docker create --network` (swarm.security.WORKER_NETWORK).
+networks:
+  # No default route. The orchestrator talks to the socket proxy here and a
+  # worker cannot reach this network at all.
+  apiary-control:
+    name: apiary-control
+    internal: true
+
+  # No default route either. Workers and the orchestrator reach the egress
+  # proxy here, and nothing else.
+  apiary-egress:
+    name: apiary-egress
+    internal: true
+
+  # The only way out, and only the egress proxy is on it.
+  apiary-uplink:
+    name: apiary-uplink

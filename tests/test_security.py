@@ -1,0 +1,503 @@
+"""Tests for the credential, egress and Docker-API policy.
+
+Four claims, one per section of `src/swarm/security.py`, and each of them is
+about something that must *not* happen - which is the hard kind to test,
+because a check that looks at nothing passes every negative assertion
+perfectly. So each negative here is paired with the positive control that
+proves the check can see at all.
+
+**The token cannot be account-wide.** `gh auth token` prints a `gho_`, which is
+the most convenient credential on a developer's machine and reaches every
+repository the account can reach. The control is that a fine-grained token is
+accepted.
+
+**The allowlist and the proxy configuration cannot drift.** They are two
+renderings of one tuple, and the test compiles the generated regexes and checks
+them against `EgressPolicy.allows` over a corpus that includes the hostnames an
+unanchored pattern would wrongly admit.
+
+**The one path that creates containers creates no privileged one.**
+`ContainerManager.spawn`'s real argv goes through `assert_unprivileged`, so this
+is a regression test on `containers/manager.py` rather than on a fixture. The
+control is a corpus of argvs that must each be rejected, one per rule.
+
+**The token reaches no artifact on disk.** A container that deliberately echoes
+its token is run through the real capture path - `DockerCLI`, its `Redactor`,
+`dispose_container` - and what comes out is written to a run directory and
+scanned. The control writes the raw token to the same directory and requires
+the scan to find it.
+
+Hermetic throughout: `EchoingRunner` answers where a `docker` subprocess would,
+so the real capture boundary is under test rather than mocked out.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Sequence
+
+import pytest
+
+from swarm.containers.manager import ContainerManager, Handle, Redactor, dispose_container
+from swarm.run import Run
+from swarm.security import (
+    DOCKER_HOST_URL,
+    EGRESS_ALLOWLIST,
+    FORBIDDEN_PERMISSIONS,
+    REQUIRED_PERMISSIONS,
+    SOCKET_PROXY_ENV,
+    WORKER_NETWORK,
+    CredentialError,
+    EgressPolicy,
+    PolicyError,
+    assert_scoped_token,
+    assert_unprivileged,
+    classify_token,
+    find_secrets,
+    scan_artifacts,
+    worker_create_flags,
+)
+
+REPO = "shahrestani-me/apiary"
+BASE_COMMIT = "9f2c1ab3d4e5f60718293a4b5c6d7e8f90a1b2c3"
+CONTAINER_ID = "c0ffee" + "0" * 58
+
+#: Deliberately *not* GitHub-shaped, for the reason `test_container_manager`
+#: gives: a `ghp_...` string is caught by pattern alone, and these tests would
+#: then pass without the enrolment path working at all.
+TOKEN = "s3cr3t-push-credential-9f2c1ab3"
+
+COMPOSE = Path(__file__).resolve().parents[1] / "compose.yaml"
+
+
+@pytest.fixture()
+def run() -> Run:
+    return Run.start(REPO, "harden the credential path", run_id="apiary-20260814-120000-abcd")
+
+
+# --------------------------------------------------------------------------
+# The daemon double
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class EchoingRunner:
+    """A `Runner` whose containers print `echo_text` when their logs are read.
+
+    Records every argv, which is what the privilege assertions read. `docker
+    logs` is the only command that answers with anything interesting, because
+    the leak being tested for is a worker that printed its own environment.
+    """
+
+    echo_text: str = ""
+    calls: list[list[str]] = field(default_factory=list)
+
+    def __call__(
+        self, argv: Sequence[str], *, timeout_s: float | None, merge: bool
+    ) -> subprocess.CompletedProcess:
+        self.calls.append(list(argv))
+        stdout = self.echo_text if argv[1] == "logs" else CONTAINER_ID + "\n"
+        return subprocess.CompletedProcess(list(argv), 0, stdout, "")
+
+    def argv_for(self, subcommand: str) -> list[str]:
+        for call in self.calls:
+            if call[1] == subcommand:
+                return call
+        raise AssertionError(f"no {subcommand!r} command was issued")
+
+
+# --------------------------------------------------------------------------
+# 1. The token
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("token", "kind"),
+    [
+        ("github_pat_11ABCDEFG0abcdefghijklmnop", "fine-grained"),
+        ("ghs_16charsminimum0000000000", "app"),
+        ("ghp_16charsminimum0000000000", "account-wide"),
+        ("gho_16charsminimum0000000000", "account-wide"),
+        ("ghu_16charsminimum0000000000", "account-wide"),
+        ("ghr_16charsminimum0000000000", "account-wide"),
+        ("v1.0123456789abcdef", "unrecognised"),
+        ("", "unrecognised"),
+        (None, "unrecognised"),
+    ],
+)
+def test_token_kinds_are_told_apart_by_prefix(token: str | None, kind: str) -> None:
+    assert classify_token(token) == kind
+
+
+def test_a_fine_grained_token_is_accepted() -> None:
+    """The control: the check has to admit the token the docs tell you to mint."""
+    assert assert_scoped_token("github_pat_11ABCDEFG0abcdefghijklmnop") == "fine-grained"
+
+
+def test_an_app_installation_token_is_accepted() -> None:
+    assert assert_scoped_token("ghs_16charsminimum0000000000") == "app"
+
+
+@pytest.mark.parametrize("prefix", ["ghp_", "gho_", "ghu_", "ghr_"])
+def test_an_account_wide_token_is_refused(prefix: str) -> None:
+    """A classic or OAuth token is scoped to verbs, so it reaches every repo."""
+    with pytest.raises(CredentialError) as caught:
+        assert_scoped_token(prefix + "16charsminimum0000000000")
+    # The message has to say what to do instead; a refusal with no remedy gets
+    # worked around rather than fixed.
+    assert "fine-grained" in str(caught.value)
+    assert "contents:write" in str(caught.value)
+
+
+def test_an_absent_token_is_refused_before_anything_spends_time_on_it() -> None:
+    with pytest.raises(CredentialError, match="GITHUB_TOKEN"):
+        assert_scoped_token(None)
+
+
+def test_an_unrecognised_prefix_is_refused_unless_asked_for() -> None:
+    with pytest.raises(CredentialError, match="allow_unrecognised"):
+        assert_scoped_token("some-enterprise-token")
+    assert assert_scoped_token("some-enterprise-token", allow_unrecognised=True) == "unrecognised"
+
+
+def test_the_required_permissions_are_the_four_and_only_the_four() -> None:
+    assert REQUIRED_PERMISSIONS == {
+        "contents": "write",
+        "pull_requests": "write",
+        "issues": "write",
+        "metadata": "read",
+    }
+
+
+def test_workflows_is_forbidden() -> None:
+    """The sharp one: with it, generated code can rewrite the gate that checks it."""
+    assert "workflows" in FORBIDDEN_PERMISSIONS
+    assert not set(REQUIRED_PERMISSIONS) & set(FORBIDDEN_PERMISSIONS)
+
+
+# --------------------------------------------------------------------------
+# 2. Egress
+# --------------------------------------------------------------------------
+
+#: Hosts the policy must admit, and hosts it must refuse. The refusals are the
+#: interesting half: `github.com.attacker.net` and `notgithub.com` are the two
+#: shapes a careless allowlist admits, and both are hostnames someone else owns.
+ALLOWED_HOSTS = [
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com.github.com",
+    "host.docker.internal",
+    "https://api.github.com/repos/x/y",
+    "HOST.DOCKER.INTERNAL:11434",
+]
+REFUSED_HOSTS = [
+    "gitlab.com",
+    "pypi.org",
+    "notgithub.com",
+    "github.com.attacker.net",
+    "attacker.net",
+    "169.254.169.254",
+    "",
+]
+
+
+@pytest.mark.parametrize("host", ALLOWED_HOSTS)
+def test_the_allowlist_admits_github_and_the_hosts_ollama(host: str) -> None:
+    assert EgressPolicy().allows(host)
+
+
+@pytest.mark.parametrize("host", REFUSED_HOSTS)
+def test_the_allowlist_refuses_everything_else(host: str) -> None:
+    assert not EgressPolicy().allows(host)
+
+
+def test_the_generated_filter_agrees_with_the_predicate() -> None:
+    """The proxy's configuration and the policy cannot mean different things.
+
+    `filter_lines` is what tinyproxy enforces and `allows` is what everything
+    else reasons about; they are one tuple rendered twice, and this is the
+    assertion that keeps them that way.
+    """
+    policy = EgressPolicy()
+    patterns = [re.compile(line, re.IGNORECASE) for line in policy.filter_lines()]
+
+    for host in ALLOWED_HOSTS + REFUSED_HOSTS:
+        bare = host.split("://")[-1].split("/")[0].split(":")[0]
+        matched = any(pattern.match(bare) for pattern in patterns)
+        assert matched == policy.allows(host), host
+
+
+def test_the_filter_is_anchored_at_both_ends() -> None:
+    for line in EgressPolicy().filter_lines():
+        assert line.startswith("^") and line.endswith("$")
+
+
+def test_the_default_allowlist_is_the_goal_sentence_and_nothing_more() -> None:
+    assert EgressPolicy().hosts == EGRESS_ALLOWLIST
+    assert set(EGRESS_ALLOWLIST) == {
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "host.docker.internal",
+    }
+
+
+def test_a_package_index_is_off_until_an_operator_asks_for_it() -> None:
+    """The widening knob is opt-in, and opting in is one variable, not an edit."""
+    assert not EgressPolicy.from_env({}).allows("pypi.org")
+
+    widened = EgressPolicy.from_env({"APIARY_EGRESS_ALLOW": "pypi.org, files.pythonhosted.org"})
+    assert widened.allows("pypi.org")
+    assert widened.allows("files.pythonhosted.org")
+    # ... and widening never narrows: the defaults are still there.
+    assert widened.allows("api.github.com")
+
+
+def test_the_proxy_environment_is_set_in_both_cases() -> None:
+    """One client reading only the spelling nobody set is a silent bypass."""
+    env = EgressPolicy().proxy_env()
+    assert env["HTTP_PROXY"] == env["http_proxy"] == "http://egress-proxy:8888"
+    assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://egress-proxy:8888"
+    assert "egress-proxy" in env["NO_PROXY"] == env["no_proxy"]
+
+
+# --------------------------------------------------------------------------
+# 3. The Docker API
+# --------------------------------------------------------------------------
+
+
+def test_the_socket_proxy_grants_containers_and_the_version_handshake() -> None:
+    """Exactly what `containers/manager.py` calls, and the handshake before it."""
+    assert SOCKET_PROXY_ENV["CONTAINERS"] == "1"
+    assert SOCKET_PROXY_ENV["POST"] == "1"
+    assert SOCKET_PROXY_ENV["ALLOW_START"] == "1"
+    assert SOCKET_PROXY_ENV["ALLOW_STOP"] == "1"
+    # Without /version the CLI cannot negotiate an API version and every
+    # command fails before it is routed anywhere.
+    assert SOCKET_PROXY_ENV["VERSION"] == "1"
+
+
+@pytest.mark.parametrize("endpoint", ["EXEC", "BUILD", "IMAGES", "VOLUMES", "NETWORKS", "SWARM", "SYSTEM"])
+def test_the_socket_proxy_denies_everything_else(endpoint: str) -> None:
+    assert SOCKET_PROXY_ENV[endpoint] == "0"
+
+
+def test_the_socket_proxy_surface_is_stated_in_full() -> None:
+    """Every key explicit, including the ones whose default is already off.
+
+    "This is off" and "nobody thought about it" read identically in a file that
+    omits them, and the next person to widen the surface reads this one.
+    """
+    assert set(SOCKET_PROXY_ENV) >= {
+        "AUTH", "BUILD", "COMMIT", "CONFIGS", "DISTRIBUTION", "EXEC", "IMAGES",
+        "INFO", "NETWORKS", "NODES", "PLUGINS", "SECRETS", "SERVICES", "SESSION",
+        "SWARM", "SYSTEM", "TASKS", "VOLUMES",
+    }
+
+
+PRIVILEGED_ARGVS = [
+    ["create", "--privileged", "apiary-worker"],
+    ["create", "--cap-add", "SYS_ADMIN", "apiary-worker"],
+    ["create", "--cap-add=NET_ADMIN", "apiary-worker"],
+    ["create", "--device", "/dev/kmsg", "apiary-worker"],
+    ["create", "--device-cgroup-rule", "c 1:* rmw", "apiary-worker"],
+    ["create", "--group-add", "docker", "apiary-worker"],
+    ["create", "--pid", "host", "apiary-worker"],
+    ["create", "--pid=host", "apiary-worker"],
+    ["create", "--ipc=host", "apiary-worker"],
+    ["create", "--userns=host", "apiary-worker"],
+    ["create", "--network=host", "apiary-worker"],
+    ["create", "--security-opt", "seccomp=unconfined", "apiary-worker"],
+    ["create", "--security-opt=apparmor=unconfined", "apiary-worker"],
+    ["create", "-v", "/var/run/docker.sock:/var/run/docker.sock", "apiary-worker"],
+    ["create", "--volume", "/:/host", "apiary-worker"],
+    ["create", "--mount", "type=bind,source=/etc,target=/host-etc", "apiary-worker"],
+    ["create", "--user", "0", "apiary-worker"],
+    ["create", "--user", "root:root", "apiary-worker"],
+]
+
+
+@pytest.mark.parametrize("argv", PRIVILEGED_ARGVS, ids=lambda argv: argv[1])
+def test_a_privileged_create_is_refused(argv: list[str]) -> None:
+    """One case per rule, because the proxy cannot see any of them.
+
+    All of these travel in the body of the single `POST /containers/create`
+    the socket proxy has to allow, so this function is the only thing that
+    looks at them at all.
+    """
+    with pytest.raises(PolicyError):
+        assert_unprivileged(argv)
+
+
+def test_the_confinement_flags_are_themselves_unprivileged() -> None:
+    """The control: what a worker is meant to be created with must pass."""
+    flags = worker_create_flags()
+    assert flags[:2] == ["--network", WORKER_NETWORK]
+    assert "--cap-drop" in flags and "no-new-privileges:true" in flags
+    assert_unprivileged(["create", *flags, "apiary-worker"])
+
+
+def test_the_one_path_that_creates_containers_creates_no_privileged_one(run: Run) -> None:
+    """A regression test on `ContainerManager.spawn`, not on a fixture.
+
+    `spawn` builds the only `docker create` this system ever issues. If a
+    future change to it adds a mount, a capability or a host namespace, this
+    fails here rather than in production, where the socket proxy would route
+    it through without looking.
+    """
+    runner = EchoingRunner()
+    manager = ContainerManager(run=run, env={"GITHUB_TOKEN": TOKEN}, runner=runner)
+    manager.spawn(28, BASE_COMMIT)
+
+    assert_unprivileged(runner.argv_for("create"))
+
+
+def test_the_docker_host_url_names_the_proxy_and_not_the_socket() -> None:
+    assert DOCKER_HOST_URL == "tcp://docker-socket-proxy:2375"
+    assert "docker.sock" not in DOCKER_HOST_URL
+
+
+# --------------------------------------------------------------------------
+# 4. Artifacts
+# --------------------------------------------------------------------------
+
+
+def test_a_worker_that_echoes_its_token_leaves_it_in_no_artifact(
+    run: Run, tmp_path: Path
+) -> None:
+    """The "done when" clause of #28, end to end through the real capture path.
+
+    The container prints its whole environment, as a shell trace or a debug
+    dump would. What `dispose` hands back is what #29 writes to disk, so
+    writing exactly that to a run directory and scanning it is the same
+    question asked of the same string.
+    """
+    leaky = (
+        "+ git push https://x-access-token:" + TOKEN + "@github.com/o/n.git\n"
+        f"GITHUB_TOKEN={TOKEN}\n"
+        "fatal: could not read Username for 'https://github.com'\n"
+    )
+    runner = EchoingRunner(echo_text=leaky)
+    manager = ContainerManager(run=run, env={"GITHUB_TOKEN": TOKEN}, runner=runner)
+
+    handle = manager.spawn(28, BASE_COMMIT)
+    captured = manager.dispose(handle)
+
+    artifacts = run.artifacts_dir(tmp_path)
+    artifacts.mkdir(parents=True)
+    (artifacts / "worker-28.log").write_text(captured, encoding="utf-8")
+
+    assert scan_artifacts(artifacts, literals=[TOKEN]) == []
+    assert TOKEN not in captured
+
+
+def test_the_scan_finds_a_token_that_was_written_raw(run: Run, tmp_path: Path) -> None:
+    """The control. A scanner that looks at nothing passes the test above.
+
+    Two findings, because both halves of the detector have to be live: the
+    literal this process registered, and the GitHub-shaped string it was never
+    told about.
+    """
+    artifacts = run.artifacts_dir(tmp_path)
+    artifacts.mkdir(parents=True)
+    (artifacts / "worker-28.log").write_text(
+        f"GITHUB_TOKEN={TOKEN}\nnothing to see here\nghp_0123456789abcdefghij\n",
+        encoding="utf-8",
+    )
+
+    leaks = scan_artifacts(artifacts, literals=[TOKEN])
+    assert [leak.line for leak in leaks] == [1, 3]
+    # A report that quotes the leak is a second copy of it.
+    assert all(TOKEN not in str(leak) for leak in leaks)
+
+
+def test_the_scan_enrols_credentials_by_variable_name(tmp_path: Path) -> None:
+    """`env=os.environ` is the calling convention; nobody lists their secrets."""
+    (tmp_path / "run.log").write_text(f"the value was {TOKEN}\n", encoding="utf-8")
+
+    assert scan_artifacts(tmp_path, env={"GITHUB_TOKEN": TOKEN})
+    assert scan_artifacts(tmp_path, env={"HARMLESS": TOKEN}) == []
+
+
+def test_the_scan_survives_a_binary_file(tmp_path: Path) -> None:
+    """A run directory can hold a core dump; stopping at it scans nothing."""
+    (tmp_path / "core").write_bytes(b"\x00\xff\xfe" * 64)
+    (tmp_path / "run.log").write_text(f"{TOKEN}\n", encoding="utf-8")
+
+    assert [leak.path.name for leak in scan_artifacts(tmp_path, literals=[TOKEN])] == ["run.log"]
+
+
+def test_short_values_are_not_treated_as_secrets() -> None:
+    """`DEBUG=1` must not make every `1` in a log a finding."""
+    assert find_secrets("level=1\nverbose=1\n", literals=["1"]) == []
+
+
+def test_the_scanner_and_the_redactor_agree_about_what_a_secret_is() -> None:
+    """One definition, in `containers/manager.py`; this module audits it.
+
+    Anything the redactor would remove must be something the scanner reports,
+    or an artifact could pass the scan while carrying what redaction missed -
+    and the two would have to be kept in step by hand forever.
+    """
+    redactor = Redactor([TOKEN])
+    for line in (
+        f"GITHUB_TOKEN={TOKEN}",
+        "https://x-access-token:ghp_0123456789abcdefghij@github.com/o/n.git",
+        "github_pat_11ABCDEFG0abcdefghijklmnop",
+    ):
+        assert redactor(line) != line
+        assert find_secrets(line, literals=[TOKEN])
+
+
+# --------------------------------------------------------------------------
+# The deployed copy
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def compose_text() -> str:
+    return COMPOSE.read_text(encoding="utf-8")
+
+
+def test_compose_carries_the_generated_allowlist(compose_text: str) -> None:
+    """A widened allowlist cannot land in the YAML alone."""
+    for line in EgressPolicy().filter_lines():
+        assert f"      {line}\n" in compose_text, line
+
+
+def test_compose_points_the_orchestrator_at_the_socket_proxy(compose_text: str) -> None:
+    assert f"DOCKER_HOST: {DOCKER_HOST_URL}" in compose_text
+
+
+def test_compose_grants_the_socket_proxy_exactly_the_stated_surface(compose_text: str) -> None:
+    for name, value in SOCKET_PROXY_ENV.items():
+        assert f"      {name}: {value}\n" in compose_text, name
+
+
+def test_only_the_socket_proxy_sees_the_socket(compose_text: str) -> None:
+    """One mount, read-only, and nowhere near the container that runs model output.
+
+    Comment lines are skipped, and the socket is discussed at length in them:
+    the file explains why `:ro` is worth having and why it is not what makes
+    this safe.
+    """
+    mounts = [
+        line
+        for line in compose_text.splitlines()
+        if "/var/run/docker.sock" in line and not line.lstrip().startswith("#")
+    ]
+    assert mounts == ["      - /var/run/docker.sock:/var/run/docker.sock:ro"]
+
+
+def test_the_worker_network_has_no_route_off_the_host(compose_text: str) -> None:
+    """`internal: true` is what makes ignoring the proxy a failure, not a bypass."""
+    assert f"  {WORKER_NETWORK}:\n    name: {WORKER_NETWORK}\n    internal: true\n" in compose_text
+    assert "  apiary-control:\n    name: apiary-control\n    internal: true\n" in compose_text
+
+
+def test_no_service_is_declared_privileged(compose_text: str) -> None:
+    assert "privileged:" not in compose_text
