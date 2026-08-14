@@ -1015,3 +1015,37 @@ def test_swarm_show_of_a_malformed_id_is_refused_before_it_becomes_a_path(tmp_pa
 def _utc_at(clock: str) -> dt.datetime:
     hour, minute, second = (int(part) for part in clock.split(":"))
     return dt.datetime(2026, 8, 14, hour, minute, second, tzinfo=dt.timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# The two clocks, at the point of no return
+# --------------------------------------------------------------------------
+
+
+def test_an_inverted_timeout_pair_stops_the_run_before_it_starts(monkeypatch, capsys):
+    """`swarm doctor` explains this one; `swarm run` refuses it.
+
+    Checked before `_target`, which is what creates a repository for `--new`:
+    provisioning a repo and then dying in the first container is a worse way to
+    learn that two environment variables contradict each other.
+    """
+    monkeypatch.setattr(
+        cli, "SETTINGS", SETTINGS.__class__(worker_timeout_s=600, verify_timeout_s=900)
+    )
+
+    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "SWARM_WORKER_TIMEOUT" in err and "SWARM_VERIFY_TIMEOUT" in err
+    assert "Traceback" not in err
+
+
+def test_swarm_doctor_still_runs_with_an_inverted_pair(monkeypatch):
+    """The command that diagnoses the problem must not be stopped by it."""
+    monkeypatch.setattr(
+        cli, "SETTINGS", SETTINGS.__class__(worker_timeout_s=600, verify_timeout_s=900)
+    )
+    monkeypatch.setattr(cli, "doctor_main", lambda argv: 1)
+
+    assert main(["doctor", REPO]) == 1

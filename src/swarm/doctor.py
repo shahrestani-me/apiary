@@ -130,6 +130,7 @@ CHECK_BOOT_TOKEN = "github.boot-token"
 CHECK_REPO = "github.repo"
 CHECK_LABELS = "github.labels"
 CHECK_CI = "github.ci"
+CHECK_TIMEOUTS = "config.timeouts"
 CHECK_DOCKER_CLI = "docker.cli"
 CHECK_DOCKER_DAEMON = "docker.daemon"
 CHECK_WORKER_IMAGE = "docker.image"
@@ -491,7 +492,12 @@ class Doctor:
 
         cli = self.check_docker_cli()
         daemon = self._after(cli, CHECK_DOCKER_DAEMON, self.check_docker_daemon)
-        checks += [cli, daemon, self._after(daemon, CHECK_WORKER_IMAGE, self.check_worker_image)]
+        checks += [
+            self.check_timeouts(),
+            cli,
+            daemon,
+            self._after(daemon, CHECK_WORKER_IMAGE, self.check_worker_image),
+        ]
 
         return Diagnosis(tuple(checks))
 
@@ -838,6 +844,41 @@ class Doctor:
                 f"of the repo itself"
             )
         return self._token_fix()
+
+    # --- config ---------------------------------------------------------
+
+    def check_timeouts(self) -> Check:
+        """Can the inner clock ever be reached before the outer one fires?
+
+        Costs no I/O and probes nothing - it is arithmetic over two environment
+        variables - and it earns its place here for the reason every check here
+        does: it fails as something else entirely. A container killed at the
+        outer cap is recorded as a consumed attempt whose reason names the
+        *container*, so an operator raising `SWARM_VERIFY_TIMEOUT` in response
+        buys literally nothing and sees the same failure again with the same
+        wording. The pair is only meaningful together, so it is checked
+        together.
+
+        `Settings.clock_conflict` owns the sentence, because the numbers and
+        the reason they relate belong beside the defaults rather than beside
+        the report that prints them.
+        """
+        conflict = self.settings.clock_conflict()
+        if not conflict:
+            return Check.passed(
+                CHECK_TIMEOUTS,
+                f"verify {self.settings.verify_timeout_s}s inside "
+                f"worker {self.settings.worker_timeout_s}s",
+            )
+        return Check.failed(
+            CHECK_TIMEOUTS,
+            conflict,
+            fix=(
+                f"export SWARM_WORKER_TIMEOUT={max(self.settings.verify_timeout_s * 4, 1200)}  "
+                f"# must exceed SWARM_VERIFY_TIMEOUT={self.settings.verify_timeout_s} "
+                "with room for the clone, the inference call and the push"
+            ),
+        )
 
     # --- docker ---------------------------------------------------------
 
