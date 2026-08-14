@@ -859,12 +859,15 @@ def test_live_docker_checks_run_against_the_real_daemon():
 
     daemon = subject.check_docker_daemon()
     assert daemon.ok, daemon.fix
-    # The image may or may not be built on this machine; what must hold is that
-    # the check reaches a verdict and that a missing image names its build.
-    image = subject.check_worker_image()
-    assert image.status in (OK, FAIL, SKIP)
-    if image.status == FAIL:
-        assert "docker build" in image.fix
+    # One per stack since #99 chooses the image per task. Whether any given
+    # image is built on this machine is a fact about the machine; what must
+    # hold is that each check reaches a verdict and that a failure names the
+    # build command, because the orchestrator cannot build or pull one itself.
+    for stack in subject.stacks:
+        image = subject.check_stack_image(stack)
+        assert image.status in (OK, FAIL, SKIP), stack
+        if image.status == FAIL:
+            assert "docker build" in image.fix, stack
 
 
 # --------------------------------------------------------------------------
