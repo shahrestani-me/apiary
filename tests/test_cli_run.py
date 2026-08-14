@@ -810,7 +810,9 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
     monkeypatch.setattr("swarm.containers.manager.ContainerManager", spy_fleet)
     monkeypatch.setattr("swarm.containers.reaper.Reaper", lambda **k: SimpleNamespace())
     monkeypatch.setattr(cli.RunArtifacts, "open", classmethod(
-        lambda cls, run: SimpleNamespace(
+        # `**_` absorbs `stack=` and `verify=`: #97 records both in
+        # `run.json`, and this double is about the client, not the artifacts.
+        lambda cls, run, **_: SimpleNamespace(
             worker_env=lambda: {},
             mount_flags=lambda: [],
             log_sink=lambda handle: None,

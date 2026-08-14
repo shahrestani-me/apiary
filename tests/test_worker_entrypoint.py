@@ -30,6 +30,7 @@ from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 from swarm.github.ledger import ContractError
 from swarm.state import FileEdit, WorkerOutput
 from swarm.worker import edit as edit_module
+from swarm.worker import entrypoint
 from swarm.worker.entrypoint import (
     EXIT_INFRASTRUCTURE,
     EXIT_OK,
@@ -39,6 +40,7 @@ from swarm.worker.entrypoint import (
     TASK_FAILED,
     UNRUNNABLE_EXIT_CODES,
     VERIFY_ENV_REQUIRED,
+    OUTPUT_TAIL_CHARS,
     InfrastructureError,
     WorkerResult,
     classify_verify,
@@ -950,3 +952,85 @@ def test_an_ordinary_failure_still_returns_rather_than_raising(tmp_path):
 
     assert not passed
     assert "1 failed" in output
+
+
+# --------------------------------------------------------------------------
+# What the record says about an attempt that died (#97)
+# --------------------------------------------------------------------------
+
+
+def test_a_truncated_verify_output_says_it_was_truncated(tmp_path):
+    """A complete 3KB log and the last 4KB of a 400KB npm log used to be
+    indistinguishable, which is the difference between "this is the failure"
+    and "the failure is somewhere above this"."""
+    # `seq` rather than a quoted Python string: the output has to be genuinely
+    # long, and shell-quoting 13KB of it into the command is its own bug.
+    _, output = run_verify(tmp_path, "sh -c 'seq 1 3000; exit 1'")
+
+    assert "earlier characters elided" in output
+    assert len(output) < 5_000
+
+
+def test_a_short_verify_output_is_not_marked(tmp_path):
+    _, output = run_verify(tmp_path, "sh -c 'echo \"1 failed\"; exit 1'")
+
+    assert "elided" not in output
+    assert "1 failed" in output
+
+
+def test_the_marker_is_the_records_own(tmp_path):
+    """`result.tail`, not a local slice. Two artifacts disagreeing about what a
+    truncated log looks like is worse than neither marking one."""
+    from swarm.worker.result import tail
+
+    _, output = run_verify(
+        tmp_path, f'{sys.executable} -c "print(\'z\' * 9000); raise SystemExit(1)"'
+    )
+
+    assert output.startswith(tail("z" * 9_000, OUTPUT_TAIL_CHARS)[:20])
+
+
+def test_an_attempt_that_died_after_its_gate_reports_the_gate():
+    """`_unrun` blanked `verify_command` and `written` on exactly the path
+    where they matter most. "The clone failed" and "the gate passed and the
+    push failed" are both exit 2; only one of them has a command and a file
+    list, and reporting an empty command for it actively misleads."""
+    error = InfrastructureError("pushing issue #7: remote hung up")
+    error.learned(verify_command="npm test", written=("src/a.js",), task_id="add-thing")
+
+    result = entrypoint._unrun(
+        7,
+        "owner/name",
+        str(error),
+        verify_command=error.verify_command,
+        written=error.written,
+        task_id=error.task_id,
+    )
+
+    assert result.verify_command == "npm test"
+    assert result.written == ("src/a.js",)
+    assert result.task_id == "add-thing"
+
+
+def test_an_attempt_that_died_before_its_gate_still_reports_nothing():
+    """The other half. A clone that failed genuinely has neither, and inventing
+    a command for it would be the same lie in the other direction."""
+    result = entrypoint._unrun(7, "owner/name", "cloning failed")
+
+    assert result.verify_command == ""
+    assert result.written == ()
+
+
+def test_context_is_attached_by_the_frame_that_has_it():
+    """`run_verify` cannot know which files were written and `commit_edits`
+    cannot know the gate command, so `learned` fills in from the frame that has
+    both rather than threading context through every raise site."""
+    error = InfrastructureError("boom")
+    assert (error.verify_command, error.written) == ("", ())
+
+    error.learned(verify_command="pytest -q", written=("a.py",), task_id="t")
+    # Idempotent, and never overwrites what the raiser did know.
+    error.learned(verify_command="npm test", written=("b.js",), task_id="u")
+
+    assert error.verify_command == "pytest -q"
+    assert error.written == ("a.py",)

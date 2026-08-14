@@ -72,7 +72,7 @@ from .config import SETTINGS, ConfigError
 from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .github.client import GitHubClient, GitHubError
-from .github.ledger import LedgerError
+from .github.ledger import DEFAULT_STACK, LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.provision import provision
 from .greenfield.scaffold import ScaffoldedPlan
@@ -370,7 +370,13 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # A context manager, and used as one: leaving through an exception is
     # recorded rather than swallowed, and the run summary is written on the way
     # out however the loop ends.
-    artifacts = RunArtifacts.open(run)
+    # The stack and the gate go into `run.json` and `summary.json` here, at the
+    # one place that knows both: #87's success signal is a query over
+    # `.swarm/runs/*/summary.json` returning a non-Python run with merged PRs,
+    # and no artifact recorded either until now. `DEFAULT_STACK` until #99
+    # makes it vary - written down rather than left blank, because "python"
+    # and "nobody recorded it" are different answers to that query.
+    artifacts = RunArtifacts.open(run, stack=DEFAULT_STACK, verify=verify)
     # Merged, not replaced. `ContainerManager` inherits GITHUB_TOKEN and
     # OLLAMA_HOST from this process when `env` is None, and passing an `env`
     # *overrides* that - so handing it only the artifacts variables shipped
