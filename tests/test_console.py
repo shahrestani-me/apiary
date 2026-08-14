@@ -305,6 +305,69 @@ def test_the_page_names_the_wait():
 
 
 # --------------------------------------------------------------------------
+# The startup banner earns its half-second
+# --------------------------------------------------------------------------
+
+
+class FakeProbe:
+    base_url = "http://localhost:11434"
+
+    def __init__(self, version="0.32.9", models=None, boom=None):
+        self._version, self._models, self._boom = version, models, boom
+
+    def version(self):
+        if self._boom:
+            raise self._boom
+        return self._version
+
+    def installed(self):
+        return self._models if self._models is not None else []
+
+
+def test_an_unreachable_ollama_is_named_at_startup(monkeypatch):
+    """Without this the first sign of a dead server arrives after the operator
+    has filled in a form and waited two minutes."""
+    monkeypatch.setattr(
+        "swarm.doctor.HostInference",
+        lambda *a, **k: FakeProbe(boom=RuntimeError("connection refused")),
+    )
+    from swarm.console import _ollama_note
+
+    lines = _ollama_note()
+
+    assert "UNREACHABLE" in lines[0]
+    assert "ollama serve" in lines[1]
+
+
+def test_an_unpulled_model_is_named_at_startup(monkeypatch):
+    from swarm.config import SETTINGS
+    from swarm.console import _ollama_note
+
+    monkeypatch.setattr(
+        "swarm.doctor.HostInference",
+        lambda *a, **k: FakeProbe(models=[SETTINGS.orchestrator_model]),
+    )
+
+    lines = _ollama_note()
+
+    assert any("NOT pulled" in line for line in lines)
+    assert any(f"ollama pull {SETTINGS.worker_model}" in line for line in lines)
+
+
+def test_a_healthy_host_says_so_briefly(monkeypatch):
+    from swarm.config import SETTINGS
+    from swarm.console import _ollama_note
+
+    monkeypatch.setattr(
+        "swarm.doctor.HostInference",
+        lambda *a, **k: FakeProbe(
+            models=[SETTINGS.orchestrator_model, SETTINGS.worker_model]),
+    )
+
+    assert _ollama_note() == ["ollama http://localhost:11434 — v0.32.9"]
+
+
+# --------------------------------------------------------------------------
 # The subcommand
 # --------------------------------------------------------------------------
 

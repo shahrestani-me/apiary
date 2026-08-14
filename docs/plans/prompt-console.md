@@ -12,8 +12,10 @@ The spike ran the recorded fixture for `shahrestani-me/trip-planner#2` (goal
 human turn) through a **host-side** `propose_edits` against `gemma4:26b`, the same
 model and settings the worker uses.
 
-**4 of the first 10 attempts produced corrupt output**, covering every failure
-class in the recorded run:
+**4 of 10 attempts produced corrupt output**, covering every failure class in the
+recorded run. (The spike was configured for 20 attempts and stopped after 10 —
+the question was already answered, and the remaining attempts were competing for
+the same GPU as the verification work.)
 
 | Attempt | Failure |
 |---|---|

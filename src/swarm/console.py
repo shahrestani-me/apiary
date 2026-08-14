@@ -471,6 +471,37 @@ def _handler(console: Console) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def _ollama_note() -> list[str]:
+    """What the startup banner should say about Ollama, checked not assumed.
+
+    Two GETs against the server, reusing doctor's `HostInference` rather than
+    reimplementing its probe. Worth the half-second: without it the first sign
+    that Ollama is down or a model is unpulled arrives *after* the operator has
+    filled in a form and waited, and the whole point of this tool is to shorten
+    that loop. Never fatal - a console that refused to start because a probe
+    failed would be harder to use than one that says so and serves anyway.
+    """
+    from .doctor import HostInference
+
+    probe = HostInference()
+    try:
+        version = probe.version()
+    except Exception as exc:  # noqa: BLE001 - the reason is the message
+        return [
+            f"ollama {probe.base_url} — UNREACHABLE ({type(exc).__name__})",
+            "fix: start it with `ollama serve`, or launch the Ollama app",
+        ]
+
+    lines = [f"ollama {probe.base_url} — v{version}"]
+    try:
+        installed = set(probe.installed())
+    except Exception:  # noqa: BLE001 - reachable but not listable; not worth a scene
+        return lines
+    missing = [m for m in (SETTINGS.orchestrator_model, SETTINGS.worker_model) if m not in installed]
+    lines += [f"{model} is NOT pulled — fix: `ollama pull {model}`" for model in missing]
+    return lines
+
+
 def serve(
     *,
     host: str = DEFAULT_HOST,
@@ -493,7 +524,8 @@ def serve(
 
     print(f"» console on http://{host}:{console.port}")
     print(f"  · orchestrator {SETTINGS.orchestrator_model} · worker {SETTINGS.worker_model}")
-    print(f"  · ollama {SETTINGS.ollama_base_url}")
+    for line in _ollama_note():
+        print(f"  · {line}")
     print(f"  · captures in {console.sink.directory}")
     print("  · ctrl-c to stop")
     if forever:
