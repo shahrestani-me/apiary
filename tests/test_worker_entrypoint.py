@@ -101,10 +101,23 @@ def issue_body(
 
 
 def issue(number: int = ISSUE, **kwargs: Any):
-    """The one API response a worker run needs: `GET /issues/<n>`."""
+    """The first API response a worker run needs: `GET /issues/<n>`."""
     return response(
         200,
         {"number": number, "title": "Add a sub function", "body": issue_body(**kwargs)},
+    )
+
+
+def publishes(number: int = 42):
+    """The two further responses a *verified* run needs, now that #17 landed.
+
+    A run that passes its gate no longer stops at the commit: `_publish` opens
+    the PR and applies `swarm:review`. Scripting them is what keeps these tests
+    about the entrypoint rather than about how far the seam had got.
+    """
+    return (
+        response(201, {"number": number, "html_url": f"https://example.invalid/pull/{number}"}),
+        response(200, [{"name": "swarm:review"}]),
     )
 
 
@@ -159,7 +172,7 @@ def checkout(workspace: Path, scratch_repo: ScratchRepo) -> ScratchRepo:
 
 @pytest.mark.usefixtures("worker_env")
 def test_verified_task_produces_a_commit(fake_github, scratch_repo, workspace):
-    gh, transport, _ = fake_github(issue())
+    gh, transport, _ = fake_github(issue(), *publishes())
     base = scratch_repo.head()
     editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
 
@@ -170,9 +183,14 @@ def test_verified_task_produces_a_commit(fake_github, scratch_repo, workspace):
     assert work.head() != base
     assert work.subjects()[0].startswith("swarm[add-sub]:")
     assert work.read("calc.py") == GOOD_CALC
-    # One API call, and it is the issue read: the worker writes no labels and
-    # opens nothing until #17 lands.
-    assert transport.calls == [("GET", f"/repos/{gh.repo}/issues/{ISSUE}")]
+    # Read the contract, open the PR, apply the review label - in that order,
+    # and nothing else. The label goes on last because a `swarm:review` issue
+    # with no PR behind it is a state the reconciler cannot act on.
+    assert transport.calls == [
+        ("GET", f"/repos/{gh.repo}/issues/{ISSUE}"),
+        ("POST", f"/repos/{gh.repo}/pulls"),
+        ("POST", f"/repos/{gh.repo}/issues/{ISSUE}/labels"),
+    ]
 
 
 @pytest.mark.usefixtures("worker_env")
@@ -183,7 +201,7 @@ def test_commit_stages_only_the_declared_files(fake_github, scratch_repo, worksp
     the command dropped into the tree straight into the PR.
     """
     litter = f'{VERIFY_COMMAND} && {sys.executable} -c "open(\'stray.txt\', \'w\')"'
-    gh, _, _ = fake_github(issue(verify=litter))
+    gh, _, _ = fake_github(issue(verify=litter), *publishes())
     editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
 
     assert main(argv(scratch_repo, workspace), client=gh, editor=editor) == EXIT_OK
