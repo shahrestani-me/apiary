@@ -35,7 +35,7 @@ from typing import Any, Iterable
 import pytest
 
 from swarm.containers.limits import HostBudget, LimitError
-from swarm.containers.manager import DockerError, Handle
+from swarm.containers.manager import ContainerError, DockerError, Handle
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry
 from swarm.orchestrator import dispatcher
@@ -109,7 +109,16 @@ class FakeSwarm:
     log: list[str] = field(default_factory=list)
     label_error: Exception | None = None
     spawn_error: Exception | None = None
+    #: Per-issue spawn failures, which is what #94 is about: one image is
+    #: missing and seventeen other issues are fine. `spawn_error` stays for the
+    #: fleet-wide case and the two compose, this one winning.
+    spawn_errors: dict[int, Exception] = field(default_factory=dict)
     handles: dict[int, Handle] = field(default_factory=dict)
+    #: What `find` reports, per issue. Empty means "the daemon says nothing is
+    #: running under that issue", which is the only reading that releases a
+    #: claim.
+    running: dict[int, list[Handle]] = field(default_factory=dict)
+    find_error: Exception | None = None
 
     # --- Labeller -------------------------------------------------------
 
@@ -127,11 +136,18 @@ class FakeSwarm:
 
     def spawn(self, issue: int, base_commit: str) -> Handle:
         self.log.append(f"spawn #{issue}")
-        if self.spawn_error is not None:
-            raise self.spawn_error
+        error = self.spawn_errors.get(issue, self.spawn_error)
+        if error is not None:
+            raise error
         handle = Handle(id=f"{issue:0>64x}", run_id="apiary-test", issue=issue)
         self.handles[issue] = handle
         return handle
+
+    def find(self, *, issue: int | None = None) -> list[Handle]:
+        self.log.append(f"find #{issue}")
+        if self.find_error is not None:
+            raise self.find_error
+        return list(self.running.get(issue, []))
 
     # --- what the assertions read ---------------------------------------
 
@@ -142,6 +158,11 @@ class FakeSwarm:
     @property
     def claimed(self) -> list[int]:
         return [int(line.split("#")[1]) for line in self.log if line.startswith(f"+{CLAIMED}")]
+
+    @property
+    def released(self) -> list[int]:
+        """Issues put back to `swarm:ready` after being claimed."""
+        return [int(line.split("#")[1]) for line in self.log if line.startswith(f"-{CLAIMED}")]
 
 
 def rate_limited() -> GitHubHTTPError:
@@ -423,7 +444,7 @@ def test_a_dispatched_issue_reports_the_container_holding_it():
     assert report.failed == ()
 
 
-def test_a_failed_spawn_keeps_its_claim():
+def test_a_spawn_that_failed_on_a_dead_daemon_keeps_its_claim():
     swarm = FakeSwarm(spawn_error=daemon_down())
 
     report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
@@ -431,22 +452,166 @@ def test_a_failed_spawn_keeps_its_claim():
     # Releasing it looks tidier and is wrong: a `docker start` whose reply this
     # process never read may still have started a container, and putting the
     # issue back to ready would give it a second one next cycle. #35 resolves
-    # that by looking for a live container first.
+    # that by looking for a live container first - and with the daemon down,
+    # `find` could not answer that question either, so nothing is asked.
     assert report.failed[0].claimed is True
     assert f"-{READY} #7" in swarm.log
     assert swarm.claimed == [7]
+    assert "find #7" not in swarm.log
 
 
-def test_a_failed_spawn_stops_the_cycle_rather_than_burning_every_claim():
+def test_a_daemon_that_is_not_there_stops_the_cycle_rather_than_burning_every_claim():
     swarm = FakeSwarm(spawn_error=daemon_down())
 
     report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
 
     # If the daemon is down the second spawn fails exactly like the first, and
     # each attempt costs one more stuck claim. #5 is untouched and still ready.
+    # This is the case the `break` was always right about, and it is the only
+    # one left that still halts a cycle.
     assert swarm.claimed == [4]
     assert swarm.spawned == [4]
     assert [failure.number for failure in report.failed] == [4]
+    assert report.failed[0].fatal is True
+
+
+# --------------------------------------------------------------------------
+# One failed spawn must not halt the whole cycle (#94)
+# --------------------------------------------------------------------------
+#
+# The `break` above was defensible while one image existed: a spawn failure
+# meant the daemon was down, so the second spawn would fail exactly like the
+# first. #99 chooses the image per task, and from then on a single missing
+# image is a fact about one issue - one that would otherwise halt every cycle
+# and burn attempts right across the ledger, on issues with nothing wrong with
+# them.
+
+
+def missing_image() -> DockerError:
+    """The failure #99 makes reachable: this task's stack has no image here."""
+    return DockerError(
+        ["docker", "create"], 125, "Unable to find image 'apiary-worker-node:latest' locally"
+    )
+
+
+def test_one_failed_spawn_does_not_stop_the_other_issues_in_the_cycle():
+    """The ticket's first criterion, and the reason it exists."""
+    swarm = FakeSwarm(spawn_errors={4: missing_image()})
+
+    report = dispatch(
+        swarm, swarm, ledger(entry(4), entry(5), entry(6)), BASE_COMMIT, capacity=capacity(3)
+    )
+
+    assert swarm.spawned == [4, 5, 6]
+    assert [item.number for item in report.dispatched] == [5, 6]
+    assert [failure.number for failure in report.failed] == [4]
+
+
+def test_a_deferred_issue_does_not_stay_claimed_with_no_container():
+    """The second criterion. Left claimed, it waits for #35 to sweep it and
+    costs an attempt on the way through; released, the next cycle just retries
+    it."""
+    swarm = FakeSwarm(spawn_errors={7: missing_image()})
+
+    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+
+    assert report.failed[0].claimed is False
+    assert swarm.released == [7]
+    # Asked before written, and `ready` added before `claimed` is removed - a
+    # crash between the two leaves the conservative reading, exactly as `claim`
+    # does in the other direction.
+    assert swarm.log == [
+        f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7",
+        "find #7", f"+{READY} #7", f"-{CLAIMED} #7",
+    ]
+
+
+def test_a_deferred_issue_keeps_its_claim_when_a_container_did_start():
+    """The ambiguous case the old comment was right about, now decided by
+    asking rather than by assuming. `docker start` failed this process's read;
+    the daemon says a container exists; releasing would buy a second worker."""
+    swarm = FakeSwarm(
+        spawn_errors={7: missing_image()},
+        running={7: [Handle(id="f" * 64, run_id="apiary-test", issue=7)]},
+    )
+
+    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+
+    assert report.failed[0].claimed is True
+    assert swarm.released == []
+
+
+def test_a_probe_that_cannot_answer_keeps_the_claim():
+    """False is the safe answer: a claim #35 sweeps beats two containers."""
+    swarm = FakeSwarm(spawn_errors={7: missing_image()}, find_error=daemon_down())
+
+    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+
+    assert report.failed[0].claimed is True
+    assert swarm.released == []
+
+
+def test_an_unrecognised_spawn_failure_defers_rather_than_halting():
+    """`DAEMON_DOWN_RE` is narrow and the default is to keep going.
+
+    Being wrong that way costs one label round-trip per issue and no attempts.
+    Being wrong the other way is the bug this ticket fixes.
+    """
+    swarm = FakeSwarm(
+        spawn_errors={4: DockerError(["docker", "create"], 125, "something nobody has seen")}
+    )
+
+    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+
+    assert swarm.spawned == [4, 5]
+    assert report.failed[0].fatal is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        "Is the docker daemon running?",
+        "error during connect: Get http://docker/v1.45/containers/create",
+    ],
+)
+def test_every_daemon_signature_stops_the_cycle(output):
+    swarm = FakeSwarm(spawn_error=DockerError(["docker", "create"], 125, output))
+
+    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+
+    assert swarm.spawned == [4]
+    assert report.failed[0].fatal is True
+
+
+def test_a_docker_binary_that_is_not_on_path_is_a_daemon_level_failure():
+    """`DockerCLI._run` raises a bare `ContainerError` for this one, not a
+    `DockerError` - and no binary means no daemon for any issue. It is also the
+    failure the orchestrator image actually shipped with."""
+    swarm = FakeSwarm(
+        spawn_error=ContainerError("'docker' is not on PATH; the orchestrator reaches the daemon")
+    )
+
+    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+
+    assert swarm.spawned == [4]
+    assert report.failed[0].fatal is True
+
+
+def test_the_two_kinds_of_failure_are_distinguishable_in_the_log():
+    """The last criterion. They read identically at a glance and want opposite
+    responses: restart Docker, versus look at that one issue."""
+    halted = FakeSwarm(spawn_error=daemon_down())
+    deferred = FakeSwarm(spawn_errors={7: missing_image()})
+
+    fatal = dispatch(halted, halted, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1)).failed[0]
+    local = dispatch(
+        deferred, deferred, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1)
+    ).failed[0]
+
+    assert "daemon-level, cycle stopped" in str(fatal)
+    assert "this issue only" in str(local)
+    assert str(fatal) != str(local)
 
 
 def test_a_claim_that_could_not_be_written_spawns_nothing():
