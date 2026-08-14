@@ -75,6 +75,7 @@ from .doctor import preflight
 from .github.client import GitHubClient, GitHubError
 from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
+from .greenfield.bootstrap import Bootstrap
 from .greenfield.provision import provision
 from .greenfield.scaffold import ScaffoldedPlan
 from .security import EgressPolicy, worker_create_flags
@@ -321,7 +322,7 @@ def _run(
     # refused a run over an unrelated `github.ci` verdict gets turned off.
     _refuse_unrunnable_stacks(args.stack)
 
-    repo, objective, verify = _target(args, parser, client=client)
+    repo, objective, verify, bootstrap = _target(args, parser, client=client)
 
     attachment = start_run(
         repo,
@@ -349,6 +350,10 @@ def _run(
             planned = plan_node(
                 {"objective": objective}, source=source, verify=verify,
                 stack=args.stack,
+                # Only for `--new`. A repository that already exists has its
+                # project; generating one over the top of it is the opposite
+                # of what the operator asked for.
+                bootstrap=bootstrap.task if bootstrap is not None else None,
             )
         except Exception as exc:  # noqa: BLE001 - local model failures are varied
             print(f"! planning failed: {exc}", file=sys.stderr)
@@ -610,8 +615,8 @@ def _target(
     parser: argparse.ArgumentParser,
     *,
     client: GitHubClient | None,
-) -> tuple[str, str, str]:
-    """Resolve the two modes down to one `(repo, objective, verify)` triple.
+) -> tuple[str, str, str, Bootstrap | None]:
+    """Resolve the two modes down to `(repo, objective, verify, bootstrap)`.
 
     The greenfield branch creates a repository, so every way of asking for it
     ambiguously is refused *before* that happens rather than after.
@@ -633,7 +638,8 @@ def _target(
     if not args.new:
         if not args.objective:
             parser.error("--repo needs an --objective")
-        return args.repo, args.objective, args.verify or SETTINGS.verify_command
+        # No bootstrap: the repository exists and has whatever project it has.
+        return args.repo, args.objective, args.verify or SETTINGS.verify_command, None
 
     if args.objective:
         # The prompt *is* the objective for a greenfield run, and two of them
@@ -654,11 +660,19 @@ def _target(
     # It also chooses the stack, which is what declines a prompt naming a
     # toolchain the worker image does not carry - at this point, before anything
     # irreversible has happened.
+    # Which stack the prompt implies, decided before anything is created - the
+    # generated CI workflow needs it (#96) and so does the image the first
+    # worker runs in (#99). `--stack` is the operator overriding the model,
+    # which is the right precedence: they know what the repository is for.
+    bootstrap = Bootstrap.for_prompt(args.new, stack=args.stack)
     plan = ScaffoldedPlan.for_prompt(
         args.new,
         owner=args.owner,
         name=args.name,
         private=not args.public,
+        # So the generated workflow sets up the right toolchain (#96). The
+        # scaffold's own stack choice is still Python-only; #104 deletes it.
+        stack=bootstrap.stack,
         # Only when asked: `for_prompt` defaults this to the stack's command,
         # and passing None would override it with nothing.
         **({"verify_command": args.verify} if args.verify else {}),
@@ -669,7 +683,7 @@ def _target(
     print()
     # The report's, not the plan's. What the issues must agree with is the
     # command in the commit that now exists.
-    return report.repo, args.new, report.verify_command
+    return report.repo, args.new, report.verify_command, bootstrap
 
 
 def _report_run(attachment: Attachment, *, dry_run: bool) -> None:

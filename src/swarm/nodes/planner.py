@@ -459,6 +459,31 @@ def _path(raw: str) -> str:
     return path
 
 
+def with_bootstrap(
+    tasks: Sequence[PlannedTask], bootstrap: PlannedTask
+) -> tuple[PlannedTask, ...]:
+    """Put the bootstrap first and block every other task on it.
+
+    Every task the model planned edits files that do not exist yet, so all of
+    them depend on the bootstrap whether or not the model said so. Blocking
+    them explicitly is what readiness (#11) reads: without it the dispatcher
+    would run three workers against an empty repository in the first cycle,
+    each generating its own idea of the project.
+
+    A task that *is* the bootstrap - a replan re-emitting it under its own id -
+    is left alone rather than made to depend on itself, which `order_drafts`
+    would refuse.
+    """
+    others = [task for task in tasks if task.id != bootstrap.id]
+    blocked = [
+        task.model_copy(
+            update={"depends_on": sorted({*task.depends_on, bootstrap.id})}
+        )
+        for task in others
+    ]
+    return (bootstrap, *blocked)
+
+
 def normalise(
     tasks: Iterable[PlannedTask], *, verify: str, stack: str | None = None
 ) -> tuple[tuple[Draft, ...], tuple[IssueAction, ...]]:
@@ -610,6 +635,7 @@ def write_plan(
     verify: str | None = None,
     retire_dropped: bool = True,
     stack: str | None = None,
+    bootstrap: PlannedTask | None = None,
 ) -> PlanReport:
     """Write a plan to the tracker: create what is new, update what is not.
 
@@ -632,8 +658,15 @@ def write_plan(
     client = _as_client(source)
     ledger = load_ledger(client) if ledger is None else ledger
 
+    tasks = list(plan.tasks)
+    if bootstrap is not None:
+        # First, and everything else blocked on it. The stack the bootstrap
+        # resolved is also the plan's stack, because a repository is one stack
+        # (#87's non-goals: "One repo, one stack").
+        tasks = list(with_bootstrap(tasks, bootstrap))
+        stack = stack or bootstrap.stack
     drafts, actions = normalise(
-        plan.tasks, verify=verify or SETTINGS.verify_command, stack=stack
+        tasks, verify=verify or SETTINGS.verify_command, stack=stack
     )
     ordered = order_drafts(drafts)  # before the first write, or not at all
 
@@ -865,6 +898,7 @@ def plan_node(
     source: GitHubClient | str | None = None,
     verify: str | None = None,
     stack: str | None = None,
+    bootstrap: PlannedTask | None = None,
 ) -> dict:
     """Plan (or replan) the objective, and write the result to the ledger.
 
@@ -913,7 +947,7 @@ def plan_node(
         }
 
     client = _as_client(target)
-    report = write_plan(client, plan, verify=verify, stack=stack)
+    report = write_plan(client, plan, verify=verify, stack=stack, bootstrap=bootstrap)
     # Re-read rather than project: `docs/architecture-v2.md`'s "on any
     # disagreement, GitHub wins" is only a rule that means anything if nothing
     # keeps a second copy. `adopt=False` because the write above just adopted

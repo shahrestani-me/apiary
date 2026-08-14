@@ -78,6 +78,21 @@ def workflow_command(workflow: str) -> str:
     return str(steps[-1]["run"]).strip()
 
 @pytest.fixture(autouse=True)
+def no_stack_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub #101's stack classification for every test in this file.
+
+    `Bootstrap.for_prompt` asks the orchestrator model which stack a prompt
+    implies, and leaving that live turned this suite into a 118-second run
+    against the host's Ollama - the definition of a test that does not run.
+    `choose_stack`'s own behaviour is asserted in `test_bootstrap.py` with an
+    injected oracle.
+    """
+    monkeypatch.setattr(
+        "swarm.greenfield.bootstrap.choose_stack", lambda prompt, llm=None: "python"
+    )
+
+
+@pytest.fixture(autouse=True)
 def no_image_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub `swarm run`'s image preflight for every test in this file.
 
@@ -556,6 +571,8 @@ class Planning:
     #: What `--stack` sent, so the flag is asserted where it is handed over
     #: rather than only where it is parsed.
     stack: str | None = None
+    #: The bootstrap task #101 prepends, or None for a `--repo` run.
+    bootstrap: Any = None
 
     def __call__(
         self,
@@ -563,9 +580,11 @@ class Planning:
         source: Any = None,
         verify: str | None = None,
         stack: str | None = None,
+        bootstrap: Any = None,
     ) -> dict:
         self.verify = verify
         self.stack = stack
+        self.bootstrap = bootstrap
         self.client.issues.append(issue(1, marker="seed", labels=("swarm:ready",)))
         return {"tasks": {"seed": {}}, "events": ["planned 1 task(s)"]}
 
