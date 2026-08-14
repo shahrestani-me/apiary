@@ -63,10 +63,11 @@ Then point it at a real repo:
 ```bash
 export SWARM_REPO=~/sources/your-repo
 export SWARM_VERIFY="python -m pytest -q"   # must match YOUR repo's test command
-swarm "add exponential backoff retry to the HTTP client"
+swarm run --repo owner/name --objective "add exponential backoff to the HTTP client"
 ```
 
 Full install, model choice and memory budgeting: **[SETUP.md](SETUP.md)**.
+Credentials and what currently runs end to end: **[Running v2 locally](#running-v2-locally)**.
 
 ## Requirements
 
@@ -93,6 +94,127 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `SWARM_MAX_STALLS` | `2` | No-progress rounds before **replanning** instead of retrying. |
 | `SWARM_MAX_ATTEMPTS` | `3` | Per-task retries before abandoning. |
 | `SWARM_WORKER_CTX` | `16384` | Never set this to a model's advertised 256K — the KV cache would cost more than the weights. |
+
+## Running v2 locally
+
+v2 puts the ledger on GitHub, so it needs a token. This section is the whole
+credential story, and an honest account of which parts of the loop are wired.
+
+### The token: fine-grained, one repository
+
+Mint a **fine-grained** PAT at
+<https://github.com/settings/personal-access-tokens/new>. Classic (`ghp_`) and
+OAuth (`gho_`) tokens are refused by prefix, including the one `gh auth token`
+prints — their scope is a *verb* like `repo`, so they reach every repository the
+account can reach. A fine-grained token is scoped to repositories, which is the
+whole point.
+
+- **Resource owner:** your account
+- **Repository access:** *Only select repositories* → the one target repo
+- **Permissions:** Contents `write`, Pull requests `write`, Issues `write`,
+  Metadata `read`. Nothing else.
+
+Leave **Workflows, Actions, Administration, Secrets, Environments, Packages and
+Members off.** `security.py` names them rather than merely omitting them, and
+`workflows` is the sharp one: with it, generated code can rewrite
+`.github/workflows/*`, and CI is the neutral ground that independently re-runs
+the verify command. A worker that can edit CI can edit its own grader.
+
+> **Greenfield mode needs more than this and is therefore not yet usable.**
+> `swarm run --new` pushes a CI workflow in the initial commit, which requires
+> the `workflows` permission this policy forbids, and repo creation needs
+> account-level administration. Use an existing repo until that contradiction
+> is resolved.
+
+### Where to put it
+
+**Outside the repo.** Nothing in the Python loads `.env` — there is no
+`python-dotenv` dependency and no `load_dotenv` call — so a `.env` file is
+silently ignored by `swarm` and `swarm doctor`, and you get "token is not set"
+while looking at a file containing the token. `.env` is read by **`docker
+compose` only**.
+
+```bash
+mkdir -p ~/.config/apiary && chmod 700 ~/.config/apiary
+cat > ~/.config/apiary/env <<'EOF'
+GITHUB_TOKEN=github_pat_...
+APIARY_MERGE_ADMIN_OVERRIDE=0
+SWARM_MAX_PARALLEL=1
+EOF
+chmod 600 ~/.config/apiary/env
+
+set -a; source ~/.config/apiary/env; set +a
+```
+
+That serves both paths: the CLI reads the exported variables, and compose
+inherits them from the shell without needing a `.env` at all.
+
+The two extra settings are deliberate for a first run. `APIARY_MERGE_ADMIN_OVERRIDE=0`
+means **nothing merges itself** — you review every PR the swarm opens.
+`SWARM_MAX_PARALLEL=1` matches what the dispatcher computes on a 36 GB machine
+anyway (see below).
+
+### Check the machine before involving any model
+
+```bash
+python -m swarm.doctor owner/name
+```
+
+Eleven checks, each naming the command that fixes it: Ollama's client target
+and reachability, both models present, **schema-forced JSON actually honoured**,
+token shape and scope, repo readable, `swarm:*` labels present, CI configured,
+Docker CLI and daemon, worker image built. Every one of these fails in a way
+that looks like something else — an absent model looks like a planning bug, a
+token missing a scope looks like a permissions bug three modules away.
+
+`doctor` writes nothing, ever. Missing labels are reported, not created; the fix
+it prints is `python -m swarm.github.labels owner/name`.
+
+### Run the orchestrator on the host, not in the container
+
+The image builds and `docker compose run --rm orchestrator --help` works, but
+the orchestrator image ships `git` and **no `docker` binary**, so `DOCKER_HOST`
+is honoured by nothing and it cannot spawn workers from inside. Running `swarm`
+from the venv uses the host's own Docker and Ollama and sidesteps this
+entirely. The container is for reproducibility, not a requirement.
+
+### What actually runs today
+
+Run identity, ledger attach and readiness work:
+
+```bash
+swarm run --repo owner/name --objective "..." --dry-run
+```
+
+`--dry-run` reads the ledger and writes nothing to GitHub. Without it, unmarked
+issues carrying a `swarm:*` state label are **adopted** — their bodies rewritten
+to add an identity marker — so try a scratch repo before a real one.
+
+These are complete, tested, and **not yet reachable**, because the call sites
+that would wire them belong to files no remaining issue owns:
+
+| Component | Waiting on a call in |
+|---|---|
+| planner writing issues, dispatcher spawning | `cli.py` |
+| worker result files reaching the host | a volume mount in `containers/manager.py` |
+| PR checks, mergeability, judge/replan, mid-cycle claim recovery | `orchestrator/reconcile.py` |
+| retry feedback reaching the next attempt | `worker/entrypoint.py` |
+
+`swarm run` says so on stderr rather than exiting silently. Until that wiring
+lands, v2 plans and dispatches nothing — v1's in-process path is still the one
+that completes a loop.
+
+### Concurrency is bounded by inference, not memory
+
+The dispatcher derives its cap from `OLLAMA_NUM_PARALLEL` **minus one slot for
+the orchestrator's own planner and judge calls** — with
+`OLLAMA_MAX_LOADED_MODELS=1` those are model swaps, not queued requests. On a
+36 GB M4 Max that arithmetic yields **one worker**. The memory bound is looser
+than it looks for a second reason: Docker Desktop's Linux VM gets ~7.6 GB, not
+the host's 36 GB, so container limits divide that, not the machine.
+
+Containers buy isolation, reproducibility and disposability. They do not buy
+parallelism.
 
 ### Choosing the two models
 
