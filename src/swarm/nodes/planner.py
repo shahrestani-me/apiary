@@ -460,7 +460,7 @@ def _path(raw: str) -> str:
 
 
 def normalise(
-    tasks: Iterable[PlannedTask], *, verify: str
+    tasks: Iterable[PlannedTask], *, verify: str, stack: str | None = None
 ) -> tuple[tuple[Draft, ...], tuple[IssueAction, ...]]:
     """Turn planned tasks into drafts, rejecting the ones that cannot be written.
 
@@ -511,7 +511,12 @@ def normalise(
                 # dropped to `None` so the task defaults rather than failing
                 # the whole plan at `parse_contract` time. The section is only
                 # written when the answer is one the parser will accept back.
-                stack=_stack_of(task.stack),
+                # An explicit `--stack` overrides the model's answer for every
+                # task. It is the operator saying what this repository *is*,
+                # which is knowledge the planner does not have and cannot
+                # infer from an objective; the model's own answer is the
+                # fallback, not the authority.
+                stack=_stack_of(stack) or _stack_of(task.stack),
             )
         )
 
@@ -604,6 +609,7 @@ def write_plan(
     ledger: Ledger | None = None,
     verify: str | None = None,
     retire_dropped: bool = True,
+    stack: str | None = None,
 ) -> PlanReport:
     """Write a plan to the tracker: create what is new, update what is not.
 
@@ -626,7 +632,9 @@ def write_plan(
     client = _as_client(source)
     ledger = load_ledger(client) if ledger is None else ledger
 
-    drafts, actions = normalise(plan.tasks, verify=verify or SETTINGS.verify_command)
+    drafts, actions = normalise(
+        plan.tasks, verify=verify or SETTINGS.verify_command, stack=stack
+    )
     ordered = order_drafts(drafts)  # before the first write, or not at all
 
     actions = list(actions)
@@ -856,6 +864,7 @@ def plan_node(
     *,
     source: GitHubClient | str | None = None,
     verify: str | None = None,
+    stack: str | None = None,
 ) -> dict:
     """Plan (or replan) the objective, and write the result to the ledger.
 
@@ -904,7 +913,7 @@ def plan_node(
         }
 
     client = _as_client(target)
-    report = write_plan(client, plan, verify=verify)
+    report = write_plan(client, plan, verify=verify, stack=stack)
     # Re-read rather than project: `docs/architecture-v2.md`'s "on any
     # disagreement, GitHub wins" is only a rule that means anything if nothing
     # keeps a second copy. `adopt=False` because the write above just adopted

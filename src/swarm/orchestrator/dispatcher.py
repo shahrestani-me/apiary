@@ -69,7 +69,13 @@ from typing import Any, Iterable, Protocol
 
 from ..config import SETTINGS
 from ..containers.limits import Budget, HostBudget, LimitError
-from ..containers.manager import ContainerError, Handle
+from ..containers.manager import (
+    ContainerError,
+    Handle,
+    StackImages,
+    build_hint,
+    missing_image,
+)
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
@@ -271,7 +277,7 @@ class Spawner(Protocol):
     ordering rule above is a test that does not run.
     """
 
-    def spawn(self, issue: int, base_commit: str) -> Handle: ...
+    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle: ...
 
     #: The safe-release probe. A spawn that raised may still have left a
     #: container running - `docker start` can fail this process's read after
@@ -566,6 +572,7 @@ def dispatch(
     capacity: Capacity | None = None,
     ready: Iterable[int] | None = None,
     dry_run: bool = False,
+    images: StackImages | None = None,
 ) -> DispatchReport:
     """Claim and spawn this cycle's issues, one at a time, in that order.
 
@@ -607,9 +614,20 @@ def dispatch(
     if dry_run:
         return DispatchReport(plan=plan)
 
+    images = images if images is not None else StackImages()
     dispatched: list[Dispatched] = []
     failed: list[DispatchFailure] = []
     for entry in plan.dispatch:
+        # Resolved *before* the claim, on purpose. A task whose stack this host
+        # has no image for cannot be run whatever happens next, and a claim
+        # spent on it is a claim #35 has to sweep - so the refusal costs
+        # nothing and names something to do about it, where a `docker create`
+        # failure names a tag.
+        try:
+            image = images.for_stack(entry.stack)
+        except ContainerError as exc:
+            failed.append(DispatchFailure(entry.number, f"no image: {exc}"))
+            continue
         try:
             claim(client, entry)
         except GitHubError as exc:
@@ -620,9 +638,14 @@ def dispatch(
             failed.append(DispatchFailure(entry.number, f"claim failed: {exc}", fatal=True))
             break
         try:
-            handle = manager.spawn(entry.number, base_commit)
+            handle = manager.spawn(entry.number, base_commit, image=image)
         except ContainerError as exc:
             fatal = daemon_is_down(exc)
+            if missing_image(exc):
+                # The one failure whose fix is a command rather than an
+                # investigation. The orchestrator cannot build or pull, so a
+                # human has to, and the message should say which line to run.
+                exc = ContainerError(f"{exc}; {build_hint(image)}")
             # Only worth asking when the cycle is going to continue: if the
             # daemon is unreachable then `find` cannot answer either, and the
             # claim stays for #35 exactly as it did before.

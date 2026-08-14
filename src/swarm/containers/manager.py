@@ -58,6 +58,43 @@ from ..run import RUN_ID_ENV, RUN_LABEL, SUFFIX_ALPHABET, Run, validate_run_id
 #: is how anyone tests a worker change before it is published anywhere.
 WORKER_IMAGE = "apiary-worker"
 
+#: Which image carries which stack's toolchain.
+#:
+#: `Dockerfile.worker` deliberately baked in no toolchain, and the stated
+#: purpose of that was stack-agnosticism - "baking a stack in would quietly
+#: narrow the swarm to repos that happen to use that stack". Baking *none*
+#: narrowed it to Python instead, because the one thing every image did have
+#: was the Python the package itself needs. Agnosticism is bought here instead:
+#: several images, one per stack, selected per task.
+#:
+#: Node and React share an image on purpose. React web needs Node and nothing
+#: else at the toolchain level, and two tags for one Dockerfile would be two
+#: things to keep built rather than one.
+DEFAULT_STACK_IMAGES: Mapping[str, str] = {
+    "python": WORKER_IMAGE,
+    "node": "apiary-worker-node",
+    "react": "apiary-worker-node",
+}
+
+#: Override, as `stack=image` pairs: `APIARY_WORKER_IMAGES=node=my-node:dev`.
+#: Merged over the defaults rather than replacing them, so overriding one stack
+#: does not silently un-configure the others - the same call this codebase makes
+#: everywhere a mapping is env-overridable.
+STACK_IMAGES_ENV = "APIARY_WORKER_IMAGES"
+
+#: How a worker learns which image it is running in, so its own result record
+#: can say. Spelled here rather than imported from `worker/entrypoint.py`: that
+#: module imports nothing from this package by design - it is what runs *inside*
+#: the container - and `test_the_image_variable_matches_the_workers_own` pins
+#: the two spellings together.
+IMAGE_ENV = "APIARY_WORKER_IMAGE"
+
+#: The label a stack image carries so it can be recognised without being run.
+#: `docker image inspect` is denied to a containerised orchestrator
+#: (`SOCKET_PROXY_ENV` sets `IMAGES=0`), so this is for a human and for #100's
+#: doctor check running on the host, not for the dispatch path.
+STACK_LABEL = "org.apiary.stack"
+
 #: The per-container half of the label pair. `docs/issue-contract.md` §2: the
 #: issue *number* addresses a task, the marker id identifies it, and a label
 #: read back off a container is an address.
@@ -140,6 +177,107 @@ class ContainerTimeout(ContainerError):
     task ran and failed" from "the task never finished", and only the second
     one means the container is still there holding a clone.
     """
+
+
+@dataclass(frozen=True)
+class StackImages:
+    """Which image to spawn for a task's declared stack.
+
+    House convention, matching `MergePolicy` and `InfrastructurePolicy`: a
+    documented default, an `APIARY_*` override, a `from_env()` read once at the
+    call site, and a `summary()` worth logging at startup.
+
+    **The supply side is the hard half, and it is not solved here.** The
+    orchestrator can neither pull (`IMAGES=0`) nor build (`BUILD=0`) - that is
+    the socket-proxy narrowing working as designed - so every stack image is a
+    manual `docker build` on the host. Nothing in the repository documented that
+    command before this ticket; it appeared only in a `doctor` fix hint. So the
+    refusal below names the build line, and `SETUP.md` gains a step.
+    """
+
+    images: Mapping[str, str] = field(default_factory=lambda: dict(DEFAULT_STACK_IMAGES))
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> StackImages:
+        """`APIARY_WORKER_IMAGES=node=my-node:dev,python=my-py:dev`.
+
+        Merged over the defaults rather than replacing them: overriding one
+        stack must not silently un-configure the others, which is the failure
+        mode of a whole-mapping override that somebody edits in a hurry.
+        """
+        source = os.environ if env is None else env
+        raw = (source.get(STACK_IMAGES_ENV) or "").strip()
+        images = dict(DEFAULT_STACK_IMAGES)
+        for pair in raw.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            stack, sep, image = pair.partition("=")
+            if not sep or not stack.strip() or not image.strip():
+                # Loud on garbage, like `_env_int` and `_env_flag`. A mistyped
+                # pair that silently fell back would run the whole ledger on
+                # the Python image while somebody believed otherwise.
+                raise ContainerError(
+                    f"{STACK_IMAGES_ENV}={raw!r}: expected comma-separated stack=image pairs, "
+                    f"got {pair!r}"
+                )
+            images[stack.strip().casefold()] = image.strip()
+        return cls(images=images)
+
+    def for_stack(self, stack: str) -> str:
+        """The image for one stack, or `ContainerError` naming what is missing.
+
+        Refused here, before anything is claimed, rather than as a `docker
+        create` failure mid-cycle: a claim spent on a task this host cannot run
+        is a claim #35 has to sweep, and the message a create failure produces
+        names a tag rather than a thing to do about it.
+        """
+        image = self.images.get((stack or "").casefold())
+        if image:
+            return image
+        known = ", ".join(sorted(self.images)) or "(none)"
+        raise ContainerError(
+            f"no worker image is configured for stack {stack!r}; this host knows {known}. "
+            f"Add one with {STACK_IMAGES_ENV}=<stack>=<image>, and build it - see SETUP.md"
+        )
+
+    def summary(self) -> str:
+        pairs = ", ".join(f"{stack}={image}" for stack, image in sorted(self.images.items()))
+        return f"worker images: {pairs} ({STACK_IMAGES_ENV} to override)"
+
+
+#: `docker create` on an image that was never built. Matching the message is
+#: the same trade `is_missing` makes, for the same reason: the CLI gives no
+#: other signal. Used only to *improve* an error, never to decide anything.
+_NO_IMAGE_RE = re.compile(r"unable to find image|no such image|manifest unknown", re.I)
+
+
+def missing_image(error: ContainerError) -> bool:
+    """Did this fail because the image is not on this host?
+
+    The one failure whose fix is a command rather than an investigation, which
+    is why it is worth telling apart: the orchestrator cannot build or pull, so
+    a human has to, and the message should say so.
+    """
+    return isinstance(error, DockerError) and bool(_NO_IMAGE_RE.search(error.output))
+
+
+def build_hint(image: str) -> str:
+    """The command a human runs to fix `missing_image`.
+
+    One place, so the fix hint in `doctor`, the dispatcher's refusal and
+    `SETUP.md` cannot drift. The orchestrator can neither build nor pull -
+    `SOCKET_PROXY_ENV` sets `BUILD=0` and `IMAGES=0` - so this really is the
+    whole remedy, and it is a human's to run.
+
+    `apiary-worker-node:tag` -> `Dockerfile.worker.node`. A tag this convention
+    does not cover falls back to naming the image, which is still more use than
+    "no such image".
+    """
+    tag = image.split(":")[0]
+    if not tag.startswith("apiary-"):
+        return f"build or pull {image}"
+    return f"docker build -f Dockerfile.{tag.removeprefix('apiary-').replace('-', '.')} -t {image} ."
 
 
 def is_missing(error: ContainerError) -> bool:
@@ -547,6 +685,7 @@ class ContainerManager:
         issue: int,
         base_commit: str,
         *,
+        image: str | None = None,
         entrypoint: str | None = None,
         command: Sequence[str] | None = None,
     ) -> Handle:
@@ -557,15 +696,25 @@ class ContainerManager:
         container, and this way there is a handle to dispose it with instead of
         an id that only exists inside a failed command's output.
 
+        `image` is per *task*, not per manager: #98 lets an issue declare its
+        stack and the toolchain that stack needs is not in one image. The
+        manager's own `image` stays the default, because a run whose tasks
+        never declare anything must keep working unchanged.
+
         `entrypoint` and `command` override what the image runs. The dispatcher
         never passes either - they exist so a caller can put a probe container
         under this run's labels, limits and redaction, which is what the
         integration tests do and what a `swarm doctor` check would want.
         """
+        image = image or self.image
         name = self._container_name(issue)
         args = [
             "create",
             "--name", name,
+            # The worker cannot ask the daemon which image it is running in -
+            # it has no socket and no `docker` binary, which is the containment
+            # working - so #97's result record can only name it if it is told.
+            "--env", f"{IMAGE_ENV}={image}",
             # PID 1 in the worker is the entrypoint, which spawns git and the
             # verify command; without an init it reaps none of them and a
             # finished task can sit on zombies until the pids limit bites.
@@ -582,7 +731,7 @@ class ContainerManager:
         ]
         if entrypoint is not None:
             args += ["--entrypoint", entrypoint]
-        args.append(self.image)
+        args.append(image)
         args += list(command) if command is not None else self._worker_args(issue, base_commit)
 
         created = self._cli(*args).strip().splitlines()
@@ -594,7 +743,7 @@ class ContainerManager:
             run_id=self.run.id,
             issue=int(issue),
             name=name,
-            image=self.image,
+            image=image,
         )
         try:
             self._cli("start", handle.id)

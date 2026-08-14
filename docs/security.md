@@ -175,12 +175,39 @@ that.
 
 `APIARY_EGRESS_ALLOW=pypi.org,files.pythonhosted.org`
 
-The honest default breaks something: `Dockerfile.worker` deliberately bakes in no
-toolchain, so a `## Verify` command that runs `pip install -e .` needs a package
-index. It is an environment variable rather than a constant because **a registry
-that accepts uploads is an exfiltration channel** — a token fits in a package
-name — so it is a decision an operator makes per target repository, out loud,
+The honest default breaks something: a `## Verify` command that runs
+`pip install -e .` needs a package index. It is an environment variable rather
+than a constant because **a registry that accepts uploads is an exfiltration
+channel** — a token fits in a package name — so it is a decision an operator
+makes per target repository, out loud,
 rather than a default nobody reads.
+
+### Why the worker images carry toolchains
+
+`Dockerfile.worker` used to argue for baking in no toolchain at all, on the
+grounds that "baking a stack in would quietly narrow the swarm to repos that
+happen to use that stack", with the `## Verify` command installing whatever the
+target repo required at run time.
+
+**That argument does not survive contact with this section.** A worker sits on
+an `internal: true` network whose only route out is the egress proxy, and the
+enforced allowlist is the static block above — so a run-time install is not
+slow, it is *denied*, in under a second. And the intent was stack-agnosticism
+while the effect was the opposite: baking in none narrowed the swarm to Python,
+because the one toolchain every image did carry was the Python the package
+itself needs.
+
+So agnosticism is bought by **several images, selected per task** (#99), each
+carrying one stack and nothing else. That is a security improvement rather than
+a regression, and for the reason this whole section exists: an image with a
+toolchain in it needs no registry at run time, so the honest default stops
+breaking anything and `APIARY_EGRESS_ALLOW` stops being the thing standing
+between a green gate and a widened allowlist.
+
+The images are built on the **host**, never by the orchestrator — the socket
+proxy sets `BUILD=0` and `IMAGES=0` (§4), so it can neither build nor pull one.
+`SETUP.md` step 4 is the command; `containers.manager.build_hint` is the same
+line, produced by the code that refuses.
 
 ### What this does not buy
 

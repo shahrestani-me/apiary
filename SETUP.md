@@ -228,7 +228,37 @@ plumbing. That distinction will save you days of debugging.
 
 ---
 
-## 4. Point it at a real repo
+## 4. Build the worker images
+
+**Do this before the first run.** The orchestrator spawns one container per
+issue, and it can neither build nor pull the image it needs: the Docker socket
+it reaches is behind a proxy with `BUILD=0` and `IMAGES=0`
+([`docs/security.md`](docs/security.md) §4), which is the narrowing working as
+designed rather than a gap. So the images are a human's to build, once.
+
+```bash
+docker build -f Dockerfile.worker      -t apiary-worker      .
+docker build -f Dockerfile.worker.node -t apiary-worker-node .
+```
+
+One image per stack, chosen per task from the issue's `## Stack` section:
+
+| Stack | Image | Carries |
+|---|---|---|
+| `python` | `apiary-worker` | git, Python 3.12 |
+| `node` | `apiary-worker-node` | git, Python 3.12, Node 22, npm |
+| `react` | `apiary-worker-node` | the same — React web needs Node and nothing else |
+
+Build only the ones you will use; a task whose stack has no image is refused
+before it is claimed, with the build line in the message. `APIARY_WORKER_IMAGES`
+overrides the mapping as `stack=image` pairs (`node=my-node:dev`), merged over
+the defaults so overriding one stack does not un-configure the others.
+
+`swarm doctor` reports which of these are actually present.
+
+---
+
+## 5. Point it at a real repo
 
 ```bash
 export SWARM_REPO=~/sources/your-repo
@@ -252,7 +282,7 @@ swarm --resume a3f9c1d2
 
 ---
 
-## 5. Tuning knobs
+## 6. Tuning knobs
 
 All via environment variables — see `src/swarm/config.py`.
 
@@ -280,7 +310,7 @@ and `swarm run` will not start on one.
 
 ---
 
-## 6. What to expect, honestly
+## 7. What to expect, honestly
 
 **Round one will disappoint you.** A local sub-30B model on a real repo will
 write code that doesn't compile maybe a third of the time. That is normal and

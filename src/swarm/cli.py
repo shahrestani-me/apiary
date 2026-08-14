@@ -72,7 +72,7 @@ from .config import SETTINGS, ConfigError
 from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .github.client import GitHubClient, GitHubError
-from .github.ledger import DEFAULT_STACK, LedgerError
+from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.provision import provision
 from .greenfield.scaffold import ScaffoldedPlan
@@ -132,6 +132,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan-only",
         action="store_true",
         help="plan and compute readiness, then stop before dispatching anything",
+    )
+    run.add_argument(
+        "--stack",
+        default=None,
+        choices=sorted(KNOWN_STACKS),
+        help=(
+            "the stack every planned task targets, written into each issue's "
+            "## Stack (default: whatever the planner chooses, falling back to python). "
+            "This is how a Node repository is reachable before #103 inverts the refusal"
+        ),
     )
     run.add_argument(
         "--base-commit",
@@ -305,7 +315,10 @@ def _run(
         # being wrong makes every issue in the plan unrunnable.
         print(f"» planning from the objective; every task verifies with: {verify}")
         try:
-            planned = plan_node({"objective": objective}, source=source, verify=verify)
+            planned = plan_node(
+                {"objective": objective}, source=source, verify=verify,
+                stack=args.stack,
+            )
         except Exception as exc:  # noqa: BLE001 - local model failures are varied
             print(f"! planning failed: {exc}", file=sys.stderr)
             return 1
@@ -356,6 +369,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     from .orchestrator.checks import MergePolicy
     from .orchestrator.mergeability import UpdateBudget, UpdatePolicy
     from .orchestrator.recovery import Recovery
+    from .containers.manager import StackImages
     from .orchestrator.reconcile import InfrastructurePolicy, Reconciler
 
     run = attachment.run
@@ -403,12 +417,14 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     merge_policy = MergePolicy.from_env()
     update_policy = UpdatePolicy.from_env()
     infrastructure_policy = InfrastructurePolicy.from_env()
+    images = StackImages.from_env()
     if args.no_merge:
         print("» merge policy: --no-merge; every pull request waits for a human")
     else:
         print(f"» {merge_policy.summary()}")
         print(f"» {update_policy.summary()}")
     print(f"» {infrastructure_policy.summary()}")
+    print(f"» {images.summary()}")
     if args.no_goal_check:
         print("» goal gate: off; the run stops when the plan is exhausted")
 
@@ -435,6 +451,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         # every fifteen seconds and therefore bounds nothing.
         update_budget=UpdateBudget(cap=update_policy.max_update_rounds),
         infrastructure_policy=infrastructure_policy,
+        images=images,
         objective=run.objective,
         verify=verify,
         goal_gate=not args.no_goal_check,
