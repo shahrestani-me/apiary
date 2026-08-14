@@ -32,6 +32,8 @@ from swarm.github.ledger import load_ledger, render_marker
 from swarm.nodes import planner
 from swarm.nodes.planner import (
     NO_DEPENDENCIES,
+    IssueAction,
+    PlanReport,
     Draft,
     PlanError,
     area_label,
@@ -674,3 +676,79 @@ def test_plan_node_takes_its_target_from_the_run_state(github, monkeypatch):
 
     assert set(result["tasks"]) == {"root"}
     assert numbers_of(store) == [1]
+
+
+# --------------------------------------------------------------------------
+# Reading back a plan GitHub has not finished showing
+# --------------------------------------------------------------------------
+
+
+def test_the_read_back_waits_for_issues_github_has_not_surfaced_yet():
+    """A write is not immediately visible to the list endpoint.
+
+    Seen twice on a real repository: the planner created two issues and the
+    very next read returned the ledger as it was before them, so the run
+    printed "the planner wrote nothing" directly beneath a line naming what it
+    had written. Dropping the conditional cache was necessary and not
+    sufficient - GitHub's own replication is the rest of it.
+    """
+    from swarm.nodes.planner import _read_back
+
+    calls = {"n": 0}
+    def payload(number: int, task_id: str) -> dict:
+        return {
+            "number": number,
+            "title": task_id,
+            "state": "open",
+            "labels": [{"name": "swarm:ready"}],
+            "body": (
+                f"<!-- apiary:task id={task_id} attempt=0 -->\n\n"
+                "## Goal\ndo the thing\n\n## Files\n- a.py\n\n"
+                f"## Verify\n{VERIFY}\n\n## Blocked by\n_none._\n"
+            ),
+        }
+
+    late = [payload(1, "one"), payload(2, "two")]
+
+    class LaggingClient:
+        repo = REPO
+
+        def list_issues(self, **_):
+            calls["n"] += 1
+            # Empty until the third read, which is the shape of the real thing.
+            return late if calls["n"] >= 3 else []
+
+        def invalidate_cache(self):
+            pass
+
+    report = PlanReport(repo=REPO, actions=(
+        IssueAction(kind="created", task_id="one", number=1),
+        IssueAction(kind="created", task_id="two", number=2),
+    ))
+
+    ledger = _read_back(LaggingClient(), report, sleep=lambda _: None)
+
+    assert set(ledger.entries) == {"one", "two"}
+    assert calls["n"] == 3
+
+
+def test_the_read_back_gives_up_rather_than_hanging():
+    """Bounded: a caller deciding what an empty ledger means beats a run that
+    never returns."""
+    from swarm.nodes.planner import READ_BACK_ATTEMPTS, _read_back
+
+    calls = {"n": 0}
+
+    class NeverClient:
+        repo = REPO
+
+        def list_issues(self, **_):
+            calls["n"] += 1
+            return []
+
+    report = PlanReport(repo=REPO, actions=(IssueAction(kind="created", task_id="one", number=1),))
+
+    ledger = _read_back(NeverClient(), report, sleep=lambda _: None)
+
+    assert ledger.entries == {}
+    assert calls["n"] == READ_BACK_ATTEMPTS
