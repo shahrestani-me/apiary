@@ -50,6 +50,7 @@ implying a swarm ran.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -214,7 +215,7 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     containers, the reaper owns the signal handlers, and both have to be torn
     down whatever ends the run.
     """
-    from .containers.manager import ContainerManager
+    from .containers.manager import INHERITED_ENV, ContainerManager
     from .containers.reaper import Reaper
     from .orchestrator.recovery import Recovery
     from .orchestrator.reconcile import Reconciler
@@ -232,9 +233,15 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     # recorded rather than swallowed, and the run summary is written on the way
     # out however the loop ends.
     artifacts = RunArtifacts.open(run)
+    # Merged, not replaced. `ContainerManager` inherits GITHUB_TOKEN and
+    # OLLAMA_HOST from this process when `env` is None, and passing an `env`
+    # *overrides* that - so handing it only the artifacts variables shipped
+    # workers with no token and no model host. The first worker to actually
+    # start said "GITHUB_TOKEN is not set" and recorded it.
+    inherited = {name: os.environ[name] for name in INHERITED_ENV if os.environ.get(name)}
     fleet = ContainerManager(
         run=run,
-        env={**artifacts.worker_env()},
+        env={**inherited, **artifacts.worker_env()},
         extra_flags=[*artifacts.mount_flags(), *worker_create_flags()],
     )
     # `sink` is what puts a disposed container's logs in the run directory.
@@ -246,7 +253,10 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     reconciler = Reconciler(
         run=run,
         client=github,
-        base_commit=args.base_commit or "",
+        # A commit, never a branch: a worker branching from whatever main
+        # happened to be would verify against a tree nobody planned for. Empty
+        # here meant the worker was dispatched with no base at all.
+        base_commit=args.base_commit or github.head_sha(),
         fleet=fleet,
         recovery=Recovery(client=github, run=run, dry_run=args.dry_run),
         merge_gate=not args.no_merge,
