@@ -173,9 +173,26 @@ Each cycle reconciles desired state (issues) with actual state (containers, PRs)
 3. **Dispatch** ready issues up to the concurrency cap, one container each.
 4. **Observe** finished containers and PR check status. Merged → `done`. Failed
    checks → bump `swarm:attempt/N`, reopen for retry, or `failed` at the cap.
+   Green PRs are merged by the orchestrator, not by a human: the `## Verify`
+   command and CI are the gate, and `APIARY_MERGE_ADMIN_OVERRIDE=0` is how a
+   repository asks for a person to press the button instead.
 5. **Judge** progress. Same progress ledger as v1: satisfied? progressing?
    looping? Stall triggers a replan, which rewrites issues rather than
    in-memory tasks.
+6. **Close the loop.** When no issue is left in a non-terminal state the plan is
+   finished — which is not the same as the objective being met. The orchestrator
+   asks whether the objective the run was given is actually delivered by the
+   work that landed, and if it is not, plans *additional* issues and keeps
+   going. Bounded at two follow-up rounds, refused outright when a task was
+   abandoned (`swarm:failed` means a human is needed) or when the model that
+   would answer is unreachable.
+
+The distinction in step 6 is the difference between a swarm that stops when its
+first decomposition runs out and one that stops when the objective is met or it
+has run out of ways to reach it. A plan is one model's first reading of an
+objective, written before any of the code existed; running it to completion
+proves the plan is finished and nothing more. Follow-up rounds only ever *add*
+issues — nothing that already merged is rewritten or retired.
 
 Because every input to that loop comes from GitHub, the orchestrator is
 restartable at any point and holds no irreplaceable state.
@@ -198,6 +215,7 @@ empty repo has no test command and therefore no quality gate.
 | `state.py` schemas | Kept; issue bodies serialize to the same shapes |
 | `graph.py` | Kept; nodes swap their backing store |
 | `nodes/planner.py` | Kept, now writes issues |
+| `nodes/judge.py` | Kept; observes the ledger, and the reconciler calls it |
 | `nodes/verifier.py` | Moves into the worker container |
 | `nodes/integrator.py` | Replaced by PR + CI + branch protection |
 | `worktree.py` | Demoted; containers clone rather than share a checkout |

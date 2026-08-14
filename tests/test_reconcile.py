@@ -60,6 +60,7 @@ from swarm.orchestrator.reconcile import (
     rewrite_marker,
 )
 from swarm.run import Run
+from swarm.state import ProgressJudgement
 from swarm.worker.result import ResultRecord, write_result
 
 REPO = "shahrestani-me/apiary"
@@ -265,8 +266,51 @@ def running(*issues: int) -> dict[int, Handle]:
     return {n: Handle(id=f"{n:0>64x}", run_id=RUN_ID, issue=n) for n in issues}
 
 
+class ModelCalled(BaseException):
+    """Not an `Exception`: `judge` and `assess` both catch those and report the
+    cycle unresolved, which would swallow the assertion this exists to make."""
+
+
+class Never:
+    """An oracle that fails the test if a cycle asks it anything."""
+
+    def invoke(self, messages: Any) -> Any:
+        raise ModelCalled(f"a cycle asked a model: {messages!r}")
+
+
+@dataclass
+class Judged:
+    """A scripted judge. Inert, and above all *injected*.
+
+    Step 5 consults a model on a cycle that changed nothing while nothing is in
+    flight, and this suite is full of those. On a host with Ollama running, a
+    reconcile test that reached the real oracle would not fail - it would
+    quietly spend a 31B inference per quiet cycle and pass slowly, which is how
+    a 0.5 s suite became a 207 s one. So every reconciler built here is given
+    one of these, and no test in this file can reach a model at all.
+    """
+
+    judgement: ProgressJudgement = field(
+        default_factory=lambda: ProgressJudgement(
+            request_satisfied=False,
+            progress_being_made=True,
+            in_loop=False,
+            reason="the test's judge",
+        )
+    )
+    asked: list[Any] = field(default_factory=list)
+
+    def invoke(self, messages: Any) -> ProgressJudgement:
+        self.asked.append(messages)
+        return self.judgement
+
+
 def reconciler(client: Any, fleet: Any = None, **kwargs: Any) -> Reconciler:
     kwargs.setdefault("capacity", Capacity(slots=3, configured=2))
+    # Hermetic by default; the step-5 tests below script their own answers, and
+    # the goal gate is opt-in because it writes issues.
+    kwargs.setdefault("oracle", Judged())
+    kwargs.setdefault("goal_gate", False)
     # Nothing sleeps for real: the pacing test injects its own recorder, and
     # every other test here would otherwise pay `DEFAULT_INTERVAL_S` per cycle
     # to assert something that has nothing to do with the clock.
@@ -949,3 +993,126 @@ def test_recovery_is_handed_containers_not_issue_numbers(fake_github):
     assert all(not isinstance(c, int) for c in seen["containers"]), (
         f"recovery received issue numbers, not handles: {seen['containers']}"
     )
+
+
+# --------------------------------------------------------------------------
+# Step 5: judge, replan, and the goal gate
+# --------------------------------------------------------------------------
+
+
+def test_an_exhausted_ledger_is_not_the_end_of_the_run_if_the_gate_extends(monkeypatch):
+    """The property this whole feature exists for.
+
+    Every task is `swarm:done`, so the *plan* is finished - and until the goal
+    gate existed that was also where the run stopped, which is a statement
+    about the planner's first guess rather than about the objective. A gate
+    that appends work must leave the loop running so the next cycle dispatches
+    it.
+    """
+    calls: list = []
+
+    def spy(client, ledger, objective, **kwargs):
+        calls.append(objective)
+        # Extends once, then reports the objective met, or this loop is infinite.
+        if len(calls) == 1:
+            return SimpleNamespace(
+                done=False, rounds=1, summary=lambda: "planned 1 follow-up task(s)"
+            )
+        return SimpleNamespace(done=True, rounds=1, summary=lambda: "objective met")
+
+    monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
+
+    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    reports = reconciler(
+        client, FakeFleet(), goal_gate=True, objective="make the thing work"
+    ).loop(cycles=5)
+
+    assert [report.exhausted for report in reports] == [True, True]
+    assert [report.finished for report in reports] == [False, True]
+    assert len(reports) == 2, "the loop stopped at plan exhaustion"
+    assert calls == ["make the thing work"] * 2
+
+
+def test_the_goal_gate_is_skipped_without_an_objective(monkeypatch, capsys):
+    """Assessing against an empty objective asks a model whether nothing was
+    delivered, and then plans follow-ups from whatever it answered."""
+    monkeypatch.setattr(
+        "swarm.orchestrator.goal.close_the_loop",
+        lambda *a, **k: pytest.fail("the gate assessed an empty objective"),
+    )
+
+    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    reports = reconciler(client, FakeFleet(), goal_gate=True, objective="  ").loop(cycles=3)
+
+    assert len(reports) == 1
+    assert reports[0].finished is True
+    assert "no objective" in capsys.readouterr().err
+
+
+def test_a_dry_run_neither_judges_nor_extends(monkeypatch):
+    """Both halves of step 5 write - one rewrites the tracker, one adds to it -
+    and a command that promised to change nothing must do neither."""
+    monkeypatch.setattr(
+        "swarm.orchestrator.goal.close_the_loop",
+        lambda *a, **k: pytest.fail("a dry run reached the goal gate"),
+    )
+
+    client = FakeClient(issues={4: issue_payload(4)})
+    report = reconciler(
+        client, FakeFleet(), goal_gate=True, objective="x", dry_run=True, oracle=Never()
+    ).cycle()
+
+    assert report.verdict is None
+    assert report.goal is None
+
+
+def test_a_stall_reaches_the_replanner_with_the_runs_own_verify_command(monkeypatch):
+    """A replanned issue must carry the gate the original carried. Defaulting it
+    inside the replanner re-points every task in a generated repository at
+    `SETTINGS.verify_command`, which that repository has no way to run."""
+    seen: dict = {}
+
+    def spy(client, ledger, objective, verdict, **kwargs):
+        seen.update(kwargs, objective=objective, verdict=verdict)
+        return SimpleNamespace(replanned=False, replans=0, summary=lambda: "refused")
+
+    monkeypatch.setattr("swarm.orchestrator.replan.replan", spy)
+
+    stalled = Judged(
+        ProgressJudgement(
+            request_satisfied=False,
+            progress_being_made=False,
+            in_loop=True,
+            reason="failed again identically",
+        )
+    )
+    client = FakeClient(issues={4: issue_payload(4)})
+    report = reconciler(
+        client, None, objective="make the thing work", verify="pytest -q", oracle=stalled
+    ).cycle()
+
+    assert report.verdict is not None and report.verdict.stalled
+    assert report.replanned is not None
+    assert seen["verify"] == "pytest -q"
+    assert seen["objective"] == "make the thing work"
+
+
+def test_the_merge_policy_reaches_the_check_gate(monkeypatch):
+    """`APIARY_MERGE_ADMIN_OVERRIDE=0` decides whether a human presses merge.
+    A cycle that does not pass the policy down leaves that setting inert."""
+    from swarm.orchestrator.checks import MergePolicy
+
+    seen: dict = {}
+    real = __import__("swarm.orchestrator.checks", fromlist=["plan_checks"]).plan_checks
+
+    def spy(ledger, **kwargs):
+        seen.update(kwargs)
+        return real(ledger, **kwargs)
+
+    monkeypatch.setattr("swarm.orchestrator.checks.plan_checks", spy)
+
+    policy = MergePolicy(admin_override=False, merge_method="rebase")
+    client = PullAwareClient(issues={4: issue_payload(4, label=REVIEW)})
+    reconciler(client, FakeFleet(), merge_policy=policy).cycle()
+
+    assert seen["policy"] is policy

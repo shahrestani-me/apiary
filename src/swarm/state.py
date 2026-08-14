@@ -69,6 +69,25 @@ class ProgressJudgement(BaseModel):
     reason: str = Field(default="", description="one sentence")
 
 
+class ObjectiveAssessment(BaseModel):
+    """Was the *objective* met, as opposed to the *plan* being exhausted.
+
+    Deliberately a different question from `ProgressJudgement`, which asks
+    whether a run is moving. A plan can run to completion, every task merged,
+    and still leave the objective half-done - the decomposition only ever
+    covered what the planner thought of on its first read. So this is asked once
+    the ledger has nothing live left in it, and `missing` is what the follow-up
+    plan is written from (`orchestrator/goal.py`).
+    """
+
+    objective_met: bool
+    missing: list[str] = Field(
+        default_factory=list,
+        description="one line per thing the objective asks for that is not there yet",
+    )
+    reason: str = Field(default="", description="one sentence")
+
+
 # --------------------------------------------------------------------------
 # Runtime records
 # --------------------------------------------------------------------------

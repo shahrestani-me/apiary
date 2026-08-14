@@ -97,6 +97,10 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `SWARM_MAX_ROUNDS` | `8` | Hard stop. |
 | `SWARM_MAX_STALLS` | `2` | No-progress rounds before **replanning** instead of retrying. |
 | `SWARM_MAX_ATTEMPTS` | `3` | Per-task retries before abandoning. |
+| `APIARY_MERGE_ADMIN_OVERRIDE` | `1` | Whether the swarm merges its own green PRs. `0` leaves them for a human, and the issues sit in `swarm:review` until one presses the button. |
+| `APIARY_MERGE_METHOD` | `squash` | How it merges. Must be a method the target repo allows. |
+| `APIARY_MAX_UPDATE_ROUNDS` | `3` | How many times one PR may be dragged forward onto a moving base before the starvation is called and a human is asked. |
+| `APIARY_MERGES_PER_CYCLE` | `1` | Merges are serialised under a strict status-check policy, because each one invalidates its siblings. |
 | `SWARM_WORKER_CTX` | `16384` | Never set this to a model's advertised 256K — the KV cache would cost more than the weights. |
 
 ## Running v2 locally
@@ -219,19 +223,28 @@ swarm run --repo owner/name --objective "..." --dry-run
 issues carrying a `swarm:*` state label are **adopted** — their bodies rewritten
 to add an identity marker — so try a scratch repo before a real one.
 
-These are complete, tested, and **not yet reachable**, because the call sites
-that would wire them belong to files no remaining issue owns:
+The loop is wired end to end: `swarm run` plans issues, dispatches containers,
+reads CI, merges what passes, dispatches whatever that unblocks, and stops when
+the objective is met.
 
-| Component | Waiting on a call in |
-|---|---|
-| planner writing issues, dispatcher spawning | `cli.py` |
-| worker result files reaching the host | a volume mount in `containers/manager.py` |
-| PR checks, mergeability, judge/replan, mid-cycle claim recovery | `orchestrator/reconcile.py` |
-| retry feedback reaching the next attempt | `worker/entrypoint.py` |
+**It merges its own pull requests.** A `swarm:review` issue whose PR is green
+and mergeable is merged by the orchestrator, and the issue it closes unblocks
+its dependants on the next cycle. That is deliberate and it is also the whole
+quality argument: `## Verify` and CI are the only gate, so the gate had better
+be real. `APIARY_MERGE_ADMIN_OVERRIDE=0` turns it off and leaves the review
+queue to a person; `swarm run --no-merge` does the same for one run.
 
-`swarm run` says so on stderr rather than exiting silently. Until that wiring
-lands, v2 plans and dispatches nothing — v1's in-process path is still the one
-that completes a loop.
+**It does not stop when the plan runs out.** When nothing is left in a
+non-terminal state, the run asks whether the objective was actually met — the
+plan being finished is a fact about the planner's first guess, not about the
+objective — and plans follow-up issues if it was not, for at most two rounds.
+`--no-goal-check` stops at plan exhaustion instead. The run exits non-zero when
+it stops short, and prints what is still missing.
+
+One piece is still not reachable: the CI failure that `checks.write_feedback`
+persists onto an issue is not yet read back into the next attempt's prompt
+(`worker/entrypoint.py`), so a retry sees the same context the first attempt
+did. It is on the issue for a human either way.
 
 ### Concurrency is bounded by inference, not memory
 

@@ -10,6 +10,12 @@ cap and its own answer to "is that file already being edited".
 
 `dispatcher.py` (#21) is the first tenant. The reconciler (#22, #23) and the
 recovery sweep (#35) join it and read the same shapes.
+
+`goal.py` is the last step of a run rather than a step of a cycle: it asks
+whether the objective the run was given is actually met once the plan has
+nothing live left in it, and appends issues when it is not. It belongs here
+for the same reason everything else does - it reads the ledger and writes the
+tracker, and a module elsewhere doing that would be a second scheduler.
 """
 
 from __future__ import annotations

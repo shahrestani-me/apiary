@@ -116,6 +116,24 @@ and simply omit a task you are dropping.
 
 Produce a different decomposition. Do not repeat the approach that failed."""
 
+FOLLOWUP_SUFFIX = """
+
+This is a FOLLOW-UP round. Every task already planned has landed on the default
+branch, and the objective is still not met. Here is what shipped:
+{shipped}
+
+Here is what is judged to be missing:
+{missing}
+
+Emit ONLY the additional tasks needed to close that gap, under new ids. Do not
+re-emit a task from the shipped list: it is done, its issue is closed, and
+naming it again cannot reopen it. If the gap needs nothing further, emit no
+tasks at all rather than inventing work.
+
+The shipped files are on the branch you are extending, so a follow-up task may
+list a file an earlier task created - the hard rule about non-overlapping files
+applies among the tasks you emit now, not against work that is already in."""
+
 # `## Blocked by` with no list items parses to no dependencies (§1.3). Written
 # out rather than left blank so a human reading the issue sees an answer.
 NO_DEPENDENCIES = "_none._"
