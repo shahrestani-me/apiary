@@ -44,6 +44,7 @@ import pytest
 from fixtures.github import page, response
 from swarm.config import Settings
 from swarm.containers.manager import WORKER_IMAGE, DockerCLI
+from swarm.security import PROVISION_TOKEN_ENV
 from swarm.doctor import (
     CHECK_CI,
     CHECK_DOCKER_CLI,
@@ -53,6 +54,7 @@ from swarm.doctor import (
     CHECK_OLLAMA_REACHABLE,
     CHECK_OLLAMA_SCHEMA,
     CHECK_OLLAMA_TARGET,
+    CHECK_BOOT_TOKEN,
     CHECK_REPO,
     CHECK_TOKEN,
     CHECK_WORKER_IMAGE,
@@ -73,6 +75,7 @@ REPO = "shahrestani-me/apiary"
 #: A fine-grained PAT's prefix, which is the only shape `assert_scoped_token`
 #: accepts. The tail is not token-shaped enough to be a real one and long
 #: enough to be redacted like one.
+BOOT_TOKEN = "github_pat_" + "b" * 40
 TOKEN = "github_pat_11ABCDEFG0doctorpreflightfixture"
 
 #: What `config.py` produces on a correctly configured machine.
@@ -252,7 +255,7 @@ def doctor(fake_github) -> Any:
             github=gh,
             docker=DockerCLI(runner=docker_runner),
             inference=probe,
-            env={"GITHUB_TOKEN": TOKEN} if env is None else env,
+            env={"GITHUB_TOKEN": TOKEN, PROVISION_TOKEN_ENV: BOOT_TOKEN} if env is None else env,
             which=kwargs.pop("which", lambda name: f"/usr/local/bin/{name}"),
             in_container=kwargs.pop("in_container", False),
             **kwargs,
@@ -314,6 +317,7 @@ def test_a_healthy_environment_passes_every_check(doctor):
         CHECK_OLLAMA_MODELS,
         CHECK_OLLAMA_SCHEMA,
         CHECK_TOKEN,
+        CHECK_BOOT_TOKEN,
         CHECK_REPO,
         CHECK_LABELS,
         CHECK_CI,
@@ -345,7 +349,7 @@ def test_the_report_is_readable(doctor):
     subject, _, _, _ = doctor()
     report = subject.run().report()
 
-    assert "all 11 preconditions met" in report
+    assert "all 12 preconditions met" in report
     for name in (CHECK_OLLAMA_SCHEMA, CHECK_TOKEN, CHECK_WORKER_IMAGE):
         assert name in report
 
@@ -722,7 +726,7 @@ def test_every_failure_names_a_command(doctor):
 def test_main_exits_non_zero_when_something_is_wrong(doctor, capsys):
     healthy, _, _, _ = doctor()
     assert main([REPO], doctor=healthy) == 0
-    assert "all 11 preconditions met" in capsys.readouterr().out
+    assert "all 12 preconditions met" in capsys.readouterr().out
 
     broken, _, _, _ = doctor(runner=RecordingRunner(images=()))
     assert main([REPO], doctor=broken) == 1

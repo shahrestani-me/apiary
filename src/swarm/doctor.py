@@ -83,7 +83,14 @@ from .containers.manager import WORKER_IMAGE, ContainerError, DockerCLI, Redacto
 from .github.client import GitHubClient, GitHubError, GitHubHTTPError
 from .github.labels import SWARM_LABELS, list_label_names
 from .llm import orchestrator_llm, structured, worker_llm
-from .security import REQUIRED_PERMISSIONS, CredentialError, assert_scoped_token
+from .security import (
+    PROVISION_PERMISSIONS,
+    PROVISION_TOKEN_ENV,
+    REQUIRED_PERMISSIONS,
+    CredentialError,
+    assert_provision_token,
+    assert_scoped_token,
+)
 
 __all__ = [
     "DoctorError",
@@ -119,6 +126,7 @@ CHECK_OLLAMA_REACHABLE = "ollama.reachable"
 CHECK_OLLAMA_MODELS = "ollama.models"
 CHECK_OLLAMA_SCHEMA = "ollama.schema"
 CHECK_TOKEN = "github.token"
+CHECK_BOOT_TOKEN = "github.boot-token"
 CHECK_REPO = "github.repo"
 CHECK_LABELS = "github.labels"
 CHECK_CI = "github.ci"
@@ -129,7 +137,7 @@ CHECK_WORKER_IMAGE = "docker.image"
 _MARK = {OK: "ok  ", FAIL: "FAIL", SKIP: "skip"}
 _NAME_WIDTH = max(len(name) for name in (
     CHECK_OLLAMA_TARGET, CHECK_OLLAMA_REACHABLE, CHECK_OLLAMA_MODELS, CHECK_OLLAMA_SCHEMA,
-    CHECK_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI,
+    CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI,
     CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON, CHECK_WORKER_IMAGE,
 ))
 
@@ -475,6 +483,7 @@ class Doctor:
         access = self._after(token, CHECK_REPO, self.check_repo_access)
         checks += [
             token,
+            self.check_boot_token(),
             access,
             self._after(access, CHECK_LABELS, self.check_labels),
             self._after(access, CHECK_CI, self.check_ci),
@@ -629,6 +638,48 @@ class Doctor:
         except CredentialError as exc:
             return Check.failed(CHECK_TOKEN, str(exc), fix=self._token_fix())
         return Check.passed(CHECK_TOKEN, f"a {kind} token is set")
+
+    def check_boot_token(self) -> Check:
+        """Is a boot key present, and is it a shape that can be repo-scoped?
+
+        Reported rather than required, because it is only needed to *create* a
+        repository: a run against a repo that already exists never touches it.
+        Skipping loudly beats failing, since most runs legitimately have no
+        boot key - but staying silent would leave `--new` failing with a 403
+        from GitHub, three steps into something that has already created
+        nothing.
+        """
+        token = self.env.get(PROVISION_TOKEN_ENV)
+        if not token:
+            return Check.skipped(
+                CHECK_BOOT_TOKEN,
+                f"{PROVISION_TOKEN_ENV} is not set; `swarm run --new` cannot create a "
+                f"repository, and every other command is unaffected",
+            )
+        try:
+            kind = assert_provision_token(token)
+        except CredentialError as exc:
+            return Check.failed(
+                CHECK_BOOT_TOKEN,
+                str(exc),
+                fix=(
+                    f"mint a second fine-grained token with "
+                    f"{', '.join(f'{k}:{v}' for k, v in sorted(PROVISION_PERMISSIONS.items()))} "
+                    f"and export it as {PROVISION_TOKEN_ENV} - see docs/security.md"
+                ),
+            )
+        if token == self.env.get("GITHUB_TOKEN"):
+            return Check.failed(
+                CHECK_BOOT_TOKEN,
+                "the boot key and the work key are the same token, so workers would "
+                "hold `administration` and `workflows` - and a worker that can edit "
+                "`.github/workflows` can rewrite the CI that judges its own work",
+                fix=(
+                    f"mint a separate token for {PROVISION_TOKEN_ENV}; the two are "
+                    f"deliberately different credentials, not one used twice"
+                ),
+            )
+        return Check.passed(CHECK_BOOT_TOKEN, f"a {kind} boot key is set, distinct from the work key")
 
     def check_repo_access(self) -> Check:
         """Can this token read this repository's ledger?

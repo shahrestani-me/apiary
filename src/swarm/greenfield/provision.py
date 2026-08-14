@@ -64,12 +64,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import re
 import sys
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
 from ..github.client import GitHubClient, GitHubError, GitHubHTTPError
+from ..security import PROVISION_TOKEN_ENV, assert_provision_token
 from ..github.labels import SWARM_LABELS, LabelReport, ensure_labels
 
 # The ruleset this module writes. Named, so a second run can recognise its own
@@ -374,6 +376,20 @@ class ProvisionReport:
 # --------------------------------------------------------------------------
 
 
+def _boot_client(repo: str) -> GitHubClient:
+    """A client authenticated as the boot key.
+
+    Falls back to nothing: if `APIARY_PROVISION_TOKEN` is unset, this raises
+    rather than quietly reaching for `GITHUB_TOKEN`. The fallback is the whole
+    bug - it would work on the first try, produce a repository, and leave the
+    operator believing one token is enough right up until a worker holds
+    `workflows` and can rewrite the CI that judges it.
+    """
+    token = os.environ.get(PROVISION_TOKEN_ENV)
+    assert_provision_token(token)
+    return GitHubClient(repo, token or "")
+
+
 def provision(
     plan: ProvisionPlan,
     target: GitHubClient | None = None,
@@ -396,7 +412,12 @@ def provision(
     # Nothing above this line touches the network. That is the guarantee the
     # confirmation is worth anything at all: an abort cannot have created
     # something already.
-    client = target if target is not None else GitHubClient.from_env(plan.full_name)
+    # The boot key, not the work key. Creating a repository needs
+    # `administration` and pushing the CI workflow needs `workflows`, and both
+    # are permissions `security.FORBIDDEN_PERMISSIONS` refuses to let a worker
+    # hold - so this step authenticates as a credential that never enters a
+    # container. See docs/security.md.
+    client = target if target is not None else _boot_client(plan.full_name)
 
     repo = _create_repository(client, plan)
     html_url = repo.get("html_url") or f"https://github.com/{plan.full_name}"

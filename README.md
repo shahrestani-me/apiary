@@ -120,11 +120,36 @@ Members off.** `security.py` names them rather than merely omitting them, and
 `.github/workflows/*`, and CI is the neutral ground that independently re-runs
 the verify command. A worker that can edit CI can edit its own grader.
 
-> **Greenfield mode needs more than this and is therefore not yet usable.**
-> `swarm run --new` pushes a CI workflow in the initial commit, which requires
-> the `workflows` permission this policy forbids, and repo creation needs
-> account-level administration. Use an existing repo until that contradiction
-> is resolved.
+### Creating projects needs a second token
+
+`swarm run --new "a trip planner"` creates the repository itself — private by
+default — seeds it with a CI workflow and a passing test, and then plans issues
+into it. Creating a repo needs `administration` and pushing a workflow needs
+`workflows`, and those are exactly the two permissions the work key must never
+have: a worker holding `workflows` can rewrite the CI that independently
+re-runs its own verify command.
+
+So they are two credentials, not one widened credential:
+
+| | Work key (`GITHUB_TOKEN`) | Boot key (`APIARY_PROVISION_TOKEN`) |
+|---|---|---|
+| Job | The whole run | Create the repository, once |
+| Permissions | contents, pull_requests, issues, metadata | administration, contents, workflows, metadata |
+| Lives | In every worker container | In the orchestrator, for seconds |
+| Sees model output | Yes | Never — it runs before any container exists |
+
+`ContainerManager` refuses to start a container whose environment carries the
+boot key, by name *or* by value, so the separation is enforced rather than
+documented. `swarm doctor` reports whether a boot key is present and fails if
+it is the same token as the work key.
+
+If you only ever run against repositories that already exist, skip the boot key
+entirely — nothing else needs it.
+
+**One caveat:** branch protection on *private* repositories needs a paid GitHub
+plan. A generated private repo may end up with CI but no enforced protection,
+and protection plus CI is what makes the merge gate mean anything. `provision`
+detects this and says so.
 
 ### Where to put it
 

@@ -648,3 +648,28 @@ def test_labels_are_readable_back_off_a_live_container(live: ContainerManager):
         assert found[0].image == live.image
     finally:
         live.dispose(handle)
+
+
+def test_a_manager_refuses_to_carry_the_boot_key_into_a_container(monkeypatch):
+    """The separation is enforced where containers are made, not only in prose.
+
+    `ContainerManager.__post_init__` is the one place a worker's environment is
+    decided, so it is the only place the check is worth putting. A refusal to
+    start beats a container that holds `administration` and `workflows` while
+    running whatever the model just wrote.
+    """
+    from swarm.security import PROVISION_TOKEN_ENV, PolicyError
+
+    monkeypatch.delenv(PROVISION_TOKEN_ENV, raising=False)
+    with pytest.raises(PolicyError):
+        ContainerManager(run=make_run(), env={PROVISION_TOKEN_ENV: "github_pat_" + "a" * 40})
+
+
+def test_the_boot_key_is_redacted_even_though_it_is_never_passed(monkeypatch):
+    """Belt and braces: enrolled so an unforeseen route cannot leak it."""
+    from swarm.security import PROVISION_TOKEN_ENV
+
+    secret = "github_pat_" + "z" * 40
+    monkeypatch.setenv(PROVISION_TOKEN_ENV, secret)
+    manager, _ = make_manager()
+    assert secret not in manager.redactor(f"leaked {secret} somehow")

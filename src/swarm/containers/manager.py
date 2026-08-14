@@ -518,6 +518,20 @@ class ContainerManager:
         # credential is registered before a single command runs, so no code
         # path exists in which a secret reaches the daemon before the redactor
         # knows about it.
+        # The boot key (`administration` + `workflows`) must never reach a
+        # worker. Checked here because this is the one place a container's
+        # environment is decided, and a refusal to start beats a container that
+        # quietly holds the permissions that would let model output rewrite the
+        # CI judging it. Imported locally: `security` imports this module.
+        from ..security import PROVISION_TOKEN_ENV, assert_no_provision_token
+
+        assert_no_provision_token(self.env)
+        # Enrolled even though it is not passed: if it ever reaches a log by a
+        # route nobody predicted, the redactor has already seen it.
+        boot_key = os.environ.get(PROVISION_TOKEN_ENV)
+        if boot_key:
+            self.redactor.add(boot_key)
+
         self.redactor.add_env(self.env)
         if self.docker is None:
             # `runner` is the short spelling of "same manager, different

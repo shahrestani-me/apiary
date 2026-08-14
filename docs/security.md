@@ -283,3 +283,43 @@ is a function a human runs, and the suite is what keeps it correct.
 to `docker`, `Dockerfile` installs only git, and `DOCKER_HOST` is useless without
 a binary to honour it. That is #21's Dockerfile change, not this ticket's, but it
 is the first thing to hit when the socket proxy is first exercised end to end.
+
+
+## The boot key
+
+Creating a repository and doing the work inside it are two jobs with
+incompatible permissions, so apiary uses two credentials.
+
+| | Work key | Boot key |
+|---|---|---|
+| Variable | `GITHUB_TOKEN` | `APIARY_PROVISION_TOKEN` |
+| Permissions | contents:write, pull_requests:write, issues:write, metadata:read | administration:write, contents:write, workflows:write, metadata:read |
+| Used by | Orchestrator and every worker | `greenfield/provision.py`, once |
+| Lifetime | The whole run | The seconds it takes to create the repo |
+| Reaches model output | Yes | No — it runs before the first container exists |
+
+The work key's forbidden list and the boot key's required list overlap on
+exactly `administration` and `workflows`. That overlap is the argument: no
+single token can do both jobs without handing model-written code the ability
+to rewrite `.github/workflows/*` — the file that independently re-runs the
+verify command a task is judged by. A worker that can edit CI can make
+anything pass, and every gate downstream becomes decoration.
+
+The separation is a lifetime as much as a scope, and it is enforced in code
+rather than in this document:
+
+- `security.assert_no_provision_token` refuses an environment carrying the boot
+  key **by name or by value** — renaming it on the way in does not narrow what
+  it can do.
+- `ContainerManager.__post_init__` runs every worker environment through that
+  check before a container is created, so the failure is a refusal to start.
+- The boot key's value is enrolled in the redactor even though it is never
+  passed, so an unforeseen route cannot put it in a log.
+- `doctor` fails if the two are the same token.
+
+Rotation is per key. The boot key can be revoked the moment a project has been
+created; the work key lives as long as runs against that repository do.
+
+Both remain scoped to a single repository. The split is not about what apiary
+can reach — it is about what model-written code may touch inside the one
+repository it is working in.
