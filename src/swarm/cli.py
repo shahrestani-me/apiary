@@ -71,6 +71,7 @@ from typing import Sequence
 from .config import SETTINGS, ConfigError
 from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
+from .doctor import preflight
 from .github.client import GitHubClient, GitHubError
 from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
@@ -243,6 +244,29 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
         return 1
 
 
+def _refuse_unrunnable_stacks(stack: str | None) -> None:
+    """Stop the run when a stack it needs has no image on this host.
+
+    The stacks are the ones this invocation can actually reach: `--stack node`
+    means Node, and no flag means whatever the planner may choose - so all of
+    them, because refusing to name them would mean discovering a missing image
+    on cycle four instead of before the first one.
+
+    A **skipped** check passes. Through the socket proxy the image probe is
+    denied by design, and doctor's inability to look is not evidence about the
+    host - refusing there would make the containerised orchestrator unstartable.
+    """
+    diagnosis = preflight([stack] if stack else sorted(KNOWN_STACKS))
+    if diagnosis.ok:
+        return
+    lines = [str(check) for check in diagnosis.failures]
+    raise ConfigError(
+        "this host cannot run every stack this run may need:\n  "
+        + "\n  ".join(lines)
+        + "\n  (swarm doctor for the whole preflight; SETUP.md step 4 builds the images)"
+    )
+
+
 def _doctor(args: argparse.Namespace) -> int:
     """Hand the arguments straight back to `doctor.main`, which owns the verdict.
 
@@ -289,6 +313,13 @@ def _run(
     # the command that explains this one, with a fix hint.
     if conflict := SETTINGS.clock_conflict():
         raise ConfigError(conflict)
+
+    # A stack whose image is not on this host cannot produce anything but
+    # infrastructure failures, and `IMAGES=0`/`BUILD=0` mean the orchestrator
+    # cannot fix that itself - so it is worth stopping for, before `_target`
+    # creates a repository for `--new`. Only the image checks: a preflight that
+    # refused a run over an unrelated `github.ci` verdict gets turned off.
+    _refuse_unrunnable_stacks(args.stack)
 
     repo, objective, verify = _target(args, parser, client=client)
 

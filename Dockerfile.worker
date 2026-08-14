@@ -48,6 +48,12 @@ RUN pip install .
 
 FROM python:3.12-slim AS runtime
 
+# Which stack this image carries. #99 selects an image per task and #100's
+# doctor check reads this back: an image under the right tag with no label is
+# indistinguishable from a stale build of a different Dockerfile that happened
+# to be tagged this way, and the failure that produces lands inside a worker.
+LABEL org.apiary.stack="python"
+
 # git: the worker's entire job is a clone/branch/commit/push cycle, so a missing
 # binary here is not a subtle degradation, it is the whole task.
 RUN apt-get update \

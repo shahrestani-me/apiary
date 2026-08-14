@@ -35,15 +35,21 @@ real probes against this machine and are deselected by default.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pytest
 
 from fixtures.github import page, response
 from swarm.config import Settings
-from swarm.containers.manager import WORKER_IMAGE, DockerCLI
+from swarm.containers.manager import (
+    DEFAULT_STACK_IMAGES,
+    STACK_LABEL,
+    WORKER_IMAGE,
+    DockerCLI,
+)
 from swarm.security import PROVISION_TOKEN_ENV
 from swarm.doctor import (
     CHECK_CI,
@@ -68,6 +74,7 @@ from swarm.doctor import (
     DoctorError,
     HostInference,
     main,
+    stack_check,
 )
 from swarm.github.labels import SWARM_LABELS
 
@@ -155,7 +162,12 @@ class RecordingRunner:
     """
 
     server_version: str = "29.2.1"
-    images: tuple[str, ...] = (WORKER_IMAGE,)
+    #: image -> the `org.apiary.stack` label it carries. An image mapped to ""
+    #: is present but unlabelled, which #100 treats as indistinguishable from a
+    #: stale build of something else tagged the same way.
+    images: Mapping[str, str] = field(
+        default_factory=lambda: {image: stack for stack, image in DEFAULT_STACK_IMAGES.items()}
+    )
     denied: bool = False
     calls: list[list[str]] = field(default_factory=list)
 
@@ -170,7 +182,16 @@ class RecordingRunner:
             if self.denied:
                 return self._done(1, "", "Error response from daemon: 403 Forbidden")
             if args[2] in self.images:
-                return self._done(0, "sha256:" + "d0c70" * 12)
+                # The real `--format` is `{{.Id}}|{{json .Config}}`, so the
+                # double answers in that shape rather than in one only this
+                # file would accept - including the "no Labels key at all"
+                # case, which is what an image built before the label existed
+                # looks like and what broke the first implementation.
+                labels = (
+                    {STACK_LABEL: self.images[args[2]]} if self.images[args[2]] else {}
+                )
+                config = json.dumps({"Entrypoint": ["apiary-worker"], **({"Labels": labels} if labels else {})})
+                return self._done(0, f"sha256:{'d0c70' * 12}|{config}")
             return self._done(1, "", f"Error: No such image: {args[2]}")
         raise AssertionError(f"unexpected docker call: {argv}")
 
@@ -330,7 +351,11 @@ def test_a_healthy_environment_passes_every_check(doctor):
         CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI,
         CHECK_DOCKER_DAEMON,
-        CHECK_WORKER_IMAGE,
+        # One per stack: #99 chooses the image per task, so "the worker image
+        # is present" stopped being a single fact about a host.
+        stack_check("node"),
+        stack_check("python"),
+        stack_check("react"),
     ]
     assert diagnosis.ok, diagnosis.report()
     assert not diagnosis.skipped
@@ -348,7 +373,10 @@ def test_the_run_reads_and_never_writes(doctor):
     subject.run()
 
     assert {method for method, _ in transport.calls} == {"GET"}
-    assert runner.subcommands == ["version", "image"]
+    # `version` once, then one `image inspect` per stack. Still only the two
+    # read subcommands - which is the assertion, not the count.
+    assert set(runner.subcommands) == {"version", "image"}
+    assert runner.subcommands[0] == "version"
     assert all("create" not in call and "pull" not in call for call in runner.calls)
 
 
@@ -356,8 +384,8 @@ def test_the_report_is_readable(doctor):
     subject, _, _, _ = doctor()
     report = subject.run().report()
 
-    assert "all 13 preconditions met" in report
-    for name in (CHECK_OLLAMA_SCHEMA, CHECK_TOKEN, CHECK_WORKER_IMAGE):
+    assert "all 15 preconditions met" in report
+    for name in (CHECK_OLLAMA_SCHEMA, CHECK_TOKEN, stack_check("python")):
         assert name in report
 
 
@@ -620,16 +648,64 @@ def test_an_unreachable_daemon_names_docker_host(doctor):
 
     assert verdict.status == FAIL
     assert "DOCKER_HOST" in verdict.fix
-    assert diagnosis.by_name(CHECK_WORKER_IMAGE).status == SKIP
+    assert diagnosis.by_name(stack_check("python")).status == SKIP
 
 
 def test_a_missing_worker_image_names_its_build_command(doctor):
-    subject, _, _, _ = doctor(runner=RecordingRunner(images=()))
-    verdict = subject.run().by_name(CHECK_WORKER_IMAGE)
+    subject, _, _, _ = doctor(runner=RecordingRunner(images={}))
+    verdict = subject.run().by_name(stack_check("python"))
 
     assert verdict.status == FAIL
     assert f"docker build -f Dockerfile.worker -t {WORKER_IMAGE} ." in verdict.fix
     assert "IMAGES=0" in verdict.fix
+    # And BUILD=0, because "pull it then" is the obvious next thought.
+    assert "BUILD=0" in verdict.fix
+
+
+def test_each_stack_is_checked_separately(doctor):
+    """A host with the Python image and not the Node one is the normal state of
+    a machine that has only ever run Python backlogs, and it must read as
+    exactly that rather than as "the worker image is missing"."""
+    subject, _, _, _ = doctor(runner=RecordingRunner(images={WORKER_IMAGE: "python"}))
+    diagnosis = subject.run()
+
+    assert diagnosis.by_name(stack_check("python")).status == OK
+    assert diagnosis.by_name(stack_check("node")).status == FAIL
+    assert "Dockerfile.worker.node" in diagnosis.by_name(stack_check("node")).fix
+
+
+def test_only_the_stacks_a_run_needs_are_checked(doctor):
+    """A Python-only backlog must not be told to build a Node image it will
+    never spawn."""
+    subject, _, _, _ = doctor(
+        runner=RecordingRunner(images={WORKER_IMAGE: "python"}), stacks=("python",)
+    )
+    diagnosis = subject.run()
+
+    assert [check.name for check in diagnosis.checks if check.name.startswith("docker.image")] == [
+        stack_check("python")
+    ]
+    assert diagnosis.ok
+
+
+def test_an_image_with_no_stack_label_is_not_trusted(doctor):
+    """An image under the right tag with no label is indistinguishable from a
+    stale build of a different Dockerfile that happened to be tagged this way,
+    and the failure that produces lands inside a worker."""
+    subject, _, _, _ = doctor(
+        runner=RecordingRunner(images={image: "" for image in DEFAULT_STACK_IMAGES.values()})
+    )
+    verdict = subject.run().by_name(stack_check("node"))
+
+    assert verdict.status == FAIL
+    assert "stale build" in verdict.detail
+    assert "rebuild" in verdict.fix
+
+
+def test_the_image_check_reports_the_stack_the_image_says_it_carries(doctor):
+    subject, _, _, _ = doctor()
+
+    assert "node" in subject.run().by_name(stack_check("node")).detail
 
 
 def test_the_socket_proxy_denying_images_is_unanswered_not_missing(doctor):
@@ -641,8 +717,8 @@ def test_the_socket_proxy_denying_images_is_unanswered_not_missing(doctor):
     subject, _, _, _ = doctor(runner=RecordingRunner(denied=True))
     diagnosis = subject.run()
 
-    assert diagnosis.by_name(CHECK_WORKER_IMAGE).status == SKIP
-    assert "IMAGES=0" in diagnosis.by_name(CHECK_WORKER_IMAGE).detail
+    assert diagnosis.by_name(stack_check("python")).status == SKIP
+    assert "IMAGES=0" in diagnosis.by_name(stack_check("python")).detail
     assert diagnosis.ok
 
 
@@ -695,7 +771,7 @@ def provoked_failures(doctor) -> list[Check]:
         (CHECK_TIMEOUTS, {"settings": settings(verify_timeout_s=1800)}),
         (CHECK_DOCKER_CLI, {"which": lambda name: None}),
         (CHECK_DOCKER_DAEMON, {"runner": DeadRunner()}),
-        (CHECK_WORKER_IMAGE, {"runner": RecordingRunner(images=())}),
+        (stack_check("python"), {"runner": RecordingRunner(images={})}),
     ]
 
     failures: list[Check] = []
@@ -734,7 +810,7 @@ def test_every_failure_names_a_command(doctor):
 def test_main_exits_non_zero_when_something_is_wrong(doctor, capsys):
     healthy, _, _, _ = doctor()
     assert main([REPO], doctor=healthy) == 0
-    assert "all 13 preconditions met" in capsys.readouterr().out
+    assert "all 15 preconditions met" in capsys.readouterr().out
 
     broken, _, _, _ = doctor(runner=RecordingRunner(images=()))
     assert main([REPO], doctor=broken) == 1
