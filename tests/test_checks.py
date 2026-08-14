@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 import pytest
+from fixtures import failures
 
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
@@ -66,6 +67,7 @@ from swarm.orchestrator.checks import (
     summarise_checks,
     write_feedback,
 )
+from swarm.nodes.judge import mentioned_paths
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
 
@@ -833,3 +835,110 @@ def test_a_failing_pass_leaves_the_issue_ready_with_the_failure_on_it():
     assert report.merged == ()
     assert client.labels_on(23) == {READY}
     assert "FAILED tests/test_mod23.py::test_x" in read_feedback(client.issues[23]["body"])
+
+
+# --------------------------------------------------------------------------
+# Failing paths in more than one language (#93)
+# --------------------------------------------------------------------------
+#
+# `foreign_failure` is the escalate-without-consuming-attempts valve: a failure
+# whose paths lie entirely outside the issue's `## Files` is one no attempt can
+# fix, so it goes to a human instead of burning three. Both patterns behind it
+# were hardcoded to `\.py`, which turned that valve off for every non-Python
+# stack - silently, with a green suite and a docstring blessing it as "allowed
+# to find nothing".
+
+
+@pytest.mark.parametrize("language", sorted(failures.SAMPLES))
+def test_a_failing_path_is_found_in_every_language(language):
+    found = failing_paths(failures.SAMPLES[language])
+
+    assert found == failures.EXPECTED[language]
+
+
+@pytest.mark.parametrize("language", sorted(failures.SAMPLES))
+def test_a_foreign_failure_escalates_in_every_language(language):
+    """The behaviour the paths exist for, end to end."""
+    declared = failures.EXPECTED[language]
+    mine = entry(23, *declared)
+    someone_elses = entry(24, "src/unrelated/thing.py")
+    text = failures.SAMPLES[language]
+
+    # Named inside the declared set: the worker has something to act on.
+    assert foreign_failure(mine, text) == ()
+    # Named entirely outside it: no attempt can fix this, so a human gets it.
+    assert foreign_failure(someone_elses, text) == declared
+
+
+def test_pytest_extraction_is_unchanged():
+    """The existing corpus, asserted again beside the new one.
+
+    Widening the extension list must not change what pytest output yields, and
+    this is the row that would notice.
+    """
+    text = "FAILED tests/test_a.py - boom\ntests/test_b.py::test_y failed\nsee src/thing.py for why"
+
+    assert failing_paths(text) == ("tests/test_a.py", "tests/test_b.py")
+
+
+def test_output_in_a_language_with_no_pattern_still_finds_nothing():
+    """The documented default is correct; #93 widens it, it does not replace it.
+
+    An ordinary retry is the right answer when nothing is named - escalation is
+    an optimisation on top of a correct default, never a precondition for one.
+    """
+    task = entry(23, "src/mod23.py")
+
+    assert failing_paths("Segmentation fault (core dumped)") == ()
+    assert failing_paths("BUILD FAILED in 3s") == ()
+    assert foreign_failure(task, "the build died") == ()
+
+
+def test_a_frame_through_a_dependency_is_not_this_tasks_fault():
+    """Dropped on `judge._FOREIGN`'s list, spelled the same way. A path the task
+    could never have been given an answer about is not evidence either way."""
+    text = (
+        "  at Object.<anonymous> (node_modules/expect/build/index.js:12:5)\n"
+        "  File \"/usr/lib/python3.12/unittest/case.py\", line 3\n"
+        "  tests/test_calc.py:12: AssertionError\n"
+    )
+
+    assert failing_paths(text) == ("tests/test_calc.py",)
+
+
+def test_an_absolute_path_is_not_a_repo_relative_one():
+    assert failing_paths("thread 'x' panicked at /build/src/lib.rs:12:9:") == ()
+
+
+def test_go_test_output_names_a_file_judge_cannot_see():
+    """The one asymmetry between the two extractors, stated out loud.
+
+    A Go package's tests run in that package's directory, so `go test` prints a
+    bare `calc_test.go:12:`. `judge._PATH_RE` requires a slash - which is what
+    stops an English sentence parsing as a file - so it cannot see this one, and
+    that is a deliberate difference rather than a bug in either. `failing_paths`
+    can accept it because `_test.go` is mandatory in Go and it only looks for it
+    in the indented position under `--- FAIL:`.
+    """
+    assert failing_paths(failures.GO_TEST) == ("calc_test.go",)
+    assert mentioned_paths(failures.GO_TEST) == ()
+
+
+@pytest.mark.parametrize(
+    "language", ["pytest", "node", "vitest", "jest", "go-build", "cargo"]
+)
+def test_the_two_extractors_agree_on_every_language(language):
+    """`judge.mentioned_paths` and `checks.failing_paths` answer the same
+    question about the same text, and this is what keeps them in step.
+
+    `judge._PATH_RE` is **already** stack-agnostic and needed no change for
+    #93. That is exactly why this test exists: nothing else would notice
+    somebody narrowing it, and the two modules quietly disagreeing about which
+    file a failure names is the kind of divergence that surfaces months later
+    as an escalation that did not happen.
+    """
+    text = failures.SAMPLES[language]
+
+    assert set(failing_paths(text)) <= set(mentioned_paths(text))
+    for path in failures.EXPECTED[language]:
+        assert path in mentioned_paths(text)

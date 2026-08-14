@@ -447,6 +447,28 @@ def test_only_paths_the_repository_could_own_are_evidence():
     assert mentioned_paths(text) == ("src/swarm/github/client.py",)
 
 
+def test_a_filename_with_two_extensions_survives_intact():
+    """`src/calc.test.js`, not `src/calc.test`.
+
+    The truncated form is a path that does not exist, so it compares equal to
+    nothing in any `## Files` set - which made every double-extension file
+    invisible to the "could the worker have fixed it" question, silently.
+    `*.test.js` and `*.spec.tsx` are the dominant naming convention in exactly
+    the stacks #87 adds. Surfaced by #93's agreement test.
+    """
+    assert mentioned_paths("❯ src/calc.test.ts:5:19") == ("src/calc.test.ts",)
+    assert mentioned_paths("at (test/calc.test.js:5:10)") == ("test/calc.test.js",)
+    assert mentioned_paths("FAIL app/routes/home.spec.tsx") == ("app/routes/home.spec.tsx",)
+
+
+def test_a_leading_dot_slash_is_not_a_different_file():
+    """Go build errors are spelled `./internal/calc/calc.go`, and a `## Files`
+    set never is. `checks.failing_paths` has always stripped it."""
+    assert mentioned_paths("./internal/calc/calc.go:12:2: undefined: helper") == (
+        "internal/calc/calc.go",
+    )
+
+
 def test_two_runs_of_one_failure_share_a_signature():
     assert failure_signature("FAILED tests/test_a.py::test_x in 0.42s") == failure_signature(
         "FAILED tests/test_a.py::test_x in 11.7s"
