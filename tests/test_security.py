@@ -168,13 +168,23 @@ def test_an_unrecognised_prefix_is_refused_unless_asked_for() -> None:
     assert assert_scoped_token("some-enterprise-token", allow_unrecognised=True) == "unrecognised"
 
 
-def test_the_required_permissions_are_the_four_and_only_the_four() -> None:
+def test_the_required_permissions_are_these_and_only_these() -> None:
+    """`checks` is read-only on purpose, and it earned its place the hard way.
+
+    A first real run reached `github.ci` with the other four granted and got a
+    403: GitHub files check runs under `checks`, and `checks.py` cannot tell a
+    green pull request from a red one without them. Write is refused for the
+    same reason `workflows` is - a worker able to create a check run can report
+    its own work as passing.
+    """
     assert REQUIRED_PERMISSIONS == {
         "contents": "write",
         "pull_requests": "write",
         "issues": "write",
+        "checks": "read",
         "metadata": "read",
     }
+    assert REQUIRED_PERMISSIONS["checks"] == "read"
 
 
 def test_workflows_is_forbidden() -> None:
