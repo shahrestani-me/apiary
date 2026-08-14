@@ -23,6 +23,7 @@ It is written to be lifted into the shared fixture set (#31), alongside
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -333,9 +334,35 @@ def test_the_workflow_is_valid_yaml_that_runs_on_push():
     # `on` is YAML 1.1's boolean true, which is why the key is not the string.
     triggers = document.get("on", document.get(True))
     assert set(triggers) == {"push", "pull_request"}
-    # No branch filter on push: the initial commit lands straight on the
-    # default branch and has to produce a check run there.
-    assert triggers["push"] is None
+    # Filtered to the default branch, where it used to be unfiltered. The
+    # initial commit lands straight on that branch and still produces a check
+    # run there; what the filter removes is the second run every PR push paid
+    # for, once for `push` on `swarm/issue-<n>` and once for `pull_request`.
+    assert triggers["push"] == {"branches": ["main"]}
+
+
+def test_a_pull_request_push_produces_one_run_and_not_two():
+    """~20 issues x ~1.3 attempts x 2 runs is ~52 CI runs per objective, each
+    with a cold install, on a billed private repo."""
+    yaml = pytest.importorskip("yaml")
+    triggers = yaml.safe_load(plan_for().files()[CI_WORKFLOW_PATH])
+    triggers = triggers.get("on", triggers.get(True))
+
+    assert triggers["push"]["branches"] == ["main"]
+    assert "swarm/issue-7" not in triggers["push"]["branches"]
+
+
+def test_the_push_filter_names_the_branch_github_actually_made():
+    """`provision` corrects `default_branch` from the creation response before
+    generating any file, because the account has a preference and this plan is
+    only guessing. A filter naming the guess would never fire."""
+    yaml = pytest.importorskip("yaml")
+    plan = dataclasses.replace(plan_for(), default_branch="trunk")
+
+    document = yaml.safe_load(plan.files()[CI_WORKFLOW_PATH])
+    triggers = document.get("on", document.get(True))
+
+    assert triggers["push"] == {"branches": ["trunk"]}
 
 
 def test_the_ci_job_name_is_the_required_status_check_context():
@@ -352,8 +379,85 @@ def test_the_ci_job_name_is_the_required_status_check_context():
 
 
 def test_the_workflow_runs_the_plans_verify_command():
+    """Read back through the parser, not as a substring.
+
+    The command is a block scalar now, so `run: cargo test` no longer appears
+    in the text - and a substring assertion could not have caught the reason
+    for the change anyway.
+    """
+    yaml = pytest.importorskip("yaml")
     workflow = plan_for(verify_command="cargo test").files()[CI_WORKFLOW_PATH]
-    assert "run: cargo test" in workflow
+
+    steps = yaml.safe_load(workflow)["jobs"][CHECK_NAME]["steps"]
+
+    assert steps[-1]["run"].strip() == "cargo test"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "a: b" && pytest -q',          # a mapping-looking colon
+        "pytest -q  # every test",            # a comment marker
+        "pytest -q -k 'not slow'",            # single quotes
+        'pytest -q -k "not slow"',            # double quotes
+        "go test ./... # all packages",
+    ],
+)
+def test_an_awkward_verify_command_still_yields_valid_yaml(command):
+    """The reason the block scalar matters more than it looks.
+
+    #101 makes this command model-generated. Interpolated inline, a stray `: `
+    yields an invalid workflow - and an invalid workflow does not fail loudly:
+    the required check never reports, and **every PR blocks forever** while
+    looking exactly like a check that is still running.
+    """
+    yaml = pytest.importorskip("yaml")
+    workflow = plan_for(verify_command=command).files()[CI_WORKFLOW_PATH]
+
+    steps = yaml.safe_load(workflow)["jobs"][CHECK_NAME]["steps"]
+
+    assert steps[-1]["run"].strip() == command
+
+
+def test_python_generates_no_setup_step():
+    """`ubuntu-latest` ships a Python, which is why there was never a setup
+    step and why the command has to be spelled `python3`. The steps list is
+    what it was before this ticket."""
+    yaml = pytest.importorskip("yaml")
+
+    steps = yaml.safe_load(plan_for().files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+
+    assert [step.get("uses") for step in steps] == ["actions/checkout@v4", None]
+
+
+def test_node_sets_up_its_toolchain_and_caches_it():
+    """Not because `ubuntu-latest` lacks Node, but because it lacks a *pinned*
+    Node - and an unpinned runtime is a gate that changes under the repo."""
+    yaml = pytest.importorskip("yaml")
+    plan = dataclasses.replace(plan_for(verify_command="npm test"), stack="node")
+
+    steps = yaml.safe_load(plan.files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+    setup = steps[1]
+
+    assert setup["uses"] == "actions/setup-node@v4"
+    assert setup["with"]["cache"] == "npm"
+    assert setup["with"]["node-version"]
+    # Parsed, not grepped: `test_provision` already prefers this, and a
+    # substring assertion cannot catch a setup step indented one space wrong -
+    # which is valid YAML that GitHub reads as part of the previous step.
+    assert steps[0]["uses"] == "actions/checkout@v4"
+
+
+def test_a_stack_with_no_entry_emits_no_setup_step_rather_than_failing():
+    """Refusing a stack this host cannot run is #103's job, at planning time,
+    before a repository exists. Here the only thing left to do about it would
+    be to write a broken workflow."""
+    yaml = pytest.importorskip("yaml")
+    plan = dataclasses.replace(plan_for(), stack="haskell")
+
+    steps = yaml.safe_load(plan.files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+
+    assert [step.get("uses") for step in steps] == ["actions/checkout@v4", None]
 
 
 def test_the_license_carries_the_owner_and_the_year():
@@ -583,7 +687,11 @@ def test_the_report_carries_the_command_the_committed_workflow_runs():
     report = provision_into(fake, plan)
 
     assert report.verify_command == plan.verify_command
-    assert f"run: {report.verify_command}" in fake.files()[CI_WORKFLOW_PATH]
+    # Parsed rather than grepped: the command is a block scalar now, so
+    # `run: <command>` no longer appears in the text.
+    yaml = pytest.importorskip("yaml")
+    steps = yaml.safe_load(fake.files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+    assert steps[-1]["run"].strip() == report.verify_command
     assert report.verify_command in report.summary()
 
 

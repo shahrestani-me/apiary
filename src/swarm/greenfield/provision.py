@@ -156,6 +156,16 @@ class ProvisionPlan:
     default_branch: str = "main"
     verify_command: str = PLACEHOLDER_VERIFY
     require_reviews: bool = False
+    #: Which stack's toolchain the generated workflow sets up. A plain string
+    #: rather than a `Stack`, because the only thing this module does with it
+    #: is look it up in `CI_SETUP` - and importing `scaffold.py` for a key
+    #: would make the module that generates the *repository* depend on the one
+    #: that generates the *project inside it*, which is the wrong way round.
+    #:
+    #: Defaulting to python is today's behaviour written down: `choose_stack`
+    #: returns `DEFAULT_STACK` unconditionally, so nothing can yet pass
+    #: anything else. #99 and #101 are what make this field carry information.
+    stack: str = "python"
 
     def __post_init__(self) -> None:
         if not self.owner or "/" in self.owner:
@@ -219,7 +229,13 @@ class ProvisionPlan:
         return {
             "README.md": _readme(self),
             "LICENSE": _mit_license(self.license_holder, self.year),
-            CI_WORKFLOW_PATH: _ci_workflow(self.verify_command),
+            # The branch, not a constant: `provision` corrects `default_branch`
+            # from the creation response before generating any file, so the
+            # push filter names the branch GitHub actually made rather than the
+            # one this plan guessed.
+            CI_WORKFLOW_PATH: _ci_workflow(
+                self.verify_command, stack=self.stack, branch=self.default_branch
+            ),
         }
 
     def rules(self) -> list[dict[str, Any]]:
@@ -631,18 +647,78 @@ def _explain(exc: GitHubHTTPError) -> str:
 # --------------------------------------------------------------------------
 
 
-def _ci_workflow(verify_command: str) -> str:
+#: The setup step each stack's toolchain needs, keyed by stack id.
+#:
+#: **Python emits nothing, and that is the whole reason the default is safe.**
+#: `ubuntu-latest` ships a Python, so today's generated workflow has no setup
+#: step at all - and the steps list it produces after this change is the one it
+#: produced before, unchanged.
+#:
+#: Node is the second entry because it is #87's first non-Python stack, and it
+#: is where the caching matters: `cache: npm` keys on the lockfile and turns a
+#: cold install into a warm one. `ubuntu-latest` ships a Node too, but not a
+#: pinned one, and an unpinned runtime is a gate that changes under the repo.
+#:
+#: A stack with no entry gets no setup step rather than an error. The refusal
+#: for a stack this host cannot run belongs to #103, at planning time, before a
+#: repository exists - not here, where the only thing left to do about it is
+#: write a broken workflow.
+CI_SETUP: dict[str, tuple[str, ...]] = {
+    "python": (),
+    "node": (
+        "- uses: actions/setup-node@v4",
+        "  with:",
+        "    node-version: '22'",
+        "    cache: npm",
+    ),
+    "react": (
+        "- uses: actions/setup-node@v4",
+        "  with:",
+        "    node-version: '22'",
+        "    cache: npm",
+    ),
+}
+
+#: How deep a step sits under `steps:`. One place, because the whole failure
+#: mode this function has is an indent that YAML accepts and GitHub ignores.
+_STEP_INDENT = " " * 6
+
+
+def _ci_workflow(verify_command: str, *, stack: str = "python", branch: str = "main") -> str:
     """The workflow whose one job is the required status check.
 
-    `on: push` with no branch filter is deliberate: the initial commit lands
-    directly on the default branch and must produce a check run there, since
-    "CI passes on the initial commit" is what this issue is judged on.
+    Three decisions worth stating, because two of them replace earlier ones.
+
+    **`push` is filtered to the default branch.** It used to be unfiltered, and
+    the argument was that the initial commit lands directly on the default
+    branch and must produce a check run there. That is still true and the
+    filter still allows it - what the filter removes is the *second* run every
+    PR push paid for, once for `push` on `swarm/issue-<n>` and once for
+    `pull_request`. Roughly 20 issues x ~1.3 attempts x 2 runs is ~52 CI runs
+    per objective, each with a cold install, on billed private repositories.
+
+    **The setup step is per stack.** `ubuntu-latest` ships a Python, which is
+    why there was no setup step and why the Python command has to be spelled
+    `python3`. Nothing else the swarm can generate is so lucky. `CI_SETUP` is
+    the table; a stack that is not in it emits nothing, and refusing a stack
+    this host cannot run is #103's job, at planning time.
+
+    **The command is a block scalar.** `run: {command}` interpolated inline is
+    valid YAML right up until the command contains `: `, a `#`, or a quote -
+    and #101 makes that command model-generated. An invalid workflow does not
+    fail loudly: the required check never reports, and **every PR blocks
+    forever** while looking exactly like a check that is still running.
     """
+    # Each setup line carries its own newline, so a stack with no setup step
+    # leaves the steps list byte-for-byte as it was rather than a blank line
+    # where a block used to be.
+    steps = "".join(f"{_STEP_INDENT}{line}\n" for line in CI_SETUP.get(stack, ()))
     return f"""\
 name: ci
 
 on:
   push:
+    branches: [{branch}]
   pull_request:
 
 jobs:
@@ -654,9 +730,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+{steps}
       - name: {CHECK_NAME}
-        run: {verify_command}
+        run: |
+          {verify_command}
 """
 
 

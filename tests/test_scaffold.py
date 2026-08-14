@@ -29,7 +29,12 @@ from typing import Any
 
 import pytest
 
-from swarm.greenfield.provision import CI_WORKFLOW_PATH, PLACEHOLDER_VERIFY, ProvisionPlan
+from swarm.greenfield.provision import (
+    CHECK_NAME,
+    CI_WORKFLOW_PATH,
+    PLACEHOLDER_VERIFY,
+    ProvisionPlan,
+)
 from swarm.greenfield.scaffold import (
     INITIAL_VERSION,
     PYTHON,
@@ -364,7 +369,9 @@ def test_a_provisioned_repo_verifies_with_the_scaffolds_command(tmp_path: Path):
         target.write_text(content, encoding="utf-8")
 
     assert plan.verify_command == PYTHON_VERIFY
-    assert f"run: {PYTHON_VERIFY}" in plan.files()[CI_WORKFLOW_PATH]
+    yaml = pytest.importorskip("yaml")
+    steps = yaml.safe_load(plan.files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+    assert steps[-1]["run"].strip() == PYTHON_VERIFY
     assert PYTHON_VERIFY in plan.files()["README.md"]
     assert run_verify(tmp_path, plan.verify_command).returncode == 0
 
