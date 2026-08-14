@@ -63,8 +63,12 @@ Then point it at a real repo:
 ```bash
 export SWARM_REPO=~/sources/your-repo
 export SWARM_VERIFY="python -m pytest -q"   # must match YOUR repo's test command
-swarm run --repo owner/name --objective "add exponential backoff to the HTTP client"
+swarm run --repo owner/name --objective @brief.md
 ```
+
+`@path` reads the objective from a file, and for anything real that is what you
+want: the planner decomposes this text into tasks, and a phrase gives it
+nothing to decompose. Both `--objective` and `--new` accept it.
 
 Full install, model choice and memory budgeting: **[SETUP.md](SETUP.md)**.
 Credentials and what currently runs end to end: **[Running v2 locally](#running-v2-locally)**.
