@@ -474,10 +474,16 @@ def test_greenfield_runs_against_the_repository_it_just_created(monkeypatch, cap
     # A fresh repository has an empty ledger, which is now the planner's cue.
     # This test is about provisioning, and letting it reach `plan_node` would
     # put a real model call in the unit suite.
-    monkeypatch.setattr(
-        "swarm.cli.plan_node",
-        lambda state, source=None: {"tasks": {"seed": {}}, "events": ["planned 1 task(s)"]},
-    )
+    def fake_plan(state, source=None):
+        # Writes an issue as the real planner does, because the run now judges
+        # planning by re-reading the ledger rather than by trusting the
+        # planner's own return value - a read taken straight after a write can
+        # be served stale, and trusting it once printed "produced nothing"
+        # under a list of the issues just created.
+        client.issues.append(issue(1, marker="seed", labels=("swarm:ready",)))
+        return {"tasks": {"seed": {}}, "events": ["planned 1 task(s)"]}
+
+    monkeypatch.setattr("swarm.cli.plan_node", fake_plan)
 
     code = main(
         # --plan-only: this test is about provisioning and the hand-off to the

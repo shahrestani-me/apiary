@@ -783,6 +783,13 @@ def plan_node(state: SwarmState, *, source: GitHubClient | str | None = None) ->
     # disagreement, GitHub wins" is only a rule that means anything if nothing
     # keeps a second copy. `adopt=False` because the write above just adopted
     # everything it touched.
+    # Unconditional: GitHub answers a conditional re-read of a list it has just
+    # accepted writes to with a 304 for a short window, and the cached body is
+    # the ledger as it was *before* the plan. Re-reading is only worth doing if
+    # it can see what was written.
+    invalidate = getattr(client, "invalidate_cache", None)
+    if invalidate is not None:
+        invalidate()
     ledger = load_ledger(client, adopt=False)
 
     events = [f"planned onto {report.summary()}"]
