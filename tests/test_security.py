@@ -580,3 +580,21 @@ def test_an_ordinary_worker_environment_passes(monkeypatch):
     assert_no_provision_token({"GITHUB_TOKEN": "github_pat_" + "f" * 40})
     assert_no_provision_token({})
     assert_no_provision_token(None)
+
+
+def test_compose_hands_the_boot_key_to_the_orchestrator_and_no_one_else():
+    """The split is only real if the key actually arrives where it is needed.
+
+    It was added to `security.py` and to `doctor` before it was added to
+    `compose.yaml`, so the containerized `--new` path failed at the credential
+    check having already asked the operator to confirm the repository name.
+    The check did its job; the wiring had not been done.
+    """
+    compose = (Path(__file__).resolve().parents[1] / "compose.yaml").read_text()
+    orchestrator, _, rest = compose.partition("docker-socket-proxy:")
+
+    assert f"{PROVISION_TOKEN_ENV}: ${{{PROVISION_TOKEN_ENV}:-}}" in orchestrator
+    # And nowhere else: the worker network's containers are created by
+    # `ContainerManager`, not by compose, but a future service added here must
+    # not be handed it either.
+    assert PROVISION_TOKEN_ENV not in rest

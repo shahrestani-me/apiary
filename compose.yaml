@@ -56,6 +56,16 @@ services:
     # EgressPolicy.proxy_env().
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+
+      # The boot key, for `swarm run --new` only. Passed to *this* service and
+      # never to a worker: `ContainerManager` inherits only GITHUB_TOKEN and
+      # OLLAMA_HOST into a container, and `security.assert_no_provision_token`
+      # refuses to start one carrying this by name or by value.
+      #
+      # Empty rather than required, because every command except --new works
+      # without it and `assert_provision_token` already fails by name when it
+      # is genuinely needed.
+      APIARY_PROVISION_TOKEN: ${APIARY_PROVISION_TOKEN:-}
       GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
       OLLAMA_HOST: ${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
       DOCKER_HOST: tcp://docker-socket-proxy:2375
