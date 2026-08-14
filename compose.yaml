@@ -66,6 +66,18 @@ services:
       NO_PROXY: localhost,127.0.0.1,egress-proxy,docker-socket-proxy
       no_proxy: localhost,127.0.0.1,egress-proxy,docker-socket-proxy
 
+      # The artifacts directory as the *daemon* sees it. This service reaches
+      # Docker through a socket proxy, so every --volume source it names when
+      # spawning a worker is resolved on the host - where /var/apiary/runs does
+      # not exist. Without this the daemon creates an empty directory there,
+      # the worker writes its result into it, and the orchestrator reads the
+      # bind mount below and finds nothing: a run that looks healthy and learns
+      # nothing about what any worker did.
+      #
+      # ${PWD} is the directory compose was invoked from, which is also what
+      # `./.swarm/runs` below resolves against, so the two stay in step.
+      APIARY_ARTIFACTS_HOST_ROOT: ${PWD}/.swarm/runs
+
     # Two internal networks, not one. The orchestrator needs both the Docker API
     # and the outside world; a worker needs only the second, and putting them on
     # one network would put the Docker API one DNS lookup away from a container

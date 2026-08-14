@@ -32,6 +32,8 @@ from typing import Any, Sequence
 import pytest
 
 from swarm.artifacts import (
+    HOST_ROOT_ENV,
+    host_path,
     EVENT_LOG_NAME,
     RESULTS_DIR_NAME,
     SUMMARY_FILE_NAME,
@@ -554,3 +556,51 @@ def test_the_summary_is_derived_and_the_result_files_are_the_truth(root):
     assert view.results.latest[7].outcome == "infrastructure"
     assert view.needs_human == (7,)
     assert (artifacts.path / RESULTS_DIR_NAME / "issue-7-attempt-1.json").exists()
+
+
+# --------------------------------------------------------------------------
+# The daemon's view of the mount
+# --------------------------------------------------------------------------
+
+
+def test_the_mount_source_is_the_hosts_path_when_the_orchestrator_is_a_container(
+    tmp_path, monkeypatch
+):
+    """A containerized orchestrator must not name its own path to the daemon.
+
+    It reaches Docker through a socket, so `--volume <src>:...` is resolved on
+    the host. `/var/apiary/runs` is real inside the orchestrator and absent
+    outside it, so the daemon would create an empty directory, the worker would
+    write its result into that, and the orchestrator would read its own bind
+    mount and find nothing — a run that looks healthy and learns nothing about
+    what any worker did.
+    """
+    monkeypatch.setenv(HOST_ROOT_ENV, "/Users/someone/apiary/.swarm/runs")
+    artifacts = RunArtifacts.open(a_run(), root=tmp_path / "var" / "apiary" / "runs")
+
+    flags = artifacts.mount_flags()
+
+    assert flags[0] == "--volume"
+    source, _, target = flags[1].rpartition(":")
+    assert target == DEFAULT_RESULT_DIR
+    assert source.startswith("/Users/someone/apiary/.swarm/runs/")
+    assert source.endswith("/results")
+    # The run id survives the translation: results are filed per run, and a
+    # rewrite that lost it would put every run's results in one directory.
+    assert artifacts.run.id in source
+
+
+def test_the_mount_source_is_unchanged_on_the_host(tmp_path, monkeypatch):
+    """One filesystem serves both, so the translation is the identity."""
+    monkeypatch.delenv(HOST_ROOT_ENV, raising=False)
+    artifacts = RunArtifacts.open(a_run(), root=tmp_path)
+
+    assert artifacts.mount_flags() == [
+        "--volume", f"{artifacts.results_dir}:{DEFAULT_RESULT_DIR}"
+    ]
+
+
+def test_a_path_outside_the_artifacts_root_is_left_alone(monkeypatch):
+    """This translates one mount. Guessing about others would be worse."""
+    monkeypatch.setenv(HOST_ROOT_ENV, "/Users/someone/runs")
+    assert host_path("/etc/hosts", root="/var/apiary/runs") == Path("/etc/hosts")
