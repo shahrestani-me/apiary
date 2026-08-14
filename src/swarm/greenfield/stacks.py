@@ -21,20 +21,21 @@ from __future__ import annotations
 
 #: The React toolchain, pinned, in the one place it is written down.
 #:
-#: **Three copies have to agree.** `Dockerfile.worker.react` installs it at
-#: image build time, `greenfield.provision.CI_SETUP["react"]` installs it on a
-#: GitHub runner, and this tuple is what
-#: `test_the_react_toolchain_is_pinned_identically_everywhere` compares both
-#: against. The same shape as `security.py` / `compose.yaml` /
-#: `test_security.py`, for the same reason: the drift is silent, and the
-#: failure it produces is a red CI run on a green worker - the one result that
-#: makes the whole gate untrustworthy.
+#: **Two copies have to agree, and only one of the two directions needs a
+#: test.** `greenfield.provision.CI_SETUP["react"]` interpolates this tuple, so
+#: the generated workflow cannot drift from it by construction.
+#: `Dockerfile.worker.react` cannot import Python and therefore repeats the
+#: versions, which is the copy
+#: `test_the_react_toolchain_is_pinned_identically_everywhere` exists for. Same
+#: shape as `security.py` / `compose.yaml` / `test_security.py`, for the same
+#: reason: the drift is silent, and the failure it produces is a red CI run on
+#: a green worker - the one result that makes the whole gate untrustworthy.
 #:
-#: **Why three copies rather than one artefact both consume.** The worker gets
-#: its toolchain from its image; a GitHub runner cannot. That is the residual
-#: gap #106 could not close: `npm ci` needs a lockfile, producing a lockfile
-#: needs the registry a worker is denied (docs/security.md §3), and #105
-#: shipped the mechanism for *committing* a generated lockfile, not for
+#: **Why the workflow installs at all**, rather than consuming the image: the
+#: worker gets its toolchain from its image and a GitHub runner cannot. That is
+#: the residual gap #106 could not close - `npm ci` needs a lockfile, producing
+#: a lockfile needs the registry a worker is denied (docs/security.md §3), and
+#: #105 shipped the mechanism for *committing* a generated lockfile, not for
 #: generating one without a network. So CI runs `npm install` and resolves
 #: inside these ranges independently.
 #:

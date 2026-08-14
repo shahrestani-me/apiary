@@ -28,8 +28,9 @@
 # on a `"type": "module"` project, which is what a modern React project is.
 # What works is putting the dependencies at the **filesystem root**: the ESM
 # resolver walks parent directories looking for `node_modules`, so
-# `/node_modules` resolves from `/workspace/<repo>` with no symlink, no
-# environment variable, and nothing for the generated project to declare.
+# `/node_modules` resolves from any working directory below `/` - a worker's
+# clone, or the falsifier's `/w` - with no symlink, no environment variable,
+# and nothing for the generated project to declare.
 #
 # **No npm cache warming, and no NPM_CONFIG_PREFER_OFFLINE.** #106 asked for
 # both, on the theory that the verify command would install. It does not - the
@@ -38,6 +39,34 @@
 # a knob describing a design that was abandoned.
 
 FROM node:22-bookworm-slim AS node
+
+
+# The React toolchain, resolved in a stage that is thrown away.
+#
+# **Not in the runtime stage, and not as root.** `npm install` runs package
+# lifecycle scripts, and this image exists to hold model output at arm's
+# length - installing ~170 transitive packages as uid 0 in the final image's
+# own build would let any one of their `postinstall` hooks write to
+# `/opt/venv`, which is the orchestrator package the worker imports. So the
+# resolution happens here, as the base image's unprivileged `node` user, with
+# `--ignore-scripts`, and the runtime stage takes only the resulting directory
+# via `COPY` - which copies files and executes nothing.
+#
+# `--ignore-scripts` is not free of consequence and was measured rather than
+# assumed: this set installs and the gate runs green without any of them,
+# because esbuild ships its platform binary as an optional dependency rather
+# than fetching it in a hook. A future addition that genuinely needs its
+# postinstall will fail loudly here, at build time, on the host, which is the
+# right place to have that argument.
+FROM node:22-bookworm-slim AS deps
+RUN mkdir -p /deps && chown node:node /deps
+USER node
+WORKDIR /deps
+RUN npm install --no-audit --no-fund --ignore-scripts --loglevel=error \
+      react@18 react-dom@18 vitest@2 @vitejs/plugin-react@4 jsdom@25 \
+      @testing-library/react@16 @testing-library/jest-dom@6
+
+
 FROM python:3.12-slim AS build
 
 # Same interpreter as Dockerfile.worker on purpose - see its note. A bug that
@@ -72,26 +101,30 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-# The React toolchain, at the filesystem root - see the header note on why
-# NODE_PATH is not an option. `npm install --prefix /` does *not* produce
-# `/node_modules`; it has to be installed somewhere ordinary and moved.
+# The toolchain, at the filesystem root - see the header note on why NODE_PATH
+# is not an option. Root-owned and not writable by uid 10001, deliberately:
+# the gate reads it and has no business changing it.
 #
-# Every version here is also in `greenfield/stacks.py`'s `REACT_TOOLCHAIN` and in
-# the install step of the generated CI workflow, and
+# The versions live in the `deps` stage above, and also in
+# `greenfield/stacks.py`'s `REACT_TOOLCHAIN` and in the install step of the
+# generated CI workflow.
 # `tests/test_bootstrap.py::test_the_react_toolchain_is_pinned_identically_everywhere`
 # fails if the three drift. That test is the only thing keeping worker-green
 # and CI-green statements about the same versions: the worker gets its
 # toolchain from this layer and a GitHub runner cannot.
-RUN mkdir -p /tmp/deps && cd /tmp/deps \
- && npm install --no-audit --no-fund --loglevel=error \
-      react@18 react-dom@18 vitest@2 @vitejs/plugin-react@4 jsdom@25 \
-      @testing-library/react@16 @testing-library/jest-dom@6 \
- && mv /tmp/deps/node_modules /node_modules \
- && rm -rf /tmp/deps
+COPY --from=deps /deps/node_modules /node_modules
 
 COPY --from=build /opt/venv /opt/venv
 
-ENV PATH="/node_modules/.bin:/opt/venv/bin:$PATH" \
+# `/node_modules/.bin` goes **last**, and that ordering is load-bearing rather
+# than stylistic. npm fills `.bin` from every installed package's `bin` field,
+# so a prefix would let any one of ~170 transitive packages ship a file called
+# `git` and have the worker's clone/branch/commit/push cycle - a process
+# holding a push token, with an allowlisted route to github.com - run it
+# instead of the real one. Appending means the toolchain is reachable and
+# shadows nothing: `vitest` exists nowhere else, and `git`, `node`, `npm` and
+# `python3` keep resolving to the system copies this image installed.
+ENV PATH="/opt/venv/bin:$PATH:/node_modules/.bin" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

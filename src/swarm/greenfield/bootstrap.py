@@ -168,33 +168,58 @@ STACK_VERIFY: dict[str, str] = {
     "react": "vitest run",
 }
 
-#: What the bootstrap is allowed to depend on, per stack, in the goal the
-#: worker is handed.
+#: Everything a stack's bootstrap must be told beyond "write these files",
+#: spliced into the goal the worker is handed.
 #:
-#: **A per-stack sentence rather than one sentence, because the single sentence
-#: was false.** Every bootstrap used to be told "no dependencies beyond the
-#: language's standard library", which is the correct instruction for Python
-#: and for `node --test` and an impossible one for React: react and react-dom
-#: *are* dependencies, and a model obeying the rule literally would write no
-#: React at all.
+#: **Named for the stack and not for dependencies**, because for one stack it
+#: is only about dependencies and for another it is not. It began as a single
+#: sentence - "no dependencies beyond the language's standard library" - which
+#: is the correct instruction for Python and for `node --test` and an
+#: impossible one for React: react and react-dom *are* dependencies, and a
+#: model obeying the rule literally would write no React at all. Whatever the
+#: next stack needs said belongs here, whether or not it is about packages.
 #:
-#: The React text names the packages instead, because that list is the whole
-#: contract with the image. A worker has no route to a registry
-#: (docs/security.md §3), so a package outside this set is not slow to add, it
-#: is unobtainable - and the failure a model sees is a resolution error in its
-#: own test run rather than anything that says "you were not allowed that".
-DEPENDENCY_RULE: dict[str, str] = {
+#: React's entry names the packages, because that list is the whole contract
+#: with the image: a worker has no route to a registry (docs/security.md §3),
+#: so a package outside this set is not slow to add, it is unobtainable.
+#:
+#: **The `@testing-library/jest-dom` import line is not decoration.**
+#: Installing that package supplies nothing on its own - `expect` learns
+#: `toBeInTheDocument` only once the registration module has run - and
+#: `toBeInTheDocument()` is what a model writes whether or not anything told it
+#: to. So the package is in the image *and* the prompt demands the import. One
+#: without the other produces exactly the failure the package is there to
+#: prevent, on a project that is otherwise correct.
+#:
+#: **It has to be an import in the test file; `setupFiles` does not work.**
+#: Measured: `setupFiles: ["@testing-library/jest-dom/vitest"]` resolves to
+#: `/node_modules/@testing-library/jest-dom/dist/vitest.mjs`, which Vite then
+#: reads as a root-*relative URL* under the project root and fails to load -
+#: "Does the file exist?", about a file that does. It is the second consequence
+#: of putting the toolchain at `/` (see `Dockerfile.worker.react` on why
+#: `NODE_PATH` was not an option either): a bare specifier inside a source file
+#: resolves by walking parent directories and works, an absolute path handed to
+#: Vite's config does not.
+#:
+#: The package list hangs off "already installed", never off a prohibition.
+#: Written the other way - "do not add any others: react, react-dom, ..." - the
+#: colon binds to the nearest clause, and a plausible reading is that React
+#: itself is the forbidden thing.
+STACK_RULE: dict[str, str] = {
     "python": "Use no dependencies beyond the language's standard library.",
     "node": "Use no dependencies beyond the language's standard library.",
     "react": (
         "This is React on the web, not React Native. "
-        "These packages are already installed and are the only ones available - "
-        "there is no network, so do not add any others: "
+        "These packages are already installed and are the only ones available: "
         + ", ".join(package_names())
-        + ". package.json must set \"type\": \"module\" and list exactly those "
-        "packages. vitest.config.js must export a config using the "
-        "@vitejs/plugin-react plugin with test.environment 'jsdom' and "
-        "test.globals true. Tests render components with @testing-library/react."
+        + ". There is no network, so do not import or declare anything else. "
+        "package.json must set \"type\": \"module\" and list exactly those "
+        "packages. vitest.config.js must export a config that uses the "
+        "@vitejs/plugin-react plugin and sets test.environment to \"jsdom\" and "
+        "test.globals to true. Every test file must begin with the line "
+        "import \"@testing-library/jest-dom/vitest\"; - without it, matchers "
+        "such as toBeInTheDocument() do not exist - and must render components "
+        "with @testing-library/react."
     ),
 }
 
@@ -308,7 +333,7 @@ class Bootstrap:
         return (
             f"Create the initial {self.stack} project for: {self.prompt} "
             f"Write every file listed, complete and working. "
-            f"{DEPENDENCY_RULE.get(self.stack, DEPENDENCY_RULE[DEFAULT_STACK])} "
+            f"{STACK_RULE.get(self.stack, STACK_RULE[DEFAULT_STACK])} "
             f"The test file must contain at "
             f"least one real assertion about the code in this project - a suite that "
             f"passes because it tests nothing is worse than no suite."
@@ -532,16 +557,30 @@ def _container_run(command: str, tree: Path, *, stack: str = DEFAULT_STACK) -> i
     filter: `vitest` writes a transformed config beside the real one and exits
     **1** on a read-only mount whatever the code says. The isolation now comes
     from the volume being a throwaway copy rather than from the flag.
+
+    **`HARDENING_FLAGS` came with that change and should have been here all
+    along.** `security.worker_create_flags` adds `--cap-drop ALL` and
+    `--security-opt no-new-privileges:true` to the *dispatcher's* containers,
+    and this is the other place model-proposed shell runs. While the mount was
+    read-only the omission was survivable, because the container had no
+    writable path to the host at all; a writable bind mount plus a setuid
+    binary reachable in the image is a different question, and the answer is
+    two flags rather than an argument.
     """
     from ..containers.manager import ContainerManager, StackImages
     from ..run import Run
+    from ..security import HARDENING_FLAGS
 
     manager = ContainerManager(
         run=Run.start("apiary/falsify", "falsify a proposed gate"),
         image=StackImages().for_stack(stack),
         env={},
         timeout_s=FALSIFY_TIMEOUT_S,
-        extra_flags=["--network", "none", "--volume", f"{Path(tree).resolve()}:/w"],
+        extra_flags=[
+            "--network", "none",
+            *HARDENING_FLAGS,
+            "--volume", f"{Path(tree).resolve()}:/w",
+        ],
     )
     handle = manager.spawn(
         0, "", entrypoint="/bin/sh", command=["-c", f"cd /w && {command}"]
@@ -557,11 +596,20 @@ def choose_gate(
     tree: Path,
     files: Sequence[str],
     *,
+    stack: str,
     operator: str | None = None,
     fallback: str = "",
     **kwargs,
 ) -> Verdict:
     """Which command becomes the repository's gate.
+
+    **`stack` is required, and deliberately not defaulted.** It reaches
+    `falsify` where it selects the probe's image, and the natural wiring -
+    `choose_gate(proposed, tree, files)` - would otherwise probe React's
+    `vitest run` in the Python image, get exit 127, refuse it as "red on its
+    own code" and silently drop the repository back to `PLACEHOLDER_VERIFY`.
+    A parameter whose wrong value is that expensive does not get a default,
+    even though the caller always has one to hand.
 
     **An explicit `--verify` skips falsification entirely.** It is the escape
     hatch, and an escape hatch that can be refused is not one: a false rejection
@@ -577,7 +625,7 @@ def choose_gate(
     """
     if operator:
         return Verdict(operator.strip(), True, "chosen by the operator with --verify; not falsified")
-    verdict = falsify(proposed, tree, files, **kwargs)
+    verdict = falsify(proposed, tree, files, stack=stack, **kwargs)
     if verdict.accepted:
         return verdict
     return Verdict(fallback, False, f"keeping {fallback!r}: {verdict.reason}")

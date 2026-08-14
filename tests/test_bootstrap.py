@@ -30,7 +30,7 @@ from swarm.greenfield.provision import CI_SETUP, PLACEHOLDER_VERIFY
 from swarm.greenfield.stacks import REACT_TOOLCHAIN, package_names
 from swarm.greenfield.bootstrap import (
     BOOTSTRAP_FILES,
-    DEPENDENCY_RULE,
+    STACK_RULE,
     STACK_VERIFY,
     FALSIFY_TIMEOUT_S,
     ProposedGate,
@@ -340,6 +340,48 @@ def test_neither_run_touches_the_tree_the_repository_will_keep(tmp_path):
     assert (tree / "src/main.py").read_text() == "real content\n"
 
 
+def test_the_probe_is_confined_however_the_mount_changes(monkeypatch, tmp_path):
+    """`--network none` was the *unpinned* half of the isolation pair.
+
+    Deleting it passed the whole suite, docker-marked tests included, while
+    three docstrings and `docs/security.md` rest the entire no-widened-egress
+    argument on it - and now that `:ro` is gone it is the only thing standing
+    between model-proposed shell and a package registry. Pinned here, together
+    with the `HARDENING_FLAGS` the dispatcher has always applied and this probe
+    did not, so an edit that widens either has to say so out loud.
+    """
+    from swarm.security import HARDENING_FLAGS
+    import swarm.greenfield.bootstrap as module
+
+    captured: dict[str, list[str]] = {}
+
+    class Manager:
+        def __init__(self, **kwargs):
+            captured["flags"] = list(kwargs["extra_flags"])
+            captured["image"] = kwargs["image"]
+            captured["env"] = kwargs["env"]
+
+        def spawn(self, *args, **kwargs):
+            return object()
+
+        def wait(self, handle, timeout_s=None):
+            return 0
+
+        def dispose(self, handle):
+            return None
+
+    monkeypatch.setattr("swarm.containers.manager.ContainerManager", Manager)
+    module._container_run("echo hi", tmp_path, stack="python")
+
+    flags = captured["flags"]
+    assert flags[:2] == ["--network", "none"]
+    for flag in HARDENING_FLAGS:
+        assert flag in flags
+    # Nothing that could carry a credential into model-proposed shell.
+    assert captured["env"] == {}
+    assert not any(":ro" in flag for flag in flags), "the mount is a copy, not read-only"
+
+
 def test_the_probe_runs_in_the_stacks_own_image(monkeypatch, tmp_path):
     """React's gate is `vitest run` and `vitest` exists only in
     `apiary-worker-react`. Probing it in the Python image would refuse the
@@ -619,7 +661,12 @@ def test_an_operators_verify_command_is_never_falsified(tmp_path):
     runs = Runs([])
 
     verdict = choose_gate(
-        "pytest -q", a_tree(tmp_path), ["src/main.py"], operator="make check", run=runs
+        "pytest -q",
+        a_tree(tmp_path),
+        ["src/main.py"],
+        stack="python",
+        operator="make check",
+        run=runs,
     )
 
     assert verdict.accepted
@@ -634,6 +681,7 @@ def test_a_refused_gate_keeps_the_placeholder_rather_than_failing_the_run(tmp_pa
         "true",
         a_tree(tmp_path),
         ["src/main.py"],
+        stack="python",
         fallback=PLACEHOLDER_VERIFY,
         run=Runs([]),
         workspace=tmp_path,
@@ -649,6 +697,7 @@ def test_an_accepted_gate_replaces_the_placeholder(tmp_path):
         "pytest -q",
         a_tree(tmp_path),
         ["src/main.py"],
+        stack="python",
         fallback=PLACEHOLDER_VERIFY,
         run=Runs([0, 1]),
         workspace=tmp_path,
@@ -708,10 +757,15 @@ def test_the_node_gate_cannot_pass_on_a_project_with_no_tests():
 
 
 def test_every_declarable_stack_has_a_gate_entry():
-    """Empty says "considered"; missing says "forgotten". React's was empty
-    until #106, because `node --test` cannot run JSX without a transform and
-    inheriting the placeholder was better than claiming a command that could
-    not run. It has a real one now."""
+    """Every stack, and every one of them non-empty.
+
+    The wider house convention is 'empty says "considered", missing says
+    "forgotten"' - `ledger.GENERATED_FILES` still uses it. `STACK_VERIFY` no
+    longer does, and that is the assertion below: React's entry was empty until
+    #106, because `node --test` cannot run JSX without a transform and
+    inheriting the placeholder beat claiming a command that could not run. Now
+    that every declarable stack has a gate that runs, an empty one is a stack
+    whose gate somebody forgot."""
     assert set(STACK_VERIFY) == KNOWN_STACKS
     assert all(command for command in STACK_VERIFY.values())
 
@@ -729,11 +783,7 @@ def test_the_react_gate_needs_no_guard_where_the_node_one_did():
     bytes run in both places. `npx` would work too and is worse - it is an
     installer, so its behaviour differs on the two sides of the egress fence.
     """
-    command = STACK_VERIFY["react"]
-
-    assert command == "vitest run"
-    assert "npx" not in command
-    assert "&&" not in command
+    assert STACK_VERIFY["react"] == "vitest run"
 
 
 def test_the_react_bootstrap_declares_the_config_its_gate_needs():
@@ -759,6 +809,11 @@ def _npm_specs(text: str) -> set[str]:
     code = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
+    # Checked, not assumed: a *second* `RUN npm install` layer would be
+    # invisible to a parser that reads the first one and stops, which is
+    # precisely the "package in the image that the workflow never installs"
+    # drift the caller advertises catching.
+    assert code.count("npm install") == 1, "expected exactly one npm install"
     body = code.split("npm install", 1)[1]
     for terminator in ("&&", "\n\n", "|"):
         body = body.split(terminator, 1)[0]
@@ -819,7 +874,37 @@ def test_a_scoped_package_survives_having_its_version_stripped():
 
 
 def test_every_declarable_stack_says_what_it_may_depend_on():
-    assert set(DEPENDENCY_RULE) == KNOWN_STACKS
+    assert set(STACK_RULE) == KNOWN_STACKS
+
+
+def test_the_react_rule_demands_the_jest_dom_registration_import():
+    """Shipping the package supplies nothing on its own - `expect` learns
+    `toBeInTheDocument` only once the registration module has run - and
+    `toBeInTheDocument()` is what a model writes whether or not anything told
+    it to. The package in the image without this line in the prompt is the
+    failure the package is there to prevent.
+
+    It must be an import in the test file. `setupFiles` was measured and does
+    not work with the toolchain at `/`: Vite reads the resolved absolute path
+    as a root-relative URL under the project root and fails to load a file that
+    exists.
+    """
+    rule = STACK_RULE["react"]
+
+    assert "@testing-library/jest-dom/vitest" in rule
+    assert "toBeInTheDocument" in rule
+    assert "setupFiles" not in rule
+
+
+def test_the_react_rule_never_hangs_the_package_list_off_a_prohibition():
+    """"do not add any others: react, react-dom, ..." binds the colon to the
+    nearest clause, and a plausible reading is that React itself is forbidden -
+    which would produce a package.json with no React in it."""
+    rule = STACK_RULE["react"]
+    before_list = rule.split(package_names()[0] + ",")[0]
+
+    assert "already installed" in before_list
+    assert "do not" not in before_list
 
 
 def test_the_python_bootstrap_still_gets_the_standard_library_rule():
