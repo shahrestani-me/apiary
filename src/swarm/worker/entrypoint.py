@@ -78,6 +78,12 @@ EXIT_INFRASTRUCTURE = 2
 #: workdir and the only directory the unprivileged user owns.
 DEFAULT_WORKSPACE = "/workspace"
 
+#: The shell's own codes for "I could not run that": 127 is command not found,
+#: 126 is found but not executable. Both mean the gate never opened, so neither
+#: is evidence about the work - see `run_verify`. Deliberately narrow: a suite
+#: that runs and exits 2, or 5, has genuinely failed and is the task's problem.
+UNRUNNABLE_EXIT_CODES = frozenset({126, 127})
+
 #: How much of the verify output travels onward. #17 puts it in the PR body and
 #: #29 writes it to disk, and neither wants a megabyte of pytest chatter.
 OUTPUT_TAIL_CHARS = 4_000
@@ -203,6 +209,18 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
     A timeout is a failure, not an error. A suite that hangs is as unmergeable
     as one that fails, and calling it infrastructure would hand back an
     unconsumed attempt to a task that can hang again for free.
+
+    **A command that could not be executed is a different thing entirely**, and
+    raises `InfrastructureError` rather than returning a failure. The shell
+    reports 127 for "command not found" and 126 for "found but not
+    executable", and neither says anything about the code the model wrote. A
+    target repository whose `## Verify` names a tool the image lacks - or
+    simply says `python` on a host that only has `python3` - would otherwise
+    fail identically on every attempt, exhaust its budget, land on
+    `swarm:failed`, and feed the model three rounds of "command not found" as
+    though it were a code review. That is exactly the case
+    `docs/issue-contract.md` §4 separates exit 1 from exit 2 to prevent, and it
+    is invisible inside the container, where the command usually does exist.
     """
     try:
         proc = subprocess.run(
@@ -215,7 +233,16 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
         )
     except subprocess.TimeoutExpired:
         return False, f"verify timed out after {SETTINGS.verify_timeout_s}s"
+    except OSError as exc:
+        # The shell itself could not be started. Nothing ran.
+        raise InfrastructureError(f"could not run the verify command: {exc}") from exc
+
     output = f"{proc.stdout}\n{proc.stderr}".strip()
+    if proc.returncode in UNRUNNABLE_EXIT_CODES:
+        raise InfrastructureError(
+            f"the verify command could not be run (exit {proc.returncode}): "
+            f"{command!r}\n{output[-OUTPUT_TAIL_CHARS:]}"
+        )
     return proc.returncode == 0, output[-OUTPUT_TAIL_CHARS:]
 
 

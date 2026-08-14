@@ -569,3 +569,46 @@ def test_the_real_worker_model_closes_the_loop(fake_github, scratch_repo, worksp
 
     assert main(argv(scratch_repo, workspace), client=gh) == EXIT_OK
     assert checkout(workspace, scratch_repo).head() != scratch_repo.head()
+
+
+# --------------------------------------------------------------------------
+# A gate that never opened
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_verify_command_that_does_not_exist_is_infrastructure(
+    fake_github, scratch_repo, workspace
+):
+    """Exit 2, not 1: nothing about this says the model was wrong.
+
+    Found on the first real local run. The command was `python -m pytest`, on a
+    machine that has only `python3`. The model's code was correct both times;
+    the shell said 127. Classified as a task failure it would fail identically
+    on all three attempts, exhaust the budget, reach `swarm:failed`, and feed
+    the model three rounds of "command not found" as if it were review.
+    """
+    gh, _, _ = fake_github(issue(verify="definitely-not-a-real-command --quiet"))
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    code = main(argv(scratch_repo, workspace), client=gh, editor=editor)
+
+    assert code == EXIT_INFRASTRUCTURE
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_command_that_runs_and_fails_is_still_the_task(
+    fake_github, scratch_repo, workspace
+):
+    """The narrowness is the point.
+
+    Only 126 and 127 mean "never ran". A suite that exits 3 has genuinely
+    failed, and calling that infrastructure would hand back an unconsumed
+    attempt to work that can fail again for free.
+    """
+    gh, _, _ = fake_github(issue(verify=ALWAYS_FAILS))
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    code = main(argv(scratch_repo, workspace), client=gh, editor=editor)
+
+    assert code == EXIT_TASK_FAILED
