@@ -425,6 +425,90 @@ def test_context_skips_binaries_and_vendor_directories(tmp_path):
     assert paths == ["src/neighbour.py"]
 
 
+def _js_project(root: Path, *, lockfile: str = "package-lock.json") -> None:
+    """A JS repo whose lockfile is the size real lockfiles actually are.
+
+    600KB is not an exaggeration for effect: a measured Expo lockfile is 16,347
+    lines. `_read` truncates it to `MAX_FILE_CHARS`, which is the whole problem
+    - 20,000 of a 24,000 character budget, spent on a resolved dependency graph.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "index.js").write_text("require('./server')\n")
+    (root / "package.json").write_text("j" * 2_000)
+    (root / lockfile).write_text("L" * 600_000)
+    # Both sort *after* `package-lock.json`, which is what makes them the
+    # victims: the budget is already gone by the time the walk reaches them.
+    (root / "server.js").write_text("s" * 3_000)
+    (root / "utils.js").write_text("u" * 3_000)
+
+
+def test_a_lockfile_is_not_read_into_the_context(tmp_path):
+    """The ticket's headline criterion: the manifest survives, the lock does not."""
+    root = tmp_path / "repo"
+    _js_project(root)
+
+    paths = [source.path for source in edit_module.gather_context(root, ["index.js"])]
+
+    assert "package.json" in paths
+    assert "package-lock.json" not in paths
+
+
+def test_a_lockfile_starves_the_files_that_sort_after_it(tmp_path, monkeypatch):
+    """Budget occupancy, before and against the same tree.
+
+    This is the bug stated as a measurement rather than an assertion about a
+    file list. With the skip disabled the lockfile takes 20,000 of the 24,000
+    characters - 83% - and every neighbour after it alphabetically is dropped
+    for want of room, on every task in that repository forever.
+    """
+    root = tmp_path / "repo"
+    _js_project(root)
+
+    def spend(context):
+        return sum(len(source.text or "") for source in context)
+
+    monkeypatch.setattr(edit_module, "CONTEXT_SKIP_FILES", frozenset())
+    before = edit_module.gather_context(root, ["index.js"])
+    monkeypatch.undo()
+    after = edit_module.gather_context(root, ["index.js"])
+
+    # Before: the lockfile is in, and the two real source files are not.
+    assert [source.path for source in before] == ["package.json", "package-lock.json"]
+    assert spend(before) > 20_000
+
+    # After: the lockfile is out, and the budget it was holding buys the source.
+    assert [source.path for source in after] == ["package.json", "server.js", "utils.js"]
+    assert spend(after) < 10_000
+
+
+@pytest.mark.parametrize("name", sorted(edit_module.CONTEXT_SKIP_FILES))
+def test_every_named_lockfile_is_kept_out_of_the_context(tmp_path, name):
+    """Parametrised over the constant itself, so an entry added without being
+    reachable is still pinned - `CONTEXT_SUFFIXES` is an allow-list today and
+    only two of these get past it, but adding `.lock` to it must not silently
+    reopen this."""
+    root = tmp_path / name.replace(".", "-")
+    _js_project(root, lockfile=name)
+
+    paths = [source.path for source in edit_module.gather_context(root, ["index.js"])]
+
+    assert name not in paths
+
+
+def test_a_lockfile_the_task_was_told_to_edit_is_still_read(tmp_path):
+    """The skip is ambient. A task whose `## Files` names a lockfile is a task
+    about that lockfile, and refusing to show it would make the task
+    unimplementable rather than cheap."""
+    root = tmp_path / "repo"
+    _js_project(root)
+
+    writable = edit_module.read_writable(root, ["package-lock.json"])
+
+    assert [source.path for source in writable] == ["package-lock.json"]
+    assert writable[0].text
+    assert writable[0].truncated
+
+
 @pytest.mark.usefixtures("worker_env")
 def test_the_context_reaches_the_prompt_marked_read_only(fake_github, scratch_repo, workspace):
     gh, _, _ = fake_github(issue())
