@@ -665,6 +665,12 @@ def _target(
     # worker runs in (#99). `--stack` is the operator overriding the model,
     # which is the right precedence: they know what the repository is for.
     bootstrap = Bootstrap.for_prompt(args.new, stack=args.stack)
+    # The refusal, inverted: this host either has an image for the stack the
+    # prompt implies or it does not, and the answer is checked here - the last
+    # moment it is free. Afterwards there is a real repository with a URL, a
+    # branch ruleset and a backlog, and a refusal is something a human has to
+    # delete rather than something they read.
+    _refuse_unrunnable_stacks(bootstrap.stack)
     plan = ScaffoldedPlan.for_prompt(
         args.new,
         owner=args.owner,
