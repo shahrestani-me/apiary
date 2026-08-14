@@ -188,6 +188,38 @@ rather than a default nobody reads.
 cannot tell the target repository from an unrelated one; only the token can. Both
 layers, or neither.
 
+### What the verify subprocess can see
+
+`## Verify` is arbitrary shell chosen by the target repository, run inside the
+container, in a process whose parent is holding two credentials. Its output
+goes into the PR body, into `.swarm/runs/<id>/results/`, and in front of a
+human — so a suite that echoes its own environment publishes them.
+
+`worker/entrypoint.verify_env` therefore hands the subprocess an environment
+**filtered from the worker's own**, dropping `GITHUB_TOKEN`, `APIARY_PUSH_TOKEN`
+and anything whose name matches `containers.manager.SECRET_NAME_RE` — the same
+regex that already enrols a container's variables for redaction, reused so the
+two cannot drift apart.
+
+Two things about the shape of that filter:
+
+- **It is a deny-list, and that is deliberate.** An allow-list is the stronger
+  posture and the wrong tool: the verify command belongs to the target
+  repository, and a suite that needs `PYTHONPATH`, `NODE_ENV` or a database URL
+  would be broken by one, in a way that looks like a bug in its own tests.
+- **It filters rather than rebuilds.** A freshly constructed dict drops
+  `HTTPS_PROXY`, and a worker has no default route — so the verify command
+  would not fail, it would **hang**, until the outer container clock killed it
+  several hundred seconds later with a reason naming the container. The eight
+  load-bearing names are `VERIFY_ENV_REQUIRED` and each is pinned by a test.
+
+**This stops accidents, not attackers.** Verified: a scrubbed child can still
+read `/proc/1/environ` and get `GITHUB_TOKEN` back, because PID 1 in the
+container is the worker and it runs as the same user. Anything that goes
+looking still finds them. What removes that is the three-container split
+(fetch / build / publish), so the push token and a widened egress never coexist
+in one process — §6.
+
 ---
 
 ## 4. The Docker API

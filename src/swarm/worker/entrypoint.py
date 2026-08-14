@@ -56,11 +56,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from ..config import SETTINGS
+from ..containers.manager import SECRET_NAME_RE
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import ContractError, TaskContract, parse_contract
 # GitError says "a git command failed" and means it in both v1's worktrees and
@@ -83,6 +85,76 @@ DEFAULT_WORKSPACE = "/workspace"
 #: is evidence about the work - see `run_verify`. Deliberately narrow: a suite
 #: that runs and exits 2, or 5, has genuinely failed and is the task's problem.
 UNRUNNABLE_EXIT_CODES = frozenset({126, 127})
+
+#: 128 + SIGKILL. On this host that is almost always the out-of-memory killer:
+#: the Docker Desktop VM has 7.65 GiB and two workers at `--memory 4g` overcommit
+#: it. Python used ~100MB so nobody ever saw it; a toolchain will.
+#:
+#: It is also what a `docker stop` produces, which is the same conclusion - the
+#: gate did not reach a verdict, so there is no verdict to charge the task for.
+OOM_EXIT_CODE = 137
+
+#: Signatures that mean the command could not reach something it needed, on a
+#: run where reaching it was never going to work. A worker sits on an
+#: `internal: true` network whose only route out is the egress proxy, and the
+#: enforced allowlist is a static block in `compose.yaml` - so a `## Verify`
+#: that installs anything is denied, every attempt, identically.
+#:
+#: Measured through the real `apiary-egress` tinyproxy: a denied `npm install`
+#: exits **1** in under a second with `npm error code E403 ... 403 Filtered`.
+#: `UNRUNNABLE_EXIT_CODES` cannot see that - it is a *shell*-level signal, and
+#: every modern toolchain catches its own errors and normalises to exit 1. So
+#: commit c015e4f's fix ("a verify command that cannot run is infrastructure,
+#: not a failed task") held for 127 and reopened for every non-Python stack:
+#: three attempts burned in ~3 seconds, then `swarm:failed`.
+#:
+#: **Narrow on purpose, and the default is the task's fault.** Everything not
+#: matched here is `TASK_FAILED`, because the cost of being wrong is not
+#: symmetric: a task failure misread as infrastructure never consumes an
+#: attempt and so retries forever, which is why #91 exists as the backstop.
+DENIED_EGRESS_SIGNATURES: tuple[str, ...] = (
+    # tinyproxy's own refusal body, and the code npm/yarn/pip surface it as.
+    "403 filtered",
+    "code e403",
+    # No default route and no resolver, which is what the containment looks
+    # like from inside when a command tries to leave.
+    "temporary failure in name resolution",
+    "could not resolve host",
+    "could not resolve proxy",
+    "proxy connect aborted",
+    "tunnel connection failed",
+)
+
+#: The verdicts `classify_verify` returns. Strings for the reason the check
+#: statuses in `orchestrator/checks.py` are strings: they are printed, logged
+#: and asserted on far more often than they are matched.
+PASSED = "passed"
+TASK_FAILED = "task_failed"
+INFRASTRUCTURE = "infrastructure"
+
+#: Environment names the verify subprocess must never see. The *shape* test is
+#: `containers.manager.SECRET_NAME_RE`, reused rather than restated - it is the
+#: same question ("does this name hold a credential?") that `Redactor` already
+#: answers, and a second opinion here would drift from the one that does the
+#: redacting. The two literals are the ones this system actually sets, listed
+#: so that grepping for either lands here even though the regex already covers
+#: both. `pr.TOKEN_ENV` is that second name and is spelled out rather than
+#: imported: `pr.py` imports *this* module, so the dependency only runs one way.
+VERIFY_ENV_DENY = ("GITHUB_TOKEN", "APIARY_PUSH_TOKEN")
+
+#: Names that survive whatever else happens. Not an allow-list - see
+#: `verify_env` - but the set whose absence breaks the run rather than
+#: degrading it, and the set the regression test names one by one.
+VERIFY_ENV_REQUIRED = (
+    "PATH",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
 
 #: How much of the verify output travels onward. #17 puts it in the PR body and
 #: #29 writes it to disk, and neither wants a megabyte of pytest chatter.
@@ -230,6 +302,122 @@ def commit_edits(root: Path, message: str, paths: Sequence[str]) -> str | None:
 # --------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What one verify run means: `PASSED`, `TASK_FAILED` or `INFRASTRUCTURE`.
+
+    A verdict carries its reason because the reason is the whole product here.
+    A container killed at its outer cap and a suite that genuinely failed both
+    arrive as "the attempt did not work"; which of the two it was decides
+    whether an attempt is consumed, and an operator reading the run afterwards
+    has nothing else to go on.
+    """
+
+    outcome: str
+    reason: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome == PASSED
+
+    @property
+    def infrastructure(self) -> bool:
+        return self.outcome == INFRASTRUCTURE
+
+
+def classify_verify(
+    returncode: int, stdout: str, stderr: str, duration: float = 0.0
+) -> Verdict:
+    """Decide what a finished verify command means. Pure, and that is the point.
+
+    Purity is what puts this truth table in bare CI with no subprocess, no
+    Docker and no model. The previous version of this decision lived inline in
+    `run_verify` around a `subprocess.run`, which is why the only rule it ever
+    grew was the one a shell hands you for free.
+
+    **Fail closed.** Only the cases below are infrastructure; everything else
+    is the task's fault, including an exit code nobody here has seen. The two
+    errors are not symmetric - a task failure misread as infrastructure never
+    consumes an attempt, so it retries forever, and #91 exists precisely
+    because even the correct classification can loop.
+
+    `duration` is recorded, not decided on. A denied `npm install` returns in
+    under a second and a real suite does not, which is tempting - and it would
+    mean a fast machine and a slow one classifying the same failure
+    differently. It goes in the reason, where a human can weigh it.
+    """
+    if returncode == 0:
+        return Verdict(PASSED, "the verify command passed")
+
+    if returncode in UNRUNNABLE_EXIT_CODES:
+        return Verdict(
+            INFRASTRUCTURE,
+            f"the verify command could not be run (exit {returncode}); the shell "
+            "reports 127 for a command that is not there and 126 for one it may "
+            "not execute",
+        )
+
+    if returncode == OOM_EXIT_CODE:
+        return Verdict(
+            INFRASTRUCTURE,
+            f"the verify command was killed (exit {returncode}), which on this host "
+            "is the out-of-memory killer: the Docker VM has less memory than the "
+            "configured workers add up to",
+        )
+
+    haystack = f"{stdout}\n{stderr}".casefold()
+    for signature in DENIED_EGRESS_SIGNATURES:
+        if signature in haystack:
+            return Verdict(
+                INFRASTRUCTURE,
+                f"the verify command was denied the network (exit {returncode} after "
+                f"{duration:.1f}s, matching {signature!r}); a worker reaches nothing "
+                "but the egress proxy's allowlist, so this fails identically every "
+                "attempt",
+            )
+
+    return Verdict(TASK_FAILED, f"the verify command failed (exit {returncode})")
+
+
+def verify_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment the verify command gets: this one, minus the credentials.
+
+    **Filtered, never rebuilt.** A fresh dict is how this goes wrong: a worker
+    sits on an `internal: true` network with no default route, so dropping
+    `HTTPS_PROXY` does not make the verify command fail, it makes it *hang* -
+    until the outer container clock kills it, several hundred seconds later,
+    with a reason naming the container. `VERIFY_ENV_REQUIRED` names the eight
+    that are load-bearing and a test asserts each one survives.
+
+    **A deny-list, not an allow-list**, which is a deliberate reversal of what
+    the plan sketched. An allow-list is the stronger posture against an
+    adversary and this is not an adversary problem: `## Verify` is arbitrary
+    shell from the target repository, and a repo whose suite needs
+    `DATABASE_URL` or `PYTHONPATH` or `NODE_ENV` would be broken by an
+    allow-list in a way that looks like a bug in its own tests. The threat
+    being addressed is a *leak* - generated code echoing its environment into a
+    log that lands in a PR body - and for that, name-shaped filtering is the
+    right size.
+
+    The shape test is `containers.manager.SECRET_NAME_RE`, reused rather than
+    restated. Handing a container a variable called `..._TOKEN` already enrols
+    its value for redaction; this makes the same names invisible one layer
+    further in, and the two cannot drift apart because there is one regex.
+
+    **This stops accidents, not attackers.** Verified: `/proc/1/environ` still
+    returns `GITHUB_TOKEN` to a scrubbed child, because PID 1 in the container
+    is the worker and it is the same user. Anything that reads it deliberately
+    still can. The three-container split (fetch / build / publish) is what
+    would actually make this safe, and it is a follow-up on #87, not this.
+    """
+    source = os.environ if environ is None else environ
+    return {
+        name: value
+        for name, value in source.items()
+        if name not in VERIFY_ENV_DENY and not SECRET_NAME_RE.search(name)
+    }
+
+
 def run_verify(root: Path, command: str) -> tuple[bool, str]:
     """Run the contract's command from the repository root. Believe the exit code.
 
@@ -254,6 +442,7 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
     `docs/issue-contract.md` §4 separates exit 1 from exit 2 to prevent, and it
     is invisible inside the container, where the command usually does exist.
     """
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             command,
@@ -262,6 +451,10 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=SETTINGS.verify_timeout_s,
+            # Filtered from this process's environment, never rebuilt - see
+            # `verify_env`. Rebuilding drops the proxy variables, and a worker
+            # with no route out does not fail, it hangs.
+            env=verify_env(),
         )
     except subprocess.TimeoutExpired:
         return False, f"verify timed out after {SETTINGS.verify_timeout_s}s"
@@ -270,12 +463,14 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
         raise InfrastructureError(f"could not run the verify command: {exc}") from exc
 
     output = f"{proc.stdout}\n{proc.stderr}".strip()
-    if proc.returncode in UNRUNNABLE_EXIT_CODES:
+    verdict = classify_verify(
+        proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started
+    )
+    if verdict.infrastructure:
         raise InfrastructureError(
-            f"the verify command could not be run (exit {proc.returncode}): "
-            f"{command!r}\n{output[-OUTPUT_TAIL_CHARS:]}"
+            f"{verdict.reason}: {command!r}\n{output[-OUTPUT_TAIL_CHARS:]}"
         )
-    return proc.returncode == 0, output[-OUTPUT_TAIL_CHARS:]
+    return verdict.passed, output[-OUTPUT_TAIL_CHARS:]
 
 
 # --------------------------------------------------------------------------
