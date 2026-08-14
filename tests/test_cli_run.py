@@ -791,7 +791,11 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
     monkeypatch.setattr("swarm.containers.manager.ContainerManager", lambda **k: SimpleNamespace(docker=None))
     monkeypatch.setattr("swarm.containers.reaper.Reaper", lambda **k: SimpleNamespace())
     monkeypatch.setattr(cli.RunArtifacts, "open", classmethod(
-        lambda cls, run: SimpleNamespace(worker_env=lambda: {}, mount_flags=lambda: [])))
+        lambda cls, run: SimpleNamespace(
+            worker_env=lambda: {},
+            mount_flags=lambda: [],
+            log_sink=lambda handle: None,
+        )))
 
     client = FakeClient([issue(1, marker="task-one", labels=("swarm:ready",))])
     args = SimpleNamespace(base_commit="", no_merge=True, dry_run=False, max_cycles=1)

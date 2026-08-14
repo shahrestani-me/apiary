@@ -237,7 +237,12 @@ def _loop(args, attachment: Attachment, *, source) -> int:
         env={**artifacts.worker_env()},
         extra_flags=[*artifacts.mount_flags(), *worker_create_flags()],
     )
-    reaper = Reaper(run=run, docker=fleet.docker)
+    # `sink` is what puts a disposed container's logs in the run directory.
+    # Without it every worker is destroyed with the only account of what it
+    # did, and a failed run leaves an empty `logs/` - which is exactly what the
+    # first real dispatch produced: a container spawned, disposed, and nothing
+    # to say why it had finished in seconds.
+    reaper = Reaper(run=run, docker=fleet.docker, sink=artifacts.log_sink)
     reconciler = Reconciler(
         run=run,
         client=github,
@@ -263,7 +268,7 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     for report in reports:
         print(f"  · cycle {report.index}: {report.summary()}")
     print()
-    print(f"» artifacts in {artifacts.directory}")
+    print(f"» artifacts in {artifacts.path}")
     return 0
 
 
