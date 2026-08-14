@@ -32,12 +32,18 @@ Required review stays available as a documented opt-in (`require_reviews`) for
 repos that do have a human in the loop, and the generated README says which
 shape was chosen and why.
 
-**One commit, built through the git data API.** GitHub's `auto_init` would
-write its own initial commit, and the workflow file could then only arrive as a
-second one - leaving the actual first commit with no CI at all, when "CI passes
-on the initial commit" is this issue's acceptance criterion. Blob-tree-commit-
-ref puts every file in the first commit, so the first thing that ever happens
-in the repository is a green check.
+**One commit, built through the git data API.** The workflow has to be *in*
+the first commit - "CI passes on the initial commit" is this issue's acceptance
+criterion, and a repository whose first commit has no CI has an unverified
+commit at the root of its history forever.
+
+That cannot be done from nothing: GitHub answers `POST /git/blobs` on a
+repository with no commits with `409: Git Repository is empty`, so there is no
+way to write the first commit through the data API. So the repository is
+created *with* `auto_init`, which gives it a commit the data API will accept,
+and the parentless blob-tree-commit built here then replaces it by
+force-updating the ref. The throwaway commit is unreachable and collected; what
+remains is a one-commit history with the workflow in it.
 
 **Protection is applied last.** A ruleset with required status checks rejects a
 push to the default branch that has not passed them, and creating
@@ -469,8 +475,14 @@ def _create_repository(client: GitHubClient, plan: ProvisionPlan) -> dict[str, A
         "name": plan.name,
         "description": plan.description,
         "private": plan.private,
-        # False on purpose - see the module docstring on the single commit.
-        "auto_init": False,
+        # True, and then thrown away. GitHub refuses `POST /git/blobs` on a
+        # repository with no commits at all - "409: Git Repository is empty" -
+        # so the blob-tree-commit-ref path cannot bootstrap one. `auto_init`
+        # gives the repository a commit so that API works; the parentless
+        # commit below then *replaces* it by force-updating the ref, leaving a
+        # history one commit long that contains the workflow. The acceptance
+        # criterion is kept: the first commit anyone ever sees has CI in it.
+        "auto_init": True,
         # Issues are the ledger (`docs/architecture-v2.md`). A repo with issues
         # disabled cannot host the swarm at all.
         "has_issues": True,
@@ -533,11 +545,24 @@ def _push_initial_commit(
             client._url(f"{base}/commits"),
             {"message": _commit_message(plan), "tree": tree_sha, "parents": []},
         )
-        client._send_json(
-            "POST",
-            client._url(f"{base}/refs"),
-            {"ref": f"refs/heads/{branch}", "sha": commit["sha"]},
-        )
+        # `auto_init` already created this ref, so the ordinary case is a
+        # force-update that discards its commit. POST first anyway: a caller
+        # that reached here on a repository without the ref (an adopted empty
+        # one, a non-default branch) still gets it created.
+        try:
+            client._send_json(
+                "POST",
+                client._url(f"{base}/refs"),
+                {"ref": f"refs/heads/{branch}", "sha": commit["sha"]},
+            )
+        except GitHubHTTPError as exc:
+            if exc.status != 422:
+                raise
+            client._send_json(
+                "PATCH",
+                client._url(f"{base}/refs/heads/{branch}"),
+                {"sha": commit["sha"], "force": True},
+            )
     except GitHubHTTPError as exc:
         raise ProvisionError(f"{html_url} exists but is empty: {_explain(exc)}") from exc
     return str(commit["sha"])
