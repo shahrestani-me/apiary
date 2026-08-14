@@ -220,6 +220,14 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     from .orchestrator.reconcile import Reconciler
 
     run = attachment.run
+    # Resolved once, and every collaborator gets the same object. `source` is a
+    # client when a caller injected one and a repository *slug* otherwise, and
+    # handing the slug to something expecting a client fails deep inside a
+    # cycle - `Recovery` got the string here while `Reconciler` got a client,
+    # and the run died three frames into `apply_plan` asking a `str` for
+    # `get_issue`. One conversion, at the top, or this recurs per collaborator.
+    github = source if not isinstance(source, str) else GitHubClient.from_env(source)
+
     # A context manager, and used as one: leaving through an exception is
     # recorded rather than swallowed, and the run summary is written on the way
     # out however the loop ends.
@@ -232,10 +240,10 @@ def _loop(args, attachment: Attachment, *, source) -> int:
     reaper = Reaper(run=run, docker=fleet.docker)
     reconciler = Reconciler(
         run=run,
-        client=source if not isinstance(source, str) else GitHubClient.from_env(source),
+        client=github,
         base_commit=args.base_commit or "",
         fleet=fleet,
-        recovery=Recovery(client=source, run=run, dry_run=args.dry_run),
+        recovery=Recovery(client=github, run=run, dry_run=args.dry_run),
         merge_gate=not args.no_merge,
         dry_run=args.dry_run,
     )

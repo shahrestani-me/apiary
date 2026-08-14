@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from types import SimpleNamespace
+
 import pytest
 
 from swarm.cli import main
@@ -763,3 +765,39 @@ def test_an_empty_brief_is_refused(tmp_path):
     with pytest.raises(SystemExit) as caught:
         main(["run", "--repo", REPO, "--objective", f"@{empty}"])
     assert caught.value.code == 2
+
+
+def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
+    """`source` is a client when injected and a repository slug otherwise.
+
+    Converting it at each use site is how `Recovery` ended up holding the
+    string while `Reconciler` held a client, and the run died three frames
+    inside `apply_plan` asking a `str` for `get_issue`. One conversion, at the
+    top of `_loop`, so a new collaborator cannot reintroduce it.
+    """
+    import swarm.cli as cli
+
+    seen: dict = {}
+
+    class StopHere(Exception):
+        pass
+
+    def spy_reconciler(**kwargs):
+        seen["reconciler"] = kwargs["client"]
+        seen["recovery"] = kwargs["recovery"].client
+        raise StopHere
+
+    monkeypatch.setattr("swarm.orchestrator.reconcile.Reconciler", spy_reconciler)
+    monkeypatch.setattr("swarm.containers.manager.ContainerManager", lambda **k: SimpleNamespace(docker=None))
+    monkeypatch.setattr("swarm.containers.reaper.Reaper", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(cli.RunArtifacts, "open", classmethod(
+        lambda cls, run: SimpleNamespace(worker_env=lambda: {}, mount_flags=lambda: [])))
+
+    client = FakeClient([issue(1, marker="task-one", labels=("swarm:ready",))])
+    args = SimpleNamespace(base_commit="", no_merge=True, dry_run=False, max_cycles=1)
+    attachment = SimpleNamespace(run=SimpleNamespace(id="r", repo=REPO))
+
+    with pytest.raises(StopHere):
+        cli._loop(args, attachment, source=client)
+
+    assert seen["reconciler"] is seen["recovery"] is client
