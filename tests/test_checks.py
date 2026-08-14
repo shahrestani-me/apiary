@@ -1,0 +1,835 @@
+"""Tests for the check-run gate.
+
+Five properties carry this file, and each of them is a way the run goes wrong
+rather than a way it computes wrong.
+
+**Green merges, red retries with the failure in hand, exhausted stops.** The
+issue's own acceptance criterion, and the middle one is the load-bearing half: a
+retry whose context does not carry the failure reproduces the failure, so the
+output is asserted to be on the issue *before* the label goes back to
+`swarm:ready`.
+
+**Zero checks is its own answer.** An empty check set is never a merge and never
+an endless wait: it is pending inside the grace period and a human's problem
+outside it. Both directions are tested, because each of the two obvious
+shortcuts - "no failures, ship it" and "wait for a check that is never coming" -
+is a bug this file exists to keep out.
+
+**The override is explicit.** Merging with an admin override bypasses the review
+this repository's ruleset requires, so a policy with it turned off must merge
+nothing at all, and the merge that does happen must carry the flag that says
+under whose authority.
+
+**A failure outside `## Files` is not the worker's to fix.** It is routed to a
+human without consuming attempts, because feeding it back produces three
+identical failures and a `swarm:failed` for a problem that was never in the
+worker's code.
+
+**Absence of evidence is not evidence.** A client that cannot list pull requests
+decides nothing; check runs that could not be read are pending, not passed and
+not failed.
+
+Hermetic throughout: a plain fake client, no HTTP, no daemon, no clock that
+moves on its own.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+import pytest
+
+from swarm.github.client import GitHubHTTPError
+from swarm.github.ledger import Ledger, LedgerEntry, render_marker
+from swarm.orchestrator.checks import (
+    ADMIN_OVERRIDE_ENV,
+    BRANCH_METHODS,
+    EMPTY,
+    FAILING,
+    FEEDBACK_CLOSE,
+    FEEDBACK_OPEN,
+    PASSED,
+    PENDING,
+    PULLS_METHOD,
+    CheckSet,
+    MergePolicy,
+    PullState,
+    apply_checks,
+    failing_paths,
+    foreign_failure,
+    plan_checks,
+    read_feedback,
+    read_pulls,
+    run_checks,
+    summarise_checks,
+    write_feedback,
+)
+from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
+from swarm.orchestrator.reconcile import DONE, FAILED, READY
+
+NOW = dt.datetime(2026, 8, 14, 14, 25, 30, tzinfo=dt.timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# Fixtures
+# --------------------------------------------------------------------------
+
+
+def entry(
+    number: int,
+    *files: str,
+    label: str = REVIEW,
+    attempt: int = 0,
+) -> LedgerEntry:
+    return LedgerEntry(
+        number=number,
+        title=f"issue {number}",
+        task_id=f"task-{number}",
+        attempt=attempt,
+        goal="do the thing",
+        files=files or (f"src/mod{number}.py", f"tests/test_mod{number}.py"),
+        verify="python -m pytest -q",
+        blocked_by=(),
+        state_label=label,
+        labels=frozenset({label}),
+    )
+
+
+def ledger(*entries: LedgerEntry) -> Ledger:
+    return Ledger(entries={item.task_id: item for item in entries})
+
+
+def pull(number: int, *, issue: int, age_s: float = 0.0, draft: bool = False) -> PullState:
+    return PullState(
+        number=number,
+        branch=f"swarm/issue-{issue}",
+        sha=f"{issue:0>40x}",
+        updated_at=NOW - dt.timedelta(seconds=age_s),
+        draft=draft,
+    )
+
+
+def pulls(*states: PullState) -> dict[str, PullState]:
+    return {state.branch: state for state in states}
+
+
+def run(name: str, conclusion: str | None = "success", *, text: str = "") -> dict[str, Any]:
+    """One check-run payload, in the shape `GET /commits/{ref}/check-runs` returns."""
+    return {
+        "name": name,
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+        "output": {"title": f"{name} {conclusion}", "summary": text},
+        "details_url": f"https://github.com/shahrestani-me/apiary/runs/{name}",
+    }
+
+
+def failing(*paths: str, name: str = "ci") -> CheckSet:
+    """A red check set whose output names `paths` the way pytest would."""
+    lines = [f"FAILED {path}::test_thing - AssertionError" for path in paths]
+    return summarise_checks([run(name, "failure", text="\n".join(lines))])
+
+
+def body(task_id: str, *, attempt: int = 0) -> str:
+    return "\n".join(
+        [
+            render_marker(task_id, attempt),
+            "",
+            "## Goal",
+            "Do the thing.",
+            "",
+            "## Files",
+            f"- src/{task_id}.py",
+            "",
+            "## Verify",
+            "python -m pytest -q",
+            "",
+            "## Blocked by",
+            "_none._",
+        ]
+    )
+
+
+@dataclass
+class FakeClient:
+    """Every call this module makes, recorded, with no HTTP anywhere.
+
+    Carries `list_pull_requests` and `merge_pull_request` because both are what
+    the module needs, and deliberately *not* `create_issue_comment` or a branch
+    deleter: that is the state `GitHubClient` is actually in, so the default
+    client here exercises the degraded path and the subclasses below are what
+    lands once those methods exist.
+    """
+
+    issues: dict[int, dict[str, Any]] = field(default_factory=dict)
+    open_pulls: tuple[tuple[int, str], ...] = ()
+    checks: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    log: list[str] = field(default_factory=list)
+    merge_error: Exception | None = None
+
+    # --- reads -----------------------------------------------------------
+
+    def list_pull_requests(self, *, state: str = "open") -> list[dict[str, Any]]:
+        self.log.append(f"list_pull_requests {state}")
+        return [
+            {
+                "number": number,
+                "head": {"ref": ref, "sha": f"{number:0>40x}"},
+                "updated_at": (NOW - dt.timedelta(hours=1)).isoformat(),
+            }
+            for number, ref in self.open_pulls
+        ]
+
+    def list_check_runs(self, ref: str) -> list[dict[str, Any]]:
+        self.log.append(f"list_check_runs {ref}")
+        return list(self.checks.get(ref, ()))
+
+    def get_issue(self, number: int) -> dict[str, Any]:
+        self.log.append(f"get_issue #{number}")
+        if number not in self.issues:
+            raise GitHubHTTPError(404, "GET", f"/issues/{number}", b'{"message":"Not Found"}')
+        return dict(self.issues[number])
+
+    # --- writes ----------------------------------------------------------
+
+    def update_issue(self, number: int, **kwargs: Any) -> dict[str, Any]:
+        self.log.append(f"update_issue #{number}")
+        self.issues[number].update(kwargs)
+        return dict(self.issues[number])
+
+    def add_labels(self, number: int, labels: Iterable[str]) -> Any:
+        names = list(labels)
+        self.log.append(f"+{','.join(names)} #{number}")
+        current = self.issues.setdefault(number, {}).setdefault("labels", [])
+        current.extend({"name": name} for name in names)
+        return current
+
+    def remove_label(self, number: int, label: str) -> bool:
+        self.log.append(f"-{label} #{number}")
+        payload = self.issues.get(number)
+        if payload is None:
+            return False
+        payload["labels"] = [item for item in payload.get("labels", []) if item["name"] != label]
+        return True
+
+    def merge_pull_request(self, number: int, **kwargs: Any) -> dict[str, Any]:
+        self.log.append(f"merge PR #{number} {kwargs.get('merge_method')} sha={kwargs.get('sha')}")
+        if self.merge_error is not None:
+            raise self.merge_error
+        return {"merged": True, "sha": "deadbeef"}
+
+    # --- what the assertions read ----------------------------------------
+
+    def labels_on(self, number: int) -> set[str]:
+        return {item["name"] for item in self.issues[number].get("labels", [])}
+
+
+@dataclass
+class DeletingClient(FakeClient):
+    """The client once `client.py` grows the ref deletion a merge needs."""
+
+    deleted: list[str] = field(default_factory=list)
+
+    def delete_branch(self, branch: str) -> bool:
+        self.deleted.append(branch)
+        return True
+
+
+@dataclass
+class CommentingClient(FakeClient):
+    """The client once §1.4's comment method exists."""
+
+    comments: list[tuple[int, str]] = field(default_factory=list)
+
+    def create_issue_comment(self, number: int, text: str) -> dict[str, Any]:
+        self.comments.append((number, text))
+        return {"id": len(self.comments)}
+
+
+class BlindClient(FakeClient):
+    """A client with no `list_pull_requests` - which is today's `GitHubClient`."""
+
+    list_pull_requests = None  # type: ignore[assignment]
+
+
+# --------------------------------------------------------------------------
+# Reading what CI said
+# --------------------------------------------------------------------------
+
+
+def test_a_check_still_running_is_pending_even_when_every_finished_one_passed():
+    checks = summarise_checks([run("lint", None), run("test", "success")])
+
+    # The safe direction: an unknown or unfinished status must never be read as
+    # a clearance, because the merge it clears is not reversible.
+    assert checks.verdict == PENDING
+    assert checks.pending == ("lint",)
+
+
+def test_neutral_and_skipped_conclusions_do_not_block_a_merge():
+    checks = summarise_checks([run("test", "success"), run("docs", "skipped"), run("x", "neutral")])
+
+    # A path-filtered job that decided it had nothing to do has not found a
+    # fault, and treating it as one makes the PR unmergeable forever.
+    assert checks.verdict == PASSED
+
+
+def test_a_failure_beats_a_check_that_is_still_running():
+    checks = summarise_checks([run("slow", None), run("test", "failure")])
+
+    # The PR cannot pass, so waiting for the rest of the matrix buys wall clock
+    # and nothing else.
+    assert checks.verdict == FAILING
+    assert checks.failed == ("test",)
+
+
+def test_no_check_runs_at_all_is_empty_which_is_not_passed():
+    # The distinction this whole module turns on: `empty` is a third answer, and
+    # a `verdict` that collapsed it into `passed` would merge unverified code.
+    assert summarise_checks([]).verdict == EMPTY
+    assert CheckSet(unreadable=True).verdict == PENDING
+
+
+def test_the_failure_output_carries_the_check_name_and_what_it_printed():
+    checks = summarise_checks([run("ci", "failure", text="FAILED tests/test_a.py::test_x")])
+
+    assert "ci: failure" in checks.output
+    assert "FAILED tests/test_a.py::test_x" in checks.output
+
+
+# --------------------------------------------------------------------------
+# Whose failure is it
+# --------------------------------------------------------------------------
+
+
+def test_failing_paths_reads_both_pytest_shapes_and_nothing_else():
+    text = "FAILED tests/test_a.py - boom\ntests/test_b.py::test_y failed\nsee src/thing.py for why"
+
+    # The third line is prose about a file, not evidence about a failure, and a
+    # false positive here escalates an issue a worker could have fixed.
+    assert failing_paths(text) == ("tests/test_a.py", "tests/test_b.py")
+
+
+def test_a_failure_inside_the_declared_files_is_the_workers_to_fix():
+    task = entry(23, "src/mod23.py", "tests/test_mod23.py")
+
+    assert foreign_failure(task, "FAILED tests/test_mod23.py::test_x") == ()
+    # One inside is enough: there is something the next attempt can act on.
+    assert foreign_failure(task, "FAILED tests/test_mod23.py\nFAILED tests/test_other.py") == ()
+
+
+def test_a_failure_entirely_outside_the_declared_files_is_nobodys_to_retry():
+    task = entry(23, "src/mod23.py", "tests/test_mod23.py")
+
+    assert foreign_failure(task, "FAILED tests/test_other.py::test_x") == ("tests/test_other.py",)
+    # No path named at all falls back to the ordinary retry - the escalation is
+    # an optimisation on a correct default, never a precondition for one.
+    assert foreign_failure(task, "the build died") == ()
+
+
+# --------------------------------------------------------------------------
+# The plan: green
+# --------------------------------------------------------------------------
+
+
+def test_a_green_pull_request_is_merged_and_its_issue_marked_done():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    assert [str(t) for t in plan.transitions] == [
+        "#23: swarm:review -> swarm:done (PR #101 merged: 1 passed)"
+    ]
+    assert plan.merges[0].pull == 101
+    assert plan.merges[0].admin_override is True
+
+
+def test_the_merge_deletes_the_branch_because_a_long_run_leaves_one_per_task():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    assert plan.merges[0].delete_branch is True
+    assert plan.merges[0].branch == "swarm/issue-23"
+
+
+def test_with_the_override_off_a_green_pull_request_waits_for_a_human():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        policy=MergePolicy(admin_override=False),
+        now=NOW,
+    )
+
+    # The opt-in a target repository gets instead of having its review gate
+    # bypassed: nothing is merged and nothing is relabelled, so the issue sits
+    # in `swarm:review` until a person presses the button.
+    assert plan.merges == ()
+    assert plan.transitions == ()
+    assert plan.outcomes[0].verdict == PASSED
+    assert "waiting for a human" in plan.outcomes[0].detail
+
+
+def test_a_draft_pull_request_is_not_merged_however_green_it_is():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23, draft=True)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    assert plan.merges == ()
+    assert plan.outcomes[0].verdict == PENDING
+
+
+def test_the_policy_summary_says_out_loud_what_the_override_bypasses():
+    assert "bypasses" in MergePolicy().summary()
+    assert ADMIN_OVERRIDE_ENV in MergePolicy().summary()
+    assert "will not merge" in MergePolicy(admin_override=False).summary()
+
+
+def test_the_override_is_configurable_and_loud_about_a_value_it_cannot_read(monkeypatch):
+    monkeypatch.setenv(ADMIN_OVERRIDE_ENV, "0")
+    assert MergePolicy.from_env().admin_override is False
+
+    monkeypatch.setenv(ADMIN_OVERRIDE_ENV, "flase")
+    # Falling back to the default here would leave a repository merging without
+    # review while somebody believed they had turned that off.
+    with pytest.raises(ValueError):
+        MergePolicy.from_env()
+
+
+# --------------------------------------------------------------------------
+# The plan: red
+# --------------------------------------------------------------------------
+
+
+def test_a_failing_check_retries_and_the_transition_carries_the_failure():
+    plan = plan_checks(
+        ledger(entry(23, attempt=0)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: failing("tests/test_mod23.py")},
+        now=NOW,
+    )
+    outcome = plan.outcomes[0]
+
+    assert outcome.transition is not None
+    assert outcome.transition.to_label == READY
+    # §5: the counter rides on the transition, so it is persisted before the
+    # issue can be dispatched again.
+    assert outcome.transition.attempt == 1
+    # The half without which the retry is theatre.
+    assert "tests/test_mod23.py" in outcome.feedback
+
+
+def test_the_last_attempt_gives_up_rather_than_retrying_forever():
+    plan = plan_checks(
+        ledger(entry(23, attempt=2)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: failing("tests/test_mod23.py")},
+        max_attempts=3,
+        now=NOW,
+    )
+    transition = plan.outcomes[0].transition
+
+    assert transition is not None
+    assert transition.to_label == FAILED
+    assert "against a cap of 3" in transition.reason
+
+
+def test_a_failure_outside_the_declared_files_goes_to_a_human_not_to_a_retry():
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py")),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: failing("tests/test_somebody_else.py")},
+        max_attempts=3,
+        now=NOW,
+    )
+    outcome = plan.outcomes[0]
+
+    # Tonight's real failure: a PR passed its own `## Verify` and broke a test
+    # in a file the worker is forbidden to edit. Three retries cannot fix that,
+    # and spending them hides the diagnosis behind an exhausted budget.
+    assert outcome.escalated
+    assert outcome.transition is not None
+    assert outcome.transition.to_label == FAILED
+    assert "tests/test_somebody_else.py" in outcome.transition.reason
+    # The attempt budget is untouched: this was never the attempt's fault.
+    assert outcome.transition.attempt is None
+    assert plan.escalated == (23,)
+
+
+# --------------------------------------------------------------------------
+# The plan: zero checks
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_check_set_is_pending_while_the_grace_period_runs():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23, age_s=30)),
+        checks={23: CheckSet()},
+        policy=MergePolicy(zero_check_grace_s=300),
+        now=NOW,
+    )
+
+    # The seconds after a push, before GitHub has created anything. Failing here
+    # would fail every PR the swarm ever opens.
+    assert plan.outcomes[0].verdict == PENDING
+    assert plan.transitions == ()
+    assert plan.merges == ()
+
+
+def test_an_empty_check_set_past_its_grace_goes_to_a_human_and_is_never_merged():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23, age_s=3600)),
+        checks={23: CheckSet()},
+        policy=MergePolicy(zero_check_grace_s=300),
+        now=NOW,
+    )
+    outcome = plan.outcomes[0]
+
+    # Neither of the two shortcuts: not merged, because nothing verified it, and
+    # not parked, because nothing ever will.
+    assert plan.merges == ()
+    assert outcome.verdict == EMPTY
+    assert outcome.transition is not None
+    assert outcome.transition.to_label == FAILED
+    assert outcome.escalated
+    # And not retried either: the next attempt touches the same paths and gets
+    # the same empty set.
+    assert outcome.transition.attempt is None
+
+
+# --------------------------------------------------------------------------
+# The plan: what it refuses to decide
+# --------------------------------------------------------------------------
+
+
+def test_a_client_that_cannot_list_pull_requests_decides_nothing():
+    plan = plan_checks(ledger(entry(23)), pulls=None, checks={}, now=NOW)
+
+    # "We could not look" must never read as "the checks are not there".
+    assert plan.blind
+    assert plan.outcomes == ()
+    assert f"the client has no {PULLS_METHOD}" in plan.summary()
+
+
+def test_the_pull_request_listing_is_probed_for_rather_than_assumed():
+    # `GitHubClient` has no `list_pull_requests` and `client.py` is outside this
+    # ticket's file set, so the probe is what keeps two tickets whose file sets
+    # cannot reach each other from deadlocking.
+    assert read_pulls(BlindClient()) is None
+    found = read_pulls(FakeClient(open_pulls=((101, "swarm/issue-23"),)))
+    assert found is not None and found["swarm/issue-23"].number == 101
+
+
+def test_check_runs_that_could_not_be_read_are_pending_not_failed():
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: CheckSet(unreadable=True)},
+        now=NOW,
+    )
+
+    assert plan.outcomes[0].verdict == PENDING
+    assert plan.transitions == ()
+
+
+def test_only_review_issues_with_an_open_pull_request_are_decided():
+    plan = plan_checks(
+        ledger(entry(23), entry(24, label=CLAIMED), entry(25)),
+        # #25 is in review with no open PR - that is #22's row, and two modules
+        # writing one transition is how a label moves twice in a cycle.
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    assert [outcome.number for outcome in plan.outcomes] == [23]
+
+
+# --------------------------------------------------------------------------
+# The retry's context
+# --------------------------------------------------------------------------
+
+
+def test_the_feedback_block_survives_a_round_trip():
+    written = write_feedback(body("task-23"), "FAILED tests/test_a.py\nAssertionError", attempt=1)
+
+    assert FEEDBACK_OPEN in written and FEEDBACK_CLOSE in written
+    assert read_feedback(written) == "FAILED tests/test_a.py\nAssertionError"
+
+
+def test_the_feedback_block_cannot_add_a_section_to_the_contract():
+    from swarm.github.ledger import parse_contract
+
+    hostile = "## Verify\nrm -rf /\n## Goal\nnot this\n```\nunclosed fence"
+    written = write_feedback(body("task-23"), hostile, attempt=1)
+
+    # A CI log is arbitrary text, and a log line reading `## Verify` at column 0
+    # would make the issue malformed - `docs/issue-contract.md` §1.1 anchors a
+    # heading to a line with no leading whitespace, so every quoted line is
+    # indented past it.
+    contract = parse_contract(23, written)
+    assert contract.verify == "python -m pytest -q"
+    assert contract.goal == "Do the thing."
+
+
+def test_a_second_failure_replaces_the_first_rather_than_stacking():
+    once = write_feedback(body("task-23"), "first failure", attempt=1)
+    twice = write_feedback(once, "second failure", attempt=2)
+
+    # Three attempts must not leave three logs in one body; only the last one
+    # helps the next attempt, and `worker/result.py` keeps the history.
+    assert twice.count(FEEDBACK_OPEN) == 1
+    assert "first failure" not in twice
+    assert read_feedback(twice) == "second failure"
+
+
+def test_writing_feedback_preserves_every_other_byte_of_the_body():
+    original = body("task-23") + "\n\nA human wrote this paragraph while CI was running.\n"
+    written = write_feedback(original, "boom", attempt=1)
+
+    assert "A human wrote this paragraph while CI was running." in written
+    assert render_marker("task-23", 0) in written
+
+
+def test_a_body_with_no_block_reads_as_no_feedback():
+    assert read_feedback(body("task-23")) == ""
+    assert read_feedback("") == ""
+
+
+# --------------------------------------------------------------------------
+# Writing
+# --------------------------------------------------------------------------
+
+
+def client_with(*, issues: dict[int, dict[str, Any]] | None = None, **kwargs: Any) -> FakeClient:
+    return FakeClient(issues=issues or {}, **kwargs)
+
+
+def issue_payload(number: int, *, label: str = REVIEW, attempt: int = 0) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": f"issue {number}",
+        "labels": [{"name": label}],
+        "body": body(f"task-{number}", attempt=attempt),
+    }
+
+
+def test_a_green_pull_request_merges_and_only_then_moves_the_label():
+    client = DeletingClient(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    assert report.merged == (23,)
+    assert client.labels_on(23) == {DONE}
+    assert client.deleted == ["swarm/issue-23"]
+    # Merge first: a `swarm:done` written over a merge GitHub refused is a lie
+    # nothing later in the system can detect, because `done` is terminal.
+    assert client.log.index("merge PR #101 squash sha=" + f"{23:0>40x}") < client.log.index(
+        f"+{DONE} #23"
+    )
+
+
+def test_a_refused_merge_leaves_the_issue_in_review_for_the_next_cycle():
+    client = client_with(issues={23: issue_payload(23)})
+    client.merge_error = GitHubHTTPError(
+        405, "PUT", "/pulls/101/merge", b'{"message":"not mergeable"}'
+    )
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    assert report.merged == ()
+    assert report.applied == ()
+    assert [str(f) for f in report.failures] == [
+        "#23: merging PR #101: PUT /pulls/101/merge -> 405: not mergeable"
+    ]
+    assert client.labels_on(23) == {REVIEW}
+
+
+def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
+    client = client_with(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    # `GitHubClient` has no ref deletion and `client.py` is outside this
+    # ticket's file set, so the gap degrades and says so.
+    assert report.merged == (23,)
+    assert report.undeleted == ("swarm/issue-23",)
+    assert BRANCH_METHODS[0] in report.summary()
+
+
+def test_a_retry_persists_the_failure_and_the_counter_before_the_label_moves():
+    client = client_with(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: failing("tests/test_mod23.py")},
+        now=NOW,
+    )
+
+    apply_checks(client, plan)
+
+    # The issue is what the next attempt reads, so this is where the failure has
+    # to be. One `PATCH` carries both the counter and the output.
+    assert client.labels_on(23) == {READY}
+    assert "tests/test_mod23.py" in read_feedback(client.issues[23]["body"])
+    assert render_marker("task-23", 1) in client.issues[23]["body"]
+    assert client.log.index("update_issue #23") < client.log.index(f"+{READY} #23")
+    assert client.log.count("update_issue #23") == 1
+
+
+def test_giving_up_comments_the_failure_where_a_human_will_find_it():
+    client = CommentingClient(issues={23: issue_payload(23, attempt=2)})
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py", "tests/test_mod23.py", attempt=2)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: failing("tests/test_mod23.py")},
+        max_attempts=3,
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    assert client.labels_on(23) == {FAILED}
+    assert report.uncommented == ()
+    number, text = client.comments[0]
+    assert number == 23
+    assert "giving up after 3 attempt(s)" in text
+    assert "tests/test_mod23.py" in text
+
+
+def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
+    client = client_with(issues={23: issue_payload(23, attempt=2)})
+    plan = plan_checks(
+        ledger(entry(23, attempt=2)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: failing("tests/test_mod23.py")},
+        max_attempts=3,
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    assert client.labels_on(23) == {FAILED}
+    assert report.uncommented == (23,)
+
+
+def test_a_dry_run_writes_nothing_at_all():
+    client = client_with(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan, dry_run=True)
+
+    assert report.merged == ()
+    assert client.log == []
+    assert client.labels_on(23) == {REVIEW}
+
+
+def test_one_issue_github_will_not_relabel_does_not_cost_the_others():
+    client = client_with(issues={23: issue_payload(23), 24: issue_payload(24)})
+    plan = plan_checks(
+        ledger(entry(23), entry(24)),
+        pulls=pulls(pull(101, issue=23), pull(102, issue=24)),
+        checks={
+            23: failing("tests/test_mod23.py"),
+            24: summarise_checks([run("test", "success")]),
+        },
+        now=NOW,
+    )
+    # A human deleting #23 between the read and the write.
+    del client.issues[23]
+
+    report = apply_checks(client, plan)
+
+    assert [f.number for f in report.failures] == [23]
+    assert client.labels_on(24) == {DONE}
+
+
+# --------------------------------------------------------------------------
+# One pass, end to end
+# --------------------------------------------------------------------------
+
+
+def test_one_pass_reads_checks_only_for_review_issues_with_an_open_pull_request():
+    client = DeletingClient(
+        issues={23: issue_payload(23), 24: issue_payload(24, label=CLAIMED)},
+        open_pulls=((101, "swarm/issue-23"), (102, "swarm/issue-24")),
+        checks={f"{101:0>40x}": [run("test", "success")]},
+    )
+
+    report = run_checks(client, ledger(entry(23), entry(24, label=CLAIMED)))
+
+    # One listing plus one check read per review issue, and nothing per issue in
+    # any other state: the cost is the review queue, not the ledger.
+    assert [line for line in client.log if line.startswith("list_check_runs")] == [
+        f"list_check_runs {101:0>40x}"
+    ]
+    assert report.merged == (23,)
+    assert client.labels_on(23) == {DONE}
+    assert client.deleted == ["swarm/issue-23"]
+
+
+def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothing():
+    client = BlindClient(issues={23: issue_payload(23)})
+
+    report = run_checks(client, ledger(entry(23)))
+
+    assert report.plan.blind
+    assert client.log == []
+    assert client.labels_on(23) == {REVIEW}
+
+
+def test_a_failing_pass_leaves_the_issue_ready_with_the_failure_on_it():
+    client = FakeClient(
+        issues={23: issue_payload(23)},
+        open_pulls=((101, "swarm/issue-23"),),
+        checks={
+            f"{101:0>40x}": [
+                run("test", "failure", text="FAILED tests/test_mod23.py::test_x - boom")
+            ]
+        },
+    )
+
+    report = run_checks(client, ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")))
+
+    # The issue's headline, end to end: a red PR is retried, and the next
+    # attempt has the failure to read.
+    assert report.merged == ()
+    assert client.labels_on(23) == {READY}
+    assert "FAILED tests/test_mod23.py::test_x" in read_feedback(client.issues[23]["body"])
