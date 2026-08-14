@@ -90,7 +90,7 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | Variable | Default | Notes |
 |---|---|---|
 | `SWARM_REPO` | `$PWD` | Target git repo. |
-| `SWARM_VERIFY` | `python -m pytest -q` | Your quality gate. Add lint/typecheck for a stricter one. |
+| `SWARM_VERIFY` | `python -m pytest -q` | Your quality gate, and the `## Verify` every planned issue carries. `swarm run --verify` overrides it, and `--new` takes the command its scaffold committed instead. |
 | `SWARM_ORCHESTRATOR_MODEL` | `gemma4:31b` | Planning, routing, stall judgement. Dense — buy quality. |
 | `SWARM_WORKER_MODEL` | `gemma4:26b` | Writes the code. MoE — buy throughput. |
 | `SWARM_MAX_PARALLEL` | `2` | Concurrent workers. Memory scales with this. |

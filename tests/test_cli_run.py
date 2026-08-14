@@ -33,8 +33,15 @@ from typing import Any, Iterable, Sequence
 import pytest
 
 from swarm.cli import main
+from swarm.config import SETTINGS
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import load_ledger, render_marker
+from swarm.greenfield.provision import (
+    CI_WORKFLOW_PATH,
+    PLACEHOLDER_VERIFY,
+    ProvisionReport,
+)
+from swarm.greenfield.scaffold import PYTHON_VERIFY, ScaffoldedPlan, scaffold_for
 from swarm.run import (
     MAX_RUN_ID_LENGTH,
     RUN_LABEL,
@@ -454,54 +461,215 @@ def test_ambiguous_or_incomplete_invocations_are_refused(argv):
     assert excinfo.value.code == 2
 
 
-def test_greenfield_runs_against_the_repository_it_just_created(monkeypatch, capsys):
-    created: dict[str, Any] = {}
-    client = FakeClient([])
+PROMPT = "a markdown to CSV tool"
+#: What `--new` names the repository, slugified from the prompt as it really is.
+NEW_REPO = "me/a-markdown-to-csv-tool"
 
-    class Report:
-        repo = "me/markdown-to-csv"
 
-        def summary(self) -> str:
-            return "me/markdown-to-csv: created"
+class NoLabels:
+    """`LabelReport`'s one method, which is all `ProvisionReport.summary` calls."""
 
-    def fake_provision(plan, target=None, **kwargs):
-        created["plan"] = plan
-        created["target"] = target
-        created["assume_yes"] = kwargs.get("assume_yes")
-        return Report()
+    def summary(self) -> str:
+        return "labels: unchanged"
 
-    monkeypatch.setattr("swarm.cli.provision", fake_provision)
-    # A fresh repository has an empty ledger, which is now the planner's cue.
-    # This test is about provisioning, and letting it reach `plan_node` would
-    # put a real model call in the unit suite.
-    def fake_plan(state, source=None):
-        # Writes an issue as the real planner does, because the run now judges
-        # planning by re-reading the ledger rather than by trusting the
-        # planner's own return value - a read taken straight after a write can
-        # be served stale, and trusting it once printed "produced nothing"
-        # under a list of the issues just created.
-        client.issues.append(issue(1, marker="seed", labels=("swarm:ready",)))
+
+@dataclass
+class Provisioning:
+    """Records what would have been created, and answers as `provision` does.
+
+    No repository is created anywhere in this file. The plan is the interesting
+    half anyway: it decides the initial commit, the workflow and the verify
+    command before a single request is sent, which is the property `provision`
+    exists to preserve.
+    """
+
+    calls: list[Any] = field(default_factory=list)
+    assume_yes: bool | None = None
+
+    def __call__(self, plan: Any, target: Any = None, **kwargs: Any) -> Any:
+        self.calls.append(plan)
+        self.assume_yes = kwargs.get("assume_yes")
+        # A real report, built as `provision` builds it: the command it reports
+        # is the one in the commit, not one the caller kept its own copy of.
+        return ProvisionReport(
+            repo=plan.full_name,
+            html_url=f"https://github.com/{plan.full_name}",
+            default_branch=plan.default_branch,
+            commit_sha="0" * 40,
+            labels=NoLabels(),
+            protection=("required_status_checks",),
+            verify_command=plan.verify_command,
+        )
+
+    @property
+    def plan(self) -> Any:
+        assert len(self.calls) == 1, self.calls
+        return self.calls[0]
+
+
+@dataclass
+class Planning:
+    """`plan_node`, minus the model. Records the verify command it was handed.
+
+    It also appends an issue, because the run judges planning by re-reading the
+    ledger rather than by trusting the planner's return value - a read taken
+    straight after a write can be served stale, and trusting it once printed
+    "produced nothing" under a list of the issues just created.
+    """
+
+    client: FakeClient
+    verify: str | None = None
+
+    def __call__(self, state: Any, source: Any = None, verify: str | None = None) -> dict:
+        self.verify = verify
+        self.client.issues.append(issue(1, marker="seed", labels=("swarm:ready",)))
         return {"tasks": {"seed": {}}, "events": ["planned 1 task(s)"]}
 
-    monkeypatch.setattr("swarm.cli.plan_node", fake_plan)
 
+def greenfield(monkeypatch, client: FakeClient, *argv: str) -> tuple[int, Provisioning, Planning]:
+    """Run `--new` with provisioning and planning stubbed, and nothing created."""
+    provisioning, planning = Provisioning(), Planning(client)
+    monkeypatch.setattr("swarm.cli.provision", provisioning)
+    monkeypatch.setattr("swarm.cli.plan_node", planning)
+    # --plan-only throughout: these tests are about provisioning and the
+    # hand-off to the run, not about dispatching containers into a repository
+    # that exists only as a fake.
     code = main(
-        # --plan-only: this test is about provisioning and the hand-off to the
-        # run, not about dispatching containers into a repository that exists
-        # only as a fake.
-        ["run", "--new", "a markdown to CSV tool", "--owner", "me", "--public",
-         "--yes", "--plan-only"],
+        ["run", "--new", PROMPT, "--owner", "me", "--yes", "--plan-only", *argv],
         client=client,
+    )
+    return code, provisioning, planning
+
+
+def test_greenfield_runs_against_the_repository_it_just_created(monkeypatch, capsys):
+    client = FakeClient([])
+
+    code, provisioning, _ = greenfield(monkeypatch, client, "--public")
+
+    assert code == 0
+    assert provisioning.plan.owner == "me"
+    assert provisioning.plan.private is False
+    assert provisioning.assume_yes is True
+    out = capsys.readouterr().out
+    # The prompt is the objective, and the run targets the new repo.
+    assert f"repo {NEW_REPO}" in out
+    assert PROMPT in out
+
+
+def test_greenfield_provisions_a_scaffold_rather_than_an_empty_repository(monkeypatch):
+    """The live bug: `--new` built a plain `ProvisionPlan`.
+
+    The repository that produced had a README, a LICENSE and a workflow running
+    `test -f README.md`, and the planner then wrote issues verified with a test
+    runner that repository had no way to run. A worker's first act was to clone
+    a project with no project in it.
+    """
+    code, provisioning, _ = greenfield(monkeypatch, FakeClient([]))
+    files = provisioning.plan.files()
+
+    assert code == 0
+    assert isinstance(provisioning.plan, ScaffoldedPlan)
+    # The scaffold rides in the *initial* commit, so the first check run - and
+    # the first worker's clone - already has a test suite in front of it.
+    assert set(scaffold_for(PROMPT).files()) <= set(files)
+    assert provisioning.plan.verify_command == PYTHON_VERIFY != PLACEHOLDER_VERIFY
+
+
+def test_the_workflow_and_every_issue_carry_the_same_one_command(monkeypatch):
+    """One string, from one place. Three copies that can disagree is the bug.
+
+    The required status check runs what the workflow says, the worker runs what
+    the issue says, and a run where those two differ has a gate that is red
+    before anyone has touched the task.
+    """
+    code, provisioning, planning = greenfield(monkeypatch, FakeClient([]))
+
+    assert code == 0
+    verify = provisioning.plan.verify_command
+    assert f"run: {verify}" in provisioning.plan.files()[CI_WORKFLOW_PATH]
+    assert verify in provisioning.plan.files()["README.md"]
+    assert planning.verify == verify
+
+
+def test_the_repository_this_would_create_passes_the_command_its_issues_carry(
+    monkeypatch, tmp_path
+):
+    """The defect stated as the property that was untrue.
+
+    Lay out the initial commit exactly as it would be pushed, then run the
+    string the planner puts in every `## Verify` - from the repository root,
+    with nothing installed, believing only the exit code, which is how CI and
+    the worker container both run it. Asserting on the generated files instead
+    would pass for a project that does not import.
+    """
+    code, provisioning, planning = greenfield(monkeypatch, FakeClient([]))
+    for path, content in provisioning.plan.files().items():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    result = subprocess.run(
+        planning.verify, shell=True, cwd=tmp_path, capture_output=True, text=True
     )
 
     assert code == 0
-    assert created["plan"].owner == "me"
-    assert created["plan"].private is False
-    assert created["assume_yes"] is True
-    out = capsys.readouterr().out
-    # The prompt is the objective, and the run targets the new repo.
-    assert "repo me/markdown-to-csv" in out
-    assert "a markdown to CSV tool" in out
+    assert result.returncode == 0, result.stderr
+
+
+def test_an_explicit_verify_command_overrides_the_scaffolds(monkeypatch):
+    # The override reaches the workflow as well as the issues, which is the
+    # whole point: it stays one string, it is simply the operator's string.
+    code, provisioning, planning = greenfield(monkeypatch, FakeClient([]), "--verify", "make check")
+
+    assert code == 0
+    assert planning.verify == "make check"
+    assert "run: make check" in provisioning.plan.files()[CI_WORKFLOW_PATH]
+
+
+def test_a_prompt_naming_another_stack_is_refused_before_anything_is_created(
+    monkeypatch, capsys
+):
+    # `choose_stack` declines rather than silently generating Python, and the
+    # decision is taken while a refusal is still free - afterwards there is a
+    # real repository with a URL somebody may already have seen.
+    provisioning = Provisioning()
+    monkeypatch.setattr("swarm.cli.provision", provisioning)
+
+    code = main(
+        ["run", "--new", "a dashboard in TypeScript", "--owner", "me", "--yes"],
+        client=FakeClient([]),
+    )
+
+    assert code == 1
+    assert provisioning.calls == []
+    assert "TypeScript" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv, expected",
+    [
+        ([], SETTINGS.verify_command),
+        (["--verify", "make check"], "make check"),
+    ],
+)
+def test_an_existing_repo_verifies_with_the_operators_command(monkeypatch, argv, expected):
+    """There is no scaffold to read it off, so the operator is the source.
+
+    Inferring it from the repository's own CI is the tempting alternative and
+    the wrong one: a workflow with a matrix and four setup steps has no single
+    line to lift, and a command inferred wrong is a gate that was red before a
+    worker touched the task.
+    """
+    client = FakeClient([])
+    planning = Planning(client)
+    monkeypatch.setattr("swarm.cli.plan_node", planning)
+
+    code = main(
+        ["run", "--repo", REPO, "--objective", OBJECTIVE, "--plan-only", *argv], client=client
+    )
+
+    assert code == 0
+    assert planning.verify == expected
 
 
 # --------------------------------------------------------------------------

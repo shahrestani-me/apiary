@@ -268,6 +268,7 @@ def replan(
     replans: int = 0,
     max_stalls: int = SETTINGS.max_stalls,
     max_replans: int = MAX_REPLANS,
+    verify: str | None = None,
     proposer: Proposer | None = None,
     writer: Callable[..., PlanReport] = write_plan,
 ) -> ReplanReport:
@@ -277,6 +278,12 @@ def replan(
     `write_plan` makes for taking one: re-listing the issues here would double
     the rate-limit cost of a stalled cycle, and the caller's copy is the one the
     verdict was computed from, so a fresh read could describe a different run.
+
+    `verify` is the run's repo-wide verify command, resolved once by whoever
+    started the run (`cli._target`) and carried here so that a rewritten issue
+    carries the same gate the original did. Defaulting it locally would mean a
+    stall silently re-pointed every task in a generated repository at
+    `SETTINGS.verify_command`, which that repository has no way to run.
 
     `proposer` and `writer` are the two seams, and they exist for one reason:
     **a replan rewrites a real issue tracker.** A test that exercised this
@@ -321,14 +328,14 @@ def replan(
     # The write path's own normalisation, run before the write rather than
     # inside it: `write_plan` retires every entry the plan does not contain, so
     # a plan that normalises to nothing closes the whole tracker.
-    drafts, _ = normalise(plan.tasks, verify=SETTINGS.verify_command)
+    drafts, _ = normalise(plan.tasks, verify=verify or SETTINGS.verify_command)
     if not drafts:
         return ReplanReport(
             repo=repo, reason=NO_TASKS, stalls=verdict.stalls, replans=replans
         )
 
     try:
-        report = writer(client, plan, ledger=ledger)
+        report = writer(client, plan, ledger=ledger, verify=verify)
     except PlanError as exc:
         # A ring in the proposed graph. `write_plan` orders the drafts before
         # its first write and raises having written nothing, so the tracker is
