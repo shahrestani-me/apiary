@@ -1,0 +1,929 @@
+"""Every environmental precondition, checked before anything expensive runs.
+
+The failures this module exists to catch all share one property: **none of them
+looks like what it is.** An absent model presents as a planner that returns
+nothing useful. A token missing a scope presents as a permissions bug in
+whichever module happened to make the first write. A target repo with no CI
+presents, an hour later, as issues that reach `swarm:review` and stay there
+forever. Every one of them is cheap to detect up front and expensive to
+diagnose from the symptom, which is the entire argument for a preflight.
+
+So each check answers with a verdict *and the command that fixes it*. A check
+that reports "ollama.models: failed" has moved the hour of confusion rather
+than removed it; `Check.__post_init__` therefore refuses to construct a failing
+check without a fix, which makes "every failure names its remedy" a property of
+the type rather than a habit.
+
+**Doctor is read-only, and that is load-bearing.** It runs against a live
+tracker, a live daemon and a live model server, at the moment when the operator
+has the least confidence that any of them is configured correctly - which is
+the worst possible moment to also be creating things. Concretely:
+
+- `github/labels.py` can create the missing `swarm:*` labels, and this module
+  deliberately does not call it. It imports `SWARM_LABELS` and
+  `list_label_names` - the name list and the read - and reports
+  `python -m swarm.github.labels <repo>` as the fix. Provisioning is a decision
+  someone makes; a diagnostic that quietly repaired the thing it was asked to
+  measure would report a repo that was never in the state it just described.
+- Write permission on the repository is *not* probed, for the same reason: the
+  only honest probe is a write. `check_token` asserts the token's shape through
+  `security.assert_scoped_token` and names the four permissions it must carry;
+  what it cannot do is prove they are granted without spending one.
+- The Docker checks run `version` and `image inspect` and nothing else. No
+  container is created, started or removed.
+
+`tests/test_doctor.py` asserts both halves of that: every request the GitHub
+checks make is a `GET`, and every `docker` argv is a read.
+
+**Three checks are here that the ticket did not ask for**, each because a run
+tripped over it:
+
+- `docker.cli` - the orchestrator image installs `git` and no `docker` binary,
+  and `containers/manager.py` reaches the daemon by shelling out to that
+  binary. `DOCKER_HOST` is honoured by the CLI, so with no CLI the socket proxy
+  is configured, reachable, and dialled by nobody. The daemon check cannot see
+  this: it fails identically to a stopped daemon, and the fix is completely
+  different.
+- `github.ci` - `docs/architecture-v2.md` makes CI the gate ("PRs are the
+  integration mechanism"), so against a repo with no checks nothing can ever
+  leave `swarm:review`. That is a repo the swarm should refuse to start on, not
+  one it should discover after eight issues are stuck.
+- `ollama.target` - Ollama spells a server *bind* address and a client *target*
+  with the same `OLLAMA_HOST`. `config.py` reads it as the target, and the
+  value that lets containers reach the host server is `0.0.0.0:11434`, which as
+  a target points at nothing. `compose.yaml` sidesteps it with
+  `APIARY_OLLAMA_HOST`; a process started from a shell that exported the bind
+  address does not, and gets a connection error that reads like a dead server.
+
+Manual run against a real repo - reads only, writes nothing:
+
+    GITHUB_TOKEN=... python -m swarm.doctor shahrestani-me/apiary
+
+`swarm doctor` itself is one `sub.add_parser` away, in `cli.py`, which is
+outside this issue's `## Files`; `main` below is already the shape that
+subcommand needs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol, Sequence
+
+from pydantic import BaseModel
+
+from .config import SETTINGS, Settings
+from .containers.manager import WORKER_IMAGE, ContainerError, DockerCLI, Redactor
+from .github.client import GitHubClient, GitHubError, GitHubHTTPError
+from .github.labels import SWARM_LABELS, list_label_names
+from .llm import orchestrator_llm, structured, worker_llm
+from .security import REQUIRED_PERMISSIONS, CredentialError, assert_scoped_token
+
+__all__ = [
+    "DoctorError",
+    "Check",
+    "Diagnosis",
+    "Doctor",
+    "HostInference",
+    "Inference",
+    "OK",
+    "FAIL",
+    "SKIP",
+    "main",
+]
+
+
+class DoctorError(RuntimeError):
+    """A probe could not answer. Never a verdict - verdicts are `Check`s."""
+
+
+# --------------------------------------------------------------------------
+# Verdicts
+# --------------------------------------------------------------------------
+
+OK = "ok"
+FAIL = "fail"
+SKIP = "skip"
+
+#: Check names. Constants because a test addresses a check by name and an
+#: operator greps for one; a renamed literal in three places is a rename that
+#: only two of them get.
+CHECK_OLLAMA_TARGET = "ollama.target"
+CHECK_OLLAMA_REACHABLE = "ollama.reachable"
+CHECK_OLLAMA_MODELS = "ollama.models"
+CHECK_OLLAMA_SCHEMA = "ollama.schema"
+CHECK_TOKEN = "github.token"
+CHECK_REPO = "github.repo"
+CHECK_LABELS = "github.labels"
+CHECK_CI = "github.ci"
+CHECK_DOCKER_CLI = "docker.cli"
+CHECK_DOCKER_DAEMON = "docker.daemon"
+CHECK_WORKER_IMAGE = "docker.image"
+
+_MARK = {OK: "ok  ", FAIL: "FAIL", SKIP: "skip"}
+_NAME_WIDTH = max(len(name) for name in (
+    CHECK_OLLAMA_TARGET, CHECK_OLLAMA_REACHABLE, CHECK_OLLAMA_MODELS, CHECK_OLLAMA_SCHEMA,
+    CHECK_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI,
+    CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON, CHECK_WORKER_IMAGE,
+))
+
+
+@dataclass(frozen=True)
+class Check:
+    """One precondition, its verdict, and - when it failed - its remedy.
+
+    The constructor enforces the "done when" of this module's ticket: a failing
+    check without a `fix` cannot be built. Every failure below therefore names
+    a command, a variable to export, or a file to add, and a future check that
+    forgets to fails the suite at the point it is written rather than at the
+    point somebody needed it.
+
+    `skip` is a third state on purpose. "The worker image is not on this
+    daemon" and "there is no daemon to ask" are different sentences, and
+    collapsing the second into a failure of the first sends the reader after
+    the wrong thing - which is precisely the confusion this module exists to
+    end.
+    """
+
+    name: str
+    status: str
+    detail: str
+    fix: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in (OK, FAIL, SKIP):
+            raise ValueError(f"{self.name}: unknown status {self.status!r}")
+        if self.status == FAIL and not self.fix.strip():
+            raise ValueError(f"{self.name}: a failing check must name the fix for it")
+
+    @classmethod
+    def passed(cls, name: str, detail: str) -> Check:
+        return cls(name, OK, detail)
+
+    @classmethod
+    def failed(cls, name: str, detail: str, *, fix: str) -> Check:
+        return cls(name, FAIL, detail, fix)
+
+    @classmethod
+    def skipped(cls, name: str, detail: str) -> Check:
+        return cls(name, SKIP, detail)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == OK
+
+    def lines(self) -> list[str]:
+        head = f"{_MARK[self.status]}  {self.name:<{_NAME_WIDTH}}  {self.detail}"
+        return [head, f"{'':6}{'':<{_NAME_WIDTH}}  fix: {self.fix}"] if self.fix else [head]
+
+    def __str__(self) -> str:
+        return "\n".join(self.lines())
+
+
+@dataclass(frozen=True)
+class Diagnosis:
+    """Every check of one run, and the single question the caller asked.
+
+    Skips do not fail a run. A skipped check is one this machine could not
+    answer - the daemon it needed is down, and the check that says so has
+    already failed - so counting it again would report two problems where the
+    operator has one.
+    """
+
+    checks: tuple[Check, ...] = ()
+
+    @property
+    def failures(self) -> tuple[Check, ...]:
+        return tuple(check for check in self.checks if check.status == FAIL)
+
+    @property
+    def skipped(self) -> tuple[Check, ...]:
+        return tuple(check for check in self.checks if check.status == SKIP)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures
+
+    def by_name(self, name: str) -> Check:
+        for check in self.checks:
+            if check.name == name:
+                return check
+        raise KeyError(name)
+
+    def summary(self) -> str:
+        if self.ok and not self.skipped:
+            return f"all {len(self.checks)} preconditions met"
+        parts = [f"{len(self.checks) - len(self.failures) - len(self.skipped)} ok"]
+        if self.failures:
+            parts.append(f"{len(self.failures)} failed")
+        if self.skipped:
+            parts.append(f"{len(self.skipped)} not attempted")
+        return f"{len(self.checks)} checks: " + ", ".join(parts)
+
+    def report(self) -> str:
+        lines: list[str] = []
+        for check in self.checks:
+            lines += check.lines()
+        lines += ["", f"» {self.summary()}"]
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# The model server
+# --------------------------------------------------------------------------
+
+
+class Ping(BaseModel):
+    """The trivial schema the format probe forces a model to fill.
+
+    Two fields of different types, because the failure being tested for is a
+    model that emits *plausible JSON of its own shape* rather than the one it
+    was constrained to. A single boolean is guessable; `{"ok": "yes"}` is the
+    exact answer a model that ignored the constraint produces, and pydantic
+    rejects it.
+    """
+
+    ok: bool
+    answer: int
+
+
+class Inference(Protocol):
+    """What doctor asks of Ollama. The seam that keeps the suite hermetic.
+
+    Same shape and same reason as `github.client.Transport` and
+    `containers.manager.Runner`: the interesting logic here is the wording of
+    the verdicts, and a test that needs a running model server to reach it is a
+    test that runs on one machine.
+    """
+
+    def version(self) -> str: ...
+
+    def installed(self) -> list[str]: ...
+
+    def schema_probe(self, role: str) -> str: ...
+
+
+#: The two roles `config.py` defines: the settings field naming the model, and
+#: the `llm.py` factory that builds it. The factories are used rather than a
+#: `ChatOllama` constructed here, so the probe exercises the client the
+#: orchestrator and the workers actually get - same base URL, same `num_ctx`,
+#: same temperature. A probe against a lookalike proves nothing about the one
+#: that runs.
+ROLES: dict[str, tuple[str, Callable[[], Any]]] = {
+    "orchestrator": ("orchestrator_model", orchestrator_llm),
+    "worker": ("worker_model", worker_llm),
+}
+
+PROBE_PROMPT = "Return ok=true and answer=7."
+
+
+@dataclass
+class HostInference:
+    """The real one: HTTP to the configured Ollama, and one call per model.
+
+    `/api/version` and `/api/tags` are stdlib HTTP because they are two GETs
+    and because they must work when the *reason* nothing works is that the
+    model client cannot be constructed at all.
+    """
+
+    settings: Settings = SETTINGS
+    timeout_s: float = 5.0
+    fetch: Callable[[str, float], bytes] | None = None
+
+    def __post_init__(self) -> None:
+        if self.fetch is None:
+            self.fetch = _fetch
+
+    @property
+    def base_url(self) -> str:
+        return self.settings.ollama_base_url.rstrip("/")
+
+    def version(self) -> str:
+        return str(self._get("/api/version").get("version") or "unknown")
+
+    def installed(self) -> list[str]:
+        models = self._get("/api/tags").get("models") or []
+        return [str(entry.get("model") or entry.get("name") or "") for entry in models]
+
+    def schema_probe(self, role: str) -> str:
+        """Force `Ping` out of one role's model. Raises `DoctorError` if it will not.
+
+        Broad `except` on purpose, and the only one in this module: everything
+        between here and the socket - langchain, pydantic, the HTTP client -
+        signals a refusal its own way, and a probe that let one of those escape
+        would abort the remaining checks over the very condition it exists to
+        report.
+        """
+        _, factory = ROLES[role]
+        try:
+            answer = structured(factory(), Ping).invoke(PROBE_PROMPT)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            raise DoctorError(f"{type(exc).__name__}: {exc}") from exc
+        if not isinstance(answer, Ping):
+            # The value is not asserted, only the shape. Whether the model can
+            # count to seven is not this project's problem; whether Ollama's
+            # `format` constrained its decoding is.
+            raise DoctorError(f"returned {type(answer).__name__}, not the requested schema")
+        return f"{answer.__class__.__name__} parsed"
+
+    def _get(self, path: str) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        fetch = self.fetch or _fetch
+        try:
+            payload = json.loads(fetch(url, self.timeout_s).decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise DoctorError(f"GET {url} -> {exc.code}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise DoctorError(f"GET {url}: {getattr(exc, 'reason', exc)}") from exc
+        except ValueError as exc:
+            # Two arrive here: a body that is not JSON, and a base URL with no
+            # scheme, which `urlopen` rejects before it opens anything. The
+            # second is what `ollama.target` is about.
+            raise DoctorError(f"GET {url}: {exc}") from exc
+        return payload if isinstance(payload, dict) else {}
+
+
+def _fetch(url: str, timeout_s: float) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "apiary-swarm"}, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        return response.read()
+
+
+# --------------------------------------------------------------------------
+# The checks
+# --------------------------------------------------------------------------
+
+#: Hosts that are a bind address rather than somewhere to dial. `0.0.0.0` is
+#: what SETUP.md tells the operator to give the *server* so containers can
+#: reach it, and handing it to a client points that client at itself.
+WILDCARD_HOSTS: tuple[str, ...] = ("0.0.0.0", "::", "[::]", "")
+
+#: Where the host's Ollama is, seen from inside a container. The one
+#: `Dockerfile` and `Dockerfile.worker` both bake in.
+CONTAINER_OLLAMA_URL = "http://host.docker.internal:11434"
+
+LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1", "[::1]")
+
+#: The remedy for both of the wrong-target shapes, and the paragraph this whole
+#: check exists for. It names three things because the mistake has three parts:
+#: which variable this process reads, where the *server's* bind address belongs
+#: instead, and why compose spells its own override differently.
+_TARGET_FIX = (
+    "Ollama spells the server's bind address and the client's target with the same "
+    "OLLAMA_HOST, and config.py reads it as the target. Give this process a URL - "
+    "`export OLLAMA_HOST=http://localhost:11434` - and give the server its bind address "
+    "through the server's own environment (`launchctl setenv OLLAMA_HOST 0.0.0.0:11434` "
+    "on macOS, where the app never reads your shell). compose.yaml reads "
+    "APIARY_OLLAMA_HOST for the container's copy, for exactly this reason"
+)
+
+#: Marks a filesystem as a container's. Cheap, and wrong only in the direction
+#: that matters least: a false negative reports one fewer check.
+DOCKERENV = "/.dockerenv"
+
+DOCKER_BINARY = "docker"
+
+#: The ref whose check runs answer "does anything gate a PR here". A branch
+#: name is a valid ref for `GET /commits/{ref}/check-runs`.
+DEFAULT_CI_REF = "main"
+
+#: `security.SOCKET_PROXY_ENV` sets `IMAGES=0`, so `docker image inspect`
+#: through the proxy is a 403 by design rather than a missing image.
+_DENIED_MARKERS: tuple[str, ...] = ("403", "forbidden")
+
+
+@dataclass
+class Doctor:
+    """Every check, and the collaborators each of them needs.
+
+    Constructed with its collaborators rather than reaching for globals, so a
+    test provokes a failure by handing over a double instead of by breaking the
+    machine it runs on. `from_env` is the production wiring.
+    """
+
+    repo: str | None = None
+    settings: Settings = SETTINGS
+    github: GitHubClient | None = None
+    docker: DockerCLI | None = None
+    inference: Inference | None = None
+    env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+    which: Callable[[str], str | None] = shutil.which
+    in_container: bool | None = None
+    image: str = WORKER_IMAGE
+    ci_ref: str = DEFAULT_CI_REF
+    probe_schema: bool = True
+
+    def __post_init__(self) -> None:
+        if self.inference is None:
+            self.inference = HostInference(self.settings)
+        if self.docker is None:
+            # Redacting even here. A `docker` failure is quoted verbatim into a
+            # report an operator pastes into an issue, and the orchestrator's
+            # environment is where the token lives.
+            redactor = Redactor()
+            redactor.add_env(self.env)
+            self.docker = DockerCLI(redact=redactor)
+        if self.in_container is None:
+            self.in_container = os.path.exists(DOCKERENV)
+
+    @classmethod
+    def from_env(cls, repo: str | None = None, **kwargs: Any) -> Doctor:
+        """Wire the real probes up from `GITHUB_TOKEN` and `GITHUB_REPOSITORY`.
+
+        A missing or malformed target leaves `github` unset rather than
+        raising: "there is no usable token" is a verdict this module reports,
+        not an error it dies of.
+        """
+        env: Mapping[str, str] = kwargs.pop("env", None) or dict(os.environ)
+        repo = repo or env.get("GITHUB_REPOSITORY") or None
+        token = env.get("GITHUB_TOKEN")
+        github = kwargs.pop("github", None)
+        if github is None and token and repo and _is_repo(repo):
+            github = GitHubClient(repo, token)
+        return cls(repo=repo, github=github, env=env, **kwargs)
+
+    # --- the run --------------------------------------------------------
+
+    def run(self) -> Diagnosis:
+        """Every check, in dependency order, and never fewer than all of them.
+
+        Nothing short-circuits the *run*: a broken Ollama must not hide a
+        broken token, because the operator would then fix one thing, re-run,
+        and be told about the next. Only checks whose prerequisite failed are
+        skipped, and they say which prerequisite.
+        """
+        target = self.check_ollama_target()
+        # Reachability chains off the target rather than being asked anyway: a
+        # bind address produces a connection error that names `ollama serve`,
+        # and following that advice fixes nothing. One problem, one verdict.
+        reachable = self._after(target, CHECK_OLLAMA_REACHABLE, self.check_ollama_reachable)
+        models = self._after(reachable, CHECK_OLLAMA_MODELS, self.check_models)
+        checks: list[Check] = [
+            target,
+            reachable,
+            models,
+            self._after(models, CHECK_OLLAMA_SCHEMA, self.check_schema),
+        ]
+
+        token = self.check_token()
+        access = self._after(token, CHECK_REPO, self.check_repo_access)
+        checks += [
+            token,
+            access,
+            self._after(access, CHECK_LABELS, self.check_labels),
+            self._after(access, CHECK_CI, self.check_ci),
+        ]
+
+        cli = self.check_docker_cli()
+        daemon = self._after(cli, CHECK_DOCKER_DAEMON, self.check_docker_daemon)
+        checks += [cli, daemon, self._after(daemon, CHECK_WORKER_IMAGE, self.check_worker_image)]
+
+        return Diagnosis(tuple(checks))
+
+    @staticmethod
+    def _after(prior: Check, name: str, check: Callable[[], Check]) -> Check:
+        """Run `check`, or explain which earlier verdict makes it unanswerable."""
+        if prior.ok:
+            return check()
+        return Check.skipped(name, f"not attempted: {prior.name} did not pass")
+
+    # --- ollama ---------------------------------------------------------
+
+    def check_ollama_target(self) -> Check:
+        """Is the configured URL something a *client* can dial?
+
+        Costs no I/O and runs before the reachability check, because when this
+        one is wrong the reachability failure is a connection error that reads
+        like a stopped server and sends the reader to `ollama serve`.
+        """
+        url = self.settings.ollama_base_url
+        host = _hostname(url)
+
+        if "://" not in url:
+            return Check.failed(
+                CHECK_OLLAMA_TARGET,
+                f"OLLAMA_HOST={url!r} has no scheme, which is the shape of a bind address",
+                fix=_TARGET_FIX,
+            )
+        if host in WILDCARD_HOSTS:
+            return Check.failed(
+                CHECK_OLLAMA_TARGET,
+                f"OLLAMA_HOST={url!r} names a wildcard bind address; a client cannot dial it",
+                fix=_TARGET_FIX,
+            )
+        if self.in_container and host in LOOPBACK_HOSTS:
+            return Check.failed(
+                CHECK_OLLAMA_TARGET,
+                f"OLLAMA_HOST={url!r} is this container's own loopback, and Ollama "
+                f"runs on the host (docs/architecture-v2.md, first constraint)",
+                fix=(
+                    f"export APIARY_OLLAMA_HOST={CONTAINER_OLLAMA_URL} before "
+                    f"`docker compose run orchestrator ...`; compose passes it through as "
+                    f"the container's OLLAMA_HOST"
+                ),
+            )
+        return Check.passed(CHECK_OLLAMA_TARGET, f"client target is {url}")
+
+    def check_ollama_reachable(self) -> Check:
+        assert self.inference is not None  # set in __post_init__
+        try:
+            version = self.inference.version()
+        except DoctorError as exc:
+            return Check.failed(
+                CHECK_OLLAMA_REACHABLE,
+                f"no answer from {self.settings.ollama_base_url}: {exc}",
+                fix=(
+                    "start the server - `ollama serve`, or launch the Ollama app - and "
+                    f"confirm with `curl {self.settings.ollama_base_url}/api/version`. "
+                    "It runs on the HOST, never in a container: Docker Desktop has no "
+                    "Metal passthrough (docs/architecture-v2.md)"
+                ),
+            )
+        return Check.passed(
+            CHECK_OLLAMA_REACHABLE, f"ollama {version} at {self.settings.ollama_base_url}"
+        )
+
+    def check_models(self) -> Check:
+        assert self.inference is not None
+        try:
+            installed = self.inference.installed()
+        except DoctorError as exc:
+            return Check.failed(
+                CHECK_OLLAMA_MODELS,
+                f"could not list models: {exc}",
+                fix=f"`ollama list` against {self.settings.ollama_base_url} reproduces this",
+            )
+
+        wanted = self._wanted_models()
+        missing = [(role, model) for role, model in wanted if not _has_model(installed, model)]
+        if missing:
+            return Check.failed(
+                CHECK_OLLAMA_MODELS,
+                ", ".join(f"{model} ({role}) is not pulled" for role, model in missing),
+                fix=(
+                    "; ".join(f"ollama pull {model}" for _, model in missing)
+                    + "  (or point the role elsewhere: "
+                    + ", ".join(f"SWARM_{role.upper()}_MODEL" for role, _ in missing)
+                    + ")"
+                ),
+            )
+        return Check.passed(
+            CHECK_OLLAMA_MODELS,
+            ", ".join(f"{model} ({role})" for role, model in wanted),
+        )
+
+    def check_schema(self) -> Check:
+        """Does schema-forced JSON actually constrain these models?
+
+        The whole orchestrator is `structured()` calls. A model that accepts
+        the `format` parameter and then ignores it produces empty plans and
+        unparseable judgements, which is indistinguishable from a planner bug
+        and is where an afternoon goes.
+
+        This is the one check that costs real inference - two model loads, and
+        with `OLLAMA_MAX_LOADED_MODELS=1` a swap between them - so it is the
+        one with an off switch.
+        """
+        assert self.inference is not None
+        if not self.probe_schema:
+            return Check.skipped(CHECK_OLLAMA_SCHEMA, "not attempted: --skip-schema")
+
+        results: list[str] = []
+        for role, model in self._wanted_models():
+            try:
+                results.append(f"{model} ({role}) {self.inference.schema_probe(role)}")
+            except DoctorError as exc:
+                return Check.failed(
+                    CHECK_OLLAMA_SCHEMA,
+                    f"{model} ({role}) did not return the requested schema: {exc}",
+                    fix=(
+                        f"`ollama show {model}` - a model without structured-output support "
+                        f"cannot orchestrate; set SWARM_{role.upper()}_MODEL to one that has "
+                        f"it, and check `ollama --version` (format-constrained decoding needs "
+                        f"a recent server)"
+                    ),
+                )
+        return Check.passed(CHECK_OLLAMA_SCHEMA, "; ".join(results))
+
+    def _wanted_models(self) -> list[tuple[str, str]]:
+        return [(role, getattr(self.settings, attr)) for role, (attr, _) in ROLES.items()]
+
+    # --- github ---------------------------------------------------------
+
+    def check_token(self) -> Check:
+        """The shape of the credential, before anything spends it.
+
+        `security.assert_scoped_token` is the whole check and this is its first
+        production caller: a classic or OAuth token works perfectly against the
+        target repo and also reaches every other repo the account can, so the
+        failure it prevents is not one the remaining checks could ever see.
+        """
+        try:
+            kind = assert_scoped_token(self.env.get("GITHUB_TOKEN"))
+        except CredentialError as exc:
+            return Check.failed(CHECK_TOKEN, str(exc), fix=self._token_fix())
+        return Check.passed(CHECK_TOKEN, f"a {kind} token is set")
+
+    def check_repo_access(self) -> Check:
+        """Can this token read this repository's ledger?
+
+        Reads the issues, because that is what the orchestrator does on every
+        cycle - a check against a cheaper endpoint would prove less about the
+        call that matters. Write access is deliberately unprobed: the only
+        proof is a write, and this module makes none.
+        """
+        if not self.repo:
+            return Check.failed(
+                CHECK_REPO,
+                "no target repository",
+                fix="pass one - `python -m swarm.doctor owner/name` - or export GITHUB_REPOSITORY",
+            )
+        if not _is_repo(self.repo):
+            return Check.failed(
+                CHECK_REPO,
+                f"{self.repo!r} is not a repository reference",
+                fix="spell it owner/name, as in shahrestani-me/apiary",
+            )
+        if self.github is None:
+            return Check.skipped(CHECK_REPO, f"not attempted: no client (see {CHECK_TOKEN})")
+
+        try:
+            issues = self.github.list_issues(state="open")
+        except GitHubHTTPError as exc:
+            return Check.failed(CHECK_REPO, f"{self.repo}: {exc}", fix=self._access_fix(exc.status))
+        except GitHubError as exc:
+            return Check.failed(
+                CHECK_REPO,
+                f"{self.repo}: {exc}",
+                fix=(
+                    "the API was not reachable, not refused: check the network, and - inside "
+                    "compose - that api.github.com is on the egress allowlist "
+                    "(src/swarm/security.py, APIARY_EGRESS_ALLOW)"
+                ),
+            )
+        return Check.passed(
+            CHECK_REPO,
+            f"{self.repo} readable, {len(issues)} open issues (write access is asserted "
+            f"by token shape, never probed - doctor writes nothing)",
+        )
+
+    def check_labels(self) -> Check:
+        """Are the six `swarm:*` labels there? Reported, never created.
+
+        `POST /issues/{n}/labels` with an unknown name *invents* the label, so
+        a missing one is not a crash: the run proceeds and the ledger fills
+        with labels nobody chose, in colours nobody picked. That is why this is
+        a preflight and not an exception handler.
+        """
+        assert self.github is not None  # guarded by `_after(access, ...)`
+        try:
+            present = {name.casefold() for name in list_label_names(self.github)}
+        except GitHubError as exc:
+            return Check.failed(
+                CHECK_LABELS,
+                f"could not list the labels of {self.repo}: {exc}",
+                fix=self._access_fix(getattr(exc, "status", 0)),
+            )
+
+        missing = [spec.name for spec in SWARM_LABELS if spec.name.casefold() not in present]
+        if missing:
+            return Check.failed(
+                CHECK_LABELS,
+                f"{self.repo} is missing {', '.join(missing)}",
+                fix=(
+                    f"python -m swarm.github.labels {self.repo}  (creates only what is "
+                    f"missing and touches nothing that exists; doctor reports rather than "
+                    f"provisions, so that what it measured is what was there)"
+                ),
+            )
+        return Check.passed(CHECK_LABELS, f"all {len(SWARM_LABELS)} swarm:* labels present")
+
+    def check_ci(self) -> Check:
+        """Does anything gate a PR on this repo?
+
+        `docs/architecture-v2.md` makes CI the integration gate, and #23 waits
+        on check runs before merging. Against a repo with none, every issue
+        reaches `swarm:review` and stops - a swarm that looks busy and finishes
+        nothing. Refusing to start is the cheaper outcome.
+
+        Asked through `list_check_runs`, which is the call the merge gate
+        itself makes, on the repo's default branch: an empty answer there is
+        the same emptiness the gate will see.
+        """
+        assert self.github is not None
+        try:
+            runs = self.github.list_check_runs(self.ci_ref)
+        except GitHubHTTPError as exc:
+            if exc.status == 404:
+                return Check.failed(
+                    CHECK_CI,
+                    f"{self.repo} has no commit at {self.ci_ref!r}",
+                    fix=f"name the default branch: --ci-ref <branch> (this run used {self.ci_ref!r})",
+                )
+            return Check.failed(CHECK_CI, f"{self.repo}: {exc}", fix=self._access_fix(exc.status))
+
+        if not runs:
+            return Check.failed(
+                CHECK_CI,
+                f"no check runs on {self.ci_ref} of {self.repo}: nothing would gate a PR, "
+                f"so no issue could ever leave swarm:review",
+                fix=(
+                    "add a workflow that runs the ## Verify command - .github/workflows/ci.yml, "
+                    "`on: [push, pull_request]`. If yours triggers on pull_request only, point "
+                    "this check at a recent PR head instead: --ci-ref <sha>"
+                ),
+            )
+        names = sorted({str(run.get("name") or "?") for run in runs})
+        return Check.passed(
+            CHECK_CI,
+            f"{len(runs)} check runs on {self.ci_ref}: {', '.join(names[:4])}",
+        )
+
+    def _token_fix(self) -> str:
+        permissions = ", ".join(f"{name}:{level}" for name, level in REQUIRED_PERMISSIONS.items())
+        target = self.repo or "the single target repo"
+        return (
+            f"mint a fine-grained PAT on {target} with {permissions} and nothing else "
+            f"(https://github.com/settings/personal-access-tokens/new), then "
+            f"`export GITHUB_TOKEN=github_pat_...` - see docs/security.md"
+        )
+
+    def _access_fix(self, status: int) -> str:
+        """The remedy for a refusal, which differs entirely by status code."""
+        if status == 401:
+            return f"the token was rejected outright - it is expired or mistyped; {self._token_fix()}"
+        if status == 403:
+            return (
+                "the token authenticates but is not permitted here: grant it "
+                + ", ".join(f"{name}:{level}" for name, level in REQUIRED_PERMISSIONS.items())
+                + f" on {self.repo}, or wait out a rate limit if that is what this is"
+            )
+        if status == 404:
+            return (
+                f"a fine-grained PAT sees only the repositories it was granted, and a 404 is "
+                f"how it reports one it was not - never a 403: add {self.repo} under the "
+                f"token's Repository access at "
+                f"https://github.com/settings/personal-access-tokens, or check the spelling "
+                f"of the repo itself"
+            )
+        return self._token_fix()
+
+    # --- docker ---------------------------------------------------------
+
+    def check_docker_cli(self) -> Check:
+        """Is there a `docker` binary at all?
+
+        Not a formality. `containers/manager.py` reaches the daemon by shelling
+        out - deliberately, so that every call is one a human can paste - and
+        `DOCKER_HOST` is honoured by *the binary*. The orchestrator image
+        installs `git` and no docker CLI, so inside it the socket proxy is
+        configured, running, reachable and dialled by nothing, and the failure
+        arrives as a `ContainerError` from the first dispatch.
+        """
+        path = self.which(DOCKER_BINARY)
+        if not path:
+            host = self.env.get("DOCKER_HOST", "(unset)")
+            return Check.failed(
+                CHECK_DOCKER_CLI,
+                f"no {DOCKER_BINARY!r} on PATH, so DOCKER_HOST={host} cannot be honoured",
+                fix=(
+                    "install the client in the image that runs the orchestrator - "
+                    "`COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker` in "
+                    "Dockerfile - or run the orchestrator on the host, where it is already "
+                    "on PATH"
+                ),
+            )
+        return Check.passed(CHECK_DOCKER_CLI, f"{DOCKER_BINARY} at {path}")
+
+    def check_docker_daemon(self) -> Check:
+        assert self.docker is not None  # set in __post_init__
+        try:
+            version = self.docker("version", "--format", "{{.Server.Version}}").strip()
+        except ContainerError as exc:
+            host = self.env.get("DOCKER_HOST", "(unset)")
+            return Check.failed(
+                CHECK_DOCKER_DAEMON,
+                f"the daemon did not answer: {exc}",
+                fix=(
+                    "start Docker Desktop (or `colima start`), then `docker version`. Inside "
+                    f"compose the daemon is the socket proxy, so check DOCKER_HOST={host} and "
+                    "that the docker-socket-proxy service is up"
+                ),
+            )
+        return Check.passed(CHECK_DOCKER_DAEMON, f"daemon {version or 'reachable'}")
+
+    def check_worker_image(self) -> Check:
+        """Is the image #14 builds on this daemon?
+
+        There is no pull to fall back on: `security.SOCKET_PROXY_ENV` sets
+        `IMAGES=0`, so the orchestrator cannot fetch an image of its choosing -
+        which also means this very check is refused through the proxy, and is
+        reported as unanswered rather than as a missing image.
+        """
+        assert self.docker is not None
+        try:
+            image_id = self.docker("image", "inspect", self.image, "--format", "{{.Id}}").strip()
+        except ContainerError as exc:
+            if any(marker in str(exc).lower() for marker in _DENIED_MARKERS):
+                return Check.skipped(
+                    CHECK_WORKER_IMAGE,
+                    "not attempted: the socket proxy denies /images by design "
+                    "(IMAGES=0, src/swarm/security.py). Run doctor on the host to check it",
+                )
+            return Check.failed(
+                CHECK_WORKER_IMAGE,
+                f"{self.image} is not on this daemon: {exc}",
+                fix=(
+                    f"docker build -f Dockerfile.worker -t {self.image} .  (it cannot be "
+                    f"pulled: the socket proxy sets IMAGES=0, so a worker image must already "
+                    f"be built on the host)"
+                ),
+            )
+        return Check.passed(CHECK_WORKER_IMAGE, f"{self.image} present ({image_id[:19]})")
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def _is_repo(value: str) -> bool:
+    return value.count("/") == 1 and all(part for part in value.split("/"))
+
+
+def _hostname(url: str) -> str:
+    """`http://0.0.0.0:11434/` -> `0.0.0.0`. Scheme optional, lowercased."""
+    value = url.strip().lower()
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    value = value.split("/", 1)[0].split("@")[-1]
+    if value.startswith("["):
+        return value.partition("]")[0] + "]"
+    return value.split(":", 1)[0]
+
+
+def _has_model(installed: Sequence[str], wanted: str) -> bool:
+    """Is `wanted` among `installed`, allowing for the implicit `:latest` tag?
+
+    Ollama reports `gemma4:31b` for a pull of `gemma4:31b` but `llama3:latest`
+    for a pull of `llama3`, and a config that names the untagged form is not
+    wrong - it is the form `ollama run` accepts.
+    """
+    candidates = {wanted, f"{wanted}:latest"} if ":" not in wanted else {wanted}
+    return any(name in candidates or name.removesuffix(":latest") == wanted for name in installed)
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="swarm doctor",
+        description="check every environmental precondition. Reads only; writes nothing.",
+    )
+    parser.add_argument(
+        "repo",
+        nargs="?",
+        default=None,
+        help="target repository as owner/name (default: $GITHUB_REPOSITORY)",
+    )
+    parser.add_argument(
+        "--ci-ref",
+        default=DEFAULT_CI_REF,
+        help=f"ref whose check runs prove CI exists (default: {DEFAULT_CI_REF})",
+    )
+    parser.add_argument(
+        "--skip-schema",
+        action="store_true",
+        help="do not invoke the models; skips the only check that costs inference",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, *, doctor: Doctor | None = None) -> int:
+    """Print the report; exit non-zero if any check failed.
+
+    `doctor` is the test seam, the same one `cli.main` uses for its client.
+    """
+    args = build_parser().parse_args(argv)
+    if doctor is None:
+        doctor = Doctor.from_env(args.repo, ci_ref=args.ci_ref, probe_schema=not args.skip_schema)
+
+    diagnosis = doctor.run()
+    print(diagnosis.report())
+    if not diagnosis.ok:
+        print("! start nothing until these are fixed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
