@@ -892,6 +892,43 @@ def _read_back(client: GitHubClient, report: PlanReport, *, sleep=time.sleep) ->
     return ledger
 
 
+def prompt_for(
+    objective: str,
+    existing: Mapping[str, TaskRecord] | None = None,
+) -> tuple[str, str]:
+    """The exact `(system, human)` pair the planner sends.
+
+    Note that the *system* half varies with ledger state - a replan carries the
+    failure history and the existing ids - so there is no single "the planner
+    prompt" to show. `swarm console` therefore exposes fresh-plan mode only,
+    and says so, rather than showing a replan prompt that would be right for
+    one round and wrong for every other.
+    """
+    system = _replan_prompt(existing) if existing else SYSTEM
+    return system, f"Objective:\n{objective}"
+
+
+def draft_plan(
+    objective: str,
+    *,
+    existing: Mapping[str, TaskRecord] | None = None,
+    llm=None,
+) -> Plan:
+    """One planning call, and nothing else - no ledger, no issues, no writes.
+
+    Split out of `plan_node` so the decomposition can be asked for on its own.
+    `plan_node`'s job is to plan *and write*, which needs a repository, a token
+    and a live ledger; the question "what would the planner do with this
+    objective" needs none of those, and answering it used to cost all three.
+
+    `llm` is the seam the other five call sites already have and this one did
+    not, which is why every test of it has to monkeypatch two module globals.
+    """
+    system, human = prompt_for(objective, existing)
+    model = structured(orchestrator_llm(), Plan) if llm is None else llm
+    return model.invoke([("system", system), ("human", human)])
+
+
 def plan_node(
     state: SwarmState,
     *,
@@ -919,9 +956,7 @@ def plan_node(
     objective = state["objective"]
     existing = state.get("tasks") or {}
 
-    prompt = _replan_prompt(existing) if existing else SYSTEM
-    llm = structured(orchestrator_llm(), Plan)
-    plan: Plan = llm.invoke([("system", prompt), ("human", f"Objective:\n{objective}")])
+    plan: Plan = draft_plan(objective, existing=existing)
 
     target = _source(state, source)
     if target is None:

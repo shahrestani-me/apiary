@@ -129,6 +129,51 @@ def test_the_console_shows_the_prompt_production_sends(checkout):
     assert shown["system"] == sent["system"]
     assert shown["human"] == sent["human"], "the console built a different prompt"
 
+    # -- plan_node ------------------------------------------------------
+    from swarm.nodes.planner import draft_plan
+    from swarm.state import Plan
+
+    planner = Recorder_(Plan(tasks=[], reasoning="none"))
+    draft_plan("a trip planner", llm=planner)
+    sent = dict(planner.seen[0])
+
+    shown = body(
+        Console().render(
+            "POST", "/prompt", HOST,
+            json.dumps({"site": "planner", "values": {"objective": "a trip planner"}}).encode(),
+        )
+    )
+    assert shown["system"] == sent["system"]
+    assert shown["human"] == sent["human"]
+
+
+def test_the_planner_tab_is_fresh_plan_mode_only(checkout):
+    """A replan's *system* prompt carries the failure history and the existing
+    ids, so there is no single planner prompt. The console shows the one that
+    is stable, and the blurb says which."""
+    from swarm.nodes.planner import prompt_for
+
+    fresh, _ = prompt_for("an objective")
+    replan, _ = prompt_for("an objective", {"a-task": {"id": "a-task", "status": "failed"}})
+
+    assert fresh != replan
+    assert "REPLAN" in replan
+    assert "fresh-plan" in SITES["planner"].blurb.lower()
+
+
+def test_the_planner_asks_github_for_nothing(monkeypatch):
+    """`plan_node` plans *and writes*, which needs a repo, a token and a live
+    ledger. `draft_plan` is the half the console needs and none of that."""
+    from swarm.nodes.planner import draft_plan
+    from swarm.state import Plan
+
+    planner = Recorder_(Plan(tasks=[], reasoning=""))
+
+    plan = draft_plan("build a thing", llm=planner)
+
+    assert plan.tasks == []
+    assert len(planner.seen) == 1
+
 
 def test_the_prompt_is_rendered_without_calling_the_model(checkout, console):
     """The point of a separate route: a cold call takes minutes, and the
@@ -192,10 +237,14 @@ def test_an_unknown_route_says_so(console):
 
 
 def test_an_unknown_site_is_refused(console):
-    response = console.render("POST", "/run", HOST, json.dumps({"site": "planner"}).encode())
+    """Named for a site that does not exist, and must stay that way: this test
+    once said "planner", and the day the planner tab was added it stopped
+    refusing and started firing the 31b inside the unit suite."""
+    response = console.render("POST", "/run", HOST, json.dumps({"site": "judge"}).encode())
 
     assert response.status == 400
     assert "unknown site" in body(response)["error"]
+    assert console.jobs == {}, "a refused site must not start a job"
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +346,20 @@ def test_the_page_makes_no_external_request():
     assert "http://" not in markup.replace("http://__PORT__", "")
     assert "https://" not in markup
     assert "<script src" not in markup
+
+
+def test_switching_tabs_keeps_what_was_typed():
+    """The flow this tool exists for is: read the plan, switch to the worker,
+    copy a task's goal across. Redrawing the form from the site definition
+    threw that away, which made the two tabs feel like two tools."""
+    markup = page()
+
+    assert "var typed = {}" in markup
+    assert "typed[current.key]" in markup
+
+
+def test_a_late_sites_response_cannot_steal_the_selected_tab():
+    assert "current = current || sites[0]" in page()
 
 
 def test_the_page_names_the_wait():

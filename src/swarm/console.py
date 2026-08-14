@@ -172,6 +172,30 @@ def _edits_run(payload: Mapping[str, str]) -> Any:
     }
 
 
+def _plan_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
+    from .nodes.planner import prompt_for
+
+    return prompt_for(payload.get("objective", ""))
+
+
+def _plan_run(payload: Mapping[str, str]) -> Any:
+    from .nodes.planner import draft_plan
+
+    plan = draft_plan(payload.get("objective", ""))
+    return {
+        "reasoning": plan.reasoning,
+        "tasks": [
+            {
+                "id": task.id,
+                "goal": task.goal,
+                "files": list(task.files),
+                "depends_on": list(task.depends_on),
+            }
+            for task in plan.tasks
+        ],
+    }
+
+
 def _stack_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
     from .greenfield.bootstrap import prompt_for
 
@@ -185,6 +209,22 @@ def _stack_run(payload: Mapping[str, str]) -> Any:
 
 
 SITES: dict[str, Site] = {
+    "planner": Site(
+        key="planner",
+        label="plan_node — the planner",
+        blurb=(
+            "How the objective is decomposed into tasks, which gates everything "
+            "downstream: each task becomes one issue and one worker. Fresh-plan mode "
+            "only — a replan's system prompt carries the failure history, so there is "
+            "no single planner prompt to show. Runs the 31b, and asks GitHub for nothing."
+        ),
+        fields=(
+            Field("objective", "Objective", kind="area",
+                  placeholder="What the swarm should accomplish."),
+        ),
+        prompt=_plan_prompt,
+        run=_plan_run,
+    ),
     "edits": Site(
         key="edits",
         label="propose_edits — the worker",
@@ -643,6 +683,11 @@ _PAGE = """<!doctype html>
 (function () {
   "use strict";
   var sites = [], current = null, timer = null;
+  //: What has been typed, per site. Switching tabs used to redraw the form
+  //: from the site definition and silently discard it - which is worst in the
+  //: one flow this tool exists for: read the plan, switch to the worker, and
+  //: find the objective you wanted to copy from is gone.
+  var typed = {};
   var $ = function (id) { return document.getElementById(id); };
 
   function el(tag, cls, text) {
@@ -668,16 +713,18 @@ _PAGE = """<!doctype html>
   }
 
   function values() {
-    var out = {};
+    var out = typed[current.key] || {};
     current.fields.forEach(function (f) {
       var node = document.querySelector('[name="' + f.name + '"]');
-      out[f.name] = node ? node.value : "";
+      if (node) out[f.name] = node.value;
     });
+    typed[current.key] = out;
     return out;
   }
 
   function drawForm() {
     var form = $("form");
+    var kept = typed[current.key] || {};
     form.textContent = "";
     $("blurb").textContent = current.blurb;
     current.fields.forEach(function (f) {
@@ -685,7 +732,8 @@ _PAGE = """<!doctype html>
       var node = el(f.kind === "area" ? "textarea" : "input");
       node.name = f.name;
       node.placeholder = f.placeholder || "";
-      node.value = f.value || "";
+      node.value = kept[f.name] !== undefined ? kept[f.name] : (f.value || "");
+      node.oninput = function () { values(); };
       form.appendChild(node);
     });
   }
@@ -697,7 +745,12 @@ _PAGE = """<!doctype html>
       var b = el("button", "tab", site.label);
       b.setAttribute("role", "tab");
       b.setAttribute("aria-selected", String(site.key === current.key));
-      b.onclick = function () { current = site; drawTabs(); drawForm(); };
+      b.onclick = function () {
+        values();               // keep what is on screen before replacing it
+        current = site;
+        drawTabs();
+        drawForm();
+      };
       tabs.appendChild(b);
     });
   }
@@ -760,6 +813,24 @@ _PAGE = """<!doctype html>
     if (site === "stack") {
       body.appendChild(el("pre", null, r.stack));
       return card("answer", body);
+    }
+    if (site === "planner") {
+      if (r.reasoning) {
+        body.appendChild(el("h2", null, "reasoning"));
+        body.appendChild(pre(r.reasoning));
+      }
+      (r.tasks || []).forEach(function (task, i) {
+        var d = el("details", "file");
+        d.open = true;
+        d.appendChild(el("summary", null, (i + 1) + ". " + task.id));
+        d.appendChild(pre(
+          task.goal
+          + "\\n\\nfiles:       " + (task.files.join(", ") || "(none)")
+          + "\\ndepends on:  " + (task.depends_on.join(", ") || "(nothing)")
+        ));
+        body.appendChild(d);
+      });
+      return card("plan · " + (r.tasks || []).length + " task(s)", body);
     }
     if (!r.edits || !r.edits.length) {
       body.appendChild(el("p", "empty", "the model returned no edits"));
@@ -831,7 +902,10 @@ _PAGE = """<!doctype html>
 
   api("/sites").then(function (res) {
     sites = res.body.sites;
-    current = sites[0];
+    //: Never clobber a tab the operator has already chosen. This resolves once
+    //: at load, but a slow response and a fast click put the selection back on
+    //: the first site while leaving the other one's form on screen.
+    current = current || sites[0];
     var m = res.body.models;
     $("models").textContent = "worker " + m.worker + "  ·  orchestrator " + m.orchestrator
                             + "  ·  " + m.base_url;
