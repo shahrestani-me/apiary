@@ -36,10 +36,32 @@ python -m pytest -q tests/test_thing.py
 - #12
 ```
 
-All four sections are required. The marker comment is required on issues the
-planner writes and is adopted onto issues it did not — see [§2](#2-task-identity).
-Order is not significant; the parser locates sections, it does not walk them in
-sequence.
+Those four sections are required. A fifth, `## Stack`, is optional and is
+written **last**, after `## Blocked by`:
+
+```markdown
+## Stack
+node
+```
+
+The marker comment is required on issues the planner writes and is adopted onto
+issues it did not — see [§2](#2-task-identity). Order is not significant to the
+parser, which locates sections rather than walking them in sequence — with one
+exception, and it is the reason `## Stack` goes last.
+
+**Backward compatibility.** [§1.1](#11-what-counts-as-a-section-heading) makes
+any unrecognised ATX heading a section *terminator* whose content is dropped,
+and any later recognised heading opens a new section. So an orchestrator that
+has never heard of `## Stack` reads the four required sections **identically**,
+wherever the fifth one sits — it sees the trailing heading, ends the section
+before it, and discards what follows. That is what lets an issue carrying
+`## Stack` be read by an older orchestrator, and it is pinned for three
+placements by corpus rows in [§7](#7-test-corpus).
+
+**Why last, then.** Not compatibility — readability. It keeps the four
+canonical sections contiguous and in the order [§6](#6-canonical-example)
+documents, so the optional section reads as an appendix rather than as an
+interruption of the contract.
 
 ### 1.1 What counts as a section heading
 
@@ -102,6 +124,7 @@ Unrecognised headings are ignored. A **repeated** known heading is malformed: tw
 | `## Files` | markdown list, one repo-relative path per item | `TaskRecord.files: list[str]` | empty; any path absolute, containing `..`, or containing a glob metacharacter |
 | `## Verify` | one shell command, bare or in a fence | `str` on the task's contract record | empty; more than one non-empty command line |
 | `## Blocked by` | markdown list of `- #N`, or no list at all | `list[int]` of issue numbers | a `#N` appears outside a list item; a ref is cross-repo (`owner/repo#N`) |
+| `## Stack` *(optional)* | one stack id: `python`, `node` or `react` | `str \| None` on the contract; resolved to `python` on the ledger entry | present but empty; more than one id; an id outside the known set |
 
 Notes on each:
 
@@ -409,12 +432,17 @@ python -m pytest -q tests/test_client_retry.py
 ## Blocked by
 - #7
 
+## Stack
+python
+
 ---
 
 Anything below the thematic break is prose for humans and is not parsed.
 ```
 
-Labels on that issue: one state label, plus `area/control-plane` and `size/S`.
+`## Stack` is last, and on a Python task the planner omits it entirely — it is
+shown here because this example exercises every rule. Labels on that issue: one
+state label, plus `area/control-plane` and `size/S`.
 
 ---
 
@@ -444,6 +472,10 @@ mandatory for [#9](https://github.com/shahrestani-me/apiary/issues/9) and
 | Issue carrying both `swarm:claimed` and `swarm:done` | repaired to `done`, logged |
 | `swarm:review` issue | `TaskStatus == "running"` |
 | `swarm:failed` issue | `TaskStatus == "abandoned"` |
+| A body with no `## Stack` | parses exactly as before; the entry's stack is `python` |
+| A body **with** `## Stack` — last, middle or second — read by the **pre-`## Stack`** parser | all four required sections parse identically; the fifth is discarded |
+| `## Stack` naming an id outside the known set | `ContractError`, never a silent default |
+| `## Stack` present but empty | `ContractError` |
 
 This repository's own backlog (#6–#35) is a real corpus: it has a diamond in its
 dependency graph, hand-written issues with no markers, prose outside every

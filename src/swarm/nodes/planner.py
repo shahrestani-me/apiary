@@ -77,6 +77,8 @@ from typing import Iterable, Literal, Mapping, Sequence
 from ..config import SETTINGS
 from ..github.client import GitHubClient
 from ..github.ledger import (
+    DEFAULT_STACK,
+    KNOWN_STACKS,
     ContractError,
     Ledger,
     LedgerEntry,
@@ -186,6 +188,7 @@ def render_body(
     verify: str,
     blocked_by: Sequence[int] = (),
     attempt: int = 0,
+    stack: str | None = None,
 ) -> str:
     """One issue body in the form of `docs/issue-contract.md` §6.
 
@@ -193,6 +196,23 @@ def render_body(
     human will keep editing (§2). Sections are emitted in the documented order
     even though the parser does not care, because the audience for the order is
     the person reading the issue.
+
+    **`## Stack` is emitted last**, and the compatibility property that makes
+    this section safe is stronger than the plan assumed. `_split_sections`
+    treats any unrecognised ATX heading as a section terminator, and any later
+    *known* heading opens a new section - so a pre-change parser reads all four
+    required sections identically **wherever** `## Stack` sits, not only when
+    it is last. `tests/test_ledger.py` pins that for three placements, because
+    it is the one thing making this deployable against a repository whose
+    issues were written by another version.
+
+    Last is still the right position, for the ordinary reason: it keeps the
+    four canonical sections contiguous and in the order §6 documents, so the
+    optional one reads as an appendix to a human rather than as an interruption
+    of the contract.
+
+    Omitted entirely when `stack` is None, so a Python plan's bodies are
+    byte-for-byte what they were.
     """
     lines = [
         render_marker(task_id, attempt),
@@ -209,6 +229,8 @@ def render_body(
         "## Blocked by",
         *([f"- #{number}" for number in blocked_by] or [NO_DEPENDENCIES]),
     ]
+    if stack:
+        lines += ["", "## Stack", stack]
     return "\n".join(lines) + "\n"
 
 
@@ -357,6 +379,10 @@ class Draft:
     files: tuple[str, ...]
     verify: str
     depends_on: tuple[str, ...] = ()
+    #: `None` means "did not say", which renders no `## Stack` section at all
+    #: and reads back as the default. Distinct from the string "python", which
+    #: renders the section and says so out loud.
+    stack: str | None = None
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -376,6 +402,7 @@ class Draft:
             verify=self.verify,
             blocked_by=blocked_by,
             attempt=attempt,
+            stack=self.stack,
         )
 
     def matches(self, entry: LedgerEntry, blocked_by: Sequence[int]) -> bool:
@@ -391,7 +418,27 @@ class Draft:
             and entry.files == self.files
             and entry.verify == self.verify
             and entry.blocked_by == tuple(blocked_by)
+            # Compared against the *resolved* entry stack, so a draft that says
+            # nothing matches an issue that says nothing. Without this row a
+            # replan that changed a task's stack would report the issue
+            # unchanged and write nothing - the task would keep running on the
+            # old toolchain with a plan that says otherwise.
+            and entry.stack == (self.stack or DEFAULT_STACK)
         )
+
+
+def _stack_of(value: str | None) -> str | None:
+    """A model's stack answer, normalised, or `None` if it is not one we know.
+
+    Dropped rather than raised. The alternative is that one hallucinated word
+    in one task fails `parse_contract` for the whole plan after the issues have
+    already been written - and a task with no `## Stack` is a task that runs on
+    the default, which is exactly what it did before this field existed.
+    `render_body` then omits the section, so a body never carries a value the
+    parser would refuse to read back.
+    """
+    stack = (value or "").strip().strip("`").casefold()
+    return stack if stack in KNOWN_STACKS else None
 
 
 def _one_line(text: str) -> str:
@@ -458,6 +505,13 @@ def normalise(
                 files=files,
                 verify=command,
                 depends_on=tuple(dict.fromkeys(dep for dep in deps if dep)),
+                # Normalised here rather than trusted, exactly as the id and
+                # the prose are: a model that answers "Python" or " node "
+                # meant a stack this vocabulary has, and an unknown answer is
+                # dropped to `None` so the task defaults rather than failing
+                # the whole plan at `parse_contract` time. The section is only
+                # written when the answer is one the parser will accept back.
+                stack=_stack_of(task.stack),
             )
         )
 

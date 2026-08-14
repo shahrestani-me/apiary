@@ -16,13 +16,19 @@ issues with no markers, prose outside every section, and #11's code-span trap.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
+from unittest import mock
 
 import pytest
 
+from swarm.github import ledger as ledger_module
 from swarm.github.ledger import (
+    DEFAULT_STACK,
+    KNOWN_STACKS,
     LABEL_PRECEDENCE,
+    REQUIRED_SECTIONS,
     STATUS_BY_LABEL,
     ContractError,
     DuplicateTaskIdError,
@@ -79,14 +85,22 @@ def contract_body(
     files: str = "- src/swarm/github/client.py\n- tests/test_client_retry.py",
     verify: str = "python -m pytest -q tests/test_client_retry.py",
     blocked_by: str = "- #7",
+    stack: str | None = None,
 ) -> str:
-    """The canonical body of §6, with one section swapped out per test."""
+    """The canonical body of §6, with one section swapped out per test.
+
+    `stack=None` omits `## Stack` entirely, which is what a Python task's body
+    looks like and what every body written before #98 looks like. Passing the
+    empty string writes the heading with nothing under it, which is its own
+    error case.
+    """
     head = f"{marker}\n\n" if marker else ""
+    tail = "" if stack is None else f"\n## Stack\n{stack}\n"
     return (
         f"{head}## Goal\n{goal}\n\n"
         f"## Files\n{files}\n\n"
         f"## Verify\n{verify}\n\n"
-        f"## Blocked by\n{blocked_by}\n"
+        f"## Blocked by\n{blocked_by}\n{tail}"
     )
 
 
@@ -632,3 +646,169 @@ def test_the_verify_command_survives_only_on_the_entry():
 
     assert ledger.entries["add-retry-logic"].verify == "python -m pytest -q tests/test_client_retry.py"
     assert "verify" not in ledger.tasks["add-retry-logic"]
+
+
+# --------------------------------------------------------------------------
+# The optional fifth section (#98)
+# --------------------------------------------------------------------------
+#
+# `SECTIONS` used to be one tuple doing two jobs - it built the known-heading
+# regex *and* it was the required-section loop - which is why "exactly four
+# sections" read as immovable. There was no way to say "recognised but
+# optional".
+
+
+def test_a_body_with_no_stack_parses_exactly_as_before():
+    """The compatibility floor. Every issue written before this section existed
+    is a Python one, and none of them may start failing to parse."""
+    contract = parse_contract(7, contract_body())
+
+    assert contract.stack is None
+    assert contract.goal and contract.files and contract.verify
+
+
+def test_a_body_with_no_stack_defaults_to_python_on_the_entry():
+    """`TaskContract.stack` records what the body said; `LedgerEntry.stack`
+    records the answer. Keeping them distinct is what makes "the body did not
+    declare" answerable at all."""
+    client = FakeClient([issue(7, contract_body())])
+
+    entry = load_ledger(client).entries["add-retry-logic"]
+
+    assert entry.stack == DEFAULT_STACK == "python"
+
+
+@pytest.mark.parametrize("declared", sorted(KNOWN_STACKS))
+def test_a_declared_stack_is_parsed_and_resolved(declared):
+    contract = parse_contract(7, contract_body(stack=declared))
+
+    assert contract.stack == declared
+
+
+#: The known-heading regex as it was before `## Stack` existed. Restoring it is
+#: the whole simulation of an older orchestrator: it is the only thing about the
+#: parser that differed.
+PRE_STACK_HEADING_RE = re.compile(rf"^## ({'|'.join(REQUIRED_SECTIONS)})[ \t]*$")
+
+
+def _stack_at(position: str) -> str:
+    """The same contract with `## Stack` in one of three places."""
+    goal, files = "## Goal\ng\n", "## Files\n- src/a.py\n"
+    verify, blocked = "## Verify\npytest -q\n", "## Blocked by\n- #7\n"
+    stack = "## Stack\nnode\n"
+    order = {
+        "last": (goal, files, verify, blocked, stack),
+        "middle": (goal, files, stack, verify, blocked),
+        "second": (goal, stack, files, verify, blocked),
+    }[position]
+    return "\n".join(order)
+
+
+@pytest.mark.parametrize("position", ["last", "middle", "second"])
+def test_a_body_with_a_stack_parses_on_the_pre_change_parser(position):
+    """**The property that makes this change safe to deploy**, and it holds
+    more strongly than the plan for #98 assumed.
+
+    The plan said `## Stack` had to be emitted last or compatibility "stops
+    being true". It does not: `_split_sections` treats an unrecognised ATX
+    heading as a terminator, and any *later recognised* heading opens a new
+    section - so an older parser reads all four required sections identically
+    wherever the fifth one sits, and simply discards it.
+
+    Parametrised over three placements rather than asserting the one, because
+    the useful guarantee is the general one: an issue a newer planner wrote
+    cannot break an orchestrator that has not been redeployed.
+    """
+    text = _stack_at(position)
+
+    with mock.patch.object(ledger_module, "_KNOWN_HEADING_RE", PRE_STACK_HEADING_RE):
+        before = parse_contract(7, text)
+
+    after = parse_contract(7, text)
+
+    assert (before.goal, before.files, before.verify, before.blocked_by) == (
+        after.goal,
+        after.files,
+        after.verify,
+        after.blocked_by,
+    )
+    assert before.blocked_by == (7,)
+    assert before.stack is None and after.stack == "node"
+
+
+def test_the_planner_still_writes_the_stack_last():
+    """Position is a readability decision, not a compatibility one — but it is
+    still a decision, and `render_body` is where it is made. Pinned so the
+    canonical example in §6 and the bodies actually written cannot diverge."""
+    from swarm.nodes.planner import render_body
+
+    rendered = render_body(
+        "add-retry-logic", goal="g", files=["src/a.py"], verify="pytest -q",
+        blocked_by=[7], stack="node",
+    )
+
+    assert rendered.index("## Stack") > rendered.index("## Blocked by")
+
+
+def test_a_python_task_writes_no_stack_section_at_all():
+    """So a Python plan's bodies are byte-for-byte what they were, and adding
+    this section costs nothing to a repository that never uses it."""
+    from swarm.nodes.planner import render_body
+
+    rendered = render_body("add-retry-logic", goal="g", files=["src/a.py"], verify="pytest -q")
+
+    assert "## Stack" not in rendered
+    assert parse_contract(7, rendered).stack is None
+
+
+def test_an_unknown_stack_is_refused_rather_than_defaulted():
+    """A silent default is the failure worth preventing: `## Stack` `rust` in a
+    repo with no Rust image would become a Python container that fails its gate
+    three times, and the message would name the tests."""
+    with pytest.raises(ContractError) as raised:
+        parse_contract(7, contract_body(stack="rust"))
+
+    assert raised.value.section == "Stack"
+    assert "rust" in str(raised.value)
+    assert "python" in str(raised.value)
+
+
+def test_an_empty_stack_section_is_refused():
+    """Somebody wrote the heading meaning to say something. Reading that as "no
+    opinion" discards their intent silently - the same call `## Verify` makes."""
+    with pytest.raises(ContractError) as raised:
+        parse_contract(7, contract_body(stack=""))
+
+    assert raised.value.section == "Stack"
+
+
+def test_two_stacks_are_refused():
+    text = contract_body(stack="node\npython")
+
+    with pytest.raises(ContractError) as raised:
+        parse_contract(7, text)
+
+    assert raised.value.section == "Stack"
+
+
+def test_a_stack_is_read_case_insensitively_and_unbackticked():
+    """A human writes `Node`; a model writes `` `node` ``. Neither meant a
+    different stack, and refusing them would be pedantry with a `ContractError`
+    attached."""
+    assert parse_contract(7, contract_body(stack="Node")).stack == "node"
+    assert parse_contract(7, contract_body(stack="`react`")).stack == "react"
+
+
+def test_every_generatable_stack_is_a_declarable_one():
+    """The drift pin.
+
+    `KNOWN_STACKS` deliberately does not import `greenfield.scaffold.STACKS` -
+    that registry is about generating a project, this vocabulary is about what
+    an issue may declare, and `github/` depending on `greenfield/` would be the
+    wrong way round. Two lists mean drift unless something notices, and a stack
+    the scaffolder can emit but the parser refuses is a repository whose own
+    planner cannot write an issue for it.
+    """
+    from swarm.greenfield.scaffold import STACKS
+
+    assert set(STACKS) <= KNOWN_STACKS

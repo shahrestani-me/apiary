@@ -28,7 +28,13 @@ import pytest
 
 from fixtures.github import REPO, response
 from swarm.config import SETTINGS
-from swarm.github.ledger import load_ledger, render_marker
+from swarm.github.ledger import (
+    DEFAULT_STACK,
+    LedgerEntry,
+    load_ledger,
+    parse_contract,
+    render_marker,
+)
 from swarm.nodes import planner
 from swarm.nodes.planner import (
     NO_DEPENDENCIES,
@@ -752,3 +758,113 @@ def test_the_read_back_gives_up_rather_than_hanging():
 
     assert ledger.entries == {}
     assert calls["n"] == READ_BACK_ATTEMPTS
+
+
+# --------------------------------------------------------------------------
+# A task can declare its stack (#98)
+# --------------------------------------------------------------------------
+
+
+def entry_for(draft: Draft, *, stack: str = DEFAULT_STACK) -> LedgerEntry:
+    """The ledger entry an issue written from `draft` reads back as.
+
+    Built rather than round-tripped through `parse_contract` so the stack under
+    test is the one named here, not one derived from the body the draft would
+    render - which is the value `matches` is being asked about.
+    """
+    return LedgerEntry(
+        number=7,
+        title="t",
+        task_id=draft.task_id,
+        attempt=0,
+        goal=draft.goal,
+        files=draft.files,
+        verify=draft.verify,
+        blocked_by=(),
+        stack=stack,
+        state_label="swarm:ready",
+        labels=frozenset({"swarm:ready"}),
+    )
+
+
+def test_a_draft_that_says_nothing_matches_an_issue_that_says_nothing():
+    """A Python plan against Python issues must still report "unchanged", or
+    every replan would rewrite every body for no reason."""
+    draft = Draft(task_id="t", goal="g", files=("src/a.py",), verify="pytest -q")
+    entry = entry_for(draft)
+
+    assert draft.matches(entry, ())
+
+
+def test_a_replan_that_changes_a_tasks_stack_is_not_unchanged():
+    """Without this row the replan writes nothing, reports the task unchanged,
+    and the task keeps running on the old toolchain while the plan says
+    otherwise — the kind of divergence that surfaces two stacks later."""
+    draft = Draft(task_id="t", goal="g", files=("src/a.py",), verify="pytest -q", stack="node")
+    entry = entry_for(draft, stack="python")
+
+    assert not draft.matches(entry, ())
+
+
+def test_a_draft_declaring_python_matches_an_issue_that_declared_nothing():
+    """`None` and `"python"` are the same target, and the comparison is against
+    the *resolved* entry stack. Reading them as different would rewrite every
+    body once, on the first replan after this shipped."""
+    draft = Draft(task_id="t", goal="g", files=("src/a.py",), verify="pytest -q", stack="python")
+    entry = entry_for(draft, stack="python")
+
+    assert draft.matches(entry, ())
+
+
+@pytest.mark.parametrize(
+    "answer, expected",
+    [
+        ("node", "node"),
+        ("Node", "node"),
+        ("  react  ", "react"),
+        ("`python`", "python"),
+        ("rust", None),        # a stack this vocabulary does not have
+        ("javascript", None),  # a language, not one of the ids
+        ("", None),
+        (None, None),
+    ],
+)
+def test_a_models_stack_answer_is_normalised_or_dropped(answer, expected):
+    """Dropped rather than raised.
+
+    The alternative is one hallucinated word in one task failing
+    `parse_contract` for the whole plan *after* the issues have been written. A
+    task with no `## Stack` runs on the default, which is exactly what it did
+    before the field existed.
+    """
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["src/a.py"], stack=answer)],
+        verify="pytest -q",
+    )
+
+    assert drafts[0].stack == expected
+
+
+def test_a_dropped_stack_answer_still_yields_a_body_that_parses():
+    """The reason dropping is safe: `render_body` omits the section, so a body
+    never carries a value the parser would refuse to read back."""
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["src/a.py"], stack="rust")],
+        verify="pytest -q",
+    )
+
+    body = drafts[0].body()
+
+    assert "## Stack" not in body
+    assert parse_contract(7, body).stack is None
+
+
+def test_a_declared_stack_round_trips_through_the_body():
+    """The round-trip is the planner's acceptance criterion, and this field is
+    no exception: whatever is written must read back identically."""
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["app/page.tsx"], stack="react")],
+        verify="npm test",
+    )
+
+    assert parse_contract(7, drafts[0].body()).stack == "react"
