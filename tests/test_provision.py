@@ -142,6 +142,8 @@ class FakeGitHub:
             return self.create_commit(payload)
         if method == "POST" and rest == ["git", "refs"]:
             return self.create_ref(repo, payload)
+        if method == "PATCH" and rest[:3] == ["git", "refs", "heads"]:
+            return self.update_ref(repo, "/".join(rest[3:]), payload)
         if rest == ["labels"]:
             if method == "GET":
                 return response(200, list(self.labels.values()))
@@ -176,6 +178,13 @@ class FakeGitHub:
             default_branch=self.default_branch,
             html_url=f"https://github.com/{full}",
         )
+        if payload.get("auto_init"):
+            # GitHub writes its own initial commit, which means the default
+            # branch already exists before anything else is pushed. Modelled
+            # because the real thing does it: without this the fake accepted a
+            # `POST /git/refs` the API would reject, and the suite could not
+            # see the force-update the provisioner has to perform.
+            self.refs[f"refs/heads/{self.default_branch}"] = _sha("auto-init")
         return response(201, self.repos[full])
 
     def create_blob(self, payload: Any) -> Response:
@@ -193,8 +202,20 @@ class FakeGitHub:
         self.commits[sha] = dict(payload)
         return response(201, {"sha": sha, **payload})
 
+    def update_ref(self, repo: str, branch: str, payload: Any) -> Response:
+        ref = f"refs/heads/{branch}"
+        if ref not in self.refs:
+            return response(422, {"message": "Reference does not exist"})
+        if not payload.get("force"):
+            return response(422, {"message": "Update is not a fast forward"})
+        self.refs[ref] = payload["sha"]
+        return response(200, {"ref": ref, "object": {"sha": payload["sha"]}})
+
     def create_ref(self, repo: str, payload: Any) -> Response:
         branch = payload["ref"].removeprefix("refs/heads/")
+        if payload["ref"] in self.refs:
+            # What GitHub answers when `auto_init` already made this branch.
+            return response(422, {"message": "Reference already exists"})
         # GitHub's own ordering rule: a branch carrying a required status check
         # rejects a push that has not passed it, and creating the ref is a
         # push. Provisioning that protects before it commits deadlocks here.
@@ -504,7 +525,11 @@ def test_the_repo_is_created_with_issues_on_and_one_merge_method():
     created = fake.repos[f"{OWNER}/{NAME}"]
 
     assert created["has_issues"] is True          # issues are the ledger
-    assert created["auto_init"] is False          # our commit, not GitHub's
+    # True, and then discarded: GitHub refuses the git data API on a
+    # repository with no commits, so `auto_init` is the only way to bootstrap
+    # one - and the parentless commit then force-replaces it. See
+    # `test_the_history_is_one_commit_and_it_carries_the_workflow`.
+    assert created["auto_init"] is True
     assert created["private"] is True
     assert created["allow_squash_merge"] is True
     assert created["allow_merge_commit"] is False
@@ -558,12 +583,24 @@ def test_protection_is_applied_after_the_commit_not_before():
     assert report.protection == ("deletion", "non_fast_forward", "required_status_checks")
 
 
-def test_nothing_is_ever_deleted_or_overwritten():
-    # Provisioning is additive by construction. A DELETE or a PUT in here would
-    # mean it can damage something that already existed.
+def test_nothing_that_pre_existed_is_ever_deleted_or_overwritten():
+    """Provisioning may only add, or replace something it made this run.
+
+    A DELETE or a PUT would mean it can damage what was already there. The one
+    PATCH is the exception that proves the rule: it force-updates the default
+    branch, and that branch exists only because `auto_init` created it seconds
+    earlier in this same call - the throwaway commit that made the git data
+    API usable at all. It never touches a ref the run did not create.
+    """
     fake = FakeGitHub()
     provision_into(fake)
-    assert {method for method, _, _ in fake.requests} == {"GET", "POST"}
+
+    methods = {method for method, _, _ in fake.requests}
+    assert "DELETE" not in methods
+    assert "PUT" not in methods
+
+    patched = [(method, path) for method, path, _ in fake.requests if method == "PATCH"]
+    assert all(path.endswith(f"/git/refs/heads/{fake.default_branch}") for _, path in patched)
 
 
 def test_the_report_summarises_what_now_exists():
@@ -640,3 +677,27 @@ def test_the_command_refuses_to_run_unattended_without_yes(monkeypatch, capsys):
 def test_the_command_needs_an_owner():
     with pytest.raises(SystemExit):
         main([PROMPT])
+
+
+def test_the_history_is_one_commit_and_it_carries_the_workflow():
+    """The acceptance criterion, kept despite an API that forbids the obvious route.
+
+    `auto_init` gives the repository a commit so `POST /git/blobs` is accepted
+    at all - without it GitHub answers `409: Git Repository is empty`, which is
+    how this surfaced: a repository created, and then nothing written to it.
+    The commit built here has no parents and force-replaces the ref, so what
+    survives is a one-commit history containing the workflow rather than a
+    generated README with an unverified commit under it.
+    """
+    fake = FakeGitHub()
+    provision_into(fake)
+
+    commits = [r for r in fake.requests if r[0] == "POST" and r[1].endswith("/git/commits")]
+    assert commits, "no commit was built"
+    assert commits[-1][2]["parents"] == [], "the commit must be parentless"
+
+    refs = [r for r in fake.requests if "/git/refs" in r[1]]
+    assert refs, "the branch was never pointed at the commit"
+    forced = [r for r in refs if r[0] == "PATCH"]
+    assert forced, "auto_init's ref must be force-replaced, not left in place"
+    assert forced[-1][2]["force"] is True
