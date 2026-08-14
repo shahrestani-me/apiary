@@ -54,9 +54,17 @@ that was never in the worker's code. So the failing test paths are extracted
 from the check output and compared against the declared set: a failure whose
 paths are *all* outside it is routed straight to a human, with the paths named,
 without spending the attempt budget on proving it three times. The extraction is
-a pytest-shaped heuristic and is allowed to find nothing, in which case the
-ordinary retry stands - the escalation is an optimisation on top of a correct
+a heuristic over four failure shapes - node id, summary line, location, and
+`go test`'s indented one - and is allowed to find nothing, in which case the
+ordinary retry stands. The escalation is an optimisation on top of a correct
 default, never a precondition for one.
+
+It was pytest-shaped until #93, which was the most dangerous silent degradation
+this repository has had: a hardcoded `.py` extension in both patterns meant
+`foreign_failure` returned `()` for every other stack, so `_decide` never took
+the escalate-without-consuming-attempts branch - a whole human-escalation safety
+valve switched off for every new stack, with a green suite and a docstring
+blessing it.
 
 **Two things this module needs and cannot have**, probed for rather than added,
 exactly as `reconcile.py` probes for `create_issue_comment` and `worker/pr.py`
@@ -156,12 +164,63 @@ QUOTE_INDENT = "    "
 #: reads and a model is meant to be given, and a megabyte of CI log is neither.
 FEEDBACK_CHARS = 4000
 
-#: Where a failing test path is looked for. Pytest-shaped, because
-#: `docs/issue-contract.md` §1.3 makes `## Verify` a single command and every
-#: one this repository writes is a pytest invocation. Finding nothing is a
-#: supported outcome - see the module docstring.
-_NODE_ID = re.compile(r"(?P<path>[\w./+-]+\.py)::")
-_PYTEST_LINE = re.compile(r"(?mi)^(?:FAILED|ERROR)\s+(?P<path>[\w./+-]+\.py)")
+#: Extensions a failing path may carry. An allow-list, because the shapes below
+#: are matched in running text and "a word with a dot in it" is not a file.
+#:
+#: `.py` was the only one of these until #93. That was true when every
+#: `## Verify` this repository wrote was a pytest invocation, and it turned off
+#: `foreign_failure` - and with it the whole escalate-without-consuming-attempts
+#: valve - for every other stack, silently, with a green suite.
+_SOURCE_EXT = (
+    "py|pyi|js|jsx|mjs|cjs|ts|tsx|mts|cts|go|rs|rb|java|kt|kts|cs|php|swift"
+    "|c|cc|cpp|h|hpp|scala|ex|exs"
+)
+
+#: A path with a directory component, which is `judge._PATH_RE`'s requirement
+#: copied deliberately: requiring a slash is what stops an English sentence
+#: parsing as a file. The two modules answer the same question about the same
+#: text, and `test_the_two_extractors_agree_on_every_language` keeps them in
+#: step.
+_QUALIFIED_PATH = rf"(?<![\w./+-])(?:[\w.@+-]+/)+[\w.@+-]*\.(?:{_SOURCE_EXT})(?!\w)"
+
+#: Paths that are not the repository's, spelled as `judge._FOREIGN` spells them.
+#: A traceback through `site-packages` says nothing about whether this task
+#: could have reached its own fix.
+_FOREIGN = ("site-packages", "dist-packages", ".venv/", "node_modules/", "/usr/", "/opt/")
+
+#: Where a failing test path is looked for. Three shapes, none of them tied to
+#: one language. Finding nothing is still a supported outcome - see the module
+#: docstring - and the shapes stay narrow, because a false positive here
+#: escalates an issue a worker could have fixed.
+#:
+#: A **node id**: `tests/test_x.py::test_y`. Pytest's, and nobody else's -
+#: generalising the extension costs nothing and catches the pytest-alike
+#: runners.
+_NODE_ID = re.compile(rf"(?P<path>[\w./+-]+\.(?:{_SOURCE_EXT}))::")
+
+#: A **summary line**: pytest's `FAILED tests/test_x.py`, jest's
+#: `FAIL src/calc.test.js`, vitest's `FAIL src/calc.test.ts > adds`. `FAIL` and
+#: leading whitespace are new here; go's `FAIL\texample.com/m\t0.002s` names a
+#: package rather than a file and so carries no extension to match.
+_SUMMARY_LINE = re.compile(
+    rf"(?mi)^\s*(?:FAILED|FAIL|ERROR)\s+(?P<path>[\w./+-]+\.(?:{_SOURCE_EXT}))(?!\w)"
+)
+
+#: A **location**: `path:line`, optionally `:col`. This is how cargo reports a
+#: panic (`panicked at src/lib.rs:12:9`), how vitest points at an assertion
+#: (`❯ src/calc.test.ts:5:19`), how a `node --test` stack frame reads, and how
+#: `go vet` and a failed compile report. Qualified - a directory is required -
+#: because unlike the two above this shape is not introduced by a keyword.
+_LOCATION = re.compile(rf"(?P<path>{_QUALIFIED_PATH}):\d+")
+
+#: `go test`'s own failure location, which is the one shape here that has no
+#: directory: a package's tests run in the package's directory, so the line
+#: under `--- FAIL:` reads `    calc_test.go:12: expected 4, got 3`. The
+#: `_test.go` suffix is mandatory in Go and is what makes a bare filename safe
+#: to accept; `judge.mentioned_paths` still cannot see it, which is why
+#: `test_go_test_output_names_a_file_judge_cannot_see` exists to say so out
+#: loud rather than leaving it to be discovered.
+_GO_TEST_LINE = re.compile(r"(?m)^\s+(?P<path>[\w.+-]+_test\.go):\d+:")
 
 
 # --------------------------------------------------------------------------
@@ -340,16 +399,32 @@ def _evidence(name: str, conclusion: str, run: Mapping[str, Any]) -> str:
 def failing_paths(text: str) -> tuple[str, ...]:
     """Every source path a failure names, in the order it first appears.
 
-    Two shapes, both pytest's: a node id (`tests/test_x.py::test_y`) and a
-    summary line (`FAILED tests/test_x.py`). Deliberately conservative - a bare
-    filename with no `::` and no `FAILED` in front of it is as likely to be
-    prose about the change as evidence about the failure, and a false positive
-    here escalates an issue a worker could have fixed.
+    Four shapes, none of them tied to one language: a node id
+    (`tests/test_x.py::test_y`), a summary line (`FAILED tests/test_x.py`,
+    `FAIL src/calc.test.ts`), a location (`src/lib.rs:12:9`), and `go test`'s
+    indented `calc_test.go:12:`. Deliberately conservative - a bare filename
+    with none of those around it is as likely to be prose about the change as
+    evidence about the failure, and a false positive here escalates an issue a
+    worker could have fixed.
+
+    **The location shape widens what pytest output yields**, since a pytest
+    traceback line is `tests/test_x.py:12: AssertionError` and nothing looked at
+    those before. That is the safe direction: `foreign_failure` escalates only
+    when *every* named path is outside the declared set, so finding more paths
+    can only make it escalate less often and retry more often. Escalation is an
+    optimisation on top of a correct default.
+
+    Paths outside the repository are dropped, on the same list `judge` drops
+    them on: a frame through `site-packages` or `node_modules` says nothing
+    about whether this task could have reached its own fix.
     """
     found: dict[str, None] = {}
-    for pattern in (_PYTEST_LINE, _NODE_ID):
+    for pattern in (_SUMMARY_LINE, _NODE_ID, _LOCATION, _GO_TEST_LINE):
         for match in pattern.finditer(text or ""):
-            found.setdefault(match.group("path").lstrip("./"), None)
+            path = match.group("path")
+            if path.startswith("/") or any(part in path for part in _FOREIGN):
+                continue
+            found.setdefault(path.lstrip("./"), None)
     return tuple(found)
 
 

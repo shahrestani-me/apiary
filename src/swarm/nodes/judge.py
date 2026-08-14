@@ -90,7 +90,15 @@ SIGNATURE_CHARS = 400
 # `swarm` and not a bare `judge.py`. Requiring a slash is what keeps an English
 # sentence from parsing as a file, and requiring an extension keeps a URL path
 # or an issue reference out.
-_PATH_RE = re.compile(r"(?:[\w.@+-]+/)+[\w+-]+\.[A-Za-z0-9_]+")
+#
+# The filename may itself contain dots. `[\w+-]+` did not allow that, so
+# `src/calc.test.js` came back as `src/calc.test` - a path that does not exist,
+# which therefore matched nothing in any `## Files` set and made every
+# double-extension file invisible to the "could the worker have fixed it"
+# question. That naming convention (`*.test.js`, `*.spec.tsx`) is the dominant
+# one in exactly the stacks #87 is adding. Found by #93's agreement test, which
+# exists to keep this expression honest.
+_PATH_RE = re.compile(r"(?:[\w.@+-]+/)+[\w.@+-]*\.[A-Za-z0-9_]+")
 
 # Digits are dropped from a failure signature: pytest reports `1 failed in
 # 0.42s`, a traceback names line numbers, and a temporary directory carries a
@@ -146,6 +154,11 @@ def mentioned_paths(text: str) -> tuple[str, ...]:
         path = match.group(0)
         if path.startswith("/") or any(part in path for part in _FOREIGN):
             continue
+        # `./internal/calc/calc.go` and `internal/calc/calc.go` are one file,
+        # and a `## Files` set never spells the first. `checks.failing_paths`
+        # has always stripped it; this did not, so a Go build error named a
+        # path that compared equal to nothing.
+        path = path.lstrip("./")
         if path not in found:
             found.append(path)
     return tuple(found)
