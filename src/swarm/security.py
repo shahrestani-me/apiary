@@ -101,16 +101,19 @@ REQUIRED_PERMISSIONS: dict[str, str] = {
     "contents": "write",
     "pull_requests": "write",
     "issues": "write",
-    # Read-only, and it is the whole merge gate: `checks.py` decides whether a
-    # PR may merge by reading its check runs, and GitHub files those under
-    # `checks` rather than under `actions` or `contents`. Missing, the run
-    # cannot tell a green PR from a red one - `doctor` caught it as a 403 on
-    # `github.ci` against a repository whose other four permissions were fine.
+    # Read-only, and it is the whole merge gate. The obvious permission is
+    # `checks`, which is what `/commits/{ref}/check-runs` documents - but that
+    # permission is **not offered when minting a fine-grained PAT**, so a
+    # least-privilege token gets 403 there and on the combined-status endpoint
+    # no matter what it is granted. `actions:read` is offered, and
+    # `/actions/runs?head_sha=` reports the same name/status/conclusion for a
+    # repository whose CI is GitHub Actions. Verified against a real private
+    # repo: check-runs 403, actions/runs 200.
     #
-    # Never write: a worker that can *create* a check run can report its own
-    # work as passing, which is the same failure as being able to edit the
-    # workflow, reached by a different door.
-    "checks": "read",
+    # Never write. `actions:write` would let a worker re-run, cancel or delete
+    # the very workflow judging it - the same failure `workflows` is forbidden
+    # for, reached by a different door.
+    "actions": "read",
     "metadata": "read",
 }
 

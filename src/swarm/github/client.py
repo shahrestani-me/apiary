@@ -45,6 +45,11 @@ USER_AGENT = "apiary-swarm"
 MAX_PAGES = 100
 
 
+def _looks_like_sha(value: str) -> bool:
+    """A full 40-character hex object name, as GitHub returns them."""
+    return len(value) == 40 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
 # --------------------------------------------------------------------------
 # Errors
 # --------------------------------------------------------------------------
@@ -476,6 +481,32 @@ class GitHubClient:
         """
         path = f"/repos/{self.repo}/commits/{urllib.parse.quote(ref, safe='')}/check-runs"
         return self._paginate(path, None, key="check_runs")
+
+    def list_workflow_runs(self, head_sha: str) -> list[dict[str, Any]]:
+        """Actions runs for one commit - the CI signal a fine-grained PAT can read.
+
+        `list_check_runs` is the obvious call and the right one for a token that
+        may make it, but a fine-grained PAT cannot: GitHub answers
+        `/commits/{ref}/check-runs` with 403 unless the token holds the `checks`
+        permission, and that permission is not offered when minting one. The
+        combined-status endpoint answers 403 for the same reason.
+
+        `actions:read` *is* offered, and this endpoint reports the same three
+        fields the fold needs - name, status, conclusion - for a repository whose
+        CI is GitHub Actions, which is what `greenfield` generates. Verified
+        against a real private repository: check-runs 403, this 200.
+
+        `ref` may be a commit sha or a branch name, and the endpoint filters on
+        different parameters for each: `head_sha` matches nothing when handed
+        `main`, and answers 200 with an empty list rather than an error - which
+        reads as "this repository has no CI" and is the most misleading answer
+        available. The caller's ref is a sha in the merge gate and a branch in
+        `doctor`, so both are accepted here rather than at two call sites.
+        """
+        ref = str(head_sha)
+        key = "head_sha" if _looks_like_sha(ref) else "branch"
+        path = f"/repos/{self.repo}/actions/runs"
+        return self._paginate(path, {key: ref}, key="workflow_runs")
 
     def merge_pull_request(
         self,

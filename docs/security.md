@@ -293,7 +293,7 @@ incompatible permissions, so apiary uses two credentials.
 | | Work key | Boot key |
 |---|---|---|
 | Variable | `GITHUB_TOKEN` | `APIARY_PROVISION_TOKEN` |
-| Permissions | contents:write, pull_requests:write, issues:write, checks:read, metadata:read | administration:write, contents:write, workflows:write, issues:write, metadata:read |
+| Permissions | contents:write, pull_requests:write, issues:write, actions:read, metadata:read | administration:write, contents:write, workflows:write, issues:write, metadata:read |
 | Used by | Orchestrator and every worker | `greenfield/provision.py`, once |
 | Lifetime | The whole run | The seconds it takes to create the repo |
 | Reaches model output | Yes | No — it runs before the first container exists |

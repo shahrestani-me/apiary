@@ -169,28 +169,38 @@ def test_an_unrecognised_prefix_is_refused_unless_asked_for() -> None:
 
 
 def test_the_required_permissions_are_these_and_only_these() -> None:
-    """`checks` is read-only on purpose, and it earned its place the hard way.
+    """`actions` is read-only on purpose, and it earned its place the hard way.
 
-    A first real run reached `github.ci` with the other four granted and got a
-    403: GitHub files check runs under `checks`, and `checks.py` cannot tell a
-    green pull request from a red one without them. Write is refused for the
-    same reason `workflows` is - a worker able to create a check run can report
-    its own work as passing.
+    The documented permission for check runs is `checks`, and GitHub does not
+    offer it when minting a fine-grained PAT - so a least-privilege token gets
+    403 on `/commits/{ref}/check-runs` and on the combined-status endpoint no
+    matter what it is granted. `actions:read` is grantable and answers 200 for
+    the same commit, which is why the merge gate reads workflow runs.
+
+    Write is refused: `actions:write` would let a worker re-run, cancel or
+    delete the workflow judging it - the failure `workflows` is forbidden for,
+    reached by a different door.
     """
     assert REQUIRED_PERMISSIONS == {
         "contents": "write",
         "pull_requests": "write",
         "issues": "write",
-        "checks": "read",
+        "actions": "read",
         "metadata": "read",
     }
-    assert REQUIRED_PERMISSIONS["checks"] == "read"
+    assert REQUIRED_PERMISSIONS["actions"] == "read"
 
 
 def test_workflows_is_forbidden() -> None:
     """The sharp one: with it, generated code can rewrite the gate that checks it."""
     assert "workflows" in FORBIDDEN_PERMISSIONS
-    assert not set(REQUIRED_PERMISSIONS) & set(FORBIDDEN_PERMISSIONS)
+    # `actions` appears in both lists and that is not a contradiction: the work
+    # key needs it read-only to see whether CI passed, and
+    # `FORBIDDEN_PERMISSIONS` is about write access - re-running or deleting the
+    # workflow that judges you is the failure, reading its result is not.
+    overlap = set(REQUIRED_PERMISSIONS) & set(FORBIDDEN_PERMISSIONS)
+    assert overlap == {"actions"}
+    assert REQUIRED_PERMISSIONS["actions"] == "read"
 
 
 # --------------------------------------------------------------------------

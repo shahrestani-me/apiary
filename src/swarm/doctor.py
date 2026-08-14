@@ -763,9 +763,10 @@ class Doctor:
         reaches `swarm:review` and stops - a swarm that looks busy and finishes
         nothing. Refusing to start is the cheaper outcome.
 
-        Asked through `list_check_runs`, which is the call the merge gate
-        itself makes, on the repo's default branch: an empty answer there is
-        the same emptiness the gate will see.
+        Asked the same way the merge gate asks - check runs first, workflow
+        runs when a fine-grained PAT is refused them - so an answer here is the
+        answer #23 will get. A doctor that probed an endpoint the run never
+        uses would pass while the gate stayed blind, or fail while it worked.
         """
         assert self.github is not None
         try:
@@ -777,7 +778,20 @@ class Doctor:
                     f"{self.repo} has no commit at {self.ci_ref!r}",
                     fix=f"name the default branch: --ci-ref <branch> (this run used {self.ci_ref!r})",
                 )
-            return Check.failed(CHECK_CI, f"{self.repo}: {exc}", fix=self._access_fix(exc.status))
+            if exc.status != 403:
+                return Check.failed(CHECK_CI, f"{self.repo}: {exc}", fix=self._access_fix(exc.status))
+            # Expected for every least-privilege token: `checks` cannot be
+            # granted to a fine-grained PAT. Fall through to the endpoint that
+            # can, exactly as `checks.read_checks` does.
+            try:
+                runs = self.github.list_workflow_runs(self.ci_ref)
+            except GitHubHTTPError as actions_exc:
+                return Check.failed(
+                    CHECK_CI,
+                    f"{self.repo}: check runs and workflow runs are both unreadable "
+                    f"({actions_exc})",
+                    fix=self._access_fix(actions_exc.status),
+                )
 
         if not runs:
             return Check.failed(
