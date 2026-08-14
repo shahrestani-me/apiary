@@ -482,6 +482,23 @@ class GitHubClient:
         path = f"/repos/{self.repo}/commits/{urllib.parse.quote(ref, safe='')}/check-runs"
         return self._paginate(path, None, key="check_runs")
 
+    def head_sha(self, ref: str | None = None) -> str:
+        """The commit a ref points at; the repository's default branch by default.
+
+        Workers clone at a *commit*, never at a branch name: between planning
+        and dispatch another task's PR may have merged, and a worker that
+        branched from whatever main happened to be would verify against a tree
+        nobody planned for. Something has to turn the branch into a sha, and
+        the client is the only thing that may talk to GitHub.
+        """
+        target = ref or self.get_repo().get("default_branch") or "main"
+        payload = self._get(self._url(f"/repos/{self.repo}/commits/{urllib.parse.quote(target, safe='')}"))
+        return str((payload or {}).get("sha") or "")
+
+    def get_repo(self) -> dict[str, Any]:
+        """The repository itself - default branch, visibility, permissions."""
+        return self._get(self._url(f"/repos/{self.repo}"))
+
     def list_workflow_runs(self, head_sha: str) -> list[dict[str, Any]]:
         """Actions runs for one commit - the CI signal a fine-grained PAT can read.
 

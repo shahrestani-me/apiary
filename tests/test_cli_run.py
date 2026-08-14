@@ -798,6 +798,9 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
         )))
 
     client = FakeClient([issue(1, marker="task-one", labels=("swarm:ready",))])
+    # `_loop` resolves the base commit through the client now, because a
+    # worker clones at a commit and an empty one sent it nowhere.
+    client.head_sha = lambda ref=None: "a" * 40
     args = SimpleNamespace(base_commit="", no_merge=True, dry_run=False, max_cycles=1)
     attachment = SimpleNamespace(run=SimpleNamespace(id="r", repo=REPO))
 
