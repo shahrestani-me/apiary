@@ -560,7 +560,7 @@ def test_the_real_worker_model_closes_the_loop(fake_github, scratch_repo, worksp
     Deselected by default (`tests/conftest.py`), because a suite that needs a
     36 GB host is a suite CI cannot run. Enable with `--with-ollama`.
     """
-    gh, _, _ = fake_github(issue())
+    gh, _, _ = fake_github(issue(), *publishes())
 
     assert main(argv(scratch_repo, workspace), client=gh) == EXIT_OK
     assert checkout(workspace, scratch_repo).head() != scratch_repo.head()
