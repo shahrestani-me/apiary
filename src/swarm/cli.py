@@ -150,14 +150,19 @@ def _run(
             return 1
         for line in planned.get("events", ()):
             print(f"  · {line}")
-        if not planned.get("tasks"):
-            print("! the planner produced nothing to write", file=sys.stderr)
-            return 1
-        # `plan_node` already re-read the tracker after writing - "on any
-        # disagreement, GitHub wins" only means something if nothing keeps a
-        # second copy - so re-attach and take the ledger from that read.
+
+        # Judge on the re-attach, not on `plan_node`'s own read. Both go to
+        # GitHub, and GitHub is authoritative - but a read taken immediately
+        # after a write can be served from its conditional cache and describe
+        # the world as it was a moment earlier. Failing the run on that would
+        # print "the planner produced nothing" directly under a line listing
+        # the issues it had just created, which is exactly what it did.
         attachment = start_run(repo, objective, source=source, adopt=True)
         ledger = attachment.ledger
+        if not ledger.entries:
+            print("! the planner wrote nothing the ledger can read back",
+                  file=sys.stderr)
+            return 1
 
     if args.plan_only:
         plan = apply_readiness(source, ledger=ledger, dry_run=args.dry_run)

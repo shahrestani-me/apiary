@@ -576,6 +576,21 @@ class GitHubClient:
             self.etag_cache[url] = (etag, payload, next_url)
         return payload, next_url
 
+    def invalidate_cache(self) -> None:
+        """Forget every cached ETag, so the next read is unconditional.
+
+        Needed after this client has *written* something it is about to read
+        back. GitHub serves its own conditional responses from a cache that
+        lags its writes by a little: the planner created two issues, re-read
+        the list through the same client, was answered `304 Not Modified`, and
+        concluded from the cached pre-write body that it had planned nothing.
+
+        Cheap to call and rarely correct to skip: the alternative is a read
+        that is fast, valid, and describes the world as it was a moment before
+        the caller changed it.
+        """
+        self.etag_cache.clear()
+
     def _paginate(
         self,
         path: str,
