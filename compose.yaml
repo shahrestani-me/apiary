@@ -54,27 +54,58 @@ services:
     # different ones - urllib lowercases what it finds, git reads the lowercase
     # spelling, other runtimes read only the uppercase. Keep them in step with
     # EgressPolicy.proxy_env().
+    # A list, not a mapping, and that is load-bearing. A bare name **passes the
+    # caller's value through if they set one and leaves the variable absent
+    # otherwise**; `NAME: ${NAME:-}` instead sets it to the empty string, and
+    # `config._env` is `os.environ.get(name, default)` - so an unset
+    # `SWARM_MAX_PARALLEL` forwarded that way arrives as `""`, becomes `int("")`
+    # and kills the process before it can say why. Names with `=` are this
+    # file's own settings and are unconditional.
     environment:
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      - GITHUB_TOKEN
 
       # The boot key, for `swarm run --new` only. Passed to *this* service and
       # never to a worker: `ContainerManager` inherits only GITHUB_TOKEN and
       # OLLAMA_HOST into a container, and `security.assert_no_provision_token`
       # refuses to start one carrying this by name or by value.
-      #
-      # Empty rather than required, because every command except --new works
-      # without it and `assert_provision_token` already fails by name when it
-      # is genuinely needed.
-      APIARY_PROVISION_TOKEN: ${APIARY_PROVISION_TOKEN:-}
-      GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
-      OLLAMA_HOST: ${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
-      DOCKER_HOST: tcp://docker-socket-proxy:2375
-      HTTP_PROXY: http://egress-proxy:8888
-      HTTPS_PROXY: http://egress-proxy:8888
-      http_proxy: http://egress-proxy:8888
-      https_proxy: http://egress-proxy:8888
-      NO_PROXY: localhost,127.0.0.1,egress-proxy,docker-socket-proxy
-      no_proxy: localhost,127.0.0.1,egress-proxy,docker-socket-proxy
+      - APIARY_PROVISION_TOKEN
+      - GITHUB_REPOSITORY
+
+      # The swarm's own tuning, forwarded because none of it was. Every one of
+      # these is read *inside* the container - `MergePolicy.from_env`,
+      # `UpdatePolicy.from_env`, `Settings` - and a variable this block does not
+      # name does not exist there at all. So an operator who put
+      # `APIARY_MERGE_ADMIN_OVERRIDE=0` in their environment, and reasonably
+      # believed they had told the swarm to leave merging to a human, had told
+      # it nothing: the value never crossed the container boundary, and the
+      # policy inside kept its default. Every knob the README documents is here,
+      # or the README is describing a program the operator is not running.
+      - APIARY_MERGE_ADMIN_OVERRIDE
+      - APIARY_MERGE_METHOD
+      - APIARY_MAX_UPDATE_ROUNDS
+      - APIARY_MERGES_PER_CYCLE
+      # The dispatch cap is derived from the *host's* inference slots, so the
+      # value has to cross the boundary or the cap inside is a guess about a
+      # server it cannot see (`dispatcher.Capacity.detect`).
+      - OLLAMA_NUM_PARALLEL
+      - SWARM_VERIFY
+      - SWARM_MAX_PARALLEL
+      - SWARM_MAX_ATTEMPTS
+      - SWARM_MAX_STALLS
+      - SWARM_ORCHESTRATOR_MODEL
+      - SWARM_WORKER_MODEL
+      - SWARM_WORKER_CTX
+      - SWARM_WORKER_TIMEOUT
+      - SWARM_VERIFY_TIMEOUT
+
+      - OLLAMA_HOST=${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      - HTTP_PROXY=http://egress-proxy:8888
+      - HTTPS_PROXY=http://egress-proxy:8888
+      - http_proxy=http://egress-proxy:8888
+      - https_proxy=http://egress-proxy:8888
+      - NO_PROXY=localhost,127.0.0.1,egress-proxy,docker-socket-proxy
+      - no_proxy=localhost,127.0.0.1,egress-proxy,docker-socket-proxy
 
       # The artifacts directory as the *daemon* sees it. This service reaches
       # Docker through a socket proxy, so every --volume source it names when
@@ -86,7 +117,7 @@ services:
       #
       # ${PWD} is the directory compose was invoked from, which is also what
       # `./.swarm/runs` below resolves against, so the two stay in step.
-      APIARY_ARTIFACTS_HOST_ROOT: ${PWD}/.swarm/runs
+      - APIARY_ARTIFACTS_HOST_ROOT=${PWD}/.swarm/runs
 
     # Two internal networks, not one. The orchestrator needs both the Docker API
     # and the outside world; a worker needs only the second, and putting them on
