@@ -128,7 +128,9 @@ Unrecognised headings are ignored. A **repeated** known heading is malformed: tw
 
 Notes on each:
 
-**Files.** Surrounding backticks are stripped, `./` prefixes removed. Globs are
+**Files.** A path the *verify command* produces — a lockfile — must **not** be
+listed here. Those are the **generated set**, described below, and an overlap
+is a `ContractError`. Surrounding backticks are stripped, `./` prefixes removed. Globs are
 rejected rather than expanded: the dispatcher decides concurrency by intersecting
 `## Files` sets ([#21](https://github.com/shahrestani-me/apiary/issues/21)), and a
 glob has no set semantics without a filesystem to resolve it against — the wrong
@@ -446,6 +448,56 @@ state label, plus `area/control-plane` and `size/S`.
 
 ---
 
+## 6b. Generated files
+
+A third category, between "the task's files" and "everything else": paths the
+**verify command produces** that the worker commits if they appear.
+
+It is **not part of the issue body.** It is a per-stack constant,
+`swarm.github.ledger.GENERATED_FILES`, keyed by the `## Stack` above:
+
+| Stack | Generated |
+|---|---|
+| `python` | — |
+| `node` | `package-lock.json` |
+| `react` | `package-lock.json` |
+
+### Why this is not just a wider `## Files`
+
+**A lockfile cannot be declared, because it cannot be written.** The worker's
+edit protocol demands "the COMPLETE new contents of every file you change —
+never a diff", and a measured Expo lockfile is 16,347 lines: roughly 180k
+tokens against a 16,384-token window. It also carries SHA-512 integrity hashes,
+which cannot be produced by generation at any context size. A task that
+declared one would burn its attempts on a truncated file.
+
+**And the staging rule must not simply be loosened.** `commit_edits` stages
+exactly the declared paths, which is what keeps `node_modules`, caches and
+everything else a verify command drops in the tree out of the pull request.
+`git add -A` after a verify run is precisely the change this category exists to
+avoid making.
+
+So the set is *named by the system, per stack*, rather than declared per task.
+That also means model output cannot widen what gets committed — which is the
+one property the staging rule exists to guarantee.
+
+### Rules
+
+- Absent is normal. Most tasks add no dependency; a generated path the gate did
+  not produce is simply not committed, and the task succeeds.
+- The two sets are **disjoint**. A `## Files` entry naming a generated path is a
+  `ContractError` on `## Files`, naming the path and saying it will be committed
+  if it appears.
+- Staging happens **after** the gate runs, because that is the only moment the
+  file exists.
+- A path that resolves outside the repository — a symlink — is skipped.
+
+Without this, a PR that adds a dependency carries the manifest and no lock, CI
+re-runs the command on neutral ground, and `npm ci` fails. "Add a dependency"
+is unimplementable.
+
+---
+
 ## 7. Test corpus
 
 Shared fixtures live with
@@ -476,6 +528,9 @@ mandatory for [#9](https://github.com/shahrestani-me/apiary/issues/9) and
 | A body **with** `## Stack` — last, middle or second — read by the **pre-`## Stack`** parser | all four required sections parse identically; the fifth is discarded |
 | `## Stack` naming an id outside the known set | `ContractError`, never a silent default |
 | `## Stack` present but empty | `ContractError` |
+| `## Files` naming a path the stack generates | `ContractError`, naming the path |
+| A generated path the verify command did not produce | commit succeeds without it |
+| A generated path that is a symlink out of the repository | skipped, not staged |
 
 This repository's own backlog (#6–#35) is a real corpus: it has a diamond in its
 dependency graph, hand-written issues with no markers, prose outside every

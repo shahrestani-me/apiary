@@ -64,7 +64,12 @@ from typing import Mapping, Sequence
 from ..config import SETTINGS
 from ..containers.manager import SECRET_NAME_RE
 from ..github.client import GitHubClient, GitHubError
-from ..github.ledger import ContractError, TaskContract, parse_contract
+from ..github.ledger import (
+    ContractError,
+    TaskContract,
+    generated_for,
+    parse_contract,
+)
 # GitError says "a git command failed" and means it in both v1's worktrees and
 # v2's clones; a second error class for the same fact would only make callers
 # catch both.
@@ -315,21 +320,64 @@ def prepare_checkout(clone_url: str, dest: Path, base_commit: str, branch: str) 
     return dest
 
 
-def commit_edits(root: Path, message: str, paths: Sequence[str]) -> str | None:
-    """Stage exactly `paths` and commit. `None` when they changed nothing.
+def stageable(root: Path, generated: Sequence[str]) -> tuple[str, ...]:
+    """Which of a stack's generated paths this run actually produced.
+
+    Absent is normal, not an error: `GENERATED_FILES` names what a stack's gate
+    *may* write, and most tasks add no dependency and generate no lockfile.
+    Failing a task because a file it never needed did not appear would make the
+    generated set a requirement rather than a permission.
+
+    Resolved and re-checked against the root even though the constants are the
+    repository's own, because this is the function that turns a name into a
+    `git add` and a symlink is a name that points somewhere else.
+    """
+    root = root.resolve()
+    found: list[str] = []
+    for relative in generated:
+        target = (root / relative).resolve()
+        if not target.is_file():
+            continue
+        if not target.is_relative_to(root):
+            continue
+        found.append(relative)
+    return tuple(found)
+
+
+def commit_edits(
+    root: Path,
+    message: str,
+    paths: Sequence[str],
+    generated: Sequence[str] = (),
+) -> str | None:
+    """Stage `paths` plus whatever `generated` the gate produced, and commit.
 
     `--force` because the contract, not `.gitignore`, decides what this task
     is: a declared path that happens to be ignored is a file the planner asked
     for, and failing the whole attempt over it would be an obscure way to say
-    so. Nothing outside the declared paths can reach this call.
+    so. **`.gitignore` is also exactly why `--force` matters for the generated
+    set**: `package-lock.json` is not ignored by any sane project, but a
+    generated file that some template ignored would otherwise be silently
+    dropped and take CI with it.
+
+    `generated` is the third category between "the task's files" and
+    "everything else" - see `ledger.GENERATED_FILES`. It stays a separate
+    argument rather than being folded into `paths` so this function's staging
+    rule is still readable as "exactly what it was given", and so the two sets
+    can be reported apart in the record.
+
+    Nothing outside the declared paths and the stack's generated set can reach
+    this call; `git add -A` after a verify run would sweep `node_modules` and
+    every cache the command wrote into the pull request.
 
     Identity comes from the environment - `Dockerfile.worker` sets
     `GIT_AUTHOR_*` and `GIT_COMMITTER_*` so the orchestrator can override them
     per run. Hard-coding `-c user.name=` here would overrule that from the one
     place a run cannot reach.
     """
-    _git(root, "add", "--force", "--", *paths)
-    if not _git(root, "status", "--porcelain", "--", *paths):
+    staged = [*paths, *stageable(root, generated)]
+    _git(root, "add", "--force", "--", *staged)
+    if not _git(root, "status", "--porcelain", "--", *staged):
         return None
     _git(root, "commit", "--quiet", "-m", message)
     return _git(root, "rev-parse", "HEAD")
@@ -599,7 +647,12 @@ def run_worker(
         if passed:
             subject = f"swarm[{task_id}]: {(title or contract.goal)[:60]}"
             try:
-                commit = commit_edits(root, subject, applied.written)
+                # The gate has run by now, which is the only moment a lockfile
+                # exists to commit: it is produced *by* the verify command, so
+                # staging before verification would always find nothing.
+                commit = commit_edits(
+                    root, subject, applied.written, generated=generated_for(contract.stack)
+                )
             except GitError as exc:
                 raise InfrastructureError(f"committing issue #{issue}: {exc}") from exc
     except InfrastructureError as exc:

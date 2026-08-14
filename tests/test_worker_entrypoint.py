@@ -43,6 +43,8 @@ from swarm.worker.entrypoint import (
     OUTPUT_TAIL_CHARS,
     InfrastructureError,
     WorkerResult,
+    commit_edits,
+    stageable,
     classify_verify,
     main,
     run_verify,
@@ -1034,3 +1036,103 @@ def test_context_is_attached_by_the_frame_that_has_it():
 
     assert error.verify_command == "pytest -q"
     assert error.written == ("a.py",)
+
+
+# --------------------------------------------------------------------------
+# Files the gate generates but the model cannot write (#105)
+# --------------------------------------------------------------------------
+#
+# `commit_edits` stages exactly the declared `## Files`, and that rule is
+# right - `git add -A` after a verify run would sweep `node_modules` and every
+# cache the command wrote into the PR. But a lockfile is neither declarable nor
+# writable: a measured Expo lockfile is 16,347 lines against a 16,384-token
+# window, and it carries SHA-512 hashes that cannot be produced by generation.
+#
+# Without this, the PR carries a `package.json` change and no lock, CI re-runs
+# the command on neutral ground, and `npm ci` fails. "Add a dependency" is
+# unimplementable.
+
+
+def files_in(repo, commit: str) -> list[str]:
+    """The paths one commit touched. A local helper rather than a `ScratchRepo`
+    method: `fixtures/repo.py` is shared and outside this ticket's file set."""
+    out = repo.out("show", "--name-only", "--format=", commit)
+    return sorted(line.strip() for line in out.splitlines() if line.strip())
+
+
+def test_a_generated_file_the_gate_produced_is_committed(scratch_repo):
+    """The headline: a lockfile the verify command created reaches the commit
+    even though no task declared it and no model wrote it."""
+    (scratch_repo.path / "calc.py").write_text(GOOD_CALC)
+    (scratch_repo.path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+
+    commit = commit_edits(
+        scratch_repo.path, "swarm[t]: add sub", ["calc.py"], generated=["package-lock.json"]
+    )
+
+    assert commit
+    assert "package-lock.json" in files_in(scratch_repo, commit)
+
+
+def test_a_generated_file_the_gate_did_not_produce_is_simply_absent(scratch_repo):
+    """Absent is normal, not an error. `GENERATED_FILES` names what a stack's
+    gate *may* write, and most tasks add no dependency - failing over a file
+    the task never needed would make the set a requirement rather than a
+    permission."""
+    (scratch_repo.path / "calc.py").write_text(GOOD_CALC)
+
+    commit = commit_edits(
+        scratch_repo.path, "swarm[t]: add sub", ["calc.py"], generated=["package-lock.json"]
+    )
+
+    assert commit
+    assert files_in(scratch_repo, commit) == ["calc.py"]
+
+
+def test_the_staging_rule_still_refuses_everything_else(scratch_repo):
+    """The rule this ticket had to widen without loosening. `node_modules` is
+    what `git add -A` would have swept in, and it is what a lockfile sits next
+    to by construction."""
+    (scratch_repo.path / "calc.py").write_text(GOOD_CALC)
+    (scratch_repo.path / "package-lock.json").write_text("{}")
+    modules = scratch_repo.path / "node_modules" / "left-pad"
+    modules.mkdir(parents=True)
+    (modules / "index.js").write_text("module.exports = 1\n")
+    (scratch_repo.path / ".npm-cache").write_text("junk")
+
+    commit = commit_edits(
+        scratch_repo.path, "swarm[t]: add sub", ["calc.py"], generated=["package-lock.json"]
+    )
+
+    assert sorted(files_in(scratch_repo, commit)) == ["calc.py", "package-lock.json"]
+
+
+def test_a_task_with_no_generated_set_commits_exactly_what_it_declared(scratch_repo):
+    """Python generates nothing, so this is every task that exists today and
+    its behaviour must be byte-identical."""
+    (scratch_repo.path / "calc.py").write_text(GOOD_CALC)
+    (scratch_repo.path / "package-lock.json").write_text("{}")
+
+    commit = commit_edits(scratch_repo.path, "swarm[t]: add sub", ["calc.py"])
+
+    assert files_in(scratch_repo, commit) == ["calc.py"]
+
+
+def test_a_generated_path_is_re_resolved_against_the_root(tmp_path):
+    """`stageable` turns a name into a `git add`, and a symlink is a name that
+    points somewhere else. The constants are the repository's own, which is a
+    reason to check cheaply rather than a reason not to check."""
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    (root / "package-lock.json").symlink_to(outside)
+
+    assert stageable(root, ["package-lock.json"]) == ()
+
+
+def test_a_generated_directory_is_not_a_generated_file(tmp_path):
+    root = tmp_path / "repo"
+    (root / "package-lock.json").mkdir(parents=True)
+
+    assert stageable(root, ["package-lock.json"]) == ()
