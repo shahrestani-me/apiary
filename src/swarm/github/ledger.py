@@ -37,10 +37,40 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..state import TaskRecord, TaskStatus
 from .client import GitHubClient
 
-# The four sections the contract defines. Order matters only for reporting the
-# first missing one, so the error a human sees names the section they would
-# have written first.
-SECTIONS = ("Goal", "Files", "Verify", "Blocked by")
+# The sections a body must have. Order matters only for reporting the first
+# missing one, so the error a human sees names the section they would have
+# written first.
+REQUIRED_SECTIONS = ("Goal", "Files", "Verify", "Blocked by")
+
+# Sections the parser recognises, required or not. `SECTIONS` used to be one
+# tuple doing both jobs - it built `_KNOWN_HEADING_RE` *and* it was the
+# required-section loop - which is the entire reason "exactly four sections"
+# read as immovable. There was no way to express "recognised but optional".
+#
+# `## Stack` is the first optional one, and it is emitted **last**, after
+# `## Blocked by`. See `render_body` for why - and for what turned out not to
+# be a reason.
+OPTIONAL_SECTIONS = ("Stack",)
+KNOWN_SECTIONS = REQUIRED_SECTIONS + OPTIONAL_SECTIONS
+
+#: Stack ids a `## Stack` section may name. The contract's vocabulary, which is
+#: not the same list as `greenfield.scaffold.STACKS` and must not import it:
+#: that registry is about *generating* a project, this is about what an issue
+#: may declare, and `github/` depending on `greenfield/` would be the wrong way
+#: round. `test_every_generatable_stack_is_a_declarable_one` pins that this set
+#: covers that registry, so the two cannot drift apart silently.
+#:
+#: An id outside this set is a `ContractError`, never a silent default. A task
+#: declaring `## Stack` `rust` in a repository with no Rust image should fail
+#: at parse time, where the message names the issue - not at spawn time, where
+#: it costs a claim, or worse at verify time, where it costs an attempt.
+KNOWN_STACKS = frozenset({"python", "node", "react"})
+
+#: What a task targets when its body does not say. Every issue written before
+#: `## Stack` existed is a Python one, and `choose_stack` returns Python
+#: unconditionally today, so this default is a description of the world rather
+#: than a guess about it.
+DEFAULT_STACK = "python"
 
 # Labels → TaskStatus, straight from `docs/issue-contract.md` §3. Note the two
 # collapses and the two counter-intuitive rows: `review` is `running` because
@@ -74,9 +104,9 @@ _TASK_ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 _MARKER_RE = re.compile(r"^\s*<!--\s*apiary:task\b(?P<fields>[^>]*?)-->\s*$")
 _MARKER_FIELD_RE = re.compile(r"(?P<key>[a-z_]+)=(?P<value>[^\s]+)")
 
-# `^## (Goal|Files|Verify|Blocked by)[ \t]*$` - no leading whitespace, no
-# trailing content. Anything looser re-opens the #11 trap.
-_KNOWN_HEADING_RE = re.compile(rf"^## ({'|'.join(SECTIONS)})[ \t]*$")
+# `^## (Goal|Files|Verify|Blocked by|Stack)[ \t]*$` - no leading whitespace,
+# no trailing content. Anything looser re-opens the #11 trap.
+_KNOWN_HEADING_RE = re.compile(rf"^## ({'|'.join(KNOWN_SECTIONS)})[ \t]*$")
 # Any ATX heading ends the previous section, including one the contract does
 # not know: an unrecognised `## Notes` must terminate `## Verify` rather than
 # being swallowed into it.
@@ -148,6 +178,11 @@ class TaskContract:
     files: tuple[str, ...]
     verify: str
     blocked_by: tuple[int, ...]
+    #: What the body's optional `## Stack` said, or `None` when it said
+    #: nothing. `LedgerEntry.stack` is the resolved value; this one is the
+    #: parse, and keeping them distinct is what makes "the body did not
+    #: declare" answerable at all.
+    stack: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +223,10 @@ class LedgerEntry:
     blocked_by: tuple[int, ...]
     state_label: str
     labels: frozenset[str]
+    #: The stack this task targets, resolved. `TaskContract.stack` is optional;
+    #: this one is not, because every consumer downstream - the image #99
+    #: chooses, the CI setup #96 emits - needs an answer rather than a maybe.
+    stack: str = DEFAULT_STACK
     depends_on: tuple[str, ...] = ()
     adopted: bool = False
 
@@ -395,6 +434,40 @@ def _parse_verify(number: int, lines: Sequence[tuple[str, bool]]) -> str:
     return commands[0]
 
 
+def _parse_stack(number: int, lines: Sequence[tuple[str, bool]] | None) -> str | None:
+    """The optional `## Stack`: one known id, or `None` when there is no section.
+
+    An unknown id is a `ContractError` and never a silent default. That is the
+    whole reason for a closed vocabulary: `## Stack` `rust` in a repository
+    with no Rust image is a mistake that should be reported against the issue
+    that made it, at parse time, rather than becoming a Python container that
+    fails its gate three times.
+
+    A *present but empty* section is also an error, for the same reason it is
+    one under `## Verify` - somebody wrote the heading meaning to say
+    something, and reading it as "no opinion" discards their intent silently.
+    """
+    if lines is None:
+        return None
+    names = [
+        line.strip()
+        for line, _ in lines
+        if line.strip() and not _FENCE_OPEN_RE.match(line)
+    ]
+    if not names:
+        raise ContractError(number, "Stack", "section is empty")
+    if len(names) > 1:
+        raise ContractError(number, "Stack", f"expected one stack, found {names!r}")
+    stack = names[0].strip("`").casefold()
+    if stack not in KNOWN_STACKS:
+        raise ContractError(
+            number,
+            "Stack",
+            f"unknown stack {stack!r}; known: {', '.join(sorted(KNOWN_STACKS))}",
+        )
+    return stack
+
+
 def _parse_blocked_by(number: int, lines: Sequence[tuple[str, bool]]) -> tuple[int, ...]:
     """Issue numbers from `- #N` items. No items at all means no dependencies.
 
@@ -436,7 +509,7 @@ def parse_contract(number: int, body: str | None) -> TaskContract:
     """
     scanned = _scan(body or "")
     sections = _split_sections(number, scanned)
-    for name in SECTIONS:
+    for name in REQUIRED_SECTIONS:
         if name not in sections:
             raise ContractError(number, name, "section is missing")
     task_id, attempt = _parse_marker(number, scanned)
@@ -447,6 +520,10 @@ def parse_contract(number: int, body: str | None) -> TaskContract:
         files=_parse_files(number, sections["Files"]),
         verify=_parse_verify(number, sections["Verify"]),
         blocked_by=_parse_blocked_by(number, sections["Blocked by"]),
+        # Absent is not the same as `python`: `None` records that the body did
+        # not say, which is what lets `## Stack` be added to an issue later
+        # without the loader having to guess whether it was always there.
+        stack=_parse_stack(number, sections.get("Stack")),
     )
 
 
@@ -600,6 +677,9 @@ def load_ledger(
             files=contract.files,
             verify=contract.verify,
             blocked_by=contract.blocked_by,
+            # Resolved here, so nothing downstream has to remember that `None`
+            # means Python. The contract keeps the unresolved answer.
+            stack=contract.stack or DEFAULT_STACK,
             state_label=state_label,
             labels=labels,
             adopted=adopted,

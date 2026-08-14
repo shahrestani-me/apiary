@@ -38,6 +38,19 @@ class PlannedTask(BaseModel):
     depends_on: list[str] = Field(
         default_factory=list, description="ids of tasks that must finish first"
     )
+    # The description is the prompt: this field is filled by a schema-forced
+    # model call, so what the model is told about it lives here and nowhere
+    # else. D5's defaults are stated rather than left to be inferred, and
+    # "react" means React **web** - React Native is out of scope for #87.
+    stack: str | None = Field(
+        default=None,
+        description=(
+            "which toolchain this task's code is written in: 'python', 'node' "
+            "or 'react'. Frontend or UI work is 'react' (React web, not React "
+            "Native); backend, CLI and library work is 'python'. Omit when the "
+            "task does not add code in a stack of its own."
+        ),
+    )
 
 
 class Plan(BaseModel):
