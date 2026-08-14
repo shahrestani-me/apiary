@@ -33,7 +33,11 @@ from typing import Any, Callable, Sequence
 
 import pytest
 
+from pathlib import Path
+
 from swarm.containers.manager import (
+    DEFAULT_STACK_IMAGES,
+    IMAGE_ENV,
     ISSUE_LABEL,
     MAX_LOG_CHARS,
     PLACEHOLDER,
@@ -45,10 +49,19 @@ from swarm.containers.manager import (
     Handle,
     Limits,
     Redactor,
+    STACK_IMAGES_ENV,
+    StackImages,
+    WORKER_IMAGE,
+    build_hint,
     dispose_container,
     find_containers,
+    missing_image,
 )
 from swarm.run import RUN_LABEL, Run
+
+#: The repository root, for the one test that asserts a generated command names
+#: a file that exists.
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 REPO = "shahrestani-me/apiary"
 OBJECTIVE = "add retry with exponential backoff to the http client"
@@ -673,3 +686,174 @@ def test_the_boot_key_is_redacted_even_though_it_is_never_passed(monkeypatch):
     monkeypatch.setenv(PROVISION_TOKEN_ENV, secret)
     manager, _ = make_manager()
     assert secret not in manager.redactor(f"leaked {secret} somehow")
+
+
+# --------------------------------------------------------------------------
+# One image per stack (#99)
+# --------------------------------------------------------------------------
+#
+# `Dockerfile.worker` argued for baking in no toolchain, on the grounds that a
+# baked-in stack "would quietly narrow the swarm to repos that happen to use
+# that stack". The intent was agnosticism; the effect was the opposite, because
+# the one toolchain every image did carry was the Python the package needs.
+# Agnosticism is bought here instead: several images, selected per task.
+
+
+def test_the_default_mapping_covers_every_declarable_stack():
+    """A stack an issue may declare but no image can run is a task that parses
+    and then cannot be dispatched - the drift `KNOWN_STACKS` was written to
+    make visible, checked from the other side."""
+    from swarm.github.ledger import KNOWN_STACKS
+
+    assert set(DEFAULT_STACK_IMAGES) == KNOWN_STACKS
+
+
+def test_node_and_react_share_an_image():
+    """React web needs Node and nothing else at the toolchain level. Two tags
+    for one Dockerfile would be two things to keep built."""
+    images = StackImages()
+
+    assert images.for_stack("react") == images.for_stack("node")
+
+
+def test_a_stack_is_resolved_case_insensitively():
+    assert StackImages().for_stack("Node") == "apiary-worker-node"
+
+
+def test_a_stack_with_no_image_is_refused_with_something_to_do_about_it():
+    """Never a mid-run `docker create` failure: the message a create failure
+    produces names a tag, and this one names a thing to run."""
+    with pytest.raises(ContainerError) as raised:
+        StackImages().for_stack("rust")
+
+    assert "rust" in str(raised.value)
+    assert STACK_IMAGES_ENV in str(raised.value)
+    assert "SETUP.md" in str(raised.value)
+
+
+def test_an_override_merges_rather_than_replaces():
+    """Overriding one stack must not silently un-configure the others, which is
+    the failure mode of a whole-mapping override somebody edits in a hurry."""
+    images = StackImages.from_env({STACK_IMAGES_ENV: "node=my-node:dev"})
+
+    assert images.for_stack("node") == "my-node:dev"
+    assert images.for_stack("python") == WORKER_IMAGE
+
+
+def test_an_override_can_add_a_stack_the_defaults_do_not_have():
+    images = StackImages.from_env({STACK_IMAGES_ENV: "go=apiary-worker-go"})
+
+    assert images.for_stack("go") == "apiary-worker-go"
+
+
+@pytest.mark.parametrize("raw", ["node", "node=", "=my-node", "node=a,,,broken"])
+def test_a_malformed_override_is_loud(raw):
+    """Loud on garbage, like `_env_int` and `_env_flag`. A mistyped pair that
+    silently fell back would run the whole ledger on the Python image while
+    somebody believed otherwise."""
+    with pytest.raises(ContainerError):
+        StackImages.from_env({STACK_IMAGES_ENV: raw})
+
+
+def test_an_absent_override_is_the_defaults():
+    assert StackImages.from_env({}).images == dict(DEFAULT_STACK_IMAGES)
+
+
+def test_the_build_hint_names_the_dockerfile_that_exists():
+    """One place, so `doctor`'s fix hint, the dispatcher's refusal and SETUP.md
+    cannot drift - and asserted against the repository, so a renamed Dockerfile
+    fails here rather than in somebody's terminal."""
+    for image in DEFAULT_STACK_IMAGES.values():
+        hint = build_hint(image)
+        dockerfile = hint.split("-f ")[1].split()[0]
+        assert (REPO_ROOT / dockerfile).is_file(), hint
+
+
+def test_a_missing_image_is_told_from_every_other_docker_error():
+    assert missing_image(
+        DockerError(["docker", "create"], 125, "Unable to find image 'apiary-worker-node' locally")
+    )
+    assert not missing_image(
+        DockerError(["docker", "create"], 125, "Cannot connect to the Docker daemon")
+    )
+
+
+def test_the_image_variable_matches_the_workers_own():
+    """The spawner writes it, the worker reads it, and neither imports the
+    other: `worker/entrypoint.py` is what runs *inside* the container and
+    depends on nothing in `containers/`. Two spellings of one name, pinned."""
+    from swarm.worker.entrypoint import IMAGE_ENV as worker_side
+
+    assert IMAGE_ENV == worker_side
+
+
+def test_a_spawn_uses_the_image_it_was_given_not_the_managers():
+    manager, runner = make_manager()
+
+    handle = manager.spawn(7, BASE_COMMIT, image="apiary-worker-node")
+
+    assert handle.image == "apiary-worker-node"
+    assert "apiary-worker-node" in runner.argv_for("create")
+
+
+def test_a_spawn_with_no_image_still_uses_the_managers():
+    """A run whose tasks never declare anything must keep working unchanged."""
+    manager, runner = make_manager()
+
+    handle = manager.spawn(7, BASE_COMMIT)
+
+    assert handle.image == WORKER_IMAGE
+    assert WORKER_IMAGE in runner.argv_for("create")
+
+
+def test_the_worker_is_told_which_image_it_is_running_in():
+    """It cannot ask: no socket, no `docker` binary. That is the containment
+    working, so #97's result record can only name the image if it is told."""
+    manager, runner = make_manager()
+
+    manager.spawn(7, BASE_COMMIT, image="apiary-worker-node")
+
+    assert f"{IMAGE_ENV}=apiary-worker-node" in runner.argv_for("create")
+
+
+@pytest.mark.docker
+def test_the_node_image_carries_node_and_a_writable_npm_cache():
+    """The one live check on the second worker image.
+
+    Two things, and the second is the one that would otherwise be found by a
+    task rather than by a test: npm writes a cache on **every** invocation,
+    including ones that install nothing, and an unwritable cache directory
+    fails the command rather than skipping the cache. `/opt/venv` is owned by
+    uid 10001 in `Dockerfile.worker` for the same reason.
+
+    Skipped rather than failed when the image is not built: it is a manual
+    `docker build` on the host by design (the orchestrator has `BUILD=0`), so
+    "not built here" is a fact about the machine, not a regression.
+    """
+    image = StackImages().for_stack("node")
+    manager = ContainerManager(
+        run=make_run(),
+        image=image,
+        env={},
+        limits=Limits(cpus=1.0, memory="512m", pids=128),
+        timeout_s=120,
+    )
+    try:
+        handle = shell(
+            manager,
+            "node --version && id -u && "
+            # Write into the cache the way npm itself would, as uid 10001.
+            'test -w "$NPM_CONFIG_CACHE" && echo "cache writable"',
+        )
+    except ContainerError as exc:
+        if not missing_image(exc):
+            raise
+        pytest.skip(f"{image} is not built on this host: {build_hint(image)}")
+
+    assert manager.wait(handle) == 0
+    logs = manager.logs(handle)
+    manager.dispose(handle)
+
+    assert "v22." in logs
+    assert "10001" in logs
+    assert "cache writable" in logs

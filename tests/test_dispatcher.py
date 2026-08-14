@@ -28,6 +28,7 @@ daemon.
 from __future__ import annotations
 
 import ast
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -35,7 +36,13 @@ from typing import Any, Iterable
 import pytest
 
 from swarm.containers.limits import HostBudget, LimitError
-from swarm.containers.manager import ContainerError, DockerError, Handle
+from swarm.containers.manager import (
+    STACK_IMAGES_ENV,
+    ContainerError,
+    DockerError,
+    Handle,
+    StackImages,
+)
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry
 from swarm.orchestrator import dispatcher
@@ -134,8 +141,10 @@ class FakeSwarm:
 
     # --- Spawner --------------------------------------------------------
 
-    def spawn(self, issue: int, base_commit: str) -> Handle:
-        self.log.append(f"spawn #{issue}")
+    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle:
+        # The image is in the log, because #99's whole question is which one a
+        # task got and the ordering assertions read this log.
+        self.log.append(f"spawn #{issue}" + (f" [{image}]" if image else ""))
         error = self.spawn_errors.get(issue, self.spawn_error)
         if error is not None:
             raise error
@@ -153,7 +162,18 @@ class FakeSwarm:
 
     @property
     def spawned(self) -> list[int]:
-        return [int(line.split("#")[1]) for line in self.log if line.startswith("spawn")]
+        return [
+            int(line.split("#")[1].split()[0]) for line in self.log if line.startswith("spawn")
+        ]
+
+    @property
+    def images(self) -> list[str]:
+        """The image each spawn was asked for, in order."""
+        return [
+            line.split("[", 1)[1].rstrip("]")
+            for line in self.log
+            if line.startswith("spawn") and "[" in line
+        ]
 
     @property
     def claimed(self) -> list[int]:
@@ -407,7 +427,7 @@ def test_the_claim_is_written_before_the_container_is_spawned():
 
     # Both orders have a crash window; this one strands a label #35 can sweep,
     # and the other one dispatches the issue twice.
-    assert swarm.log == [f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7"]
+    assert swarm.log == [f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7 [apiary-worker]"]
 
 
 def test_the_new_label_is_added_before_the_old_one_is_removed():
@@ -429,8 +449,8 @@ def test_each_issue_is_claimed_immediately_before_its_own_spawn():
     # Interleaved, not claim-them-all-then-spawn-them-all: an outage between the
     # two phases would otherwise strand every issue in the cycle at once.
     assert swarm.log == [
-        f"+{CLAIMED} #4", f"-{READY} #4", "spawn #4",
-        f"+{CLAIMED} #5", f"-{READY} #5", "spawn #5",
+        f"+{CLAIMED} #4", f"-{READY} #4", "spawn #4 [apiary-worker]",
+        f"+{CLAIMED} #5", f"-{READY} #5", "spawn #5 [apiary-worker]",
     ]
 
 
@@ -521,7 +541,7 @@ def test_a_deferred_issue_does_not_stay_claimed_with_no_container():
     # crash between the two leaves the conservative reading, exactly as `claim`
     # does in the other direction.
     assert swarm.log == [
-        f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7",
+        f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7 [apiary-worker]",
         "find #7", f"+{READY} #7", f"-{CLAIMED} #7",
     ]
 
@@ -715,3 +735,80 @@ def test_dispatching_reaches_for_no_model_on_any_path():
     # cycle expensive again, and the cost is invisible until a run is slow.
     assert not [name for name in imported if "llm" in name or "ollama" in name.lower()]
     assert not [name for name in imported if name.startswith("nodes")]
+
+
+# --------------------------------------------------------------------------
+# One image per task (#99)
+# --------------------------------------------------------------------------
+
+
+def test_a_task_is_spawned_in_its_own_stacks_image():
+    swarm = FakeSwarm()
+    node = entry(4)
+    node = dataclasses.replace(node, stack="node")
+
+    dispatch(swarm, swarm, ledger(node, entry(5)), BASE_COMMIT, capacity=capacity(2))
+
+    assert swarm.images == ["apiary-worker-node", "apiary-worker"]
+
+
+def test_a_stack_with_no_image_is_refused_before_it_is_claimed():
+    """Never a mid-run `docker create` failure. A claim spent on a task this
+    host cannot run is a claim #35 has to sweep, and the message a create
+    failure produces names a tag rather than a thing to do about it."""
+    swarm = FakeSwarm()
+    unrunnable = dataclasses.replace(entry(4), stack="rust")
+
+    report = dispatch(swarm, swarm, ledger(unrunnable), BASE_COMMIT, capacity=capacity(1))
+
+    assert swarm.log == []  # not claimed, not spawned
+    assert report.failed[0].claimed is False
+    assert "rust" in report.failed[0].reason
+
+
+def test_one_unrunnable_stack_does_not_stop_the_others():
+    """The #94 property, restated for the failure #99 makes possible."""
+    swarm = FakeSwarm()
+    unrunnable = dataclasses.replace(entry(4), stack="rust")
+
+    report = dispatch(
+        swarm, swarm, ledger(unrunnable, entry(5)), BASE_COMMIT, capacity=capacity(2)
+    )
+
+    assert swarm.spawned == [5]
+    assert [item.number for item in report.dispatched] == [5]
+
+
+def test_an_image_that_was_never_built_says_which_command_builds_it():
+    """The one failure whose fix is a command rather than an investigation: the
+    orchestrator can neither build nor pull, so a human has to."""
+    swarm = FakeSwarm(
+        spawn_errors={
+            4: DockerError(
+                ["docker", "create"], 125, "Unable to find image 'apiary-worker-node' locally"
+            )
+        }
+    )
+    node = dataclasses.replace(entry(4), stack="node")
+
+    report = dispatch(swarm, swarm, ledger(node), BASE_COMMIT, capacity=capacity(1))
+
+    assert "docker build -f Dockerfile.worker.node" in report.failed[0].reason
+    # And it is still a per-issue defer, not a halted cycle.
+    assert report.failed[0].fatal is False
+
+
+def test_an_override_reaches_the_spawn():
+    swarm = FakeSwarm()
+    node = dataclasses.replace(entry(4), stack="node")
+
+    dispatch(
+        swarm,
+        swarm,
+        ledger(node),
+        BASE_COMMIT,
+        capacity=capacity(1),
+        images=StackImages.from_env({STACK_IMAGES_ENV: "node=my-node:dev"}),
+    )
+
+    assert swarm.images == ["my-node:dev"]

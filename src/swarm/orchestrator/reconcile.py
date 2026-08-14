@@ -92,7 +92,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Iterable, Mapping, Protocol
 
 from ..config import SETTINGS
-from ..containers.manager import ContainerError, Handle
+from ..containers.manager import ContainerError, Handle, StackImages
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import (
     ContractError,
@@ -1142,6 +1142,11 @@ class Reconciler:
     #: startup is the same line that chose it.
     infrastructure_policy: InfrastructurePolicy = field(default_factory=InfrastructurePolicy)
 
+    #: Which image carries which stack's toolchain (#99). Read at the call site
+    #: like the policies, so the line that reports it at startup is the line
+    #: that chose it.
+    images: StackImages = field(default_factory=StackImages)
+
     #: Step 5. The objective is what the goal gate assesses against, so a
     #: reconciler without one cannot close its own loop and says so rather than
     #: assessing against an empty string; `verify` is the run's repo-wide
@@ -1307,6 +1312,7 @@ class Reconciler:
                     capacity=self.capacity,
                     ready=readiness.ready,
                     dry_run=self.dry_run,
+                    images=self.images,
                 )
 
         report = CycleReport(

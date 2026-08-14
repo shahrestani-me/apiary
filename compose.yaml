@@ -67,6 +67,18 @@ services:
       # is genuinely needed.
       APIARY_PROVISION_TOKEN: ${APIARY_PROVISION_TOKEN:-}
       GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
+
+      # Which image carries which stack's toolchain (#99). This block is an
+      # explicit list, not a passthrough, so an override that is not named here
+      # simply never reaches a containerised orchestrator - it would read the
+      # defaults while the operator believed otherwise. Empty means "use the
+      # defaults in containers.manager.DEFAULT_STACK_IMAGES".
+      #
+      # Note that the images themselves must be built on the *host*: this
+      # service can neither build nor pull (see the socket proxy's BUILD=0 and
+      # IMAGES=0 below), which is the narrowing working as designed. SETUP.md
+      # step 4 is the command.
+      APIARY_WORKER_IMAGES: ${APIARY_WORKER_IMAGES:-}
       OLLAMA_HOST: ${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       HTTP_PROXY: http://egress-proxy:8888

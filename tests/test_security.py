@@ -41,7 +41,7 @@ from typing import Sequence
 
 import pytest
 
-from swarm.containers.manager import ContainerManager, Handle, Redactor, dispose_container
+from swarm.containers.manager import STACK_IMAGES_ENV, ContainerManager, Handle, Redactor, dispose_container
 from swarm.run import Run
 from swarm.security import (
     DOCKER_HOST_URL,
@@ -628,3 +628,14 @@ def test_compose_hands_the_boot_key_to_the_orchestrator_and_no_one_else():
     # `ContainerManager`, not by compose, but a future service added here must
     # not be handed it either.
     assert PROVISION_TOKEN_ENV not in rest
+
+
+def test_compose_passes_the_worker_image_override_through(compose_text: str) -> None:
+    """`environment:` is an explicit list, not a passthrough.
+
+    An override absent from it never reaches a containerised orchestrator: the
+    process reads its default and the operator reads their `.env`, and the two
+    disagree silently for the length of a run. This file already polices that
+    drift for the token and the proxy variables; #99's mapping joins them.
+    """
+    assert f"      {STACK_IMAGES_ENV}: ${{{STACK_IMAGES_ENV}:-}}\n" in compose_text

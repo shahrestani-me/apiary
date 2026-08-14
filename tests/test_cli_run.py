@@ -536,9 +536,19 @@ class Planning:
 
     client: FakeClient
     verify: str | None = None
+    #: What `--stack` sent, so the flag is asserted where it is handed over
+    #: rather than only where it is parsed.
+    stack: str | None = None
 
-    def __call__(self, state: Any, source: Any = None, verify: str | None = None) -> dict:
+    def __call__(
+        self,
+        state: Any,
+        source: Any = None,
+        verify: str | None = None,
+        stack: str | None = None,
+    ) -> dict:
         self.verify = verify
+        self.stack = stack
         self.client.issues.append(issue(1, marker="seed", labels=("swarm:ready",)))
         return {"tasks": {"seed": {}}, "events": ["planned 1 task(s)"]}
 
