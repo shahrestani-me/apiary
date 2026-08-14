@@ -109,13 +109,17 @@ def issue(number: int = ISSUE, **kwargs: Any):
 
 
 def publishes(number: int = 42):
-    """The two further responses a *verified* run needs, now that #17 landed.
+    """The three further responses a *verified* run needs, now that #17 landed.
 
     A run that passes its gate no longer stops at the commit: `_publish` opens
     the PR and applies `swarm:review`. Scripting them is what keeps these tests
     about the entrypoint rather than about how far the seam had got.
     """
     return (
+        # The lookup for an existing PR comes first: `GitHubClient` grew
+        # `list_pull_requests`, so `find_open_pull_request` now asks rather
+        # than degrading to None.
+        response(200, []),
         response(201, {"number": number, "html_url": f"https://example.invalid/pull/{number}"}),
         response(200, [{"name": "swarm:review"}]),
     )
@@ -188,6 +192,7 @@ def test_verified_task_produces_a_commit(fake_github, scratch_repo, workspace):
     # with no PR behind it is a state the reconciler cannot act on.
     assert transport.calls == [
         ("GET", f"/repos/{gh.repo}/issues/{ISSUE}"),
+        ("GET", f"/repos/{gh.repo}/pulls"),
         ("POST", f"/repos/{gh.repo}/pulls"),
         ("POST", f"/repos/{gh.repo}/issues/{ISSUE}/labels"),
     ]

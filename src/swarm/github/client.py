@@ -363,7 +363,39 @@ class GitHubClient:
             raise
         return True
 
+    def create_issue_comment(self, number: int, body: str) -> dict[str, Any]:
+        """Comment on an issue.
+
+        `docs/issue-contract.md` §1.4 requires a malformed contract to be
+        reported as a comment on the offending issue, and the same channel
+        carries the reason when an issue reaches `swarm:failed`. Without it
+        `reconcile.post_comment` printed to stderr and recorded the issue on
+        `ReconcileReport.uncommented`, which means the explanation lived only
+        in the orchestrator's own logs - exactly where the human looking at
+        the tracker will not find it.
+        """
+        path = f"/repos/{self.repo}/issues/{number}/comments"
+        return self._send_json("POST", self._url(path), {"body": body})
+
     # --- pull requests ----------------------------------------------------
+
+    def delete_branch(self, branch: str) -> bool:
+        """Delete a branch, returning False if it was already gone.
+
+        Called after a merge so a long run does not leave one dead
+        `swarm/issue-<n>` branch per task. Already-deleted is the ordinary
+        case when GitHub's own "delete branch on merge" setting is enabled, so
+        a 404 (and the 422 the refs endpoint returns for an absent ref) is a
+        no-op rather than a failure.
+        """
+        path = f"/repos/{self.repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}"
+        try:
+            self._send_json("DELETE", self._url(path), None)
+        except GitHubHTTPError as exc:
+            if exc.status in (404, 422):
+                return False
+            raise
+        return True
 
     def get_pull_request(self, number: int) -> dict[str, Any]:
         """Fetch a PR, including `mergeable` and `mergeable_state` (#34).
@@ -374,6 +406,34 @@ class GitHubClient:
         so it is returned as-is and the caller polls.
         """
         return self._get(self._url(f"/repos/{self.repo}/pulls/{number}"))
+
+    def list_pull_requests(
+        self,
+        *,
+        state: str = "open",
+        head: str | None = None,
+        base: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List PRs, optionally narrowed to one head branch.
+
+        Three modules probed for this method and degraded without it, each
+        saying so out loud rather than guessing: `worker/pr.py` fell back to
+        GitHub's 422 on a duplicate head, and `orchestrator/checks.py` and
+        `orchestrator/mergeability.py` reported `blind` and decided nothing.
+        Deciding nothing was the right refusal - an unreadable PR list must
+        never be read as "the PR was closed" - but it also meant the merge
+        gate was inert.
+
+        `head` is qualified with the owner when it is not already, because
+        `GET /pulls?head=branch` silently matches nothing: the API wants
+        `owner:branch`.
+        """
+        params: dict[str, str] = {"state": state}
+        if head:
+            params["head"] = head if ":" in head else f"{self.repo.split('/')[0]}:{head}"
+        if base:
+            params["base"] = base
+        return self._paginate(f"/repos/{self.repo}/pulls", params)
 
     def create_pull_request(
         self,

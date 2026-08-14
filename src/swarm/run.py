@@ -76,6 +76,12 @@ RUN_LABEL = "apiary.run"
 # 64 is comfortably inside every consumer's limit (a filesystem component is
 # 255, a Docker label value is unbounded) and short enough to read in a
 # `docker ps` column without wrapping.
+#: How a worker learns which run it belongs to. Set by `ContainerManager` on
+#: every container it creates and read by `worker/entrypoint.py` when it writes
+#: its result record, so a record can be filed under the run that produced it
+#: without threading the id through `spawn`'s positional arguments.
+RUN_ID_ENV = "APIARY_RUN_ID"
+
 MAX_RUN_ID_LENGTH = 64
 SUFFIX_LENGTH = 6
 

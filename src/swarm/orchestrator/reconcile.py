@@ -241,6 +241,23 @@ class Snapshot:
         """
         if name.startswith("_") or name == "client":
             raise AttributeError(name)
+        if name == PULLS_METHOD:
+            # Served from the cache, but only when the client really has it.
+            # Defining this as an ordinary method would make every client look
+            # capable of listing pull requests, and `pull_requests()` uses the
+            # absence of this very attribute to tell "cannot see" from "nothing
+            # open" - a distinction that decides whether the whole review queue
+            # gets relabelled. So the wrapper appears if and only if the thing
+            # it wraps does.
+            inner = getattr(self.client, PULLS_METHOD)
+
+            def cached(*, state: str = "open", **kwargs: Any) -> list[dict[str, Any]]:
+                """One listing per cycle, shared by everything in it (#22)."""
+                if state != "open" or kwargs:
+                    return inner(state=state, **kwargs)
+                return list(self.pull_requests())
+
+            return cached
         return getattr(self.client, name)
 
 
@@ -810,6 +827,13 @@ class CycleReport:
     result: ReconcileReport
     readiness: ReadinessPlan | None = None
     dispatched: DispatchReport | None = None
+    #: The merge gate, in the order it runs: mergeability decides what may be
+    #: merged *against the base as it is now*, and hands the surviving plan to
+    #: checks. Both are `None` when the cycle never got that far.
+    mergeability: Any | None = None
+    checks: Any | None = None
+    #: Claims released this cycle because nothing was running behind them.
+    recovered: Any | None = None
     #: A `DependencyCycleError` - the one readiness failure that aborts a pass
     #: rather than joining its errors. Recorded rather than raised so the loop
     #: reports it every cycle until a human breaks the ring, instead of the run
@@ -886,6 +910,20 @@ class Reconciler:
     #: budget that the request count does not cover.
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+
+    #: Releases claims whose container is gone. `None` disables the mid-cycle
+    #: sweep; the startup sweep is the caller's to run either way.
+    recovery: Any | None = None
+
+    #: Whether this cycle merges. Off leaves every `swarm:review` PR alone,
+    #: which is what a run wants when a human is doing the merging.
+    merge_gate: bool = True
+
+    #: Carried across cycles so an unlucky PR cannot be updated forever. It is
+    #: in-process by design: a restart grants a fresh budget, which is the
+    #: right failure for a counter whose whole job is bounding one run.
+    update_budget: "Any | None" = None
+
     _cycles: int = field(default=0, repr=False)
 
     # --- one cycle -------------------------------------------------------
@@ -919,6 +957,60 @@ class Reconciler:
         )
         ledger = fold(ledger, result.applied)
 
+        # A claim with no container behind it is undispatchable forever, and the
+        # window that produces one is the dispatcher's own claim-then-spawn gap.
+        # Swept here rather than only at startup because that gap opens
+        # mid-run: the facts are the ones this cycle has already read, so the
+        # sweep costs nothing extra.
+        recovered = None
+        if self.recovery is not None:
+            recovered = self.recovery.sweep(
+                ledger,
+                containers=handles,
+                states=snapshot.states(),
+                open_branches=snapshot.open_branches(),
+            )
+            ledger = fold(ledger, recovered.result.applied)
+
+        # The merge gate. Mergeability runs first and *subtracts* from the plan
+        # checks built: a PR that is green against a base that has since moved
+        # is not mergeable, and merging it would land work that never ran
+        # against what it is landing on. `plan.admitted` is what survives.
+        mergeability = None
+        checks = None
+        if self.merge_gate:
+            # Local, because `checks` and `mergeability` both import this
+            # module: they are the policy over the state this one folds,
+            # so the dependency points this way and a top-level import
+            # would be a cycle.
+            from .checks import apply_checks, plan_checks, read_checks, read_pulls
+            from .mergeability import run_mergeability
+
+            pulls = read_pulls(snapshot)
+            check_runs = {}
+            if pulls is not None:
+                for entry in ledger.entries.values():
+                    pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
+                    if pull is not None:
+                        check_runs[entry.number] = read_checks(snapshot, pull.ref)
+            checks_plan = plan_checks(
+                ledger,
+                pulls=pulls,
+                checks=check_runs,
+                max_attempts=self.max_attempts,
+            )
+            mergeability = run_mergeability(
+                snapshot,
+                ledger,
+                checks_plan,
+                pulls=pulls,
+                budget=self.update_budget,
+                max_attempts=self.max_attempts,
+                dry_run=self.dry_run,
+            )
+            checks = apply_checks(snapshot, mergeability.plan.admitted, dry_run=self.dry_run)
+            ledger = fold(ledger, checks.applied)
+
         readiness: ReadinessPlan | None = None
         dispatched: DispatchReport | None = None
         cycle_error = ""
@@ -947,6 +1039,9 @@ class Reconciler:
             result=result,
             readiness=readiness,
             dispatched=dispatched,
+            mergeability=mergeability,
+            checks=checks,
+            recovered=recovered,
             cycle_error=cycle_error,
             live=len(live_entries(ledger)),
         )

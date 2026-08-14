@@ -369,7 +369,7 @@ def test_run_against_a_live_ledger_reports_the_run_and_reconciles_readiness(caps
         issue(2, marker="task-two", labels=("swarm:blocked",), blocked=[1]),
     ])
 
-    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE], client=client)
+    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE, "--plan-only"], client=client)
 
     assert code == 0
     out = capsys.readouterr().out
@@ -387,18 +387,27 @@ def test_a_dry_run_reports_readiness_without_writing_a_single_label(capsys):
         issue(2, marker="task-two", labels=("swarm:blocked",), blocked=[1]),
     ])
 
-    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE, "--dry-run"], client=client)
+    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE, "--dry-run", "--plan-only"],
+                client=client)
 
     assert code == 0
     assert "nothing will be written" in capsys.readouterr().out
     assert client.writes == []
 
 
-def test_an_empty_ledger_says_planning_is_not_wired_rather_than_doing_nothing(capsys):
-    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE], client=FakeClient([]))
+def test_a_dry_run_refuses_to_plan_an_empty_ledger(capsys):
+    """Planning writes issues, and a dry run promised to write nothing.
+
+    Saying so beats a command that silently does nothing on a fresh repo -
+    which reads as a bug in GitHub rather than as the choice it is.
+    """
+    code = main(
+        ["run", "--repo", REPO, "--objective", OBJECTIVE, "--dry-run"],
+        client=FakeClient([]),
+    )
 
     assert code == 0
-    assert "#10" in capsys.readouterr().err
+    assert "writes no plan" in capsys.readouterr().err
 
 
 def test_a_dependency_cycle_fails_the_command_rather_than_waiting_forever(capsys):
@@ -407,7 +416,7 @@ def test_a_dependency_cycle_fails_the_command_rather_than_waiting_forever(capsys
         issue(2, marker="task-two", labels=("swarm:blocked",), blocked=[1]),
     ])
 
-    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE], client=client)
+    code = main(["run", "--repo", REPO, "--objective", OBJECTIVE, "--plan-only"], client=client)
 
     assert code == 1
     assert "cycle" in capsys.readouterr().err
@@ -462,9 +471,20 @@ def test_greenfield_runs_against_the_repository_it_just_created(monkeypatch, cap
         return Report()
 
     monkeypatch.setattr("swarm.cli.provision", fake_provision)
+    # A fresh repository has an empty ledger, which is now the planner's cue.
+    # This test is about provisioning, and letting it reach `plan_node` would
+    # put a real model call in the unit suite.
+    monkeypatch.setattr(
+        "swarm.cli.plan_node",
+        lambda state, source=None: {"tasks": {"seed": {}}, "events": ["planned 1 task(s)"]},
+    )
 
     code = main(
-        ["run", "--new", "a markdown to CSV tool", "--owner", "me", "--public", "--yes"],
+        # --plan-only: this test is about provisioning and the hand-off to the
+        # run, not about dispatching containers into a repository that exists
+        # only as a fake.
+        ["run", "--new", "a markdown to CSV tool", "--owner", "me", "--public",
+         "--yes", "--plan-only"],
         client=client,
     )
 

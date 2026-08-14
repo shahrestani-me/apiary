@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 from ..config import SETTINGS
-from ..run import RUN_LABEL, SUFFIX_ALPHABET, Run, validate_run_id
+from ..run import RUN_ID_ENV, RUN_LABEL, SUFFIX_ALPHABET, Run, validate_run_id
 
 #: The image #14 builds. Overridable per manager, because a locally built tag
 #: is how anyone tests a worker change before it is published anywhere.
@@ -496,12 +496,24 @@ class ContainerManager:
     limits: Limits = DEFAULT_LIMITS
     timeout_s: float = float(SETTINGS.worker_timeout_s)
     clone_url: str | None = None
+    #: Extra `docker create` flags, appended before the image name. This is how
+    #: a worker gets somewhere to write (`RunArtifacts.mount_flags`) and how it
+    #: gets confined (`security.worker_create_flags`); both produce argv, and
+    #: neither module owns this call site. Everything passed here goes through
+    #: `assert_unprivileged` with the rest of the argv, so a flag that would
+    #: create a privileged container is refused wherever it came from.
+    extra_flags: Sequence[str] = ()
     docker: DockerCLI | None = None
     runner: Runner | None = None
     redactor: Redactor = field(default_factory=Redactor)
 
     def __post_init__(self) -> None:
         self.env = dict(self.env) if self.env is not None else _inherited_env()
+        # The worker names its own result file after the run and the attempt.
+        # It learns the attempt from the contract it already reads; the run id
+        # only exists out here, so it travels as an environment variable rather
+        # than as a fourth positional argument nobody else needs.
+        self.env.setdefault(RUN_ID_ENV, self.run.id)
         # Enrolment, not a copy: everything handed to a container as a
         # credential is registered before a single command runs, so no code
         # path exists in which a secret reaches the daemon before the redactor
@@ -552,6 +564,7 @@ class ContainerManager:
             # needs (architecture-v2, "Three constraints").
             "--add-host", "host.docker.internal:host-gateway",
             *self._env_flags(),
+            *self.extra_flags,
         ]
         if entrypoint is not None:
             args += ["--entrypoint", entrypoint]
