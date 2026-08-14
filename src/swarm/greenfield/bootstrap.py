@@ -58,6 +58,7 @@ gate today could grade an empty generation green.
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from functools import partial
@@ -264,6 +265,16 @@ class Oracle:
     def invoke(self, messages): ...  # pragma: no cover - shape only
 
 
+def prompt_for(prompt: str) -> tuple[str, str]:
+    """The exact `(system, human)` pair `choose_stack` sends.
+
+    The human turn here *is* the operator's brief, unchanged - which is what
+    makes this the cheapest site to expose in `swarm console`, and the honest
+    place to start when checking whether the console and production agree.
+    """
+    return SYSTEM, prompt
+
+
 def choose_stack(prompt: str, *, llm: object | None = None) -> str:
     """Which stack this prompt implies. D5's defaults, decided by the model.
 
@@ -279,12 +290,35 @@ def choose_stack(prompt: str, *, llm: object | None = None) -> str:
     `StackImages.for_stack` before anything is claimed.
     """
     model = structured(orchestrator_llm(), StackChoice) if llm is None else llm
+    system, human = prompt_for(prompt)
     try:
-        answer = model.invoke([("system", SYSTEM), ("human", prompt)])
-    except Exception:  # noqa: BLE001 - local model failures are varied
+        answer = model.invoke([("system", system), ("human", human)])
+    except Exception as exc:  # noqa: BLE001 - local model failures are varied
+        # Bound, named and reported. The fallback itself is unchanged and
+        # deliberate - see above - but until now the exception was not even
+        # given a name before being dropped, so "the model chose python" and
+        # "Ollama was not running" produced identical, silent output. An
+        # operator who typed a React brief and got a Python scaffold had no
+        # way to tell which had happened.
+        print(
+            f"! stack choice fell back to {DEFAULT_STACK} after "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return DEFAULT_STACK
     chosen = str(getattr(answer, "stack", "") or "").strip().casefold()
-    return chosen if chosen in KNOWN_STACKS else DEFAULT_STACK
+    if chosen in KNOWN_STACKS:
+        return chosen
+    # The other silent fallback, and a different fault: the model answered, and
+    # answered outside the vocabulary `format` was supposed to constrain it to.
+    # Worth distinguishing from a transport failure, because it is the one that
+    # says something about the model rather than about the host.
+    print(
+        f"! stack choice fell back to {DEFAULT_STACK}: the model answered "
+        f"{chosen or '(nothing)'!r}, which is not one of {sorted(KNOWN_STACKS)}",
+        file=sys.stderr,
+    )
+    return DEFAULT_STACK
 
 
 @dataclass(frozen=True)

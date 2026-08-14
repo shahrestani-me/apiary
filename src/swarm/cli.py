@@ -68,7 +68,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .capture import LLM_LOG_NAME, Recorder as CaptureRecorder
+from .capture import enabled as capture_enabled
+from .capture import set_recorder as capture_install
 from .config import SETTINGS, ConfigError
+from .console import DEFAULT_HOST as CONSOLE_HOST
+from .console import DEFAULT_PORT as CONSOLE_PORT
 from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .doctor import preflight
@@ -206,6 +211,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="artifacts directory to read (default: $APIARY_ARTIFACTS, else .swarm/runs)",
     )
+
+    console = sub.add_parser(
+        "console",
+        help="fire one model call by hand and read the answer, in a browser",
+    )
+    console.add_argument(
+        "--port",
+        type=int,
+        default=CONSOLE_PORT,
+        help=f"port to serve on (default: {CONSOLE_PORT}); 0 picks a free one",
+    )
+    console.add_argument(
+        "--host",
+        default=CONSOLE_HOST,
+        help=(
+            f"address to bind (default: {CONSOLE_HOST}). Loopback only - the console "
+            "serves captured prompts, which are whole files from the repository under test"
+        ),
+    )
+    console.add_argument(
+        "--dir",
+        default=None,
+        help="where captures are written (default: $APIARY_CONSOLE_DIR, else .swarm/console)",
+    )
     return parser
 
 
@@ -225,6 +254,8 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
             return _runs(args)
         if args.command == "show":
             return _show(args)
+        if args.command == "console":
+            return _console(args)
         return _run(args, parser, client=client)
     except DependencyCycleError as exc:
         # Its own branch because the fix is different from every other error
@@ -293,6 +324,27 @@ def _runs(args: argparse.Namespace) -> int:
     subcommand's opinion, so it lives at this call site.
     """
     print(runs_text(tuple(reversed(list_runs(args.root)))))
+    return 0
+
+
+def _console(args: argparse.Namespace) -> int:
+    """Serve the console, with capture on whether or not the operator set it.
+
+    `APIARY_CAPTURE` is off by default because a run should not pay for capture
+    it did not ask for. The console *is* the asking: every call it fires exists
+    to be read afterwards, so it turns capture on in its own process rather
+    than making the operator discover a variable before the tool does anything
+    useful. `setdefault`, so an explicit `APIARY_CAPTURE=0` still wins.
+    """
+    from .capture import CAPTURE_ENV
+    from .console import serve
+
+    os.environ.setdefault(CAPTURE_ENV, "1")
+    serve(
+        host=args.host,
+        port=args.port,
+        directory=Path(args.dir) if args.dir else None,
+    )
     return 0
 
 
@@ -427,6 +479,14 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # makes it vary - written down rather than left blank, because "python"
     # and "nobody recorded it" are different answers to that query.
     artifacts = RunArtifacts.open(run, stack=DEFAULT_STACK, verify=verify)
+    # Capture, if the operator asked for it, lands beside the run's other
+    # artifacts rather than in the console tree - one directory per run, and
+    # `llm.jsonl` next to `events.jsonl`. Announced, because an optional
+    # behaviour that nothing prints is one nobody remembers enabling, and this
+    # one writes prompts that carry whole files from the repository under test.
+    if capture_enabled():
+        capture_install(CaptureRecorder.for_run(artifacts.path))
+        print(f"» capture: ON -> {artifacts.path / LLM_LOG_NAME}")
     # Merged, not replaced. `ContainerManager` inherits GITHUB_TOKEN and
     # OLLAMA_HOST from this process when `env` is None, and passing an `env`
     # *overrides* that - so handing it only the artifacts variables shipped

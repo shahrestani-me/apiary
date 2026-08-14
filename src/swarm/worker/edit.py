@@ -306,6 +306,23 @@ def build_prompt(
 # --------------------------------------------------------------------------
 
 
+def prompt_for(
+    goal: str,
+    writable: Sequence[SourceFile],
+    readable: Sequence[SourceFile] = (),
+) -> tuple[str, str]:
+    """The exact `(system, human)` pair `propose_edits` sends.
+
+    Extracted so that `swarm console` shows the prompt production sends rather
+    than a reconstruction of it. A console that assembles its own approximation
+    is worse than no console: it invites an operator to conclude the model is
+    fine when the fault was in the context this function built - a truncated
+    lockfile eating the budget, say, so the sibling file carrying the
+    convention never made it in.
+    """
+    return SYSTEM, build_prompt(goal, writable, readable)
+
+
 def propose_edits(
     goal: str,
     writable: Sequence[SourceFile],
@@ -320,10 +337,14 @@ def propose_edits(
     test that uses it carries the `ollama` marker.
     """
     model = structured(worker_llm(), WorkerOutput) if llm is None else llm
+    system, human = prompt_for(goal, writable, readable)
     try:
-        return model.invoke([("system", SYSTEM), ("human", build_prompt(goal, writable, readable))])
+        return model.invoke([("system", system), ("human", human)])
     except Exception as exc:  # noqa: BLE001 - local model failures are varied
-        raise EditError(f"model call failed: {exc}") from exc
+        # The type as well as the message. `str(exc)` alone turns a refused
+        # socket, a missing model and a schema the server rejected into three
+        # sentences that read the same in a result file.
+        raise EditError(f"model call failed: {type(exc).__name__}: {exc}") from exc
 
 
 # --------------------------------------------------------------------------

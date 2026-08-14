@@ -303,6 +303,9 @@ All via environment variables — see `src/swarm/config.py`.
 | `SWARM_WORKER_CTX` | 16384 | Worker context window. **Never set this to gemma4's advertised 256K** — the KV cache at that size costs more memory than the 20 GB of weights. Lower to 8192 if you're memory-constrained. |
 | `SWARM_WORKER_TIMEOUT` | 1200 | Wall clock for a whole worker container: clone, one inference call, the verify run, the commit, the push, the PR. |
 | `SWARM_VERIFY_TIMEOUT` | 300 | Wall clock for `SWARM_VERIFY` alone, **inside** the above. |
+| `APIARY_CAPTURE` | unset (off) | Record every model call: prompt, raw response, Ollama's load/total durations, and the real exception. Off by default — a worker prompt carries whole file bodies from the repo under test. |
+| `APIARY_CAPTURE_MAX_CHARS` | 8192 | Per-field truncation for run captures; the digest still covers the full text. Console captures are not truncated. |
+| `APIARY_CONSOLE_DIR` | `.swarm/console` | Where `swarm console` writes captures. |
 
 **These two are one setting with two numbers.** The verify command runs inside
 the container, so `SWARM_VERIFY_TIMEOUT` is only reachable if

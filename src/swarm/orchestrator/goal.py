@@ -261,7 +261,7 @@ def assess(
     except Exception as exc:  # noqa: BLE001 - any transport failure reads the same
         return Assessment(
             met=False,
-            reason=f"the objective could not be assessed: {exc}",
+            reason=f"the objective could not be assessed: {type(exc).__name__}: {exc}",
             consulted=True,
             unresolved=True,
         )
@@ -386,7 +386,11 @@ def close_the_loop(
     except Exception as exc:  # noqa: BLE001 - any transport failure reads the same
         # The stall's reading again: the model is unreachable, the run is not
         # wrong, and the round is not spent so a later caller may try again.
-        return GoalReport(assessment, reason=f"the planner could not be reached: {exc}", rounds=rounds)
+        return GoalReport(
+            assessment,
+            reason=f"the planner could not be reached: {type(exc).__name__}: {exc}",
+            rounds=rounds,
+        )
 
     # `write_plan`'s own normalisation, run first for `replan.replan`'s reason -
     # except that here the danger it guards against is different and smaller:
