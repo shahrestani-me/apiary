@@ -74,12 +74,22 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from pydantic import BaseModel
 
 from .config import SETTINGS, Settings
-from .containers.manager import WORKER_IMAGE, ContainerError, DockerCLI, Redactor
+from .containers.manager import (
+    DEFAULT_STACK_IMAGES,
+    STACK_LABEL,
+    WORKER_IMAGE,
+    ContainerError,
+    DockerCLI,
+    Redactor,
+    StackImages,
+    build_hint,
+)
 from .github.client import GitHubClient, GitHubError, GitHubHTTPError
 from .github.labels import SWARM_LABELS, list_label_names
 from .llm import orchestrator_llm, structured, worker_llm
@@ -103,6 +113,8 @@ __all__ = [
     "FAIL",
     "SKIP",
     "main",
+    "preflight",
+    "stack_check",
 ]
 
 
@@ -133,14 +145,32 @@ CHECK_CI = "github.ci"
 CHECK_TIMEOUTS = "config.timeouts"
 CHECK_DOCKER_CLI = "docker.cli"
 CHECK_DOCKER_DAEMON = "docker.daemon"
+#: The prefix a per-stack image check reports under: `docker.image.node`. One
+#: per stack rather than one `docker.image`, because #99 chooses the image per
+#: task - "the worker image is present" stopped being a single fact about a
+#: host the moment a plan could reference two stacks.
 CHECK_WORKER_IMAGE = "docker.image"
 
+
+def stack_check(stack: str) -> str:
+    """`docker.image.node`. A function rather than a table, because the stacks
+    a run needs come from its plan, not from a list this module holds."""
+    return f"{CHECK_WORKER_IMAGE}.{stack}"
+
+
 _MARK = {OK: "ok  ", FAIL: "FAIL", SKIP: "skip"}
-_NAME_WIDTH = max(len(name) for name in (
-    CHECK_OLLAMA_TARGET, CHECK_OLLAMA_REACHABLE, CHECK_OLLAMA_MODELS, CHECK_OLLAMA_SCHEMA,
-    CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI,
-    CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON, CHECK_WORKER_IMAGE,
-))
+#: Wide enough for the longest fixed name and for a per-stack one. Computed
+#: from the stacks that exist rather than a magic number, so adding a stack
+#: with a long id cannot silently ragged-edge the report.
+_NAME_WIDTH = max(
+    len(name)
+    for name in (
+        CHECK_OLLAMA_TARGET, CHECK_OLLAMA_REACHABLE, CHECK_OLLAMA_MODELS, CHECK_OLLAMA_SCHEMA,
+        CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI, CHECK_TIMEOUTS,
+        CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON,
+        *(stack_check(stack) for stack in DEFAULT_STACK_IMAGES),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -425,6 +455,13 @@ class Doctor:
     which: Callable[[str], str | None] = shutil.which
     in_container: bool | None = None
     image: str = WORKER_IMAGE
+    #: Which image carries which stack, and which stacks this run needs. The
+    #: second is a *plan* fact, so it is passed in rather than assumed: a
+    #: Python-only backlog must not be told to build a Node image it will
+    #: never spawn. Defaulting to every known stack is the honest answer for a
+    #: bare `swarm doctor`, which has no plan to read.
+    images: StackImages = field(default_factory=StackImages)
+    stacks: Sequence[str] = tuple(sorted(DEFAULT_STACK_IMAGES))
     ci_ref: str = DEFAULT_CI_REF
     probe_schema: bool = True
 
@@ -492,12 +529,14 @@ class Doctor:
 
         cli = self.check_docker_cli()
         daemon = self._after(cli, CHECK_DOCKER_DAEMON, self.check_docker_daemon)
-        checks += [
-            self.check_timeouts(),
-            cli,
-            daemon,
-            self._after(daemon, CHECK_WORKER_IMAGE, self.check_worker_image),
-        ]
+        checks += [self.check_timeouts(), cli, daemon]
+        # One per stack rather than one for `apiary-worker`: #99 chooses the
+        # image per task, so "the worker image is present" stopped being a
+        # single fact about a host the moment a plan could reference two.
+        for stack in self.stacks:
+            checks.append(
+                self._after(daemon, stack_check(stack), partial(self.check_stack_image, stack))
+            )
 
         return Diagnosis(tuple(checks))
 
@@ -720,8 +759,9 @@ class Doctor:
                 f"{self.repo}: {exc}",
                 fix=(
                     "the API was not reachable, not refused: check the network, and - inside "
-                    "compose - that api.github.com is on the egress allowlist "
-                    "(src/swarm/security.py, APIARY_EGRESS_ALLOW)"
+                    "compose - that api.github.com is in the egress proxy's FilterURL block "
+                    "in compose.yaml. (APIARY_EGRESS_ALLOW is documented in several places "
+                    "and read by none; the enforced list is the static one in compose.)"
                 ),
             )
         return Check.passed(
@@ -924,34 +964,71 @@ class Doctor:
             )
         return Check.passed(CHECK_DOCKER_DAEMON, f"daemon {version or 'reachable'}")
 
-    def check_worker_image(self) -> Check:
-        """Is the image #14 builds on this daemon?
+    def check_stack_image(self, stack: str) -> Check:
+        """Can this host run one stack's worker image?
 
-        There is no pull to fall back on: `security.SOCKET_PROXY_ENV` sets
-        `IMAGES=0`, so the orchestrator cannot fetch an image of its choosing -
-        which also means this very check is refused through the proxy, and is
-        reported as unanswered rather than as a missing image.
+        A missing image is not a runtime inconvenience. `SOCKET_PROXY_ENV` sets
+        `IMAGES=0` and `BUILD=0`, so the orchestrator can neither pull nor build
+        one - which means a missing image is a guaranteed all-infrastructure run,
+        discovered mid-cycle, after a real repository already exists.
+
+        Three answers, and the third is the reason this check is trustworthy at
+        all: through the socket proxy the probe is *denied*, so it reports
+        unanswered rather than reporting a missing image. Doctor is read-only
+        and its own inability to look is not evidence about the host.
+
+        **What it does not check is that the image can run the gate.** That
+        means running it, and this module writes nothing and starts nothing -
+        the property that makes its report worth reading. #102's falsification
+        already creates a container and is the honest home for that probe.
         """
+        name = stack_check(stack)
+        image = self.images.for_stack(stack)
         assert self.docker is not None
         try:
-            image_id = self.docker("image", "inspect", self.image, "--format", "{{.Id}}").strip()
+            # `{{json .Config}}` rather than `{{index .Config.Labels "..."}}`:
+            # Go templates raise on a *missing map key*, and an image built
+            # before this label existed has no `Labels` key at all - so the
+            # obvious form turns "present but unlabelled", the case this check
+            # exists to report, into a template parsing error that reads like a
+            # bug in doctor. Found by running it against a real daemon.
+            inspected = self.docker(
+                "image", "inspect", image, "--format", "{{.Id}}|{{json .Config}}"
+            ).strip()
         except ContainerError as exc:
             if any(marker in str(exc).lower() for marker in _DENIED_MARKERS):
                 return Check.skipped(
-                    CHECK_WORKER_IMAGE,
+                    name,
                     "not attempted: the socket proxy denies /images by design "
                     "(IMAGES=0, src/swarm/security.py). Run doctor on the host to check it",
                 )
             return Check.failed(
-                CHECK_WORKER_IMAGE,
-                f"{self.image} is not on this daemon: {exc}",
+                name,
+                f"{image} is not on this daemon: {exc}",
                 fix=(
-                    f"docker build -f Dockerfile.worker -t {self.image} .  (it cannot be "
-                    f"pulled: the socket proxy sets IMAGES=0, so a worker image must already "
-                    f"be built on the host)"
+                    f"{build_hint(image)}  (it cannot be pulled: the socket proxy sets "
+                    f"IMAGES=0 and BUILD=0, so a worker image must already be built on "
+                    f"the host - see SETUP.md step 4)"
                 ),
             )
-        return Check.passed(CHECK_WORKER_IMAGE, f"{self.image} present ({image_id[:19]})")
+        image_id, _, config = inspected.partition("|")
+        try:
+            labels = json.loads(config or "{}").get("Labels") or {}
+        except json.JSONDecodeError:
+            labels = {}
+        labelled = str(labels.get(STACK_LABEL) or "").strip()
+        if not labelled:
+            # Not fatal-looking but worth failing on: an image under the right
+            # tag with no stack label is indistinguishable from a stale build
+            # of a different Dockerfile that happened to be tagged this way,
+            # and the failure that produces lands inside a worker.
+            return Check.failed(
+                name,
+                f"{image} carries no {STACK_LABEL} label, so it is indistinguishable "
+                f"from a stale build of another image tagged {image}",
+                fix=f"{build_hint(image)}  (rebuild it, so the tag and the contents agree)",
+            )
+        return Check.passed(name, f"{image} present for {labelled} ({image_id[:19]})")
 
 
 # --------------------------------------------------------------------------
@@ -1012,6 +1089,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not invoke the models; skips the only check that costs inference",
     )
     return parser
+
+
+def preflight(stacks: Sequence[str], *, doctor: Doctor | None = None) -> Diagnosis:
+    """The image checks alone, for a caller about to start a run.
+
+    `swarm run` calls this rather than the whole preflight, because most of
+    what `doctor` asks is expensive, is answered elsewhere, or is a judgement a
+    human should be making before they type the command - and because a preflight
+    that refused a run over an unrelated `github.ci` verdict would be turned off
+    within a week.
+
+    A missing worker image is different in kind: `IMAGES=0` and `BUILD=0` mean
+    the orchestrator can neither pull nor build one, so the run is *guaranteed*
+    to be all-infrastructure, and it would discover that mid-cycle after a real
+    repository already exists. That is worth stopping for.
+
+    A skip is not a failure. Through the socket proxy the probe is denied, and
+    doctor's inability to look is not evidence about the host.
+    """
+    subject = doctor or Doctor.from_env(stacks=tuple(stacks))
+    daemon = subject.check_docker_daemon()
+    checks = [
+        Doctor._after(daemon, stack_check(stack), partial(subject.check_stack_image, stack))
+        for stack in subject.stacks
+    ]
+    return Diagnosis(tuple(checks))
 
 
 def main(argv: Sequence[str] | None = None, *, doctor: Doctor | None = None) -> int:

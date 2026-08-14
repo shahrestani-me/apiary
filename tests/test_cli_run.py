@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import re
 import subprocess
 import sys
@@ -35,8 +36,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import swarm.cli as cli
 from swarm.cli import main
 from swarm.config import SETTINGS
+from swarm.containers.manager import DockerCLI
+from swarm.github.ledger import KNOWN_STACKS
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import load_ledger, render_marker
 from swarm.greenfield.provision import (
@@ -72,6 +76,19 @@ def workflow_command(workflow: str) -> str:
     yaml = pytest.importorskip("yaml")
     steps = yaml.safe_load(workflow)["jobs"][CHECK_NAME]["steps"]
     return str(steps[-1]["run"]).strip()
+
+@pytest.fixture(autouse=True)
+def no_image_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub `swarm run`'s image preflight for every test in this file.
+
+    It shells out to `docker image inspect`, so leaving it live would make this
+    suite's result depend on which worker images the developer happens to have
+    built - the definition of a test that does not run. The preflight's own
+    behaviour is asserted directly in "The image preflight" below, where the
+    doctor is injected rather than the daemon consulted.
+    """
+    monkeypatch.setattr(cli, "_refuse_unrunnable_stacks", lambda stack: None)
+
 
 REPO = "shahrestani-me/apiary"
 OBJECTIVE = "add retry with exponential backoff to the http client"
@@ -861,9 +878,6 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-import swarm.cli as cli
-
-
 def _cycle(goal=None, *, live: int = 0, index: int = 0) -> SimpleNamespace:
     return SimpleNamespace(index=index, live=live, goal=goal)
 
@@ -1075,3 +1089,112 @@ def test_swarm_doctor_still_runs_with_an_inverted_pair(monkeypatch):
     monkeypatch.setattr(cli, "doctor_main", lambda argv: 1)
 
     assert main(["doctor", REPO]) == 1
+
+
+# --------------------------------------------------------------------------
+# The image preflight (#100)
+# --------------------------------------------------------------------------
+#
+# `IMAGES=0` and `BUILD=0` mean the orchestrator can neither pull nor build a
+# worker image, so a missing one is not a runtime inconvenience - it is a
+# guaranteed all-infrastructure run, discovered mid-cycle, after a real
+# repository already exists. That is worth stopping for.
+#
+# These bypass the autouse stub above by driving `_refuse_unrunnable_stacks`
+# with an injected `Doctor`, so nothing here touches a daemon either.
+
+
+def a_doctor(images: dict[str, str], **kwargs):
+    """A `Doctor` whose only live collaborator is a scripted docker runner."""
+    from swarm.doctor import Doctor
+
+    subject = Doctor(
+        repo=REPO,
+        env={},
+        which=lambda name: "/usr/local/bin/docker",
+        in_container=False,
+        probe_schema=False,
+        **kwargs,
+    )
+    assert subject.docker is not None
+    subject.docker = DockerCLI(
+        redact=subject.docker.redact, runner=ImageRunner(images=images)
+    )
+    return subject
+
+
+@dataclass
+class ImageRunner:
+    """`docker version` and `docker image inspect`, and nothing else."""
+
+    images: dict[str, str] = field(default_factory=dict)
+
+    def __call__(self, argv, *, timeout_s=None, merge=False):
+        args = list(argv)[1:]
+        if args[:1] == ["version"]:
+            return subprocess.CompletedProcess([], 0, "29.2.1\n", "")
+        if args[:2] == ["image", "inspect"]:
+            if args[2] in self.images:
+                config = json.dumps({"Labels": {"org.apiary.stack": self.images[args[2]]}})
+                return subprocess.CompletedProcess([], 0, f"sha256:abc|{config}\n", "")
+            return subprocess.CompletedProcess([], 1, "", f"No such image: {args[2]}\n")
+        raise AssertionError(f"unexpected docker call: {argv}")
+
+
+def test_a_run_starts_when_every_stack_it_needs_has_an_image():
+    from swarm.containers.manager import DEFAULT_STACK_IMAGES
+    from swarm.doctor import preflight
+
+    present = {image: stack for stack, image in DEFAULT_STACK_IMAGES.items()}
+
+    assert preflight(sorted(KNOWN_STACKS), doctor=a_doctor(present)).ok
+
+
+def test_a_run_is_refused_when_a_stack_it_needs_has_no_image(capsys):
+    """The message names the image and the build line, because the orchestrator
+    cannot fix this itself and a human has to."""
+    from swarm.doctor import preflight
+
+    diagnosis = preflight(["node"], doctor=a_doctor({}, stacks=("node",)))
+
+    assert not diagnosis.ok
+    report = diagnosis.report()
+    assert "apiary-worker-node" in report
+    assert "docker build -f Dockerfile.worker.node" in report
+    assert "IMAGES=0" in report
+
+
+def test_only_the_stack_the_flag_named_is_required():
+    """`--stack python` on a host with no Node image is a run that can proceed:
+    nothing it dispatches will ever need one."""
+    from swarm.containers.manager import WORKER_IMAGE
+    from swarm.doctor import preflight
+
+    diagnosis = preflight(["python"], doctor=a_doctor({WORKER_IMAGE: "python"}, stacks=("python",)))
+
+    assert diagnosis.ok
+
+
+def test_a_denied_probe_does_not_stop_a_run():
+    """Through the socket proxy the probe is denied by design, and doctor's
+    inability to look is not evidence about the host. Refusing here would make
+    a containerised orchestrator unstartable."""
+    from swarm.doctor import preflight
+
+    @dataclass
+    class Denying(ImageRunner):
+        def __call__(self, argv, *, timeout_s=None, merge=False):
+            args = list(argv)[1:]
+            if args[:1] == ["version"]:
+                return subprocess.CompletedProcess([], 0, "29.2.1\n", "")
+            return subprocess.CompletedProcess(
+                [], 1, "", "Error response from daemon: 403 Forbidden\n"
+            )
+
+    subject = a_doctor({}, stacks=("node",))
+    subject.docker = DockerCLI(redact=subject.docker.redact, runner=Denying())
+
+    diagnosis = preflight(["node"], doctor=subject)
+
+    assert diagnosis.ok
+    assert diagnosis.skipped
