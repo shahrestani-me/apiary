@@ -30,7 +30,18 @@ class PlannedTask(BaseModel):
     """One unit of work handed to exactly one worker."""
 
     id: str = Field(description="short kebab-case id, e.g. 'add-retry-logic'")
-    goal: str = Field(description="one sentence: what must be true when done")
+    # The whole brief, because it is the whole brief: the worker is handed this
+    # string and the file list and nothing else - not the objective, not the
+    # other tasks. "One sentence" is what this used to ask for, and one sentence
+    # is a worker guessing at the other ninety percent.
+    goal: str = Field(
+        description=(
+            "the complete specification for this task, several sentences or a "
+            "short list: what must be true when done, the names and signatures "
+            "that matter, behaviour at the edges, and what the tests must "
+            "assert. The worker sees only this and the file list."
+        )
+    )
     files: list[str] = Field(
         default_factory=list,
         description="repo-relative paths this task may modify. Must not overlap other tasks.",

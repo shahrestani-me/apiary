@@ -369,10 +369,22 @@ def test_empty_sections_are_malformed():
         assert caught.value.section == section
 
 
-def test_goal_collapses_newlines():
-    contract = parse_contract(14, contract_body(goal="One sentence,\nspread over\ntwo lines."))
+def test_goal_keeps_its_line_structure():
+    """The goal is the worker's entire brief - it sees this and the file list
+    and nothing else - so a specification written as a short list has to arrive
+    as one. This used to be joined onto a single line, which was right while the
+    planner also wrote a single line and wrong once it stopped."""
+    contract = parse_contract(14, contract_body(goal="Build the store.\n- load()\n- save()"))
 
-    assert contract.goal == "One sentence, spread over two lines."
+    assert contract.goal == "Build the store.\n- load()\n- save()"
+
+
+def test_a_goal_written_on_one_line_is_unchanged():
+    """The compatibility property: issues written before the change read the
+    same after it."""
+    contract = parse_contract(14, contract_body(goal="One sentence, on one line."))
+
+    assert contract.goal == "One sentence, on one line."
 
 
 # --------------------------------------------------------------------------

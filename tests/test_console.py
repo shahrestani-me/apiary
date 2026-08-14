@@ -22,6 +22,7 @@ from swarm import capture as capture_mod
 from swarm import cli
 from swarm.capture import Recorder
 from swarm.config import ConfigError
+from swarm.nodes.planner import system_prompt
 from swarm.console import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -159,6 +160,59 @@ def test_the_planner_tab_is_fresh_plan_mode_only(checkout):
     assert fresh != replan
     assert "REPLAN" in replan
     assert "fresh-plan" in SITES["planner"].blurb.lower()
+
+
+def test_the_planner_is_told_the_command_that_judges_its_tasks():
+    """The defect this rewrite exists for.
+
+    `$SWARM_VERIFY`'s exit code is the only authority on whether a task is done,
+    and the prompt that invents tasks never named it. Asked for a "platform",
+    the planner emitted `client/src/pages/Login.tsx` against a repository gated
+    by `python3 -m unittest discover -q` - three tasks, none able to go green.
+    The command was in `plan_node`'s hand the whole time.
+    """
+    from swarm.nodes.planner import system_prompt
+
+    prompt = system_prompt(verify="python3 -m unittest discover -q")
+
+    assert "python3 -m unittest discover -q" in prompt
+    assert "exits 0" in prompt
+
+
+def test_the_planner_is_told_the_stack_so_it_stops_inventing_one():
+    from swarm.nodes.planner import system_prompt
+
+    assert "a python project" in system_prompt(stack="python")
+    # And without one, it is told there is an existing stack rather than nothing.
+    assert "existing stack" in system_prompt()
+
+
+def test_the_planner_is_told_a_task_must_pass_the_gate_alone():
+    """The other half: file-disjointness was the only rule about shape, so the
+    model cut by layer. The first recorded run split implementation from tests,
+    and the tests half - which cannot pass without the half it was severed
+    from - burned all three attempts."""
+    prompt = system_prompt(verify="pytest -q")
+
+    assert "BY ITSELF" in prompt
+    assert "depends_on" in prompt
+
+
+def test_plan_node_passes_its_gate_and_stack_to_the_model(monkeypatch):
+    """Both were already parameters, used only to stamp the issues *after* the
+    model answered. This is the wiring that puts them in front of it instead."""
+    from swarm.nodes import planner as planner_mod
+    from swarm.state import Plan
+
+    seen = Recorder_(Plan(tasks=[], reasoning=""))
+    monkeypatch.setattr(planner_mod, "structured", lambda _llm, _schema: seen)
+    monkeypatch.setattr(planner_mod, "orchestrator_llm", lambda: None)
+
+    planner_mod.draft_plan("build a thing", verify="make check", stack="node")
+
+    system = dict(seen.seen[0])["system"]
+    assert "make check" in system
+    assert "a node project" in system
 
 
 def test_the_planner_asks_github_for_nothing(monkeypatch):

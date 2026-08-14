@@ -69,6 +69,7 @@ projecting the plan it just sent. Anything else would be a second ledger, and
 
 from __future__ import annotations
 
+import re
 import time
 
 from dataclasses import dataclass
@@ -91,17 +92,99 @@ from ..github.readiness import BLOCKED, READY, IssueState, resolve_states
 from ..llm import orchestrator_llm, structured
 from ..state import Plan, PlannedTask, SwarmState, TaskRecord
 
-SYSTEM = """You decompose a software objective into independent coding tasks.
+#: The planning prompt, minus the two facts that vary per run.
+#:
+#: What was here before was a list of five constraints and no craft: never share
+#: a file, prefer 2-4 tasks, edit only what you list, use depends_on sparingly,
+#: kebab-case the ids. Every line restricted the shape of the answer and not one
+#: said what a *good* decomposition is. Two consequences, both observed:
+#:
+#: The gate went unmentioned. `$SWARM_VERIFY`'s exit code is the only authority
+#: on whether a task is done - the repository's own invariant - and the prompt
+#: that creates tasks never said so. Asked for a trip planner "platform", the
+#: planner emitted `client/src/pages/Login.tsx` against a Python repository gated
+#: by `python3 -m unittest discover -q`: three tasks, 123 seconds, none of which
+#: could ever go green. The command was already in `plan_node`'s hand at the
+#: time, being written into each issue's `## Verify` and printed to the terminal
+#: one line above the call.
+#:
+#: And file-disjointness became the cutting principle by default, because it was
+#: the only rule about shape. That is a constraint of the worktree model, not a
+#: theory of decomposition, and following it produces layers: the first recorded
+#: run split `trip-planner-implementation` from `trip-planner-tests`, and the
+#: tests half - which cannot pass without the half it was severed from - burned
+#: all three attempts and stalled the run.
+#:
+#: So the gate leads, the slice rule is stated with the example that failed, and
+#: the constraints stay constraints.
+SYSTEM_RULES = """You decompose a software objective into independent coding tasks.
 
-HARD RULES:
+Each task becomes one GitHub issue and is given to one worker in its own
+checkout. A task is DONE when, and only when, this command exits 0:
+
+    {verify}
+
+Nothing else decides. No human reviews the code, and no model is asked whether
+it looks right.
+
+So every task must be a slice that command can see:
+- A task must leave the project passing that command BY ITSELF, without the
+  other tasks. If task B only passes once task A has landed, they are one task.
+- Prefer a thin end-to-end slice over a layer. "Store and list trips, with the
+  test that proves it" is one task. "Add the data model" and "add the tests"
+  are two halves of one, and the half holding the tests cannot pass alone.
+- If part of the objective is something that command cannot exercise, say so in
+  reasoning and plan only the part it can.
+
+Constraints:
 - Two tasks must NEVER list the same file. If they would, merge them into one task.
-- Prefer 2-4 tasks. Fewer, larger tasks beat many tiny ones.
 - Each task must be completable by editing only the files it lists.
+- Every path must be plausible for {stack}. Do not invent a stack the project
+  does not use.
 - Use depends_on only when a task literally cannot start before another finishes.
-- Each task becomes one GitHub issue, and its id is how that issue is recognised
-  again later. Ids are lowercase kebab-case and describe the work, not the order.
+- There is no target number of tasks and no maximum. Emit as many as the
+  objective has slices.
+- But a task is worked by ONE model call that writes every one of its files in
+  full, in one pass. A task spanning several subsystems does not come back
+  half-done, it comes back truncated mid-file. So: every distinct capability
+  the objective names is at least one task, and a task that would need more
+  than about three files or more than one subsystem must be split until it
+  does not. One coherent slice, its test, and nothing else.
+
+Each goal is the entire brief the worker gets. It sees the goal, the files, and
+nothing else - not this objective, not the other tasks, not your reasoning. So
+write the goal as a real specification, several sentences or a short list:
+what to build, the names and signatures that matter, the behaviour at the edges,
+and what the test must assert for {verify} to pass. A one-line goal is a worker
+guessing.
+- Ids are lowercase kebab-case and describe the work, not the order; an id is
+  how the issue is recognised again later.
 
 Return JSON only."""
+
+
+def system_prompt(*, verify: str | None = None, stack: str | None = None) -> str:
+    """The planning system prompt, grounded in this run's gate and stack.
+
+    Both arguments are things `plan_node` has already been given and used to
+    pass straight through to the writer. Putting them in front of the model
+    costs nothing and is the difference between a plan whose tasks can pass and
+    one whose tasks cannot.
+    """
+    # The same collapse `_one_line` does, inlined: that helper is defined far
+    # below, and `SYSTEM` is built at import time.
+    command = " ".join((verify or SETTINGS.verify_command or "").split())
+    return SYSTEM_RULES.format(
+        verify=command,
+        stack=f"a {stack} project" if stack else "the project's existing stack",
+    )
+
+
+#: The ungrounded default, for the two callers that have no run to ground it in.
+#: `orchestrator/goal.py` and `orchestrator/replan.py` import this to build their
+#: follow-up and replan prompts, and neither is handed a verify command; the
+#: configured default is a better answer than silence about the gate.
+SYSTEM = system_prompt()
 
 REPLAN_SUFFIX = """
 
@@ -441,6 +524,46 @@ def _stack_of(value: str | None) -> str | None:
     return stack if stack in KNOWN_STACKS else None
 
 
+#: A goal line that would be read as document structure rather than prose.
+#: `_split_sections` ends a section at any ATX heading and `_scan` treats a
+#: fence as opaque, so a goal containing `## Files` or a code fence would
+#: truncate the contract or swallow every section after it. That is issue #11's
+#: trap, reached from inside the Goal section instead of from a code span.
+_GOAL_ATX_RE = re.compile(r"^#{1,6}(?=[ \t]|$)")
+_GOAL_FENCE_RE = re.compile(r"^(?:`{3,}|~{3,})")
+_GOAL_BREAK_RE = re.compile(r"^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$")
+
+
+def _goal_text(text: str) -> str:
+    """A multi-line goal, normalised to exactly what the parser reads back.
+
+    Goals used to be collapsed to one line, which was the cheap way to make the
+    `## Goal` section unable to open a `## Files` section inside itself. It also
+    capped the worker's entire brief at one sentence: the worker is handed the
+    goal and the file list and nothing else - not the objective, not the sibling
+    tasks - so the collapse was throwing away the only place detail could live.
+
+    The round trip has to be exact. `Draft.matches` compares the goal it would
+    write against the one parsed off the live issue, so a write/read pair
+    disagreeing by a single newline would rewrite every issue on every cycle.
+    This produces precisely what `_parse_goal` returns: non-empty lines,
+    stripped, defused, joined with newlines.
+    """
+    kept: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = _GOAL_ATX_RE.sub("", line).strip()
+        line = _GOAL_FENCE_RE.sub("", line).strip()
+        if not line or _GOAL_BREAK_RE.match(line):
+            continue
+        # Runs of space inside a line are decoration, exactly as they were when
+        # goals were one line. Only the line breaks are content now.
+        kept.append(" ".join(line.split()))
+    return "\n".join(kept)
+
+
 def _one_line(text: str) -> str:
     """Collapse to a single line. Both a tidy-up and a guard.
 
@@ -502,7 +625,7 @@ def normalise(
 
     for task in tasks:
         task_id = slugify(task.id or "") or slugify(task.goal or "")
-        goal = _one_line(task.goal)
+        goal = _goal_text(task.goal)
         files = tuple(dict.fromkeys(path for path in map(_path, task.files) if path))
         # In the order a reader would check them, so the reason names the first
         # thing wrong rather than the last.
@@ -895,16 +1018,20 @@ def _read_back(client: GitHubClient, report: PlanReport, *, sleep=time.sleep) ->
 def prompt_for(
     objective: str,
     existing: Mapping[str, TaskRecord] | None = None,
+    *,
+    verify: str | None = None,
+    stack: str | None = None,
 ) -> tuple[str, str]:
     """The exact `(system, human)` pair the planner sends.
 
-    Note that the *system* half varies with ledger state - a replan carries the
-    failure history and the existing ids - so there is no single "the planner
-    prompt" to show. `swarm console` therefore exposes fresh-plan mode only,
-    and says so, rather than showing a replan prompt that would be right for
-    one round and wrong for every other.
+    Note that the *system* half varies - with ledger state, because a replan
+    carries the failure history and the existing ids, and now with the run's
+    gate and stack. So there is no single "the planner prompt" to show.
+    `swarm console` exposes fresh-plan mode only, and says so, rather than
+    showing a replan prompt that would be right for one round and wrong for
+    every other.
     """
-    system = _replan_prompt(existing) if existing else SYSTEM
+    system = _replan_prompt(existing) if existing else system_prompt(verify=verify, stack=stack)
     return system, f"Objective:\n{objective}"
 
 
@@ -912,6 +1039,8 @@ def draft_plan(
     objective: str,
     *,
     existing: Mapping[str, TaskRecord] | None = None,
+    verify: str | None = None,
+    stack: str | None = None,
     llm=None,
 ) -> Plan:
     """One planning call, and nothing else - no ledger, no issues, no writes.
@@ -924,7 +1053,7 @@ def draft_plan(
     `llm` is the seam the other five call sites already have and this one did
     not, which is why every test of it has to monkeypatch two module globals.
     """
-    system, human = prompt_for(objective, existing)
+    system, human = prompt_for(objective, existing, verify=verify, stack=stack)
     model = structured(orchestrator_llm(), Plan) if llm is None else llm
     return model.invoke([("system", system), ("human", human)])
 
@@ -956,7 +1085,11 @@ def plan_node(
     objective = state["objective"]
     existing = state.get("tasks") or {}
 
-    plan: Plan = draft_plan(objective, existing=existing)
+    # `verify` and `stack` were already parameters of this function, used only
+    # to stamp the issues after the model had answered. The model is now told
+    # them first, which is what makes a task's gate knowable while it is still
+    # being invented rather than after.
+    plan: Plan = draft_plan(objective, existing=existing, verify=verify, stack=stack)
 
     target = _source(state, source)
     if target is None:

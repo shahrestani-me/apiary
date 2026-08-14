@@ -175,13 +175,16 @@ def _edits_run(payload: Mapping[str, str]) -> Any:
 def _plan_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
     from .nodes.planner import prompt_for
 
-    return prompt_for(payload.get("objective", ""))
+    # The configured gate, which is what a run with no `--verify` would use.
+    # Without it the console would show a prompt naming a different command
+    # from the one production names, which is the one thing this must not do.
+    return prompt_for(payload.get("objective", ""), verify=SETTINGS.verify_command)
 
 
 def _plan_run(payload: Mapping[str, str]) -> Any:
     from .nodes.planner import draft_plan
 
-    plan = draft_plan(payload.get("objective", ""))
+    plan = draft_plan(payload.get("objective", ""), verify=SETTINGS.verify_command)
     return {
         "reasoning": plan.reasoning,
         "tasks": [
