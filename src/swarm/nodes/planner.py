@@ -996,7 +996,7 @@ def _update(
         # this work done, and a failed task it cannot revive re-stalls the run
         # until a human relabels it by hand. See the module docstring for why
         # the signature budget makes this safe and what is deliberately kept.
-        return _revive(
+        return revive(
             client, entry, max_attempts=max_attempts, max_total_attempts=max_total_attempts
         )
     if entry.state_label not in WRITABLE:
@@ -1021,14 +1021,15 @@ def _update(
     return IssueAction("updated", draft.task_id, entry.number)
 
 
-def _revive(
+def revive(
     client: GitHubClient,
     entry: LedgerEntry,
     *,
     max_attempts: int,
     max_total_attempts: int,
+    because: str = "the replan retained this task",
 ) -> IssueAction:
-    """Return a kept `swarm:failed` task to `swarm:ready`, resetting nothing.
+    """Return a `swarm:failed` task to `swarm:ready`, resetting nothing.
 
     This is the orchestrator doing exactly what the human used to do - relabel
     the failed issue so the chain behind it can move - except it does *not*
@@ -1039,11 +1040,22 @@ def _revive(
     proven the old blocker gone and legitimately renews (§5's signature rule).
     That asymmetry is precisely why reviving is safe now and was not before.
 
+    Two callers, one rule. `_update` revives a failed task a replan *kept*, and
+    `goal._revive_abandoned` revives one the goal gate found blocking an unmet
+    objective - the second caller is why this is public and why `because`
+    exists: the comment's first sentence must say which decision put the task
+    back, and everything after it is the shared arithmetic that must not fork.
+    Neither caller can revive the same issue twice without a failure in
+    between: a revived issue is `swarm:ready`, not `swarm:failed`, so it is
+    invisible to both branches until a fresh give-up - which burned at least
+    one more attempt - puts it back. The hard total cap therefore bounds the
+    revive-fail-revive cycle without any counter of its own.
+
     The one refusal: a task whose hard total budget is spent stays failed. The
     give-up comment on the issue already says so and names the remedy, and a
     revival there would grant nothing - the very next observation would fail it
     again on the same arithmetic. Retained-and-reported costs no write, so a
-    replan that keeps refusing does not spam the issue either.
+    caller that keeps refusing does not spam the issue either.
 
     Label order is add-before-remove, `readiness._relabel`'s rule: a crash
     between the two calls leaves two state labels, which §3's precedence
@@ -1073,7 +1085,7 @@ def _revive(
     client.remove_label(entry.number, FAILED)
 
     comment = (
-        f"apiary: the replan retained this task, so it is returned to `{READY}`. "
+        f"apiary: {because}, so it is returned to `{READY}`. "
         f"The retry budget stands as it was - {budget} - so a retry that fails "
         "the same way as the last attempt gives up immediately, and one that "
         "fails differently renews its own budget."

@@ -1652,3 +1652,45 @@ def test_a_gate_that_extended_flushes_the_cache_so_the_next_read_sees_its_issues
     reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(cycles=5)
 
     assert flushed == [1], "flushed exactly once: after the extension, not after met"
+
+
+def test_a_gate_that_revived_keeps_the_loop_running_and_flushes_the_cache(monkeypatch):
+    """The revival's two loop-level obligations, asserted where they live.
+
+    A gate revival is actionable progress, not an exhausted run: `GoalReport.
+    done` is False, so `CycleReport.finished` is False and the loop carries on
+    to dispatch the revived issue. And the revival is a label write through
+    this client, so the conditional cache must be flushed for exactly the
+    extension's reason - a 304 from the pre-revival body would read the issue
+    as failed again and post a duplicate revival comment onto it."""
+    from types import SimpleNamespace
+
+    calls: list = []
+
+    def spy(client, ledger, objective, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return SimpleNamespace(
+                done=False,
+                extended=False,
+                revived=(SimpleNamespace(number=4),),
+                rounds=0,
+                summary=lambda: "revived 1 failed task(s) with budget remaining: #4",
+            )
+        return SimpleNamespace(
+            done=True, extended=False, revived=(), rounds=0, summary=lambda: "objective met"
+        )
+
+    monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
+
+    flushed: list[int] = []
+    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client.invalidate_cache = lambda: flushed.append(1)
+
+    reports = reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(
+        cycles=5
+    )
+
+    assert [report.finished for report in reports] == [False, True]
+    assert len(reports) == 2, "the loop stopped on the cycle that revived"
+    assert flushed == [1], "flushed exactly once: after the revival, not after met"
