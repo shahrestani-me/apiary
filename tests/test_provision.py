@@ -421,15 +421,26 @@ def test_an_awkward_verify_command_still_yields_valid_yaml(command):
     assert steps[-1]["run"].strip() == command
 
 
-def test_python_generates_no_setup_step():
-    """`ubuntu-latest` ships a Python, which is why there was never a setup
-    step and why the command has to be spelled `python3`. The steps list is
-    what it was before this ticket."""
+def test_python_sets_up_the_gates_tool_before_the_gate():
+    """`ubuntu-latest` ships a Python but not pytest, and this test's
+    predecessor pinned exactly that assumption: "there was never a setup
+    step". The first greenfield python run disproved it in production - the
+    worker passed `python -m pytest -q` in a container that ships pytest, and
+    the identical command failed on every PR's runner with "No module named
+    pytest". The workflow ships the gate, so it ships the gate's tool, and it
+    ships it *before* the verify step runs."""
     yaml = pytest.importorskip("yaml")
 
     steps = yaml.safe_load(plan_for().files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
 
-    assert [step.get("uses") for step in steps] == ["actions/checkout@v4", None]
+    assert steps[0].get("uses") == "actions/checkout@v4"
+    setup = [step.get("uses", "") or step.get("run", "") for step in steps[1:-1]]
+    assert any(u.startswith("actions/setup-python") for u in setup)
+    assert any("pip install" in u and "pytest" in u for u in setup)
+    # The gate itself stays last; its command is the plan's own (a placeholder
+    # on a fresh scaffold), which `test_the_workflow_runs_the_verify_command`
+    # already pins - this test is only about the setup steps before it.
+    assert "run" in steps[-1]
 
 
 def test_node_sets_up_a_pinned_toolchain():

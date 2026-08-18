@@ -421,8 +421,20 @@ def _parse_marker(number: int, scanned: Sequence[tuple[str, bool]]) -> tuple[str
 
 
 def _parse_goal(number: int, lines: Sequence[tuple[str, bool]]) -> str:
-    goal = " ".join(line.strip() for line, _ in lines if line.strip())
-    goal = re.sub(r"\s+", " ", goal).strip()
+    """The goal as written, line structure preserved.
+
+    This used to join every line with a space and collapse runs of whitespace,
+    which made a goal exactly one line however it was written. That was fine
+    while the planner also wrote one line, and wrong once the goal became the
+    worker's whole brief: a specification reads as a paragraph or a short list,
+    and flattening it to a single line is the difference between instructions
+    and a run-on sentence.
+
+    A body written before this change parses identically - one line joins to
+    itself - so an existing issue reads the same either way.
+    """
+    kept = [line.strip() for line, _ in lines if line.strip()]
+    goal = "\n".join(kept)
     if not goal:
         raise ContractError(number, "Goal", "section is empty")
     return goal

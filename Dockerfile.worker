@@ -44,6 +44,13 @@ COPY src ./src
 # graph, but `apiary` declares one flat dependency list and splitting it into
 # extras is a pyproject change, not a Dockerfile one.
 RUN pip install .
+# The default verify gate is `python -m pytest -q` (SWARM_VERIFY's fallback),
+# and this image ships the gate, so it ships the gate's tool. Without it a
+# greenfield repository - which has no pyproject of its own to install pytest
+# from - fails every attempt with "No module named pytest" and burns the whole
+# retry budget on infrastructure. Found by exactly that: issues #1-#5 of the
+# first greenfield run, three attempts each, all on this one missing package.
+RUN pip install pytest
 
 
 FROM python:3.12-slim AS runtime

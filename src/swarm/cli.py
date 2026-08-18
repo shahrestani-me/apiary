@@ -68,7 +68,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .capture import LLM_LOG_NAME, Recorder as CaptureRecorder
+from .capture import enabled as capture_enabled
+from .capture import set_recorder as capture_install
 from .config import SETTINGS, ConfigError
+from .console import DEFAULT_HOST as CONSOLE_HOST
+from .console import DEFAULT_PORT as CONSOLE_PORT
 from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .doctor import preflight
@@ -206,6 +211,56 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="artifacts directory to read (default: $APIARY_ARTIFACTS, else .swarm/runs)",
     )
+
+    local = sub.add_parser(
+        "local",
+        help="run the v1 graph against a local checkout: worktrees + host Ollama, no GitHub",
+    )
+    local.add_argument(
+        "--repo",
+        required=True,
+        help="path to a local git repository (created and initialised if missing)",
+    )
+    local.add_argument(
+        "--objective",
+        required=True,
+        help="what the swarm should accomplish; @path reads it from a file",
+    )
+    local.add_argument(
+        "--verify",
+        default=None,
+        help=f"the gate every task must pass (default: {SETTINGS.verify_command!r})",
+    )
+    local.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help=f"dispatch rounds before giving up (default: {SETTINGS.max_rounds})",
+    )
+
+    console = sub.add_parser(
+        "console",
+        help="fire one model call by hand and read the answer, in a browser",
+    )
+    console.add_argument(
+        "--port",
+        type=int,
+        default=CONSOLE_PORT,
+        help=f"port to serve on (default: {CONSOLE_PORT}); 0 picks a free one",
+    )
+    console.add_argument(
+        "--host",
+        default=CONSOLE_HOST,
+        help=(
+            f"address to bind (default: {CONSOLE_HOST}). Loopback only - the console "
+            "serves captured prompts, which are whole files from the repository under test"
+        ),
+    )
+    console.add_argument(
+        "--dir",
+        default=None,
+        help="where captures are written (default: $APIARY_CONSOLE_DIR, else .swarm/console)",
+    )
     return parser
 
 
@@ -225,6 +280,10 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
             return _runs(args)
         if args.command == "show":
             return _show(args)
+        if args.command == "console":
+            return _console(args)
+        if args.command == "local":
+            return _local(args, parser)
         return _run(args, parser, client=client)
     except DependencyCycleError as exc:
         # Its own branch because the fix is different from every other error
@@ -296,10 +355,107 @@ def _runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _console(args: argparse.Namespace) -> int:
+    """Serve the console, with capture on whether or not the operator set it.
+
+    `APIARY_CAPTURE` is off by default because a run should not pay for capture
+    it did not ask for. The console *is* the asking: every call it fires exists
+    to be read afterwards, so it turns capture on in its own process rather
+    than making the operator discover a variable before the tool does anything
+    useful. `setdefault`, so an explicit `APIARY_CAPTURE=0` still wins.
+    """
+    from .capture import CAPTURE_ENV
+    from .console import serve
+
+    os.environ.setdefault(CAPTURE_ENV, "1")
+    serve(
+        host=args.host,
+        port=args.port,
+        directory=Path(args.dir) if args.dir else None,
+    )
+    return 0
+
+
 def _show(args: argparse.Namespace) -> int:
     """One run. An id with no directory raises `ArtifactsError` naming it."""
     print(show_text(load_run(args.run_id, args.root)))
     return 0
+
+
+def ensure_local_repo(path: Path) -> Path:
+    """The local run's target, created if missing - the same promise the
+    console's repo field makes for GitHub, kept for a directory.
+
+    `ensure_repo` (worktree.py) refuses a directory with no `.git`, and the
+    graph's `base_branch` needs a commit to name, so a fresh directory gets
+    both: `git init -b main` and one commit holding a README. The identity is
+    passed per-command rather than written into the repo's config, because a
+    demo repo should not end up impersonating whatever this shell's git
+    identity is."""
+    import subprocess
+
+    repo = path.expanduser().resolve()
+    if (repo / ".git").exists():
+        return repo
+    repo.mkdir(parents=True, exist_ok=True)
+    identity = ["-c", "user.name=swarm", "-c", "user.email=swarm@localhost"]
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    readme = repo / "README.md"
+    if not readme.exists():
+        readme.write_text(f"# {repo.name}\n\nCreated by `swarm local`.\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", *identity, "commit", "-q", "-m", "init: swarm local target"],
+                   cwd=repo, check=True)
+    return repo
+
+
+def _local(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """The v1 graph, end to end, with nothing but this machine.
+
+    Worktree isolation, host model calls, the verify command's exit code as
+    the only judge of done, and ordinary merges back to the base branch. No
+    ledger: local runs exist for days when GitHub is down or a network is not
+    wanted, so their only record is the repository itself.
+
+    `Settings` is frozen and instantiated at import, so the two flags that
+    must reach the graph's nodes are written onto the singleton with
+    `object.__setattr__` - one documented mutation at the one entrypoint that
+    owns the run, not a pattern. The alternative (reloading `config` and every
+    module that imported from it) breaks whichever module reloaded first.
+    """
+    objective = _text(args.objective, "--objective", parser)
+    repo = ensure_local_repo(Path(args.repo))
+    object.__setattr__(SETTINGS, "repo_path", str(repo))
+    if args.verify:
+        object.__setattr__(SETTINGS, "verify_command", args.verify)
+    if args.max_rounds:
+        object.__setattr__(SETTINGS, "max_rounds", args.max_rounds)
+
+    from .graph import build_graph
+
+    print(f"» local run  repo {repo}  verify: {SETTINGS.verify_command}")
+    print("» no GitHub: worktrees instead of issues, merges instead of pull requests")
+    graph = build_graph()
+    seen = 0
+    final: dict = {}
+    try:
+        for state in graph.stream({"objective": objective},
+                                  config={"recursion_limit": 300},
+                                  stream_mode="values"):
+            for line in state.get("events", [])[seen:]:
+                print(f"  · {line}", flush=True)
+            seen = len(state.get("events", []))
+            final = state
+    except KeyboardInterrupt:
+        print("\n! interrupted; worktrees are left for inspection", file=sys.stderr)
+        return 130
+
+    tasks = final.get("tasks", {})
+    verified = sum(1 for t in tasks.values() if t.get("status") == "verified")
+    for task_id, task in sorted(tasks.items()):
+        print(f"  {task.get('status', '?'):10} attempts={task.get('attempts', 0)}  {task_id}")
+    print(f"» {verified}/{len(tasks)} task(s) verified and merged into the base branch")
+    return 0 if tasks and verified == len(tasks) else 1
 
 
 def _run(
@@ -427,6 +583,14 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # makes it vary - written down rather than left blank, because "python"
     # and "nobody recorded it" are different answers to that query.
     artifacts = RunArtifacts.open(run, stack=DEFAULT_STACK, verify=verify)
+    # Capture, if the operator asked for it, lands beside the run's other
+    # artifacts rather than in the console tree - one directory per run, and
+    # `llm.jsonl` next to `events.jsonl`. Announced, because an optional
+    # behaviour that nothing prints is one nobody remembers enabling, and this
+    # one writes prompts that carry whole files from the repository under test.
+    if capture_enabled():
+        capture_install(CaptureRecorder.for_run(artifacts.path))
+        print(f"» capture: ON -> {artifacts.path / LLM_LOG_NAME}")
     # Merged, not replaced. `ContainerManager` inherits GITHUB_TOKEN and
     # OLLAMA_HOST from this process when `env` is None, and passing an `env`
     # *overrides* that - so handing it only the artifacts variables shipped

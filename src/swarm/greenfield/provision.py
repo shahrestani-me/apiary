@@ -689,7 +689,20 @@ def _explain(exc: GitHubHTTPError) -> str:
 #: repository exists - not here, where the only thing left to do about it is
 #: write a broken workflow.
 CI_SETUP: dict[str, tuple[str, ...]] = {
-    "python": (),
+    # Not empty, and the reason is the run that proved it: the default verify
+    # gate is `python -m pytest -q`, and a GitHub runner's bare python has no
+    # pytest - so every PR of the first greenfield python run failed CI with
+    # "No module named pytest" after its worker had passed the identical gate
+    # in a container that ships it (Dockerfile.worker installs the same tool
+    # for the same reason). The workflow ships the gate, so it ships the
+    # gate's tool.
+    "python": (
+        "- uses: actions/setup-python@v5",
+        "  with:",
+        "    python-version: '3.12'",
+        "- name: the gate's tool",
+        "  run: python -m pip install --quiet pytest",
+    ),
     "node": (
         "- uses: actions/setup-node@v4",
         "  with:",

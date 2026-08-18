@@ -30,10 +30,30 @@ class PlannedTask(BaseModel):
     """One unit of work handed to exactly one worker."""
 
     id: str = Field(description="short kebab-case id, e.g. 'add-retry-logic'")
-    goal: str = Field(description="one sentence: what must be true when done")
+    # The whole brief, because it is the whole brief: the worker is handed this
+    # string and the file list and nothing else - not the objective, not the
+    # other tasks. "One sentence" is what this used to ask for, and one sentence
+    # is a worker guessing at the other ninety percent.
+    goal: str = Field(
+        description=(
+            "the complete specification for this task, several sentences or a "
+            "short list: what must be true when done, the names and signatures "
+            "that matter, behaviour at the edges, and what the tests must "
+            "assert. The worker sees only this and the file list."
+        )
+    )
+    # Required, with no default. `normalise` rejects a task that lists no files
+    # - a worker may only write what its task declares, so a task with none can
+    # do nothing - and a default made that rejection silent: the model, asked
+    # for detailed goals, spent its answer on prose and simply stopped emitting
+    # this field. Nine of ten tasks in one observed plan had no files, and the
+    # plan reached the reconciler as a single task with no error anywhere.
+    # Without a default the schema-constrained decoder cannot leave it out.
     files: list[str] = Field(
-        default_factory=list,
-        description="repo-relative paths this task may modify. Must not overlap other tasks.",
+        description=(
+            "repo-relative paths this task creates or modifies, at least one. "
+            "Must not overlap any other task's files."
+        ),
     )
     depends_on: list[str] = Field(
         default_factory=list, description="ids of tasks that must finish first"

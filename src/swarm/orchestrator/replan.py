@@ -319,7 +319,7 @@ def replan(
         # again rather than starting the budget over.
         return ReplanReport(
             repo=repo,
-            reason=f"the planner could not be reached: {exc}",
+            reason=f"the planner could not be reached: {type(exc).__name__}: {exc}",
             stalls=verdict.stalls,
             replans=replans,
             blockers=verdict.blockers,

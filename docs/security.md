@@ -368,8 +368,12 @@ from pathlib import Path
 from swarm.security import scan_artifacts
 import os
 
-leaks = scan_artifacts(Path(".swarm/runs"), env=os.environ)
+leaks = scan_artifacts(Path(".swarm"), env=os.environ)
 ```
+
+Point it at `.swarm/` rather than `.swarm/runs/`: capture (below) writes into
+`.swarm/console/` too, and a scanner aimed at the one directory that predates it
+would keep returning an empty list while the new one filled up.
 
 An empty list is the answer you want. Each `Leak` carries a path, a line number
 and the *kind* of match — never the matched text, because a leak report that
@@ -383,6 +387,59 @@ through the real capture path, writes what was captured to a run directory, and
 asserts the scan finds nothing — with a control that writes the raw token to the
 same directory and asserts the scan *does* find it, because a scanner that finds
 nothing because it looks at nothing passes the first test perfectly.
+
+---
+
+## 5a. Capture, and the console that reads it
+
+`APIARY_CAPTURE=1` records every model call: the rendered prompt, the raw
+response, Ollama's own `load_duration` / `total_duration`, and the real
+exception when one ends the call. `swarm console` serves a page for firing one
+call by hand and reading the result.
+
+**What a capture contains.** A worker prompt is built by `read_writable` and
+`gather_context`, so it holds *whole file bodies* from the repository under
+test — up to `MAX_FILE_CHARS` per writable file plus `CONTEXT_BUDGET_CHARS` of
+read-only context. `read_writable`'s docstring is explicit that the skip-list is
+not consulted, so a path named in an issue's `## Files` is read whatever it is,
+including a `.env`. `gather_context` skips dotfiles but reads `.json`, `.yaml`,
+`.ini`, `.cfg` and `.toml` from the checkout root, which is exactly where an
+`application.yml` password or an `appsettings.json` connection string lives.
+
+**What redaction does and does not catch.** Every capture write goes through the
+same `_redacted` / `_default_redactor` path as `events.jsonl` and `summary.json`
+— redaction here is per *writer*, not per directory, so this is a property of
+routing through `artifacts.write_json` rather than of the directory the file
+lands in. That redactor knows two things: literals enrolled from **this
+process's** environment by `SECRET_NAME_RE`, and three shapes — `gh[pousr]_`,
+`github_pat_`, and `://user:pass@`.
+
+It therefore does **not** catch a third party's credential that arrived in a
+prompt from the target repository: an AWS `AKIA…`, an OpenAI `sk-…`, a Stripe
+key, a PEM block, a JWT. `find_secrets` shares those patterns, so the audit does
+not catch them either — there is no second opinion. **Capture is justified by
+locality and retention, not by redaction:** the files are local, `.swarm/` is
+gitignored, run captures are truncated by default, and nothing publishes them.
+Do not treat a capture file as safe to paste into an issue.
+
+**The console's own surface.** It binds `127.0.0.1` and refuses anything else,
+because `EGRESS_ALLOWLIST` matches `host.docker.internal` by host with no port
+term — a worker container can reach *any* port on the host gateway through the
+sanctioned proxy, so a wildcard bind would put every captured prompt one request
+away from the process that runs model-written code. It checks the `Host` header
+(`BaseHTTPRequestHandler` validates none), which is what stops a page the
+operator happens to be browsing from firing calls here and a DNS rebind from
+reading the answers. Model output reaches the DOM only through `textContent`:
+the model's input is an arbitrary repository, so its output is hostile by
+construction.
+
+**Not captured: anything inside a worker container.** `propose_edits` runs in
+the container, whose only host-writable channel is the `results/` mount, and
+that writer bypasses redaction (see §6). `APIARY_CAPTURE` is deliberately not on
+`INHERITED_ENV`, so a host-side flag cannot switch capture on inside a
+container. The console's `propose_edits` runs on the *host* instead, which is
+close enough to be useful and different enough to be labelled as such on the
+page.
 
 ---
 
