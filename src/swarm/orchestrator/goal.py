@@ -33,7 +33,16 @@ way that asking makes the run worse:
   spent, or CI failed somewhere the worker may not edit, or nothing ever gated
   the pull request. Planning *more* work on top of that is stacking tasks onto a
   repository whose last known state is broken, and the follow-up would inherit
-  the failure. The run stops and names the issue, which is what `checks.py`
+  the failure. So no model is asked - but the gate no longer simply resigns.
+  A failed task whose issue is still open and whose hard total budget
+  (`SWARM_MAX_TOTAL_ATTEMPTS`) is not spent is **revived** instead, through the
+  same `planner.revive` the replan uses: back to `swarm:ready`, marker
+  untouched, so the failure-signature arithmetic guards the retry. Observed
+  live before this: a run merged everything else, arrived at the gate with one
+  failed task sitting at attempt 5 of a 9 hard cap, and exited failed asking a
+  human to do the one relabel the orchestrator knew was safe. Only when every
+  failed task is closed (GitHub wins - a human or the planner shut it) or
+  budget-spent does the run stop and name the issues, which is what `checks.py`
   already decided a `swarm:failed` label means.
 - **Work still in flight.** Called before the ledger is quiet, the assessment
   would judge an objective against a half-landed run. `Reconciler.loop` only
@@ -70,6 +79,7 @@ from typing import Any, Callable, Protocol, Sequence
 
 from ..config import SETTINGS
 from ..github.ledger import Ledger, LedgerEntry
+from ..github.readiness import resolve_states
 from ..llm import orchestrator_llm, structured
 from ..nodes.planner import (
     FOLLOWUP_SUFFIX,
@@ -78,6 +88,7 @@ from ..nodes.planner import (
     PlanError,
     PlanReport,
     normalise,
+    revive,
     write_plan,
 )
 from ..run import TERMINAL_LABELS
@@ -316,6 +327,14 @@ class GoalReport:
     plan: PlanReport | None = None
     reason: str = ""
     rounds: int = 0
+    #: Failed tasks this gate returned to `swarm:ready` because their issue was
+    #: open and their hard total budget was not spent. Non-empty means the run
+    #: carries on - the revived work dispatches next cycle - which is why
+    #: `done` reads it. Not counted against `rounds`: a revival plans nothing,
+    #: and its bound is the attempt budget itself (`planner.revive`'s docstring
+    #: - a revived issue is ready, not failed, so the gate cannot see it again
+    #: without a fresh give-up in between, and every give-up burned attempts).
+    revived: tuple[IssueAction, ...] = ()
 
     @property
     def met(self) -> bool:
@@ -323,14 +342,18 @@ class GoalReport:
 
     @property
     def done(self) -> bool:
-        """May the loop stop? Everything except a round that just added work."""
-        return not self.extended
+        """May the loop stop? Not after a round that added work, and not after
+        a revival - both put dispatchable issues on the tracker, and stopping
+        would strand them exactly as the pre-gate loop stranded follow-ups."""
+        return not self.extended and not self.revived
 
     @property
     def created(self) -> tuple[IssueAction, ...]:
         return () if self.plan is None else self.plan.created
 
     def summary(self) -> str:
+        if self.revived:
+            return f"objective not met; {self.reason}; the run continues"
         if self.extended:
             names = ", ".join(f"#{action.number}" for action in self.created)
             return (
@@ -344,6 +367,50 @@ class GoalReport:
         return f"stopping without meeting the objective: {self.reason}.{detail}"
 
 
+def _revive_abandoned(
+    client: Any,
+    ledger: Ledger,
+    assessment: Assessment,
+    *,
+    max_attempts: int,
+    max_total_attempts: int,
+) -> tuple[IssueAction, ...]:
+    """Revive every abandoned task the orchestrator may safely retry. See
+    `close_the_loop` for the rule; this is only its per-issue application.
+
+    The open/closed read is one issue listing (`resolve_states`), and it is the
+    load-bearing check: a closed failed issue was shut by a human or retired by
+    the planner, and relabelling it would be the orchestrator arguing with the
+    one input it never argues with. Missing and unreadable issues are treated
+    as closed for the same reason - writing to an issue this cycle could not
+    see is a guess, and `readiness._met` already established that unknown reads
+    as the cautious answer. The budget check is *not* repeated here:
+    `planner.revive` owns it and answers a spent task with a `retained` action
+    and no writes, which this function simply does not count as a revival.
+    """
+    wanted = set(assessment.abandoned)
+    entries = [entry for entry in abandoned(ledger) if entry.number in wanted]
+    states = resolve_states(client, [entry.number for entry in entries])
+    actions: list[IssueAction] = []
+    for entry in entries:
+        state = states.get(entry.number)
+        if state is None or not state.exists or state.closed:
+            continue
+        action = revive(
+            client,
+            entry,
+            max_attempts=max_attempts,
+            max_total_attempts=max_total_attempts,
+            because=(
+                "the goal gate found the objective unmet and this task still has "
+                "retry budget"
+            ),
+        )
+        if action.kind == "revived":
+            actions.append(action)
+    return tuple(actions)
+
+
 def close_the_loop(
     client: Any,
     ledger: Ledger,
@@ -355,8 +422,10 @@ def close_the_loop(
     oracle: Oracle | None = None,
     proposer: Proposer | None = None,
     writer: Callable[..., PlanReport] = write_plan,
+    max_attempts: int = SETTINGS.max_attempts_per_task,
+    max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
 ) -> GoalReport:
-    """Assess, and extend the plan if the objective is not met yet.
+    """Assess, then revive what is revivable, then extend if a gap remains.
 
     `ledger` is the read the caller already made this cycle, for
     `replan.replan`'s reason: re-listing the issues here would double the
@@ -368,17 +437,43 @@ def close_the_loop(
     called with `retire_dropped=False`, which is the single most important line
     in this module. A follow-up round must add issues and touch nothing else.
 
-    One caveat to "nothing else", documented because the write path is shared
-    rather than because this module wants it: `write_plan` revives a
-    `swarm:failed` task a plan *keeps* (planner module docstring). This gate
-    cannot reach that branch in practice - `assess` refuses to act while any
-    task is failed, so an actionable assessment has no failed task to keep -
-    but if a follow-up plan ever re-emitted a failed task's id, it would be
-    revived with its budget intact, exactly as a replan's would.
+    **The gate is the second caller of `planner.revive`** (the replan's write
+    path is the first). An unmet assessment whose blockers are `swarm:failed`
+    tasks used to end the run asking a human, even when the marker said budget
+    remained - a run was observed to merge everything else and quit over one
+    task at attempt 5 of a 9 hard cap. Now each failed, still-open issue with
+    total budget remaining is returned to `swarm:ready` (marker untouched; the
+    signature arithmetic guards the retry) and the run continues; closed
+    issues are never touched - GitHub wins - and only when every failed task
+    is closed or budget-spent does the gate keep its old answer: unmet, a
+    human's call, the run ends failed. `max_attempts`/`max_total_attempts`
+    exist so the comment the revival posts names the caps the run actually
+    enforces. A revive-fail-revive hot loop needs no counter here: a revived
+    issue is ready, not failed, so this branch cannot see it again until a
+    fresh give-up - which consumed attempts - puts it back, and the hard total
+    cap ends that cycle (`planner.revive`).
     """
     assessment = assess(objective, ledger, oracle=oracle)
     if assessment.met:
         return GoalReport(assessment, reason=assessment.reason or MET, rounds=rounds)
+    if assessment.abandoned:
+        revived = _revive_abandoned(
+            client,
+            ledger,
+            assessment,
+            max_attempts=max_attempts,
+            max_total_attempts=max_total_attempts,
+        )
+        if revived:
+            names = ", ".join(f"#{action.number}" for action in revived)
+            return GoalReport(
+                assessment,
+                revived=revived,
+                reason=(
+                    f"revived {len(revived)} failed task(s) with budget remaining: {names}"
+                ),
+                rounds=rounds,
+            )
     if not assessment.actionable:
         return GoalReport(assessment, reason=assessment.reason, rounds=rounds)
     if not assessment.missing:

@@ -77,12 +77,17 @@ def entry(
     label: str = DONE,
     goal: str = "do the thing",
     files: Sequence[str] = (),
+    attempt: int = 0,
+    blocker: str = "",
+    streak: int | None = None,
 ) -> LedgerEntry:
     return LedgerEntry(
         number=number,
         title=f"issue {number}",
         task_id=task_id or f"task-{number}",
-        attempt=0,
+        attempt=attempt,
+        blocker=blocker,
+        streak=streak,
         goal=goal,
         files=tuple(files) or (f"src/mod{number}.py",),
         verify=VERIFY,
@@ -147,6 +152,49 @@ class Writer:
                 IssueAction("created", f"new-{number}", number) for number in self.created
             ),
         )
+
+
+@dataclass
+class RevivalClient:
+    """The four calls a gate revival makes, recorded, with no HTTP anywhere.
+
+    `list_issues` answers `resolve_states`' open/closed read; the label and
+    comment calls are the revival's writes. Everything else is absent on
+    purpose - a gate that reached for more than these has grown a write this
+    suite did not agree to.
+    """
+
+    issues: list[dict[str, Any]] = field(default_factory=list)
+    added: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
+    removed: list[tuple[int, str]] = field(default_factory=list)
+    comments: list[tuple[int, str]] = field(default_factory=list)
+
+    def list_issues(self, *, state: str = "open", **_: Any) -> list[dict[str, Any]]:
+        return [dict(issue) for issue in self.issues]
+
+    def add_labels(self, number: int, labels: Any) -> list[dict[str, Any]]:
+        self.added.append((number, tuple(labels)))
+        return []
+
+    def remove_label(self, number: int, label: str) -> bool:
+        self.removed.append((number, label))
+        return True
+
+    def create_issue_comment(self, number: int, body: str) -> dict[str, Any]:
+        self.comments.append((number, body))
+        return {"id": len(self.comments)}
+
+    @property
+    def wrote(self) -> bool:
+        return bool(self.added or self.removed or self.comments)
+
+
+def open_issue(number: int) -> dict[str, Any]:
+    return {"number": number, "state": "open", "state_reason": None}
+
+
+def closed_issue(number: int, reason: str = "not_planned") -> dict[str, Any]:
+    return {"number": number, "state": "closed", "state_reason": reason}
 
 
 def met(reason: str = "everything is there") -> ObjectiveAssessment:
@@ -230,6 +278,123 @@ def test_an_unreachable_model_is_unresolved_not_unmet() -> None:
     assert verdict.unresolved
     assert not verdict.actionable
     assert "connection refused" in verdict.reason
+
+
+# --------------------------------------------------------------------------
+# Reviving: the gate does what the human used to do
+# --------------------------------------------------------------------------
+
+
+def test_the_gate_revives_an_open_failed_task_with_budget_remaining() -> None:
+    """The live gap: #23 and #24 merged, #21 sat failed at attempt 5 of a 9
+    hard cap, and the run exited failed asking a human to do the one relabel
+    the orchestrator knew was safe."""
+    client = RevivalClient(issues=[open_issue(2)])
+    writer = Writer()
+
+    report = close_the_loop(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
+        OBJECTIVE,
+        oracle=Never(),
+        proposer=Never(),
+        writer=writer,
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    # The run continues: revived work is dispatchable, not a resignation.
+    assert not report.done
+    assert not report.extended
+    assert report.rounds == 0
+    assert [action.number for action in report.revived] == [2]
+    assert report.reason == "revived 1 failed task(s) with budget remaining: #2"
+    assert "revived 1 failed task(s)" in report.summary()
+    assert "the run continues" in report.summary()
+    # The writes: ready on, failed off, in that order (two labels beats none),
+    # and the marker is never touched - no update_issue method even exists on
+    # this double, so a body write would have been an AttributeError.
+    assert client.added == [(2, (READY,))]
+    assert client.removed == [(2, FAILED)]
+    number, text = client.comments[0]
+    assert number == 2
+    assert text.startswith("apiary: the goal gate found the objective unmet")
+    assert "returned to `swarm:ready`" in text
+    assert "streak 3 of 3, total 5 of 9" in text
+    # No follow-up was planned and no model consulted: the revival is
+    # arithmetic, and the objective is re-assessed only after the retry runs.
+    assert not writer.calls
+
+
+def test_a_closed_failed_issue_is_never_revived() -> None:
+    """GitHub wins: a closed issue was shut by a human or retired by the
+    planner, and the gate arguing with that would be the one overrule this
+    system promises never to make."""
+    client = RevivalClient(issues=[closed_issue(2)])
+
+    report = close_the_loop(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=1)),
+        OBJECTIVE,
+        oracle=Never(),
+        proposer=Never(),
+        writer=Writer(),
+    )
+
+    assert report.done
+    assert report.revived == ()
+    assert report.reason == FAILED_REASON
+    assert not client.wrote
+
+
+def test_a_budget_spent_failed_task_is_not_revived() -> None:
+    """`planner.revive` owns the budget refusal: a spent task answers with a
+    retained action and no writes, so the gate resigns exactly as it always
+    did - the give-up comment on the issue already told a human what to do."""
+    client = RevivalClient(issues=[open_issue(2)])
+
+    report = close_the_loop(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9, streak=3)),
+        OBJECTIVE,
+        oracle=Never(),
+        proposer=Never(),
+        writer=Writer(),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert report.done
+    assert report.revived == ()
+    assert report.reason == FAILED_REASON
+    assert "still missing" in report.summary() or "stopping" in report.summary()
+    assert not client.wrote
+
+
+def test_only_the_revivable_failed_tasks_are_revived() -> None:
+    client = RevivalClient(issues=[open_issue(2), open_issue(3), closed_issue(4)])
+
+    report = close_the_loop(
+        client,
+        ledger(
+            entry(1, label=DONE),
+            entry(2, label=FAILED, attempt=5, streak=3),
+            entry(3, label=FAILED, attempt=9, streak=3),
+            entry(4, label=FAILED, attempt=1),
+        ),
+        OBJECTIVE,
+        oracle=Never(),
+        proposer=Never(),
+        writer=Writer(),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert not report.done
+    assert [action.number for action in report.revived] == [2]
+    assert report.reason == "revived 1 failed task(s) with budget remaining: #2"
+    assert client.added == [(2, (READY,))]
+    assert [number for number, _ in client.comments] == [2]
 
 
 # --------------------------------------------------------------------------
