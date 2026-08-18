@@ -168,6 +168,9 @@ class RevivalClient:
     added: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
     removed: list[tuple[int, str]] = field(default_factory=list)
     comments: list[tuple[int, str]] = field(default_factory=list)
+    #: `update_issue` closures, as (number, state_reason) - the supersession
+    #: write. Recorded so a test can pin that a closure happened, or did not.
+    closed: list[tuple[int, str | None]] = field(default_factory=list)
 
     def list_issues(self, *, state: str = "open", **_: Any) -> list[dict[str, Any]]:
         return [dict(issue) for issue in self.issues]
@@ -184,9 +187,14 @@ class RevivalClient:
         self.comments.append((number, body))
         return {"id": len(self.comments)}
 
+    def update_issue(self, number: int, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs.get("state") == "closed", "the gate only ever patches to close"
+        self.closed.append((number, kwargs.get("state_reason")))
+        return {"number": number, **kwargs}
+
     @property
     def wrote(self) -> bool:
-        return bool(self.added or self.removed or self.comments)
+        return bool(self.added or self.removed or self.comments or self.closed)
 
 
 def open_issue(number: int) -> dict[str, Any]:
@@ -329,35 +337,42 @@ def test_the_gate_revives_an_open_failed_task_with_budget_remaining() -> None:
 def test_a_closed_failed_issue_is_never_revived() -> None:
     """GitHub wins: a closed issue was shut by a human or retired by the
     planner, and the gate arguing with that would be the one overrule this
-    system promises never to make."""
+    system promises never to make. With nothing revivable the failed work is
+    settled, so the coverage question is asked once - and an unmet answer
+    keeps the resignation verbatim, writing nothing."""
     client = RevivalClient(issues=[closed_issue(2)])
 
     report = close_the_loop(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=1)),
         OBJECTIVE,
-        oracle=Never(),
+        oracle=Says(unmet("there is no CLI")),
         proposer=Never(),
         writer=Writer(),
     )
 
     assert report.done
     assert report.revived == ()
+    assert report.superseded == ()
     assert report.reason == FAILED_REASON
     assert not client.wrote
 
 
 def test_a_budget_spent_failed_task_is_not_revived() -> None:
     """`planner.revive` owns the budget refusal: a spent task answers with a
-    retained action and no writes, so the gate resigns exactly as it always
-    did - the give-up comment on the issue already told a human what to do."""
+    retained action and no writes. The failed work being settled earns one
+    coverage question; unmet keeps the resignation exactly as it always was -
+    the give-up comment on the issue already told a human what to do - and
+    above all the failed issue is NOT closed: unmet means its work is still
+    wanted, and only supersession closes tickets."""
     client = RevivalClient(issues=[open_issue(2)])
+    oracle = Says(unmet("there is no CLI"))
 
     report = close_the_loop(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9, streak=3)),
         OBJECTIVE,
-        oracle=Never(),
+        oracle=oracle,
         proposer=Never(),
         writer=Writer(),
         max_attempts=3,
@@ -366,9 +381,13 @@ def test_a_budget_spent_failed_task_is_not_revived() -> None:
 
     assert report.done
     assert report.revived == ()
+    assert report.superseded == ()
     assert report.reason == FAILED_REASON
     assert "still missing" in report.summary() or "stopping" in report.summary()
     assert not client.wrote
+    # The settled question was asked exactly once, over the shipped work only.
+    assert len(oracle.asked) == 1
+    assert "task-2" not in oracle.asked[0][1][1]
 
 
 def test_only_the_revivable_failed_tasks_are_revived() -> None:
@@ -395,6 +414,75 @@ def test_only_the_revivable_failed_tasks_are_revived() -> None:
     assert report.reason == "revived 1 failed task(s) with budget remaining: #2"
     assert client.added == [(2, (READY,))]
     assert [number for number, _ in client.comments] == [2]
+    # An unmet objective with budget remaining revives - it never closes. A
+    # closure here would be the gate declaring work superseded that it is
+    # about to retry.
+    assert client.closed == []
+
+
+# --------------------------------------------------------------------------
+# Superseding: a met objective leaves no failed ticket behind
+# --------------------------------------------------------------------------
+
+
+def test_a_met_objective_closes_the_superseded_failed_leftovers() -> None:
+    """The user's rule, verbatim: "at the end having failed ticket is wrong".
+    Nothing is revivable (the budget is spent), so the failed work is settled
+    and the coverage question is asked - and a met answer means the open
+    failed ticket is a request for a decision that has already been made."""
+    client = RevivalClient(issues=[open_issue(2)])
+    oracle = Says(met("the shipped work covers the objective"))
+
+    report = close_the_loop(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9, streak=3)),
+        OBJECTIVE,
+        oracle=oracle,
+        proposer=Never(),
+        writer=Writer(),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert report.met
+    assert report.done
+    assert report.revived == ()
+    assert [action.number for action in report.superseded] == [2]
+    assert "closed 1 superseded failed task(s): #2" in report.reason
+    assert report.summary().startswith("objective met")
+    assert "closed 1 superseded failed task(s)" in report.summary()
+    # The write is a closure, never a relabel: the marker and labels stay as
+    # the give-up left them, so reopening resumes the record where it stopped.
+    assert client.closed == [(2, "not_planned")]
+    assert client.added == [] and client.removed == []
+    number, text = client.comments[0]
+    assert number == 2
+    assert text.startswith("apiary: the objective was met without this task")
+    assert "closed as superseded" in text
+    assert "reopen the issue" in text
+
+
+def test_a_met_objective_leaves_a_closed_failed_issue_alone() -> None:
+    """GitHub wins on the way out too: a failed issue somebody already closed
+    is their record to keep, and re-closing it would post a comment onto a
+    conversation that is over."""
+    client = RevivalClient(issues=[closed_issue(2)])
+
+    report = close_the_loop(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9)),
+        OBJECTIVE,
+        oracle=Says(met("covered")),
+        proposer=Never(),
+        writer=Writer(),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert report.met and report.done
+    assert report.superseded == ()
+    assert "superseded" not in report.reason
+    assert not client.wrote
 
 
 # --------------------------------------------------------------------------

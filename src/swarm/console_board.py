@@ -127,7 +127,13 @@ class BoardReader:
             pr = by_head.get(entry.branch)
             card = self._card(repo, entry, pr)
             if entry.state_label == "swarm:failed":
-                failed.append(card)
+                #: Open only. The strip's title is "needs a human", and a
+                #: closed failed issue was already answered - superseded by a
+                #: changed plan, or resolved by the human it was waiting for.
+                #: Showing it forever would make every finished project wear a
+                #: red badge for work nobody intends to do.
+                if not entry.closed:
+                    failed.append(card)
                 continue
             column = COLUMN_BY_LABEL.get(entry.state_label, "backlog")
             if column == "merged":

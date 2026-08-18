@@ -1730,7 +1730,14 @@ class Reconciler:
             proposer=self.proposer,
         )
         self._goal_rounds = goal.rounds
-        wrote = getattr(goal, "extended", False) or getattr(goal, "revived", ())
+        wrote = (
+            getattr(goal, "extended", False)
+            or getattr(goal, "revived", ())
+            # Superseded closures land on a *met* report, which ends the loop -
+            # but a caller driving cycles past `finished` (tests, `until`)
+            # must still read back what was closed rather than a 304 of it.
+            or getattr(goal, "superseded", ())
+        )
         if wrote and hasattr(client, "invalidate_cache"):
             # The gate just wrote through this client - follow-up issues, or a
             # revival's label move - and the next cycle's first act is to read

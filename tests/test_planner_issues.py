@@ -611,17 +611,65 @@ def test_a_failed_marker_without_a_signature_record_still_revives(github):
     assert "streak 3 of 3, total 3 of 9" in store.comments[0][1]
 
 
-def test_a_dropped_failed_task_is_not_revived(github):
-    # Revival is for work the plan still wants. A failed task the plan dropped
-    # is the module docstring's terminal case, exactly as before.
+def test_a_dropped_failed_task_is_retired_as_superseded(github):
+    """The user's rule: "if plan changed we can cancel old tickets" - a plan
+    that dropped a failed task has already decided the work is not wanted, so
+    the ticket closes instead of wearing `swarm:failed` on the board forever.
+    Revival is for work the plan still wants; this is its complement."""
     client, store, _ = github()
-    number = store.add(body=failed_body("abandoned"), labels=("swarm:failed",))
+    body = failed_body("abandoned", attempt=3, blocker="ab12cd34ef", streak=3)
+    number = store.add(body=body, labels=("swarm:failed",))
+
+    report = write(client, task("something-else"))
+
+    retired = [action for action in report.actions if action.kind == "retired"]
+    assert [action.task_id for action in retired] == ["abandoned"]
+    assert "closed as superseded" in retired[0].reason
+    assert store.issues[number]["state"] == "closed"
+    # `not_planned`, so readiness never reads this cancellation as a
+    # dependency met - the same rule every other retirement follows.
+    assert store.issues[number]["state_reason"] == "not_planned"
+    # The label and the marker are the record and stay exactly as the give-up
+    # left them: reopen + relabel resumes the budget arithmetic mid-count.
+    assert store.label_names(number) == {"swarm:failed"}
+    assert store.issues[number]["body"] == body
+    issue_number, text = store.comments[0]
+    assert issue_number == number
+    assert text.startswith("apiary: the plan no longer contains this task")
+    assert "closed as superseded" in text
+    assert "reopen the issue" in text
+
+
+def test_a_dropped_failed_task_a_human_closed_is_left_alone(github):
+    # GitHub wins: the closure is their record, and a second comment onto a
+    # finished conversation explains nothing.
+    client, store, _ = github()
+    number = store.add(
+        body=failed_body("abandoned"),
+        labels=("swarm:failed",),
+        state="closed",
+        state_reason="completed",
+    )
 
     report = write(client, task("something-else"))
 
     retained = [action for action in report.actions if action.kind == "retained"]
     assert [action.task_id for action in retained] == ["abandoned"]
-    assert store.label_names(number) == {"swarm:failed"}
+    assert store.issues[number]["state_reason"] == "completed"
+    assert store.comments == []
+
+
+def test_a_dropped_failed_task_stays_open_when_retiring_is_switched_off(github):
+    # `retire_dropped=False` is the goal gate's whole safety argument for its
+    # follow-up rounds; the failed case must not become an exception to it.
+    client, store, _ = github()
+    number = store.add(body=failed_body("abandoned"), labels=("swarm:failed",))
+
+    report = write(client, task("something-else"), retire_dropped=False)
+
+    retained = [action for action in report.actions if action.kind == "retained"]
+    assert [action.task_id for action in retained] == ["abandoned"]
+    assert store.issues[number]["state"] == "open"
     assert store.comments == []
 
 

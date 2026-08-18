@@ -40,8 +40,20 @@ creating an issue `ready` and creating one `blocked` - and nothing else:
   from under a running container. Whether to abandon in-flight work is a
   decision for the reconciler (#22, #23) or a human, and the planner declines it
   loudly instead of making it silently.
-- `swarm:done` / `swarm:failed`: terminal. `done` is history; `failed` needs a
-  human. Both untouched when *dropped*.
+- `swarm:done`: history. Untouched when dropped - the work landed, and the
+  issue is the record of it.
+- `swarm:failed`, still open, dropped: closed as `not_planned`, with a comment
+  saying the plan superseded it. This used to be retained under "`failed`
+  needs a human", and that rationale is honestly out of date twice over: the
+  budget machinery (§5's signatures, the hard total cap, revival) now *is* the
+  human's decision within bounds - a failed task the plan still wants gets
+  revived, not held for a person - and a plan that dropped the task has
+  already decided the work is not wanted, so the only thing keeping the ticket
+  open bought was a board that ends every run wearing a `swarm:failed` badge
+  for work nobody intends to do. The marker keeps its attempt/budget record,
+  so a human who disagrees reopens the issue and gets the arithmetic exactly
+  where it stopped. A failed issue a human *closed* stays exactly as they left
+  it: GitHub wins.
 
 The same reasoning governs a task the replan *keeps*: an entry that is claimed,
 in review or done is not rewritten either, because its body is the contract a
@@ -1090,20 +1102,58 @@ def revive(
         "the same way as the last attempt gives up immediately, and one that "
         "fails differently renews its own budget."
     )
-    poster = getattr(client, "create_issue_comment", None)
-    if poster is None:
-        print(
-            f"! no create_issue_comment; revival comment for #{entry.number} not posted:\n"
-            f"{comment}",
-            file=sys.stderr,
-        )
-    else:
-        try:
-            poster(entry.number, comment)
-        except GitHubError as exc:
-            print(f"! revival comment on #{entry.number} failed: {exc}", file=sys.stderr)
+    _post_comment(client, entry.number, comment)
 
     return IssueAction("revived", entry.task_id, entry.number, reason=budget)
+
+
+def _post_comment(client: GitHubClient, number: int, text: str) -> None:
+    """Post one comment, or print it and carry on - never a prerequisite.
+
+    `reconcile.post_comment`'s discipline, held locally because the dependency
+    must not point from `nodes` up into `orchestrator`: a client that has no
+    comment method (or a comment GitHub refused) costs the explanation its
+    ideal home, not the write it was explaining.
+    """
+    poster = getattr(client, "create_issue_comment", None)
+    if poster is None:
+        print(f"! no create_issue_comment; comment for #{number} not posted:\n{text}", file=sys.stderr)
+        return
+    try:
+        poster(number, text)
+    except GitHubError as exc:
+        print(f"! comment on #{number} failed: {exc}", file=sys.stderr)
+
+
+def retire_superseded(client: GitHubClient, entry: LedgerEntry, *, because: str, reason: str) -> IssueAction:
+    """Close a `swarm:failed` task whose work is no longer wanted, and say so.
+
+    The second shared verb between the replan and the goal gate (`revive` is
+    the first, and `because` plays the same role here): `_drop` retires a
+    failed task the plan no longer contains, and `goal._retire_superseded`
+    retires the failed leftovers of an objective that was met without them.
+    Both are the same statement - this work is superseded - so the closure,
+    the state reason and the comment's shape must not fork.
+
+    `not_planned`, never `completed`, exactly as for every other retirement:
+    readiness (#11) satisfies a dependency only on `completed`, and a task
+    waiting on this one must stay blocked rather than be unblocked by a
+    cancellation. The marker is untouched - its `attempt`, `blocker` and
+    `streak` are the record of what was tried, and a human reopening the issue
+    (relabelling it `swarm:ready`) gets the budget arithmetic exactly where it
+    left off. The close lands before the comment, so a crash between the two
+    leaves a closed issue whose `state_reason` already says `not_planned`
+    rather than an open failed issue carrying a comment that claims it closed.
+    """
+    client.update_issue(entry.number, state="closed", state_reason="not_planned")
+    _post_comment(
+        client,
+        entry.number,
+        f"apiary: {because}, so it is closed as superseded. The marker keeps its "
+        "attempt and budget record; reopen the issue and relabel it "
+        f"`{READY}` to run it again.",
+    )
+    return IssueAction("retired", entry.task_id, entry.number, reason=reason)
 
 
 def _drop(
@@ -1125,6 +1175,25 @@ def _drop(
             entry.number,
             reason=f"dropped by the replan but {entry.state_label}; "
             "in-flight work is the reconciler's call, not the planner's",
+        )
+    if entry.state_label == FAILED:
+        # Dropped and failed is retired like dropped and never-started, not
+        # retained like it used to be - see the module docstring for the
+        # rewritten rationale. Human-closed stays untouched (GitHub wins), and
+        # `retire=False` keeps the promise the flag makes everywhere else.
+        if _closed(states, entry.number):
+            return IssueAction(
+                "retained", entry.task_id, entry.number, reason="dropped, already closed"
+            )
+        if not retire:
+            return IssueAction(
+                "retained", entry.task_id, entry.number, reason="dropped, left open"
+            )
+        return retire_superseded(
+            client,
+            entry,
+            because="the plan no longer contains this task",
+            reason=f"{FAILED} and not in the new plan; closed as superseded",
         )
     if entry.state_label not in WRITABLE:
         return IssueAction(

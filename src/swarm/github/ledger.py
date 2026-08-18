@@ -292,6 +292,13 @@ class LedgerEntry:
     #: blocker being gone.
     blocker: str = ""
     streak: int | None = None
+    #: Whether the issue is closed on GitHub. The ledger reads `state="all"`
+    #: because closed `swarm:done` issues anchor the dependency graph - which
+    #: means a closed issue can still wear any state label, and a projection
+    #: (the console board's failed strip is the live example) needs to tell a
+    #: failed task that still wants a human from one that was already closed
+    #: as superseded.
+    closed: bool = False
 
     @property
     def generated(self) -> tuple[str, ...]:
@@ -836,6 +843,7 @@ def load_ledger(
             state_label=state_label,
             labels=labels,
             adopted=adopted,
+            closed=(issue.get("state") or "open") != "open",
         )
         entries[task_id] = entry
         numbers[task_id] = number
