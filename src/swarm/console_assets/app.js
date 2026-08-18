@@ -123,6 +123,14 @@
     if (swarm) form.appendChild(projectBar());
     if (intake) form.appendChild(modeToggle());
     spec.fields.forEach(function (f) {
+      //: Setup-time choices describe a repository that does not exist yet.
+      //: A selected project's repository exists, so offering to create it
+      //: public, to run it locally, or to change its stack would be the form
+      //: arguing with the facts - those fields sit this state out. What is
+      //: not on screen still travels: `values()` folds only on-screen nodes
+      //: into `typed`, so the stack the selection loaded is what a fired run
+      //: submits.
+      if (selected && (f.name === "local" || f.name === "public" || f.name === "stack")) return;
       if (f.kind === "check") {
         var wrap = el("label", "checkline");
         var box = el("input");
@@ -138,9 +146,13 @@
       //: For a selected project the objective box is a prompt box, and its
       //: label must say so - the field submits the run's objective either way.
       var isPrompt = selected && f.name === "objective";
+      //: The repo label promises creation, which is exactly what a selected
+      //: project must not be promised - its repository is a fact, not a plan.
       form.appendChild(el("label", null, isPrompt
         ? "New prompt — what the swarm should do next for this project"
-        : f.label));
+        : (selected && f.name === "repo")
+          ? "Repository — the project's home on GitHub"
+          : f.label));
       var node = el(f.kind === "area" ? "textarea" : "input");
       node.name = f.name;
       node.placeholder = isPrompt
@@ -631,8 +643,13 @@
     var p = findProject(repo);
     if (!p) return;
     var kept = typed["swarm"] || {};
+    //: `local` is forced off, not carried: a stored project is a GitHub
+    //: project, and a leftover tick from an earlier local experiment would
+    //: silently read the repo slug as a directory path. `public` is dropped
+    //: for the same reason it is not rendered - existing repositories are
+    //: untouched by it either way.
     typed["swarm"] = { objective: "", repo: p.repo, stack: p.stack,
-                       verify: p.verify, local: kept.local, public: kept.public,
+                       verify: p.verify, local: "",
                        auto_merge: kept.auto_merge, no_goal_check: kept.no_goal_check,
                        max_cycles: kept.max_cycles };
     selectedProject = repo;

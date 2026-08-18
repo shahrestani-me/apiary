@@ -557,6 +557,12 @@ def test_a_selected_projects_identity_is_locked_but_its_prompt_box_is_open():
     # selecting a project empties the objective slot and says what the box is for
     assert 'objective: ""' in script
     assert "New prompt" in script
+    # setup-time choices describe a repository that does not exist yet; a
+    # selected project's repository exists, so those fields sit this state out
+    # - and a leftover local tick is forced off, not carried into the project
+    assert 'f.name === "local" || f.name === "public" || f.name === "stack"' in script
+    assert 'local: ""' in script
+    assert "the project's home on GitHub" in script
     # the old lock prose and its hint went with the design they explained
     assert "requirement is fixed once it exists" not in script
     assert ".lockhint" not in asset("app.css")
