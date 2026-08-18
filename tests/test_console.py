@@ -482,6 +482,125 @@ def test_a_late_sites_response_cannot_steal_the_selected_tab():
     assert "current = current || sites[0]" in asset("app.js")
 
 
+def test_the_model_call_tabs_hide_unless_debug_is_asked_for():
+    """The swarm tab is the product; the other tabs are its debugger, and a
+    strip with one tab is clutter - so without ?debug=1 no strip renders at
+    all. The sites stay in the array regardless: the describe wizard still
+    borrows the intake site's questions through `intakeSite()`."""
+    script = asset("app.js")
+
+    assert "debug=1" in script                       # ?debug=1 brings the strip back
+    assert "function hideTabs" in script
+    assert "if (debugMode) return false" in script   # debug mode changes nothing
+
+
+def test_a_backend_without_a_swarm_descriptor_still_gets_tabs():
+    """An older backend serves no `swarm` entry; hiding the strip then would
+    leave a page with no view at all. The strip hides only when the swarm
+    view exists to take its place."""
+    script = asset("app.js")
+
+    assert 'if (sites[i].kind === "swarm") return true' in script
+    assert "if (hideTabs()) current = sites[0]" in script
+
+
+def test_the_swarm_tab_grows_a_project_selector():
+    """The selector is the project store made visible: fed from /projects,
+    ordered as served, with New project opening the describe wizard. Pinned
+    the way the other swarm-tab features are - by the hooks that must exist
+    for the page to be project-centric at all."""
+    script = asset("app.js")
+
+    assert 'api("/projects")' in script, "the selector is fed from the store"
+    assert "New project" in script
+    assert "selectProject" in script
+    assert "newProject" in script
+    assert ".projbar" in asset("app.css")
+
+
+def test_the_project_controls_sit_out_a_run_in_flight():
+    """Switching a project's values under a running swarm would make the form
+    lie about what is running, so the selector and New project are disabled -
+    with the reason as a native tooltip - until the run ends."""
+    script = asset("app.js")
+
+    assert "function busyRun" in script
+    assert "run is in flight" in script          # the tooltip names the reason
+    assert ".title = runBusy" in script          # and it is a title, not a card
+
+
+def test_a_fresh_repository_reaches_the_selector_without_a_reload():
+    """A run start upserts the project on the backend; the page re-fetches
+    /projects at that moment so a greenfield repo appears, selected."""
+    script = asset("app.js")
+
+    assert "loadProjects" in script
+    assert 'var fired = (vals.repo || "").trim()' in script
+    assert 'loadProjects(fired)' in script
+
+
+def test_a_selected_projects_identity_is_locked_but_its_prompt_box_is_open():
+    """A project in the store was already founded from its requirement, and
+    the requirement stays immutable - but it lives in the prompt history now,
+    not in a read-only textarea. The objective box is the NEW prompt for the
+    next run: it opens empty, labeled as such, and only the repo - the
+    project's identity - is read-only. Read-only rather than disabled, so
+    `values()` still reads the value the run must use."""
+    script = asset("app.js")
+
+    # the repo locks, alone; the objective is the new-prompt box now
+    assert "node.readOnly = true" in script
+    assert 'selected && f.name === "repo"' in script
+    assert 'f.name === "objective" || f.name === "repo"' not in script
+    # the lock engages only for a selected project the store knows, shown as-is
+    assert '(kept.repo || "").trim() === selectedProject' in script
+    # selecting a project empties the objective slot and says what the box is for
+    assert 'objective: ""' in script
+    assert "New prompt" in script
+    # the old lock prose and its hint went with the design they explained
+    assert "requirement is fixed once it exists" not in script
+    assert ".lockhint" not in asset("app.css")
+    assert "input.locked" in asset("app.css")   # the repo still wears the lock
+
+
+def test_the_console_boots_with_no_project_selected():
+    """The selector opens on "pick a project" and the operator chooses; the
+    old auto-select pre-filled a form nobody asked for. The one exception
+    is a run already in flight whose repo the store knows: selecting it then
+    reflects what is actually running - reality, not a default."""
+    script = asset("app.js")
+
+    assert "selectProject(projects[0].repo)" not in script
+    assert "pick a project" in script                 # the blank option is the boot state
+    assert "if (findProject(runRepo)) selectProject(runRepo)" in script
+    # ...and only a run still going may put its repo there: a finished run's
+    # card is a record, not a choice made for the operator.
+    assert 'b.state !== "finished") runRepo = b.repo' in script
+    assert 'p.repo && j.state === "running"' in script
+    # a finished run's card shows only beside its own selected project, and
+    # the run area follows the selection the way the board does
+    assert 'b.state === "finished" && b.repo !== selectedProject' in script
+    assert "function followSelection" in script
+    assert 'prog.repo && prog.repo === selectedProject' in script
+
+
+def test_a_selected_projects_prompts_are_its_history():
+    """Selecting a project shows every prompt its runs were fired with, newest
+    first, straight from /projects/history - so the founding requirement stays
+    visible, immutably, as the oldest entry. Cached per repo for the session
+    (drawForm redraws often; the list must not flicker) and refetched around a
+    fired run so the just-fired prompt appears without a reload."""
+    script = asset("app.js")
+
+    assert 'api("/projects/history?repo="' in script
+    assert "promptHistory" in script          # the per-repo session cache
+    assert "unfinished" in script             # each prompt says how its run ended
+    assert "requirement" in script            # the oldest entry is named for what it is
+    assert "refreshHistory" in script         # the refetch points around a run
+    assert "could not be read" in script      # a failed fetch is a note, not a broken form
+    assert ".history" in asset("app.css")
+
+
 def test_the_page_names_the_wait():
     """A cold 31b takes minutes. A spinner with no explanation reads as hung."""
     assert "cold model" in page() or "cold model loads" in page()

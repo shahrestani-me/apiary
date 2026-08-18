@@ -1,6 +1,10 @@
 (function () {
   "use strict";
   var sites = [], current = null, timer = null;
+  //: The swarm tab is the product; the model-call tabs (run / plan / propose /
+  //: choose / describe) are its debugger. Open the console with ?debug=1 to
+  //: get the full tab strip back.
+  var debugMode = /(^|[?&])debug=1(&|$)/.test(location.search);
   //: What has been typed, per site. Switching tabs used to redraw the form
   //: from the site definition and silently discard it - which is worst in the
   //: one flow this tool exists for: read the plan, switch to the worker, and
@@ -101,7 +105,22 @@
     var spec = describing ? intake : current;
     var keep = describing ? intakeValues : values;
     var kept = typed[spec.key] || {};
+    //: A project already in the store was founded from its requirement, and
+    //: the requirement is immutable - but it lives in the prompt history
+    //: below the fields now, not in a read-only textarea. The objective box
+    //: becomes the NEW prompt for the next run, empty and editable; only the
+    //: repository, the project's identity, stays read-only. "Selected"
+    //: engages only when the on-screen values are that project's own: a
+    //: selection exists, the store knows it, and the form's repo agrees with
+    //: the selection. The describe wizard, "Adjust first" on a proposal, and
+    //: New project all fail one of those and stay editable.
+    var selected = swarm && !describing && Boolean(selectedProject)
+                 && Boolean(findProject(selectedProject))
+                 && (kept.repo || "").trim() === selectedProject;
     $("blurb").textContent = spec.blurb;
+    //: The project bar sits above both faces of the swarm tab: which project
+    //: the form is about is a fact that outlives the mode toggle below it.
+    if (swarm) form.appendChild(projectBar());
     if (intake) form.appendChild(modeToggle());
     spec.fields.forEach(function (f) {
       if (f.kind === "check") {
@@ -116,23 +135,58 @@
         form.appendChild(wrap);
         return;
       }
-      form.appendChild(el("label", null, f.label));
+      //: For a selected project the objective box is a prompt box, and its
+      //: label must say so - the field submits the run's objective either way.
+      var isPrompt = selected && f.name === "objective";
+      form.appendChild(el("label", null, isPrompt
+        ? "New prompt — what the swarm should do next for this project"
+        : f.label));
       var node = el(f.kind === "area" ? "textarea" : "input");
       node.name = f.name;
-      node.placeholder = f.placeholder || "";
+      node.placeholder = isPrompt
+        ? "the founding requirement, and every prompt since, sit in the history below"
+        : (f.placeholder || "");
       node.value = kept[f.name] !== undefined ? kept[f.name] : (f.value || "");
       node.oninput = function () { keep(); };
+      //: The one field that IS the project. Read-only rather than disabled:
+      //: a disabled field drops out of form reads and would leave `values()`
+      //: answering from whatever `typed` held before, while a read-only one
+      //: still reports the stored value the run must use.
+      if (selected && f.name === "repo") {
+        node.readOnly = true;
+        node.className = "locked";
+        node.title = "the repository is the project's identity — "
+                     + "switching it means picking another project above";
+      }
       form.appendChild(node);
     });
+    //: The project's past prompts sit under the fields, so the card reads
+    //: top-down as: who this project is, what to ask next, what was asked.
+    if (selected) form.appendChild(historyBlock(selectedProject));
     //: The swarm tab fires a run, not a prompt; there is no prompt to peek at.
     $("peek").style.display = swarm ? "none" : "";
     $("go").textContent = describing ? "Propose a setup"
                           : swarm ? "Run the swarm" : "Fire";
   }
 
+  //: Whether the strip stays off screen. Only when the swarm view exists to
+  //: take its place: a backend that serves no swarm descriptor would leave a
+  //: page with no view at all, so the tabs fall back to being the console.
+  function hideTabs() {
+    if (debugMode) return false;
+    for (var i = 0; i < sites.length; i++) {
+      if (sites[i].kind === "swarm") return true;
+    }
+    return false;
+  }
+
   function drawTabs() {
     var tabs = $("tabs");
     tabs.textContent = "";
+    //: One view means no strip - a bar with a single tab is clutter. The node
+    //: hides too, because an empty .tabs div still carries its bottom margin.
+    if (hideTabs()) { tabs.style.display = "none"; return; }
+    tabs.style.display = "";
     sites.forEach(function (site) {
       var b = el("button", "tab", site.label);
       b.setAttribute("role", "tab");
@@ -271,6 +325,19 @@
   //: log). The external view skips these - the same run must not appear twice,
   //: once from memory and once from its artifacts.
   var extTimer = null, extView = null, ownRunIds = {};
+  //: The console's project memory, as served by /projects: most recently
+  //: active first. `selectedProject` is a repo slug, or "" while the operator
+  //: is describing a project that does not exist yet. `runBusy` is the one
+  //: switch for "a swarm run is in flight" - the fire button, the selector
+  //: and the New project button all follow it together, because switching a
+  //: project's values under a run that is still reading them would make the
+  //: form lie about what is running.
+  var projects = [], selectedProject = "", runBusy = false;
+  var projBar = { select: null, button: null };
+  //: Which repository the console's own run view (swarmFire / adoption) is
+  //: about, recorded whatever the run's state - so followSelection can tell
+  //: whether the card in the run area belongs to the project on the selector.
+  var ownRepo = "";
 
   //: Lifecycle order, mirroring `console_board.COLUMNS`. swarm:failed is a
   //: strip below rather than a column: a ticket needing a human must not hide.
@@ -302,10 +369,16 @@
     if (!panel().runBox.childNodes.length) {
       api("/swarm/latest").then(function (res) {
         if (!res.ok || panel().runBox.childNodes.length) { extTick(); return; }
-        var view = swarmView(res.body);
+        //: The same rule the external view follows: a run still going is
+        //: adopted whatever the selection, a finished one only beside its own
+        //: selected project - otherwise the page opens looking like a project
+        //: was chosen, and nobody chose it.
+        var prog = res.body.progress || {};
         if (res.body.state === "running") {
-          $("go").disabled = true;
-          pollSwarm(res.body.id, view);
+          busyRun(true);
+          pollSwarm(res.body.id, swarmView(res.body));
+        } else if (prog.repo && prog.repo === selectedProject) {
+          swarmView(res.body);
         }
         extTick();
       });
@@ -348,7 +421,7 @@
     box.appendChild(card("the run — from its artifacts", head));
     box.appendChild(card("cycle log — as recorded", body));
 
-    return { id: b.run_id, next: 0, root: box.firstChild,
+    return { id: b.run_id, repo: b.repo || "", next: 0, root: box.firstChild,
              state: state, age: age, note: note, log: log };
   }
 
@@ -356,6 +429,15 @@
     if (ownRunIds[b.run_id]) return;              // already on screen from memory
     var box = panel().runBox;
     var ours = extView && box.contains(extView.root);
+    //: A finished run is shown only beside its own project. With nothing
+    //: selected - or another project selected - a card and a cycle log on
+    //: screen read as a choice the operator never made, which is exactly the
+    //: complaint that shaped the selector. A run still going is different:
+    //: it is a fact about this machine, and it shows regardless.
+    if (b.state === "finished" && b.repo !== selectedProject) {
+      if (ours) { box.textContent = ""; extView = null; }
+      return;
+    }
     if (box.childNodes.length && !ours) return;   // never clobber an own view
     if (!ours || extView.id !== b.run_id) {
       extView = externalCard(b);
@@ -375,7 +457,12 @@
       extView.log.scrollTop = extView.log.scrollHeight;
     }
     extView.next = b.next;
-    if (b.repo) runRepo = b.repo;                 // the board follows it too
+    //: Only a run that is still going speaks for the page: a finished run's
+    //: card stays as an account of what happened, but it must not pick the
+    //: board's repo - or, through boot, the project - for an operator who has
+    //: chosen nothing yet. And never once a project is selected; from then on
+    //: the selection owns the board.
+    if (b.repo && !selectedProject && b.state !== "finished") runRepo = b.repo;
   }
 
   function extTick() {
@@ -393,6 +480,233 @@
       //: while an orchestrator is demonstrably cycling, slower otherwise.
       var wait = res.ok && res.body.state === "active" ? 3000 : 15000;
       extTimer = setTimeout(extTick, wait);
+    });
+  }
+
+  // ---- projects: the selector, and what selecting one means ----------------
+
+  //: One project's prompts as served by /projects/history - newest first,
+  //: derived from the run artifacts, so a run fired from a terminal counts
+  //: too. Cached per repo for the session because drawForm runs on every
+  //: redraw and refetching each time would flicker the list; invalidated at
+  //: the two refetch points around a fired run (swarmFire, absorb).
+  var promptHistory = {};
+  //: The history box currently on screen, refreshed in place the way projBar
+  //: is - so a refetch never redraws the whole form under a typist.
+  var histBox = null;
+
+  function historyWhen(iso) {
+    var d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString();
+  }
+
+  function renderHistory(box, prompts) {
+    box.textContent = "";
+    box.appendChild(el("h2", null, "prompt history · " + prompts.length));
+    if (!prompts.length) {
+      box.appendChild(el("p", "empty",
+        "no recorded runs yet — the first prompt founds the history"));
+      return;
+    }
+    prompts.forEach(function (p, i) {
+      var d = el("details", "file");
+      var s = el("summary");
+      s.appendChild(el("span", null, historyWhen(p.started_at)));
+      s.appendChild(el("span", "pill" + (p.finished ? " ok" : ""),
+                       p.finished ? "finished" : "unfinished"));
+      //: The oldest prompt is the requirement the project was founded from;
+      //: the history is where it stays visible - and immutable, like the rest.
+      if (i === prompts.length - 1) s.appendChild(el("span", "pill", "requirement"));
+      d.appendChild(s);
+      d.appendChild(pre(p.objective));
+      box.appendChild(d);
+    });
+  }
+
+  function fetchHistory(repo, box) {
+    api("/projects/history?repo=" + encodeURIComponent(repo)).then(function (res) {
+      if (!res.ok || !res.body || !res.body.prompts) {
+        //: A quiet one-line note, never a broken form - the fields above it
+        //: still work, and the next selection simply tries again.
+        box.textContent = "";
+        box.appendChild(el("p", "empty", "the prompt history could not be read"
+          + (res.body && res.body.error ? " — " + res.body.error : "")));
+        return;
+      }
+      promptHistory[repo] = res.body.prompts;
+      renderHistory(box, res.body.prompts);
+    });
+  }
+
+  function historyBlock(repo) {
+    var box = el("div", "history");
+    histBox = box;
+    if (promptHistory[repo]) {
+      renderHistory(box, promptHistory[repo]);
+    } else {
+      box.appendChild(el("p", "empty", "reading the prompt history…"));
+      fetchHistory(repo, box);
+    }
+    return box;
+  }
+
+  //: Drop the cache and refresh the on-screen list in place. Only for the
+  //: selected repo: any other repo has no list on screen, and dropping its
+  //: cache alone means the next selection refetches.
+  function refreshHistory(repo) {
+    if (!repo) return;
+    delete promptHistory[repo];
+    if (repo === selectedProject && histBox && document.body.contains(histBox)) {
+      fetchHistory(repo, histBox);
+    }
+  }
+
+  function findProject(repo) {
+    for (var i = 0; i < projects.length; i++) {
+      if (projects[i].repo === repo) return projects[i];
+    }
+    return null;
+  }
+
+  //: One switch for "a run is in flight". `$("go")` was already the page's
+  //: single-flight latch; the project controls join it here rather than each
+  //: caller remembering three nodes to toggle.
+  function busyRun(on) {
+    runBusy = on;
+    $("go").disabled = on;
+    syncBar();
+  }
+
+  //: The selector and its button are rebuilt with every form redraw; this
+  //: refreshes the one currently on screen in place, so a /projects response
+  //: or a busy-state flip lands without redrawing the form under a typist.
+  function syncBar() {
+    if (!projBar.select) return;
+    var pick = projBar.select;
+    pick.textContent = "";
+    if (!selectedProject) {
+      var blank = el("option", null,
+                     projects.length ? "— pick a project —" : "— no projects yet —");
+      blank.value = "";
+      pick.appendChild(blank);
+    }
+    projects.forEach(function (p) {
+      var o = el("option", null, p.repo);
+      o.value = p.repo;
+      pick.appendChild(o);
+    });
+    pick.value = selectedProject;
+    var tip = "a run is in flight — watch it below, or stop it, before switching projects";
+    pick.disabled = runBusy;
+    pick.title = runBusy ? tip : "";
+    projBar.button.disabled = runBusy;
+    projBar.button.title = runBusy
+      ? tip : "start a fresh project from a plain-language description";
+  }
+
+  function projectBar() {
+    var wrap = el("div", "projbar");
+    wrap.appendChild(el("span", "modehint", "project"));
+    var pick = el("select");
+    pick.onchange = function () { if (pick.value) selectProject(pick.value); };
+    var fresh = el("button", "ghost", "New project");
+    fresh.type = "button";
+    fresh.onclick = function (e) { e.preventDefault(); newProject(); };
+    wrap.appendChild(pick);
+    wrap.appendChild(fresh);
+    projBar.select = pick;
+    projBar.button = fresh;
+    syncBar();
+    return wrap;
+  }
+
+  //: Selecting a project loads its stored values into the same `typed` slot
+  //: the operator's own typing lives in - the advanced form then simply shows
+  //: them. The objective is deliberately NOT loaded: the project's past
+  //: prompts (its founding requirement first among them) live in the history
+  //: below the form, and the box is for the next prompt - so it opens empty.
+  //: The checkboxes and cycle cap are left as they are: how a run is fired is
+  //: a per-fire choice, not a fact about the project.
+  function selectProject(repo) {
+    var p = findProject(repo);
+    if (!p) return;
+    var kept = typed["swarm"] || {};
+    typed["swarm"] = { objective: "", repo: p.repo, stack: p.stack,
+                       verify: p.verify, local: kept.local, public: kept.public,
+                       auto_merge: kept.auto_merge, no_goal_check: kept.no_goal_check,
+                       max_cycles: kept.max_cycles };
+    selectedProject = repo;
+    //: The board follows the selection at once - but never wrestles the repo
+    //: away from a run that is still writing its own progress.
+    if (!runBusy) runRepo = "";
+    wizardMode = "advanced";
+    if (current && current.kind === "swarm") {
+      drawForm();
+      boardTick();
+      followSelection();
+    } else {
+      syncBar();
+    }
+  }
+
+  //: The run area follows the selection the way the board does. A finished
+  //: run's card belonging to another project is removed - leaving it would
+  //: read as a choice this click just unmade - and an immediate external poll
+  //: brings the selected project's own last run back without the 15s wait.
+  //: A live run is never touched: it is a fact, not a preference.
+  function followSelection() {
+    if (runBusy) return;
+    var box = panel().runBox;
+    if (box.childNodes.length) {
+      var ours = extView && box.contains(extView.root);
+      var about = ours ? extView.repo : ownRepo;
+      if (about !== selectedProject) {
+        box.textContent = "";
+        extView = null;
+      }
+    }
+    extTick();
+  }
+
+  //: "New project" is the intake questionnaire: the front door for a project
+  //: that does not exist yet, with a blank swarm slate behind it for the
+  //: proposal to land on.
+  function newProject() {
+    typed["swarm"] = { objective: "", repo: "", stack: "", verify: "" };
+    selectedProject = "";
+    if (!runBusy) runRepo = "";
+    wizardMode = "describe";
+    drawForm();
+    boardTick();
+    followSelection();
+  }
+
+  //: A run the page adopted owns the run area; the selector still lands on
+  //: the run's repo when that repo is a project this console knows. Guarded
+  //: against the run the operator just fired: an equal selection returns
+  //: without touching the form, so nothing typed for *this* run is reloaded
+  //: from the store mid-flight.
+  function reflectRun(repo) {
+    if (!repo || repo === selectedProject) return;
+    if (findProject(repo)) selectProject(repo);
+  }
+
+  //: Re-fetched after every successful start: the backend has just upserted
+  //: the project, and a brand-new repository must appear in the selector,
+  //: selected, without a reload.
+  function loadProjects(prefer) {
+    api("/projects").then(function (res) {
+      if (!res.ok || !res.body || !res.body.projects) return;
+      projects = res.body.projects;
+      //: The moment a described project lands in the store it stops being a
+      //: draft: select it properly, so the repo locks, the prompt box empties
+      //: (the submitted brief is the history's founding entry now) and the
+      //: history renders. An unchanged selection only refreshes the bar.
+      if (prefer && findProject(prefer) && prefer !== selectedProject) {
+        selectProject(prefer);
+      } else {
+        syncBar();
+      }
     });
   }
 
@@ -543,7 +857,15 @@
         elapsed.style.display = "";
         var p = j.progress || {};
         if (p.run_id) ownRunIds[p.run_id] = 1;   // the external view must skip it
-        if (p.repo) runRepo = p.repo;   // the board follows the run's repository
+        //: While the run lives, the board follows its repository and the
+        //: selector lands on it when it is a known project. A run that has
+        //: already ended claims neither - its card is a record, not a choice
+        //: made for the operator.
+        if (p.repo) ownRepo = p.repo;
+        if (p.repo && j.state === "running") {
+          runRepo = p.repo;
+          reflectRun(p.repo);
+        }
         if (p.cycle !== null && p.cycle !== undefined) {
           cycle.textContent = "cycle " + p.cycle;
           cycle.style.display = "";
@@ -570,7 +892,10 @@
         this.next = j.next;
         if (j.state !== "running") {
           stop.style.display = "none";
-          $("go").disabled = false;
+          busyRun(false);
+          //: The run just wrote (or failed to write) its summary: refetch so
+          //: the newest history entry's pill reads finished truthfully.
+          refreshHistory(selectedProject);
         }
       }
     };
@@ -581,7 +906,7 @@
   function pollSwarm(id, view) {
     api("/swarm/status?id=" + encodeURIComponent(id) + "&since=" + view.next)
       .then(function (res) {
-        if (!res.ok) { $("go").disabled = false; return; }
+        if (!res.ok) { busyRun(false); return; }
         view.absorb(res.body);
         if (res.body.state === "running") {
           runTimer = setTimeout(function () { pollSwarm(id, view); }, 1000);
@@ -590,11 +915,12 @@
   }
 
   function swarmFire() {
-    $("go").disabled = true;
+    busyRun(true);
     clearTimeout(runTimer);
-    api("/swarm/start", { values: values() }).then(function (r) {
+    var vals = values();
+    api("/swarm/start", { values: vals }).then(function (r) {
       if (!r.ok) {
-        $("go").disabled = false;
+        busyRun(false);
         var box = panel().runBox;
         box.textContent = "";
         extView = null;
@@ -602,6 +928,27 @@
         return;
       }
       pollSwarm(r.body.id, swarmView(r.body));
+      //: The backend has just written this project down; re-fetching is what
+      //: makes a brand-new repository appear in the selector, selected. A
+      //: local run records a directory path, which is not a project.
+      var fired = (vals.repo || "").trim();
+      ownRepo = fired;   // the run view is about this repo from its first tick
+      if (vals.local !== "1") loadProjects(fired);
+      //: The prompt just fired becomes history the moment the run records its
+      //: run.json, which happens within moments of the spawn - so one refetch
+      //: ~3s in shows it without waiting for the run to end. The run-end
+      //: refetch in `absorb` then flips its pill to finished.
+      setTimeout(function () { refreshHistory(fired); }, 3000);
+      //: The prompt was submitted: an emptied box says so, and the refetch
+      //: above is where its text reappears - as history. Cleared in place,
+      //: not by redraw, so the run view below is untouched.
+      if (fired && fired === selectedProject) {
+        var slot = typed["swarm"] || {};
+        slot.objective = "";
+        typed["swarm"] = slot;
+        var promptNode = document.querySelector('[name="objective"]');
+        if (promptNode) promptNode.value = "";
+      }
     });
   }
 
@@ -736,6 +1083,10 @@
     //: at load, but a slow response and a fast click put the selection back on
     //: the first site while leaving the other one's form on screen.
     current = current || sites[0];
+    //: With the strip hidden the swarm view is the only view; `current` must
+    //: never rest on a site whose tab has no button to leave it by. sites[0]
+    //: is the swarm whenever hideTabs() answers yes - it was just unshifted.
+    if (hideTabs()) current = sites[0];
     var m = res.body.models;
     $("models").textContent = "worker " + m.worker + "  ·  orchestrator " + m.orchestrator
                             + "  ·  " + m.base_url;
@@ -743,5 +1094,19 @@
     drawTabs();
     drawForm();
     if (current.kind === "swarm") swarmShow();
+    //: The remembered projects, most recently active first - listed, never
+    //: presumed: the selector opens on "pick a project" and the operator
+    //: chooses. The one exception is a run already in flight that the page
+    //: adopted: selecting its repo, when the store knows it (either here or
+    //: in `reflectRun`, whichever response arrives second), reflects what is
+    //: actually running - reality, not a default.
+    if (res.body.swarm) {
+      api("/projects").then(function (pr) {
+        if (!pr.ok || !pr.body || !pr.body.projects) return;
+        projects = pr.body.projects;
+        if (findProject(runRepo)) selectProject(runRepo);
+        else syncBar();
+      });
+    }
   });
 })();
