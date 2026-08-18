@@ -111,6 +111,21 @@ def test_every_state_label_lands_in_its_lifecycle_column():
     assert cards(board, "verified") == []
 
 
+def test_a_closed_failed_issue_leaves_the_strip():
+    """The strip's title is "needs a human". A failed issue that was *closed* -
+    superseded by a changed plan, or resolved by the human it waited for - was
+    already answered, and a board that showed it forever would put a permanent
+    red badge on every finished project. Observed live: #21 and #22 of the
+    wallet demo, closed as superseded, still haunting the strip."""
+    closed = issue(9, "swarm:failed")
+    closed["state"] = "closed"
+    client = FakeClient(issues=[closed, issue(10, "swarm:failed")])
+
+    board = reader(client).read("me/thing")
+
+    assert [c["number"] for c in board["failed"]] == [10]
+
+
 def test_failed_is_a_strip_not_a_column():
     client = FakeClient(issues=[issue(9, "swarm:failed")])
 
