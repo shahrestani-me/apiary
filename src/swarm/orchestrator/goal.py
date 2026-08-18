@@ -40,10 +40,14 @@ way that asking makes the run worse:
   untouched, so the failure-signature arithmetic guards the retry. Observed
   live before this: a run merged everything else, arrived at the gate with one
   failed task sitting at attempt 5 of a 9 hard cap, and exited failed asking a
-  human to do the one relabel the orchestrator knew was safe. Only when every
+  human to do the one relabel the orchestrator knew was safe. When every
   failed task is closed (GitHub wins - a human or the planner shut it) or
-  budget-spent does the run stop and name the issues, which is what `checks.py`
-  already decided a `swarm:failed` label means.
+  budget-spent, the failed work is settled and the gate asks the coverage
+  question once anyway: a met answer closes the open failed leftovers as
+  superseded ("at the end having failed ticket is wrong" - the user's rule,
+  verbatim) and the run ends successfully; only an unmet one stops the run and
+  names the issues, which is what `checks.py` already decided a `swarm:failed`
+  label means.
 - **Work still in flight.** Called before the ledger is quiet, the assessment
   would judge an objective against a half-landed run. `Reconciler.loop` only
   calls it when nothing is live, and the guard is here as well because a
@@ -74,7 +78,7 @@ which `CONTRIBUTING.md` makes the first rule of this repository.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Protocol, Sequence
 
 from ..config import SETTINGS
@@ -88,6 +92,7 @@ from ..nodes.planner import (
     PlanError,
     PlanReport,
     normalise,
+    retire_superseded,
     revive,
     write_plan,
 )
@@ -335,6 +340,12 @@ class GoalReport:
     #: - a revived issue is ready, not failed, so the gate cannot see it again
     #: without a fresh give-up in between, and every give-up burned attempts).
     revived: tuple[IssueAction, ...] = ()
+    #: Failed, open tasks closed as `not_planned` because the objective was met
+    #: without them. The other half of "at the end, a failed ticket is wrong":
+    #: a run that delivered its objective must not leave a board wearing
+    #: `swarm:failed` for work nothing needs. Set only on a met report, so it
+    #: never keeps a loop alive - the run is over, successfully.
+    superseded: tuple[IssueAction, ...] = ()
 
     @property
     def met(self) -> bool:
@@ -411,6 +422,40 @@ def _revive_abandoned(
     return tuple(actions)
 
 
+def _retire_superseded(client: Any, ledger: Ledger) -> tuple[IssueAction, ...]:
+    """Close every failed, still-open task of a met objective as superseded.
+
+    The user's rule, verbatim: "at the end having failed ticket is wrong". A
+    met objective is the run declaring nothing further is needed, so a
+    `swarm:failed` issue left open at that moment is a request for a human
+    decision that has already been made - the coverage question was asked and
+    answered without that task's work. Closed issues are skipped for
+    `_revive_abandoned`'s reason (GitHub wins; unknown reads as closed), and
+    the closure itself is `planner.retire_superseded`, shared with the
+    replan's drop path so the two supersessions cannot drift apart. Bounded to
+    failed tasks only: ready or blocked leftovers on a met objective are a
+    different question, deliberately not answered here.
+    """
+    entries = abandoned(ledger)
+    if not entries:
+        return ()
+    states = resolve_states(client, [entry.number for entry in entries])
+    actions: list[IssueAction] = []
+    for entry in entries:
+        state = states.get(entry.number)
+        if state is None or not state.exists or state.closed:
+            continue
+        actions.append(
+            retire_superseded(
+                client,
+                entry,
+                because="the objective was met without this task",
+                reason="swarm:failed with the objective met; closed as superseded",
+            )
+        )
+    return tuple(actions)
+
+
 def close_the_loop(
     client: Any,
     ledger: Ledger,
@@ -444,18 +489,26 @@ def close_the_loop(
     task at attempt 5 of a 9 hard cap. Now each failed, still-open issue with
     total budget remaining is returned to `swarm:ready` (marker untouched; the
     signature arithmetic guards the retry) and the run continues; closed
-    issues are never touched - GitHub wins - and only when every failed task
-    is closed or budget-spent does the gate keep its old answer: unmet, a
-    human's call, the run ends failed. `max_attempts`/`max_total_attempts`
+    issues are never touched - GitHub wins. `max_attempts`/`max_total_attempts`
     exist so the comment the revival posts names the caps the run actually
     enforces. A revive-fail-revive hot loop needs no counter here: a revived
     issue is ready, not failed, so this branch cannot see it again until a
     fresh give-up - which consumed attempts - puts it back, and the hard total
     cap ends that cycle (`planner.revive`).
+
+    **When nothing is revivable, the failed work is settled, and the gate asks
+    the coverage question once before resigning.** Every abandoned issue being
+    closed or budget-spent means no retry is coming from anywhere, so "is the
+    objective met without that work?" finally has a stable answer - and the
+    body of the question is unchanged, because `assess` only ever catalogues
+    `shipped()` for the model. A *met* answer closes the failed leftovers as
+    `not_planned` with a superseded comment (`_retire_superseded`) and the run
+    ends successfully; an unmet or unresolved answer keeps the old resignation
+    verbatim - unmet, the abandoned issues named, the run ends failed, and no
+    follow-up is planned on top of a repository whose last known state is
+    broken.
     """
     assessment = assess(objective, ledger, oracle=oracle)
-    if assessment.met:
-        return GoalReport(assessment, reason=assessment.reason or MET, rounds=rounds)
     if assessment.abandoned:
         revived = _revive_abandoned(
             client,
@@ -474,6 +527,36 @@ def close_the_loop(
                 ),
                 rounds=rounds,
             )
+        # Nothing revivable, so the failed work is *settled*: every abandoned
+        # issue is closed (a human's or the planner's decision) or budget-spent
+        # (the machinery's own bound). One question is still worth one model
+        # swap before resigning: was the objective met without that work?
+        # `assess` only ever shows the model what `shipped()` - so this is the
+        # same coverage question the abandoned arithmetic was short-circuiting,
+        # asked over the same catalogue. Only a *met* answer is acted on; an
+        # unmet or unresolved one changes nothing, because planning follow-ups
+        # on top of a repository whose last known state is broken is exactly
+        # what the arithmetic refusal exists to prevent.
+        gave_up = {entry.task_id for entry in abandoned(ledger)}
+        settled = replace(
+            ledger,
+            entries={
+                task_id: entry
+                for task_id, entry in ledger.entries.items()
+                if task_id not in gave_up
+            },
+        )
+        if settled.entries:
+            final = assess(objective, settled, oracle=oracle)
+            if final.met:
+                assessment = final
+    if assessment.met:
+        superseded = _retire_superseded(client, ledger)
+        reason = assessment.reason or MET
+        if superseded:
+            names = ", ".join(f"#{action.number}" for action in superseded)
+            reason = f"{reason}; closed {len(superseded)} superseded failed task(s): {names}"
+        return GoalReport(assessment, superseded=superseded, reason=reason, rounds=rounds)
     if not assessment.actionable:
         return GoalReport(assessment, reason=assessment.reason, rounds=rounds)
     if not assessment.missing:
