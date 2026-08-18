@@ -939,3 +939,15 @@ def test_the_python_bootstrap_still_gets_the_standard_library_rule():
     goal = Bootstrap(prompt="a CLI", stack="python", files=()).goal
 
     assert "standard library" in goal
+
+
+def test_the_python_workflow_installs_the_gates_tool():
+    """The generated workflow runs `python -m pytest -q` on a bare GitHub
+    runner, and a bare runner has no pytest: the first greenfield python run
+    passed its worker gate in a container that ships pytest and then failed
+    the identical command in CI, on every PR, forever. The workflow ships the
+    gate, so it ships the gate's tool - same reasoning, same package, as
+    Dockerfile.worker."""
+    steps = "\n".join(CI_SETUP["python"])
+
+    assert "pip install" in steps and "pytest" in steps

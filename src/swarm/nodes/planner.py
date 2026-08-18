@@ -611,6 +611,39 @@ def with_bootstrap(
     return (bootstrap, *blocked)
 
 
+#: What a pytest collection will pick up, by its default conventions. Anchored
+#: to the basename: `contest_rules.py` must not count as a test file.
+_TEST_FILE = re.compile(r"(^|/)(test_[^/]+\.py|[^/]+_test\.py)$")
+
+
+def _with_test_file(files: tuple[str, ...], command: str) -> tuple[str, ...]:
+    """A pytest gate with nothing to collect is exit 5, forever.
+
+    The prompt tells the model every task must pass the gate alone, and the
+    first greenfield plan violated it anyway: a Goal demanding "the test must
+    assert ..." over a `## Files` of one module. A worker may only write the
+    files the contract lists, so that task cannot create the test its own goal
+    demands, pytest collects nothing, and the whole retry budget burns on a
+    contract that was unwinnable when it was written. Three attempts, one
+    human reset, and a second identical failure - this repair is cheaper.
+
+    Deterministic and minimal: when the gate runs pytest and no listed file
+    matches pytest's default collection conventions, add `test_<module>.py`
+    beside the first listed module. A task with no `.py` file at all is left
+    alone - there is nothing sane to derive, and `parse_contract` will still
+    accept it, so refusing here would reject tasks (docs, configs) that some
+    other task's tests already cover.
+    """
+    if "pytest" not in command or any(_TEST_FILE.search(path) for path in files):
+        return files
+    module = next((path for path in files if path.endswith(".py")), None)
+    if module is None:
+        return files
+    directory, _, name = module.rpartition("/")
+    prefix = f"{directory}/" if directory else ""
+    return (*files, f"{prefix}test_{name[:-3]}.py")
+
+
 def normalise(
     tasks: Iterable[PlannedTask], *, verify: str, stack: str | None = None
 ) -> tuple[tuple[Draft, ...], tuple[IssueAction, ...]]:
@@ -646,6 +679,7 @@ def normalise(
             continue
 
         seen.add(task_id)
+        files = _with_test_file(files, command)
         # Dependencies are slugified the same way ids are, or a model that
         # wrote `Parse Headers` in one place and `parse-headers` in the other
         # would name a task that exists and still not match it.

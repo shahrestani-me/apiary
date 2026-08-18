@@ -98,7 +98,14 @@ SIGNATURE_CHARS = 400
 # question. That naming convention (`*.test.js`, `*.spec.tsx`) is the dominant
 # one in exactly the stacks #87 is adding. Found by #93's agreement test, which
 # exists to keep this expression honest.
-_PATH_RE = re.compile(r"(?:[\w.@+-]+/)+[\w.@+-]*\.[A-Za-z0-9_]+")
+#: The lookbehind refuses a match that continues a URL or an absolute path:
+#: `https://docs.pytest.org/...` starts matching at `docs...` (the `:` stops
+#: the character class), looks repo-relative, and passed every filter below.
+#: pytest prints exactly that URL in its own footer, so a task that failed on
+#: "no tests collected" was reported as failing on a *file* its `## Files`
+#: does not list - the one diagnosis that suppresses the replan which exists
+#: for that situation.
+_PATH_RE = re.compile(r"(?<![:/])(?:[\w.@+-]+/)+[\w.@+-]*\.[A-Za-z0-9_]+")
 
 # Digits are dropped from a failure signature: pytest reports `1 failed in
 # 0.42s`, a traceback names line numbers, and a temporary directory carries a
@@ -159,6 +166,13 @@ def mentioned_paths(text: str) -> tuple[str, ...]:
         # has always stripped it; this did not, so a Go build error named a
         # path that compared equal to nothing.
         path = path.lstrip("./")
+        # A dotted first segment is a hostname, not a directory: a schemeless
+        # `docs.pytest.org/en/how-to.html` survives the lookbehind above.
+        # Conservative in the right direction - a dropped real path just means
+        # the failure counts as "the model keeps writing the wrong code",
+        # which replanning is allowed to fix; a kept fake path suppresses it.
+        if "." in path.split("/", 1)[0]:
+            continue
         if path not in found:
             found.append(path)
     return tuple(found)
