@@ -85,6 +85,10 @@ MAX_LINE_CHARS = 2_000
 # `cli.py`'s own output, which is pinned by its tests; a format change there
 # degrades this to "no summary" rather than to a wrong one.
 _REPO_LINE = re.compile(r"\brepo ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
+#: The run-identity line `_report_run` prints. Captured so the page can tell
+#: "this console job" and "the same run seen through its artifacts" apart -
+#: without it the external-run view would show every console run twice.
+_RUN_ID_LINE = re.compile(r"»\s*run\s+([a-z0-9][a-z0-9-]*)\s")
 _CYCLE_LINE = re.compile(r"\bcycle (\d+):")
 _PR_REF = re.compile(r"\bPR #(\d+)")
 _ISSUE_LINE = re.compile(r"^\s*#(\d+): ")
@@ -284,7 +288,7 @@ class RunJob:
     local: bool = False
     lines: list[str] = field(default_factory=list)
     progress: dict[str, Any] = field(default_factory=lambda: {
-        "repo": "", "repo_url": "", "cycle": None,
+        "repo": "", "repo_url": "", "run_id": "", "cycle": None,
         "issues": [], "prs": [], "note": "", "met": False,
     })
     stop_requested: bool = False
@@ -299,6 +303,8 @@ class RunJob:
         self.lines.append(line[:MAX_LINE_CHARS])
 
         p = self.progress
+        if not p["run_id"] and (m := _RUN_ID_LINE.search(line)):
+            p["run_id"] = m.group(1)
         if not self.local and not p["repo"] and (m := _REPO_LINE.search(line)):
             p["repo"] = m.group(1)
             # Built here from the validated slug, never lifted from the log:

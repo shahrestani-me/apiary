@@ -143,7 +143,7 @@
         drawTabs();
         drawForm();
         if (site.kind === "swarm") swarmShow();
-        else clearTimeout(boardTimer);
+        else { clearTimeout(boardTimer); clearTimeout(extTimer); }
       };
       tabs.appendChild(b);
     });
@@ -267,6 +267,10 @@
   // ---- the swarm tab: the board, and a whole run streamed ------------------
 
   var boardTimer = null, runTimer = null, runRepo = "";
+  //: Runs this console process spawned, by their swarm run id (parsed from the
+  //: log). The external view skips these - the same run must not appear twice,
+  //: once from memory and once from its artifacts.
+  var extTimer = null, extView = null, ownRunIds = {};
 
   //: Lifecycle order, mirroring `console_board.COLUMNS`. swarm:failed is a
   //: strip below rather than a column: a ticket needing a human must not hide.
@@ -297,14 +301,99 @@
     //: tabs never clobbers a view that is already following a run.
     if (!panel().runBox.childNodes.length) {
       api("/swarm/latest").then(function (res) {
-        if (!res.ok || panel().runBox.childNodes.length) return;
+        if (!res.ok || panel().runBox.childNodes.length) { extTick(); return; }
         var view = swarmView(res.body);
         if (res.body.state === "running") {
           $("go").disabled = true;
           pollSwarm(res.body.id, view);
         }
+        extTick();
       });
+    } else {
+      extTick();
     }
+  }
+
+  // ---- runs the console did not start, read from their artifacts -----------
+
+  function externalCard(b) {
+    var state = el("span", "pill", "");
+    var age = el("span", "pill", "");
+    var idPill = el("span", "pill", b.run_id);
+    var strip = el("div", "pills");
+    [state, age, idPill].forEach(function (p) { strip.appendChild(p); });
+
+    var links = el("p", "links");
+    if (b.repo_url) {
+      var a = el("a", null, b.repo);
+      a.href = b.repo_url; a.target = "_blank"; a.rel = "noopener";
+      links.appendChild(a);
+    }
+    var note = el("p", "blurb", "");
+    var head = el("div");
+    head.appendChild(strip);
+    head.appendChild(links);
+    head.appendChild(note);
+
+    var log = pre("");
+    log.className = "log";
+    var body = el("div");
+    body.appendChild(el("p", "blurb",
+      "Started outside this console (a terminal, or before a restart). What follows is "
+      + "the run's own recorded cycle log from its artifacts - the board above is its live truth."));
+    body.appendChild(log);
+
+    var box = panel().runBox;
+    box.textContent = "";
+    box.appendChild(card("the run — from its artifacts", head));
+    box.appendChild(card("cycle log — as recorded", body));
+
+    return { id: b.run_id, next: 0, root: box.firstChild,
+             state: state, age: age, note: note, log: log };
+  }
+
+  function absorbExternal(b) {
+    if (ownRunIds[b.run_id]) return;              // already on screen from memory
+    var box = panel().runBox;
+    var ours = extView && box.contains(extView.root);
+    if (box.childNodes.length && !ours) return;   // never clobber an own view
+    if (!ours || extView.id !== b.run_id) {
+      extView = externalCard(b);
+    }
+    extView.state.textContent = b.state === "quiet"
+      ? "quiet — a long model call, or interrupted" : b.state;
+    extView.state.className = "pill" + (b.state === "finished" ? " ok" : "");
+    if (b.last_event_s !== null && b.state !== "finished") {
+      extView.age.textContent = "last event " + Math.round(b.last_event_s) + "s ago";
+      extView.age.style.display = "";
+    } else {
+      extView.age.style.display = "none";
+    }
+    extView.note.textContent = b.note || "";
+    if (b.lines && b.lines.length) {
+      extView.log.textContent += b.lines.join("\n") + "\n";
+      extView.log.scrollTop = extView.log.scrollHeight;
+    }
+    extView.next = b.next;
+    if (b.repo) runRepo = b.repo;                 // the board follows it too
+  }
+
+  function extTick() {
+    clearTimeout(extTimer);
+    if (!current || current.kind !== "swarm") return;
+    //: `run` names the run the counter belongs to: when a newer run has taken
+    //: the latest slot, the server answers from line zero instead of slicing
+    //: the new run's log with the old run's offset.
+    var since = extView ? extView.next : 0;
+    var run = extView ? "&run=" + encodeURIComponent(extView.id) : "";
+    api("/swarm/external?since=" + since + run).then(function (res) {
+      if (!current || current.kind !== "swarm") return;
+      if (res.ok) absorbExternal(res.body);
+      //: 404 means nothing ever ran - not an error worth a card. Poll faster
+      //: while an orchestrator is demonstrably cycling, slower otherwise.
+      var wait = res.ok && res.body.state === "active" ? 3000 : 15000;
+      extTimer = setTimeout(extTick, wait);
+    });
   }
 
   function boardRepo() {
@@ -439,6 +528,7 @@
 
     var box = panel().runBox;
     box.textContent = "";
+    extView = null;   // an own view owns the box now; the external card is gone
     box.appendChild(card("the run", head));
     box.appendChild(card("log — the run's own output, live", body));
 
@@ -452,6 +542,7 @@
         elapsed.textContent = j.elapsed_s + "s";
         elapsed.style.display = "";
         var p = j.progress || {};
+        if (p.run_id) ownRunIds[p.run_id] = 1;   // the external view must skip it
         if (p.repo) runRepo = p.repo;   // the board follows the run's repository
         if (p.cycle !== null && p.cycle !== undefined) {
           cycle.textContent = "cycle " + p.cycle;
@@ -506,6 +597,7 @@
         $("go").disabled = false;
         var box = panel().runBox;
         box.textContent = "";
+        extView = null;
         box.appendChild(errorCard({ type: "refused", message: r.body.error, fix: r.body.fix }));
         return;
       }

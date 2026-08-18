@@ -431,6 +431,8 @@ class Console:
             return self._swarm_status(path)
         if method == "GET" and path.startswith("/swarm/board"):
             return self._swarm_board(path)
+        if method == "GET" and path.startswith("/swarm/external"):
+            return self._swarm_external(path)
         return Response.error(f"no route for {method} {path}", 404)
 
     def _payload(self, body: bytes) -> tuple[Site, dict[str, str]]:
@@ -553,6 +555,32 @@ class Console:
         except SwarmRunError as exc:
             return Response.error(str(exc), 404)
         return Response.json(status)
+
+    def _swarm_external(self, path: str) -> Response:
+        """The latest artifacts-recorded run, whoever launched it.
+
+        Read from `.swarm/runs/` exactly as `swarm runs` reads it, so a run
+        started from a terminal - or surviving a console restart - still has
+        an account on the page. 404 when nothing ever ran; the page treats
+        that as "no external run", not as an error worth showing.
+        """
+        import urllib.parse
+
+        from .console_external import latest_external
+
+        _, _, query = path.partition("?")
+        wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        since = wanted.get("since", "0")
+        try:
+            latest = latest_external(
+                since=int(since) if since.isdigit() else 0,
+                run_id=urllib.parse.unquote(wanted.get("run", "")),
+            )
+        except Exception as exc:  # noqa: BLE001 - an unreadable artifacts root belongs on the page
+            return Response.error(f"{type(exc).__name__}: {exc}", 502)
+        if latest is None:
+            return Response.error("no recorded runs", 404)
+        return Response.json(latest)
 
     def _swarm_board(self, path: str) -> Response:
         """One repository's tickets in lifecycle columns, read from GitHub.
