@@ -217,6 +217,29 @@ def test_remove_label_tolerates_an_already_absent_label():
     assert gh.remove_label(7, "swarm:ready") is False
 
 
+def test_list_issue_comments_walks_the_whole_thread():
+    """The read half of the retry-feedback channel, paginated like every listing.
+
+    The newest comment is the one a retrying worker wants, and on a
+    much-argued issue it lives on the last page - so stopping at the first
+    would hand the worker the oldest feedback instead of the latest.
+    """
+    page2 = f"{API}/repos/{REPO}/issues/7/comments?page=2"
+    gh, transport, _ = client(
+        response(200, [{"id": 1, "body": "human chatter"}],
+                 Link=f'<{page2}>; rel="next", <{page2}>; rel="last"'),
+        response(200, [{"id": 2, "body": "apiary: attempt 1 failed. details"}]),
+    )
+
+    comments = gh.list_issue_comments(7)
+
+    assert [c["id"] for c in comments] == [1, 2]
+    sent = transport.sent[0]
+    assert sent.method == "GET"
+    assert sent.url.startswith(f"{API}/repos/{REPO}/issues/7/comments")
+    assert "per_page=100" in sent.url
+
+
 # --------------------------------------------------------------------------
 # Pull requests
 # --------------------------------------------------------------------------

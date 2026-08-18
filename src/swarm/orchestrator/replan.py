@@ -22,7 +22,12 @@ most here - **leaves a dropped task that is `swarm:claimed` or `swarm:review`
 exactly where it is and reports it**. That decision belongs to the planner's
 module docstring and is not re-taken here; this module reads the retentions out
 of the `PlanReport` and reports them onwards, because a human is the only one
-who should be deciding to abandon a container mid-edit.
+who should be deciding to abandon a container mid-edit. The same ownership
+holds for the newer revival rule: a `swarm:failed` task the new plan *keeps*
+is returned to `swarm:ready` by `write_plan` itself (budget intact - the
+failure signature is the guard), and this module only surfaces it, because a
+replan that rewrote the tracker around a failed task while leaving the task
+itself dead was observed to re-stall the run until a human relabelled it.
 
 **The one model call is the plan, never the decision.** Whether to replan is
 arithmetic over the judge's verdict, and the verdict itself is arithmetic on
@@ -240,6 +245,18 @@ class ReplanReport:
         settle.
         """
         return () if self.plan is None else self.plan.retained
+
+    @property
+    def revived(self) -> tuple[IssueAction, ...]:
+        """Failed tasks the new plan kept, returned to `swarm:ready`.
+
+        The write path's decision too (`planner.write_plan`'s revival rule),
+        surfaced here because a stall is exactly where it matters: the failed
+        task whose chain blocks everything used to be "left alone" by a replan
+        - observed live as a run that replanned, stayed 0-ready and re-stalled
+        until a human relabelled the issue by hand.
+        """
+        return () if self.plan is None else self.plan.revived
 
     @property
     def numbers(self) -> tuple[int, ...]:

@@ -74,6 +74,7 @@ class Tracker:
 
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     next_number: int = 1
+    comments: list[tuple[int, str]] = field(default_factory=list)
 
     def add(
         self,
@@ -143,6 +144,9 @@ class Tracker:
                     label for label in issue["labels"] if label["name"] != parts[2]
                 ]
                 return response(200, list(issue["labels"]))
+        elif parts[1] == "comments" and request.method == "POST":
+            self.comments.append((issue["number"], payload["body"]))
+            return response(201, {"id": len(self.comments)})
 
         raise AssertionError(f"unhandled {request.method} {request.path}")
 
@@ -495,6 +499,130 @@ def test_a_task_whose_issue_a_human_closed_is_not_resurrected(github):
     # Reopening would be the planner overruling a human, and creating a second
     # issue for the same id would corrupt the ledger outright.
     assert numbers_of(store) == [number]
+
+
+# --------------------------------------------------------------------------
+# Revival: a kept swarm:failed task goes back to ready
+# --------------------------------------------------------------------------
+
+
+def failed_body(
+    task_id: str,
+    *,
+    goal: str = "the goal",
+    files: Sequence[str] = ("src/a.py",),
+    attempt: int = 3,
+    blocker: str = "",
+    streak: int | None = None,
+) -> str:
+    """A failed task's body: the marker carries the give-up's budget record."""
+    body = render_body(task_id, goal=goal, files=list(files), verify=VERIFY, attempt=attempt)
+    return body.replace(
+        render_marker(task_id, attempt),
+        render_marker(task_id, attempt, blocker=blocker, streak=streak),
+    )
+
+
+def test_a_kept_failed_task_is_revived_with_its_budget_intact(github):
+    """The live gap: a replan reported "0 created, 3 updated, 11 left alone"
+    and the failed task blocking the whole chain was among the left-alone, so
+    the run stayed 0-ready and re-stalled until a human relabelled it."""
+    client, store, _ = github()
+    body = failed_body("stuck", blocker="ab12cd34ef", streak=3)
+    number = store.add(body=body, labels=("swarm:failed",))
+
+    # The plan keeps the task unchanged - same goal, same files.
+    report = write(
+        client,
+        task("stuck", goal="the goal", files=["src/a.py"]),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert [action.kind for action in report.actions] == ["revived"]
+    assert store.label_names(number) == {"swarm:ready"}
+    # Nothing is reset: attempt, blocker and streak survive verbatim, so a
+    # retry that fails the same way again gives up on its first observation.
+    assert store.issues[number]["body"] == body
+    assert number in report.numbers
+    assert report.summary().endswith("1 revived")
+    issue_number, text = store.comments[0]
+    assert issue_number == number
+    assert text.startswith("apiary: the replan retained this task")
+    assert "returned to `swarm:ready`" in text
+    assert "streak 3 of 3, total 3 of 9" in text
+
+
+def test_a_kept_failed_task_is_revived_even_when_the_plan_updated_it(github):
+    client, store, _ = github()
+    body = failed_body("stuck", blocker="ab12cd34ef", streak=3)
+    number = store.add(body=body, labels=("swarm:failed",))
+
+    report = write(
+        client,
+        task("stuck", goal="a different decomposition of the same work", files=["src/a.py"]),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert [action.kind for action in report.actions] == ["revived"]
+    assert store.label_names(number) == {"swarm:ready"}
+    # The body is deliberately not rewritten: rendering it fresh would drop
+    # the marker's signature record, which is the whole guard.
+    assert store.issues[number]["body"] == body
+
+
+def test_a_failed_task_with_the_total_budget_spent_stays_failed(github):
+    client, store, _ = github()
+    body = failed_body("spent", attempt=9, blocker="ab12cd34ef", streak=1)
+    number = store.add(body=body, labels=("swarm:failed",))
+
+    report = write(
+        client,
+        task("spent", goal="the goal", files=["src/a.py"]),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert [action.kind for action in report.actions] == ["retained"]
+    assert "total retry budget spent" in report.actions[0].reason
+    assert store.label_names(number) == {"swarm:failed"}
+    # No comment either: the give-up comment already told a human what to do,
+    # and a replan that keeps refusing must not bury it under repetition.
+    assert store.comments == []
+
+
+def test_a_failed_marker_without_a_signature_record_still_revives(github):
+    # Back-compat: an issue failed before blocker= existed. The streak falls
+    # back to the attempt counter, which is what it was then.
+    client, store, _ = github()
+    body = failed_body("old-style", attempt=3)
+    number = store.add(body=body, labels=("swarm:failed",))
+
+    report = write(
+        client,
+        task("old-style", goal="the goal", files=["src/a.py"]),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert [action.kind for action in report.actions] == ["revived"]
+    assert store.label_names(number) == {"swarm:ready"}
+    assert "streak 3 of 3, total 3 of 9" in store.comments[0][1]
+
+
+def test_a_dropped_failed_task_is_not_revived(github):
+    # Revival is for work the plan still wants. A failed task the plan dropped
+    # is the module docstring's terminal case, exactly as before.
+    client, store, _ = github()
+    number = store.add(body=failed_body("abandoned"), labels=("swarm:failed",))
+
+    report = write(client, task("something-else"))
+
+    retained = [action for action in report.actions if action.kind == "retained"]
+    assert [action.task_id for action in retained] == ["abandoned"]
+    assert store.label_names(number) == {"swarm:failed"}
+    assert store.comments == []
 
 
 def test_a_replan_prompt_carries_the_existing_ids(monkeypatch):

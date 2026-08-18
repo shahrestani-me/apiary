@@ -37,7 +37,7 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
-from swarm.github.ledger import Ledger, LedgerEntry, load_ledger
+from swarm.github.ledger import Ledger, LedgerEntry, load_ledger, render_marker
 from swarm.nodes.judge import (
     Observation,
     Verdict,
@@ -560,6 +560,7 @@ class Tracker:
 
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     next_number: int = 1
+    comments: list[tuple[int, str]] = field(default_factory=list)
 
     def add(
         self,
@@ -613,6 +614,22 @@ class Tracker:
             if request.method == "PATCH":
                 issue.update(payload)
                 return response(200, dict(issue))
+        elif parts[1] == "labels":
+            # The revival path relabels failed -> ready through the same client.
+            if request.method == "POST":
+                names = {label["name"] for label in issue["labels"]}
+                issue["labels"].extend(
+                    {"name": name} for name in payload["labels"] if name not in names
+                )
+                return response(200, list(issue["labels"]))
+            if request.method == "DELETE":
+                issue["labels"] = [
+                    label for label in issue["labels"] if label["name"] != parts[2]
+                ]
+                return response(200, list(issue["labels"]))
+        elif parts[1] == "comments" and request.method == "POST":
+            self.comments.append((issue["number"], payload["body"]))
+            return response(201, {"id": len(self.comments)})
         raise AssertionError(f"unhandled {request.method} {request.path}")
 
 
@@ -734,6 +751,41 @@ def test_a_dropped_task_with_a_worker_on_it_is_left_alone_and_reported(tracker):
     assert store.issues[running]["state"] == "open"
     assert [action.task_id for action in report.retained] == ["in-flight"]
     assert CLAIMED in report.retained[0].reason
+
+
+def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
+    """The follow-up to the live stall this module replanned: the report read
+    "0 created, 3 updated, 0 retired, 11 left alone" and the failed task whose
+    chain blocked everything was left alone, so the run stayed 0-ready and
+    re-stalled. A replan that keeps a failed task now revives it, budget
+    intact - the failure signature is what makes that safe."""
+    client, store = tracker()
+    body = render_body("stuck", goal="Unblock the chain", files=["src/swarm/a.py"], verify=VERIFY, attempt=3)
+    body = body.replace(
+        render_marker("stuck", 3), render_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
+    )
+    number = store.add(body=body, labels=[FAILED])
+    before = load_ledger(client, adopt=False)
+
+    report = replan(
+        client,
+        before,
+        OBJECTIVE,
+        stalled(),
+        proposer=Proposal(
+            Plan(tasks=[task("stuck", goal="Unblock the chain", files=["src/swarm/a.py"])])
+        ),
+    )
+
+    assert report.replanned
+    assert [action.number for action in report.revived] == [number]
+    labels = {label["name"] for label in store.issues[number]["labels"]}
+    assert labels == {READY}
+    # The marker survives verbatim: nothing is reset, the arithmetic guards.
+    assert render_marker("stuck", 3, blocker="ab12cd34ef", streak=3) in store.issues[number]["body"]
+    assert store.comments[0][0] == number
+    assert store.comments[0][1].startswith("apiary: the replan retained this task")
+    assert "revived" in report.summary()
 
 
 def test_a_replan_resets_the_stall_count_and_counts_itself(tracker):

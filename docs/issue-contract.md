@@ -408,7 +408,39 @@ budget — the body is already in the response the loader fetched.
 - A missing or unparseable `attempt=` field reads as `0` — the adoption case in
   [§2](#2-task-identity), where a human wrote the issue by hand.
 - The cap is `Settings.max_attempts_per_task` ([`config.py`](../src/swarm/config.py)),
-  unchanged from v1.
+  unchanged from v1 — but it bounds *one blocker*, not the task; see below.
+
+### The failure signature: the budget is per blocker
+
+The marker may carry two further, optional fields:
+
+```
+<!-- apiary:task id=add-retry-logic attempt=2 blocker=ab12cd34ef streak=2 -->
+```
+
+`blocker=` is a short deterministic signature of the failure the last consumed
+attempt died on (`reconcile.signature`: the diagnosis when one was recognised,
+otherwise the normalised exception line — paths, line numbers and addresses
+stripped), and `streak=` is how many consecutive attempts have failed with that
+signature. The reconciler's give-up test runs on the **streak**: the same
+failure repeating burns the budget down as it always did, while a *different*
+failure than the last recorded one is proof the previous blocker is gone, so
+the streak restarts at 1 and the retry is granted even when `attempt` has
+reached `max_attempts_per_task`. Renewal is bounded by
+`Settings.max_total_attempts_per_task` (`SWARM_MAX_TOTAL_ATTEMPTS`, default
+three full per-blocker budgets) on the monotonic `attempt` itself, so a task
+that keeps failing in new ways still ends.
+
+Both fields ride the same body `PATCH` as `attempt=`, so the write rule above
+covers them: the record lands before the label goes back to `swarm:ready`, and
+a crash between the two costs an attempt with its signature recorded rather
+than granting a retry that forgot what it was retrying. A marker without the
+fields — every marker written before they existed — reads as "no previous
+blocker recorded" and behaves exactly as this section always specified; a
+writer that consumes an attempt with nothing to sign (a stale claim, a failed
+check run) rewrites the marker without them, which falls back to the same
+arithmetic. The worker tolerates and ignores both fields, and must: only the
+reconciler consumes them.
 
 ---
 

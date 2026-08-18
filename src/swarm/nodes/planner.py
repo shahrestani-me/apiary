@@ -41,11 +41,38 @@ creating an issue `ready` and creating one `blocked` - and nothing else:
   decision for the reconciler (#22, #23) or a human, and the planner declines it
   loudly instead of making it silently.
 - `swarm:done` / `swarm:failed`: terminal. `done` is history; `failed` needs a
-  human. Both untouched.
+  human. Both untouched when *dropped*.
 
 The same reasoning governs a task the replan *keeps*: an entry that is claimed,
-in review, done or failed is not rewritten either, because its body is the
-contract a container is working against right now.
+in review or done is not rewritten either, because its body is the contract a
+container is working against right now (or history, for `done`).
+
+**A `swarm:failed` task the plan keeps is the one exception: it is revived.**
+Observed live: a replan fired on a stalled run, reported "0 created, 3 updated,
+0 retired, 11 left alone" - and the failed task whose dependency chain blocked
+everything was among the ones left alone, so the run was still 0-ready and
+re-stalled until a human relabelled the issue by hand. A replan that can
+rewrite the whole tracker but cannot revive the one task blocking it is a
+replan that cannot fix a stall. Reviving used to be unsafe - a fresh dispatch
+against a spent counter would fail once and re-fail the task, or worse, a
+human-style counter reset would grant three more rolls at the identical
+blocker. The failure signature (`docs/issue-contract.md` §5) is what makes it
+safe now, so the revival deliberately resets **nothing**: the marker keeps its
+`attempt`, `blocker` and `streak`, the label moves `failed -> ready`, and the
+arithmetic at the next failure is the guard - the same failure again gives up
+immediately (the streak is already at its cap), a *different* failure
+legitimately renews. A failed task whose hard total budget is already spent
+(`attempt >= SWARM_MAX_TOTAL_ATTEMPTS`) stays failed and is only reported: the
+give-up comment on the issue already told a human what to do, and re-saying it
+every replan would bury it. The body is not rewritten either way - rendering it
+fresh would drop the marker's signature record, and the retry-feedback comments
+already carry what the next attempt needs.
+
+The revival lives on this write path rather than in `replan.py`, so **any**
+caller of `write_plan` whose plan retains a failed task revives it - the goal
+gate included. In practice the gate never exercises it: `goal.assess` refuses
+to act while any task is `swarm:failed` (an abandoned task is a question for a
+human, not for more planning), so the stall-replan is the path that revives.
 
 **State labels are written once, at creation.** After that `ready` <-> `blocked`
 belongs to readiness (#11), which resolves each `## Blocked by` ref's real state
@@ -70,13 +97,14 @@ projecting the plan it just sent. Anything else would be a second ledger, and
 from __future__ import annotations
 
 import re
+import sys
 import time
 
 from dataclasses import dataclass
 from typing import Iterable, Literal, Mapping, Sequence
 
 from ..config import SETTINGS
-from ..github.client import GitHubClient
+from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import (
     DEFAULT_STACK,
     KNOWN_STACKS,
@@ -154,6 +182,9 @@ Constraints:
   back truncated mid-file. Split until each task fits in one answer.
 - Every task must list the files it creates or modifies. A worker may only
   write what its task declares, so a task that declares nothing can do nothing.
+- Third-party packages reach a worker ONLY if declared in requirements.txt,
+  which is installed before {verify} runs (when the operator has allowed the
+  package index). Prefer the standard library when it suffices.
 
 Each goal is the entire brief the worker gets. It sees the goal, the files, and
 nothing else - not this objective, not the other tasks, not your reasoning. So
@@ -236,6 +267,11 @@ WRITABLE = frozenset({READY, BLOCKED})
 # these is a decision the planner refuses to make - see the module docstring.
 IN_FLIGHT = frozenset({"swarm:claimed", "swarm:review"})
 
+# The label a revival takes an issue out of. The same spelling as
+# `reconcile.FAILED`; spelled here rather than imported because `orchestrator`
+# modules import this one, and the dependency must not point back up.
+FAILED = "swarm:failed"
+
 # Path segments that are packaging, not subject matter. `src/swarm/github/…` is
 # work on the github area; the `src` says nothing about what the task is.
 AREA_CONTAINERS = frozenset(
@@ -255,7 +291,9 @@ MAX_TITLE = 72
 # number is dropped, because the issue does not exist yet.
 _SELF_CHECK_NUMBER = 0
 
-ActionKind = Literal["created", "updated", "unchanged", "retired", "retained", "rejected"]
+ActionKind = Literal[
+    "created", "updated", "unchanged", "retired", "retained", "rejected", "revived"
+]
 
 
 class PlanError(RuntimeError):
@@ -424,26 +462,40 @@ class PlanReport:
         return self.of("rejected")
 
     @property
+    def revived(self) -> tuple[IssueAction, ...]:
+        """Failed tasks the plan kept and therefore returned to `swarm:ready`.
+
+        Reported as their own kind rather than folded into `updated`, because
+        the operator watching a stalled run needs the difference: an update
+        rewrote a contract, a revival un-stuck the chain a human used to have
+        to relabel by hand. See the module docstring's revival rule.
+        """
+        return self.of("revived")
+
+    @property
     def numbers(self) -> tuple[int, ...]:
         """Issues this plan is now made of, ascending."""
         return tuple(
             sorted(
                 action.number
-                for action in self.of("created", "updated", "unchanged")
+                for action in self.of("created", "updated", "unchanged", "revived")
                 if action.number is not None
             )
         )
 
     @property
     def changed(self) -> bool:
-        return bool(self.created or self.updated or self.retired)
+        return bool(self.created or self.updated or self.retired or self.revived)
 
     def summary(self) -> str:
-        return (
+        head = (
             f"{self.repo}: {len(self.created)} created, {len(self.updated)} updated, "
             f"{len(self.unchanged)} unchanged, {len(self.retired)} retired, "
             f"{len(self.retained)} left alone, {len(self.rejected)} rejected"
         )
+        # Appended rather than always present so every existing reading of the
+        # summary line stays byte-identical on the plans that revive nothing.
+        return f"{head}, {len(self.revived)} revived" if self.revived else head
 
 
 # --------------------------------------------------------------------------
@@ -797,6 +849,8 @@ def write_plan(
     retire_dropped: bool = True,
     stack: str | None = None,
     bootstrap: PlannedTask | None = None,
+    max_attempts: int = SETTINGS.max_attempts_per_task,
+    max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
 ) -> PlanReport:
     """Write a plan to the tracker: create what is new, update what is not.
 
@@ -812,6 +866,11 @@ def write_plan(
     any worker touched the task. `None` falls back to `SETTINGS.verify_command`
     - v1's `SWARM_VERIFY`, and the right answer only for a repository that
     really is verified that way.
+
+    `max_attempts` and `max_total_attempts` exist for the revival rule (module
+    docstring): a kept `swarm:failed` task returns to `swarm:ready` unless its
+    hard total budget is spent, and the comment the revival leaves names the
+    budget state in the caps the run is actually bounded by.
 
     Raises `PlanError` - having written nothing - when the plan's own
     dependency graph has a ring in it.
@@ -859,7 +918,17 @@ def write_plan(
             if actions[-1].number is not None:
                 numbers[draft.task_id] = actions[-1].number
             continue
-        actions.append(_update(client, draft, entry, refs, states))
+        actions.append(
+            _update(
+                client,
+                draft,
+                entry,
+                refs,
+                states,
+                max_attempts=max_attempts,
+                max_total_attempts=max_total_attempts,
+            )
+        )
 
     planned = {draft.task_id for draft in ordered}
     for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].number):
@@ -898,6 +967,9 @@ def _update(
     entry: LedgerEntry,
     refs: Sequence[int],
     states: Mapping[int, IssueState],
+    *,
+    max_attempts: int = SETTINGS.max_attempts_per_task,
+    max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
 ) -> IssueAction:
     """Rewrite an existing issue's contract, or explain why this one is not touched.
 
@@ -917,6 +989,15 @@ def _update(
             draft.task_id,
             entry.number,
             reason="issue is closed; reopening it is a human's call",
+        )
+    if entry.state_label == FAILED:
+        # The plan still contains this task - updated or unchanged, it is the
+        # same decision - so the failure is not abandonment: the replan wants
+        # this work done, and a failed task it cannot revive re-stalls the run
+        # until a human relabels it by hand. See the module docstring for why
+        # the signature budget makes this safe and what is deliberately kept.
+        return _revive(
+            client, entry, max_attempts=max_attempts, max_total_attempts=max_total_attempts
         )
     if entry.state_label not in WRITABLE:
         return IssueAction(
@@ -938,6 +1019,79 @@ def _update(
 
     client.update_issue(entry.number, body=body)
     return IssueAction("updated", draft.task_id, entry.number)
+
+
+def _revive(
+    client: GitHubClient,
+    entry: LedgerEntry,
+    *,
+    max_attempts: int,
+    max_total_attempts: int,
+) -> IssueAction:
+    """Return a kept `swarm:failed` task to `swarm:ready`, resetting nothing.
+
+    This is the orchestrator doing exactly what the human used to do - relabel
+    the failed issue so the chain behind it can move - except it does *not*
+    reset the counter, because it no longer has to: the marker keeps its
+    `attempt`, `blocker` and `streak` verbatim, so the budget arithmetic at the
+    next failure is the guard. A retry that fails the same way finds its streak
+    already at the cap and gives up immediately; one that fails differently has
+    proven the old blocker gone and legitimately renews (§5's signature rule).
+    That asymmetry is precisely why reviving is safe now and was not before.
+
+    The one refusal: a task whose hard total budget is spent stays failed. The
+    give-up comment on the issue already says so and names the remedy, and a
+    revival there would grant nothing - the very next observation would fail it
+    again on the same arithmetic. Retained-and-reported costs no write, so a
+    replan that keeps refusing does not spam the issue either.
+
+    Label order is add-before-remove, `readiness._relabel`'s rule: a crash
+    between the two calls leaves two state labels, which §3's precedence
+    repairs, where zero labels puts the issue outside the ledger entirely. The
+    comment is an aid and never a prerequisite - a client that cannot post one
+    prints it instead, `reconcile.post_comment`'s discipline.
+    """
+    total_cap = max(int(max_total_attempts), 1)
+    if entry.attempt >= total_cap:
+        return IssueAction(
+            "retained",
+            entry.task_id,
+            entry.number,
+            reason=(
+                f"{FAILED} with the total retry budget spent "
+                f"({entry.attempt} of {total_cap}); reviving it is a human's call"
+            ),
+        )
+
+    cap = max(int(max_attempts), 1)
+    # An old marker carries no streak; the attempt counter is what the streak
+    # was before failures had signatures (`ledger.LedgerEntry.streak`).
+    streak = entry.attempt if entry.streak is None else entry.streak
+    budget = f"streak {streak} of {cap}, total {entry.attempt} of {total_cap}"
+
+    client.add_labels(entry.number, [READY])
+    client.remove_label(entry.number, FAILED)
+
+    comment = (
+        f"apiary: the replan retained this task, so it is returned to `{READY}`. "
+        f"The retry budget stands as it was - {budget} - so a retry that fails "
+        "the same way as the last attempt gives up immediately, and one that "
+        "fails differently renews its own budget."
+    )
+    poster = getattr(client, "create_issue_comment", None)
+    if poster is None:
+        print(
+            f"! no create_issue_comment; revival comment for #{entry.number} not posted:\n"
+            f"{comment}",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            poster(entry.number, comment)
+        except GitHubError as exc:
+            print(f"! revival comment on #{entry.number} failed: {exc}", file=sys.stderr)
+
+    return IssueAction("revived", entry.task_id, entry.number, reason=budget)
 
 
 def _drop(

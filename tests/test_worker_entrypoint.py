@@ -18,13 +18,14 @@ real checkout, because the one thing this suite must not fake is the gate.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
-from fixtures.github import response
+from fixtures.github import not_found, response
 from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 
 from swarm.github.ledger import ContractError
@@ -102,8 +103,11 @@ def issue_body(
     files: Sequence[str] = ("calc.py",),
     verify: str = VERIFY_COMMAND,
     task_id: str | None = "add-sub",
+    attempt: int = 0,
+    marker: str | None = None,
 ) -> str:
-    marker = f"<!-- apiary:task id={task_id} attempt=0 -->\n\n" if task_id else ""
+    if marker is None:
+        marker = f"<!-- apiary:task id={task_id} attempt={attempt} -->\n\n" if task_id else ""
     listed = "\n".join(f"- {path}" for path in files)
     return (
         f"{marker}## Goal\n{goal}\n\n"
@@ -401,6 +405,283 @@ def test_declared_paths_are_matched_exactly(tmp_path):
 
     assert applied.written == ("calc.py",)
     assert applied.refused == (("Calc.py", "not in the declared file set"),)
+
+
+# --------------------------------------------------------------------------
+# Dependencies: the manifest a worker may always write, and the install
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_the_dependency_manifest_is_writable_without_being_declared(
+    fake_github, scratch_repo, workspace, monkeypatch
+):
+    """`requirements.txt` joins the allowed set whether or not `## Files` lists
+    it - declaring what its code needs is part of any task - while every other
+    undeclared path keeps being refused."""
+    installed: list[Path] = []
+    monkeypatch.setattr(
+        entrypoint, "install_dependencies", lambda root: installed.append(root) or None
+    )
+    gh, _, _ = fake_github(issue())
+    editor = FakeEditor(
+        edits(
+            {
+                "calc.py": GOOD_CALC,
+                "requirements.txt": "# nothing beyond the standard library\n",
+                "README.md": "# owned\n",
+            }
+        )
+    )
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert "requirements.txt" in result.written
+    assert result.refused == (("README.md", "not in the declared file set"),)
+    assert result.passed and result.commit
+    # And the install ran, once, against this checkout, before the gate.
+    assert installed == [result.root]
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_failed_install_is_a_failed_verify_not_infrastructure(
+    fake_github, scratch_repo, workspace, monkeypatch
+):
+    """The pip error is the task's real blocker and the next retry's feedback,
+    so it lands as a FAILED gate - exit 1, attempt consumed - and the verify
+    command itself never runs against an incomplete environment."""
+    failure = "dependency install failed (exit 1): pip install -r requirements.txt\nboom"
+    monkeypatch.setattr(entrypoint, "install_dependencies", lambda root: failure)
+    gate = f'{sys.executable} -c "open(\'gate.txt\', \'w\')"'
+    gh, _, _ = fake_github(issue(verify=gate))
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert not result.passed and result.commit is None
+    assert result.exit_code == EXIT_TASK_FAILED
+    assert result.verify_output == failure
+    assert not (result.root / "gate.txt").exists()
+
+
+def _pip(returncode: int, stdout: str = "", stderr: str = "", seen: dict | None = None):
+    """A fake `subprocess.run` for the install step. No socket, no pip."""
+
+    def run(command, **kwargs):
+        if seen is not None:
+            seen.update(command=command, **kwargs)
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    return run
+
+
+def test_no_manifest_installs_nothing(tmp_path, monkeypatch):
+    def explode(*args, **kwargs):  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("install ran with no manifest")
+
+    monkeypatch.setattr(entrypoint.subprocess, "run", explode)
+
+    assert entrypoint.install_dependencies(tmp_path) is None
+
+
+def test_a_clean_install_reports_nothing_and_runs_in_the_checkout(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text("flask\n")
+    seen: dict = {}
+    monkeypatch.setattr(
+        entrypoint.subprocess, "run", _pip(0, stdout="Successfully installed flask", seen=seen)
+    )
+
+    assert entrypoint.install_dependencies(tmp_path) is None
+    assert seen["command"] == "pip install -r requirements.txt"
+    assert seen["cwd"] == str(tmp_path)
+    assert seen["timeout"] == entrypoint.INSTALL_TIMEOUT_S
+    # The filtered environment, exactly as the verify command gets it: the
+    # credentials are gone, and nothing else was rebuilt.
+    assert "GITHUB_TOKEN" not in seen["env"]
+    assert "APIARY_PUSH_TOKEN" not in seen["env"]
+
+
+def test_a_failed_install_reports_pips_own_words(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text("no-such-package\n")
+    monkeypatch.setattr(
+        entrypoint.subprocess,
+        "run",
+        _pip(1, stderr="ERROR: No matching distribution found for no-such-package"),
+    )
+
+    failure = entrypoint.install_dependencies(tmp_path)
+
+    assert failure is not None
+    assert failure.startswith("dependency install failed (exit 1)")
+    assert "No matching distribution" in failure
+    # An ordinary pip failure earns no egress advice - that hint is reserved
+    # for the failure it actually fixes.
+    assert "APIARY_EGRESS_ALLOW" not in failure
+
+
+def test_a_denied_index_names_the_operator_fix(tmp_path, monkeypatch):
+    """Blocked egress names itself, and the message names the knob: the
+    allowlist stays an operator decision (`security.EGRESS_EXTRA_ENV`), so the
+    failure text is where the fix has to live."""
+    (tmp_path / "requirements.txt").write_text("flask\n")
+    monkeypatch.setattr(
+        entrypoint.subprocess,
+        "run",
+        _pip(1, stderr="ERROR: HTTP error 403 while getting flask: 403 Filtered"),
+    )
+
+    failure = entrypoint.install_dependencies(tmp_path)
+
+    assert failure is not None
+    assert "APIARY_EGRESS_ALLOW=pypi.org,files.pythonhosted.org" in failure
+
+
+def test_a_hung_install_is_a_failure_not_a_wait(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text("flask\n")
+
+    def hang(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(entrypoint.subprocess, "run", hang)
+
+    failure = entrypoint.install_dependencies(tmp_path)
+
+    assert failure is not None
+    assert "timed out" in failure
+
+
+# --------------------------------------------------------------------------
+# Retry feedback: what a second attempt is told
+# --------------------------------------------------------------------------
+
+
+def feedback_comments() -> list[dict[str, Any]]:
+    return [
+        {"id": 1, "body": "a human said something encouraging"},
+        {"id": 2, "body": "apiary: attempt 1 failed. stale earlier feedback"},
+        {
+            "id": 3,
+            "body": (
+                "apiary: attempt 2 failed. worker exit 1: the verify command failed\n\n"
+                "Diagnosis: missing dependency 'sqlalchemy': declare it in "
+                "requirements.txt (installed before the verify runs), or use the "
+                "standard library instead"
+            ),
+        },
+    ]
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_retry_folds_the_latest_failure_report_into_its_goal(
+    fake_github, scratch_repo, workspace
+):
+    """The other half of the reconciler's retry comment: a retry that is not
+    told why the last attempt failed is the same attempt again. Latest comment
+    wins - it is the verdict on the attempt this run is retrying."""
+    gh, transport, _ = fake_github(
+        issue(attempt=1, verify=ALWAYS_FAILS), response(200, feedback_comments())
+    )
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    prompt = editor.prompts[0]
+    assert "A PREVIOUS ATTEMPT AT THIS EXACT TASK FAILED" in prompt
+    assert "missing dependency 'sqlalchemy'" in prompt
+    assert "stale earlier feedback" not in prompt
+    # The goal itself survives underneath the failure report.
+    assert "subtracts its second argument" in prompt
+    assert ("GET", f"/repos/{gh.repo}/issues/{ISSUE}/comments") in transport.calls
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_marker_carrying_the_reconcilers_signature_fields_is_a_normal_retry(
+    fake_github, scratch_repo, workspace
+):
+    """The reconciler now writes `blocker=` and `streak=` into the identity
+    marker. Only the reconciler consumes them; the worker's contract read must
+    tolerate and ignore them, because a field that failed a container would
+    turn every renewed retry into an infrastructure error."""
+    gh, _, _ = fake_github(
+        issue(
+            marker=(
+                "<!-- apiary:task id=add-sub attempt=1 "
+                "blocker=ab12cd34ef streak=1 -->\n\n"
+            ),
+            verify=ALWAYS_FAILS,
+        ),
+        not_found(),
+    )
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    # The gate failed as scripted - a *task* verdict, which proves the marker
+    # parsed, the attempt counted as a retry, and nothing choked on the fields.
+    assert result.exit_code == EXIT_TASK_FAILED
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_comment_fetch_failure_is_a_retry_without_feedback_not_an_error(
+    fake_github, scratch_repo, workspace
+):
+    """A retry without feedback is yesterday's behaviour, not a failure: the
+    comment is an aid, never a prerequisite, so a 404 on the thread must not
+    turn the attempt into infrastructure."""
+    gh, _, _ = fake_github(issue(attempt=1, verify=ALWAYS_FAILS), not_found())
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert "A PREVIOUS ATTEMPT" not in editor.prompts[0]
+    assert result.exit_code == EXIT_TASK_FAILED
+
+
+def test_the_worker_prompt_teaches_the_dependency_rule():
+    """One rule, stated where the code is written: packages exist only if
+    declared in requirements.txt, and the standard library is preferred."""
+    assert "requirements.txt" in edit_module.SYSTEM
+    assert "standard library" in edit_module.SYSTEM
 
 
 # --------------------------------------------------------------------------

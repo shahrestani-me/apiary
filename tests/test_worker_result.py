@@ -216,7 +216,10 @@ def a_record(**overrides: Any) -> ResultRecord:
 
 @pytest.mark.usefixtures("worker_env")
 def test_a_verified_run_records_exit_zero(fake_github, scratch_repo, workspace, artifacts):
-    gh, _, _ = fake_github(issue())
+    # The fixture bodies here carry `attempt=1`, so the worker asks for the
+    # previous attempt's feedback comment before it edits. No comments is the
+    # ordinary answer for an issue whose first attempt died outside the run.
+    gh, _, _ = fake_github(issue(), response(200, []))
     started = dt.datetime.now(dt.timezone.utc)
 
     result = run_worker(
@@ -244,7 +247,7 @@ def test_a_verified_run_records_exit_zero(fake_github, scratch_repo, workspace, 
 def test_a_failed_gate_records_exit_one_and_charges_the_attempt(
     fake_github, scratch_repo, workspace, artifacts
 ):
-    gh, _, _ = fake_github(issue(verify=ALWAYS_FAILS))
+    gh, _, _ = fake_github(issue(verify=ALWAYS_FAILS), response(200, []))
 
     result = run_worker(
         repo=gh.repo,
@@ -273,7 +276,7 @@ def test_a_dead_model_records_exit_two_and_charges_nothing(
     so the record for it is synthesised the way the manager would synthesise
     one, from the exit code and the container's output.
     """
-    gh, _, _ = fake_github(issue())
+    gh, _, _ = fake_github(issue(), response(200, []))
     editor = FakeEditor(RuntimeError("connection refused: host.docker.internal:11434"))
 
     code = main(argv(scratch_repo, workspace), client=gh, editor=editor)

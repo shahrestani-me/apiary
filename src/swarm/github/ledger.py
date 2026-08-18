@@ -224,6 +224,20 @@ class TaskContract:
     #: parse, and keeping them distinct is what makes "the body did not
     #: declare" answerable at all.
     stack: str | None = None
+    #: The failure signature the last consumed attempt recorded, from the
+    #: marker's optional `blocker=` field, or `""` when the marker carries
+    #: none - which is every marker written before the field existed, and
+    #: every attempt whose failure was never observed. Empty means "no
+    #: previous blocker recorded", and the reconciler treats that exactly as
+    #: it treated every failure before the field existed: same-failure
+    #: arithmetic on the attempt counter.
+    blocker: str = ""
+    #: How many consecutive attempts have failed with `blocker`'s signature,
+    #: from the marker's optional `streak=` field. `None` when the marker does
+    #: not say - the reconciler then falls back to the attempt counter, which
+    #: is what the streak *was* before failures had signatures, so an old
+    #: marker behaves exactly as it always did.
+    streak: int | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +284,14 @@ class LedgerEntry:
     stack: str = DEFAULT_STACK
     depends_on: tuple[str, ...] = ()
     adopted: bool = False
+    #: The last consumed attempt's failure signature and the length of the
+    #: consecutive run of it, straight from the marker's optional `blocker=`
+    #: and `streak=` fields. See `TaskContract` for what absent means; the
+    #: reconciler's `_retry_or_give_up` is the only consumer, and both fields
+    #: exist so a *different* failure can be recognised as the previous
+    #: blocker being gone.
+    blocker: str = ""
+    streak: int | None = None
 
     @property
     def generated(self) -> tuple[str, ...]:
@@ -392,11 +414,21 @@ def _split_sections(
     return sections
 
 
-def _parse_marker(number: int, scanned: Sequence[tuple[str, bool]]) -> tuple[str | None, int]:
+def _parse_marker(
+    number: int, scanned: Sequence[tuple[str, bool]]
+) -> tuple[str | None, int, str, int | None]:
     """Read `<!-- apiary:task id=… attempt=… -->`, ignoring fenced copies of it.
 
     A body quoting the canonical example - the contract doc's own §6, a planner
     explaining itself - must not have its example's identity adopted as its own.
+
+    Returns `(task_id, attempt, blocker, streak)`. The last two are the
+    optional failure-signature fields: a marker without them - every marker
+    written before they existed - reads as `("", None)`, and an unknown field
+    is ignored entirely, so a body written by a newer orchestrator parses
+    cleanly under an older one and vice versa. The tolerance is not an
+    accident: the worker reads this marker too (`worker.entrypoint`), and a
+    field only the reconciler consumes must never fail a container over it.
     """
     for line, fenced in scanned:
         if fenced:
@@ -416,8 +448,16 @@ def _parse_marker(number: int, scanned: Sequence[tuple[str, bool]]) -> tuple[str
             attempt = max(0, int(fields.get("attempt", "0")))
         except ValueError:
             attempt = 0
-        return task_id, attempt
-    return None, 0
+        # Same tolerance for the streak: unparseable reads as absent, and
+        # absent falls back to the attempt counter downstream, which is the
+        # pre-signature arithmetic exactly.
+        streak: int | None
+        try:
+            streak = max(0, int(fields["streak"])) if "streak" in fields else None
+        except ValueError:
+            streak = None
+        return task_id, attempt, fields.get("blocker", ""), streak
+    return None, 0, "", None
 
 
 def _parse_goal(number: int, lines: Sequence[tuple[str, bool]]) -> str:
@@ -602,13 +642,15 @@ def parse_contract(number: int, body: str | None) -> TaskContract:
     for name in REQUIRED_SECTIONS:
         if name not in sections:
             raise ContractError(number, name, "section is missing")
-    task_id, attempt = _parse_marker(number, scanned)
+    task_id, attempt, blocker, streak = _parse_marker(number, scanned)
     stack = _parse_stack(number, sections.get("Stack"))
     files = _parse_files(number, sections["Files"])
     _refuse_generated_files(number, files, stack)
     return TaskContract(
         task_id=task_id,
         attempt=attempt,
+        blocker=blocker,
+        streak=streak,
         goal=_parse_goal(number, sections["Goal"]),
         files=files,
         verify=_parse_verify(number, sections["Verify"]),
@@ -625,9 +667,25 @@ def parse_contract(number: int, body: str | None) -> TaskContract:
 # --------------------------------------------------------------------------
 
 
-def render_marker(task_id: str, attempt: int = 0) -> str:
-    """The identity line, in the one form every writer must emit."""
-    return f"<!-- apiary:task id={task_id} attempt={attempt} -->"
+def render_marker(
+    task_id: str, attempt: int = 0, *, blocker: str = "", streak: int | None = None
+) -> str:
+    """The identity line, in the one form every writer must emit.
+
+    `blocker` and `streak` are the optional failure-signature fields, and they
+    are emitted only when set: a caller that does not pass them - which is
+    every caller that predates them, and every writer that consumed an attempt
+    through a channel where the signature has no meaning (a stale claim, a
+    failed check run) - produces byte-for-byte the marker it always did, so an
+    old body round-trips unchanged and dropping the record deliberately falls
+    back to the pre-signature arithmetic downstream.
+    """
+    fields = [f"id={task_id}", f"attempt={attempt}"]
+    if blocker:
+        fields.append(f"blocker={blocker}")
+    if streak is not None:
+        fields.append(f"streak={streak}")
+    return f"<!-- apiary:task {' '.join(fields)} -->"
 
 
 def slugify(title: str, *, limit: int = MAX_ID_LENGTH) -> str:
@@ -766,6 +824,8 @@ def load_ledger(
             title=title,
             task_id=task_id,
             attempt=contract.attempt,
+            blocker=contract.blocker,
+            streak=contract.streak,
             goal=contract.goal,
             files=contract.files,
             verify=contract.verify,

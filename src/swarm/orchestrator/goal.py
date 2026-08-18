@@ -367,6 +367,14 @@ def close_the_loop(
     without an Ollama and without a tracker; `write_plan` is the default and is
     called with `retire_dropped=False`, which is the single most important line
     in this module. A follow-up round must add issues and touch nothing else.
+
+    One caveat to "nothing else", documented because the write path is shared
+    rather than because this module wants it: `write_plan` revives a
+    `swarm:failed` task a plan *keeps* (planner module docstring). This gate
+    cannot reach that branch in practice - `assess` refuses to act while any
+    task is failed, so an actionable assessment has no failed task to keep -
+    but if a follow-up plan ever re-emitted a failed task's id, it would be
+    revived with its budget intact, exactly as a replan's would.
     """
     assessment = assess(objective, ledger, oracle=oracle)
     if assessment.met:
