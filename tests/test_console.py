@@ -564,6 +564,13 @@ def test_console_is_a_subcommand(monkeypatch, tmp_path):
         seen.update(kwargs)
 
     monkeypatch.setattr("swarm.console.serve", fake_serve)
+    # `cli._console` writes APIARY_CAPTURE into the real environment; the
+    # setenv/delenv pair registers a teardown that removes whatever it set,
+    # which a bare `delenv(raising=False)` on an absent variable does not.
+    from swarm.capture import CAPTURE_ENV
+
+    monkeypatch.setenv(CAPTURE_ENV, "sentinel")
+    monkeypatch.delenv(CAPTURE_ENV)
 
     assert cli.main(["console", "--port", "9999", "--dir", str(tmp_path)]) == 0
     assert seen["port"] == 9999
@@ -577,7 +584,11 @@ def test_the_console_turns_capture_on_for_itself(monkeypatch, tmp_path):
     before the tool does anything useful."""
     from swarm.capture import CAPTURE_ENV
 
-    monkeypatch.delenv(CAPTURE_ENV, raising=False)
+    # setenv-then-delenv rather than a bare delenv: the pair registers a
+    # teardown even when the variable was absent, so the "1" the command
+    # under test writes cannot leak into whichever test runs next.
+    monkeypatch.setenv(CAPTURE_ENV, "sentinel")
+    monkeypatch.delenv(CAPTURE_ENV)
     monkeypatch.setattr("swarm.console.serve", lambda **kwargs: None)
 
     cli.main(["console", "--dir", str(tmp_path)])
@@ -605,4 +616,4 @@ def test_every_subcommand_still_parses():
     parser = cli.build_parser()
     actions = [a for a in parser._actions if a.dest == "command"]
 
-    assert set(actions[0].choices) == {"run", "doctor", "runs", "show", "console"}
+    assert set(actions[0].choices) == {"run", "doctor", "runs", "show", "console", "local"}

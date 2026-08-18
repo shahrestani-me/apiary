@@ -970,3 +970,30 @@ def test_a_run_whose_pull_requests_are_only_being_rebased_never_replans():
     report = replan(object(), review, OBJECTIVE, verdict, proposer=Proposal(Plan(tasks=[])), writer=spy)
     assert not report.replanned and report.reason == PROGRESSING
     assert spy.calls == []
+
+
+def test_a_url_in_the_failure_is_not_a_file_the_task_cannot_edit():
+    """pytest prints `-- Docs: https://docs.pytest.org/...capture-warnings.html`
+    in its own footer. The path extractor matched everything after the scheme,
+    the judge reported the task as failing on a file outside its ## Files, and
+    that one diagnosis suppressed the replan which exists for exactly the
+    failure at hand. Observed live, on the first greenfield run's issue #1."""
+    from swarm.nodes.judge import mentioned_paths
+
+    footer = (
+        "1 warning in 0.00s\n"
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n"
+        "see also docs.pytest.org/en/stable/reference.html"
+    )
+
+    assert mentioned_paths(footer) == ()
+
+
+def test_repository_paths_are_still_extracted_beside_a_url():
+    from swarm.nodes.judge import mentioned_paths
+
+    text = ("FAILED tests/test_main.py::test_total - AssertionError\n"
+            "-- Docs: https://docs.pytest.org/en/stable/warnings.html\n"
+            "src/pkg/budget.py:12: in get_total")
+
+    assert mentioned_paths(text) == ("tests/test_main.py", "src/pkg/budget.py")

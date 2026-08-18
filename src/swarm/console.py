@@ -31,6 +31,15 @@ minutes, cannot be refreshed, and loses the answer if anything times out. So the
 call runs on a worker thread and the page polls - and the concurrency that would
 otherwise make a process-wide recorder unsafe is bounded by single-flight: one
 inference at a time, refused rather than queued.
+
+**And one tab that is not a model call at all.** Firing the planner from this
+page and watching nothing appear on GitHub taught the obvious lesson: an
+operator who has just read a good plan wants to *run* it, and making them
+reconstruct the `swarm run` invocation in a terminal is where the console
+stopped helping. The `swarm` tab (`console_runs.py`) execs the real CLI as a
+subprocess and streams its log to the page - repository, issues, workers,
+pull requests, merges, the goal verdict - without this module gaining any
+pipeline logic of its own.
 """
 
 from __future__ import annotations
@@ -50,6 +59,9 @@ from . import capture as capture_mod
 from .artifacts import console_root
 from .capture import CAPTURE_ENV, Capture, Recorder
 from .config import ConfigError, SETTINGS
+from .console_board import BoardError, BoardReader
+from .console_intake import QUESTIONS as INTAKE_QUESTIONS
+from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns
 
 __all__ = [
     "ASSETS",
@@ -215,6 +227,18 @@ def _stack_run(payload: Mapping[str, str]) -> Any:
     return {"stack": choose_stack(payload.get("brief", ""))}
 
 
+def _intake_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
+    from .console_intake import compose_brief, prompt_for
+
+    return prompt_for(compose_brief(payload))
+
+
+def _intake_run(payload: Mapping[str, str]) -> Any:
+    from .console_intake import propose
+
+    return propose(payload)
+
+
 SITES: dict[str, Site] = {
     "planner": Site(
         key="planner",
@@ -261,6 +285,19 @@ SITES: dict[str, Site] = {
         ),
         prompt=_stack_prompt,
         run=_stack_run,
+    ),
+    "intake": Site(
+        key="intake",
+        label="describe — for non-developers",
+        blurb=(
+            "Say what you need in plain language - no paths, no commands. A model "
+            "proposes the technical setup: a repository name and a stack, with the "
+            "rest derived from them. Nothing is created anywhere until the proposal "
+            "is fired as a run."
+        ),
+        fields=tuple(Field(**question) for question in INTAKE_QUESTIONS),
+        prompt=_intake_prompt,
+        run=_intake_run,
     ),
 }
 
@@ -327,6 +364,8 @@ class Console:
     port: int = DEFAULT_PORT
     sink: Recorder | None = None
     jobs: dict[str, Job] = field(default_factory=dict)
+    runs: SwarmRuns = field(default_factory=SwarmRuns)
+    board: BoardReader = field(default_factory=BoardReader)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _running: str = ""
 
@@ -368,6 +407,10 @@ class Console:
             return Response(200, asset(path.lstrip("/")).encode("utf-8"), ASSET_TYPES[path])
         if method == "GET" and path == "/sites":
             return Response.json({"sites": [s.to_dict() for s in SITES.values()],
+                                  # Its own key, not a fourth entry in `sites`:
+                                  # nothing that iterates model-call sites may
+                                  # pick up a form with no prompt behind it.
+                                  "swarm": SWARM_SITE,
                                   "models": {"orchestrator": SETTINGS.orchestrator_model,
                                              "worker": SETTINGS.worker_model,
                                              "base_url": SETTINGS.ollama_base_url}})
@@ -377,6 +420,17 @@ class Console:
             return self._run(body)
         if method == "GET" and path.startswith("/status"):
             return self._status(path)
+        if method == "POST" and path == "/swarm/start":
+            return self._swarm_start(body)
+        if method == "POST" and path == "/swarm/stop":
+            return self._swarm_stop(body)
+        if method == "GET" and path == "/swarm/latest":
+            latest = self.runs.latest()
+            return Response.json(latest) if latest else Response.error("no runs yet", 404)
+        if method == "GET" and path.startswith("/swarm/status"):
+            return self._swarm_status(path)
+        if method == "GET" and path.startswith("/swarm/board"):
+            return self._swarm_board(path)
         return Response.error(f"no route for {method} {path}", 404)
 
     def _payload(self, body: bytes) -> tuple[Site, dict[str, str]]:
@@ -459,10 +513,84 @@ class Console:
             return Response.error("no such call", 404)
         return Response.json(job.to_dict())
 
+    # -- the swarm tab ----------------------------------------------------
+    #
+    # Thin on purpose: everything these decide lives in `console_runs`, which
+    # is testable without a socket, exactly as `render` itself is. The only
+    # logic here is translating `SwarmRunError` into the same
+    # `{error, fix}` shape every other refusal on this page uses.
+
+    def _swarm_start(self, body: bytes) -> Response:
+        try:
+            values = {k: str(v) for k, v in (json.loads(body or b"{}").get("values") or {}).items()}
+            job = self.runs.start(values)
+        except SwarmRunError as exc:
+            return Response.error(str(exc), 409 if "in flight" in str(exc) else 400,
+                                  fix=exc.fix)
+        except json.JSONDecodeError as exc:
+            return Response.error(f"bad request body: {exc}", 400)
+        return Response.json(job.to_dict(), 202)
+
+    def _swarm_stop(self, body: bytes) -> Response:
+        try:
+            job_id = validate_capture_id(str(json.loads(body or b"{}").get("id", "")))
+            job = self.runs.stop(job_id)
+        except (ConsoleError, SwarmRunError) as exc:
+            return Response.error(str(exc), 404 if "no such" in str(exc) else 400)
+        except json.JSONDecodeError as exc:
+            return Response.error(f"bad request body: {exc}", 400)
+        return Response.json(job.to_dict())
+
+    def _swarm_status(self, path: str) -> Response:
+        _, _, query = path.partition("?")
+        wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        since = wanted.get("since", "0")
+        try:
+            job_id = validate_capture_id(wanted.get("id", ""))
+            status = self.runs.status(job_id, since=int(since) if since.isdigit() else 0)
+        except ConsoleError as exc:
+            return Response.error(str(exc), 400)
+        except SwarmRunError as exc:
+            return Response.error(str(exc), 404)
+        return Response.json(status)
+
+    def _swarm_board(self, path: str) -> Response:
+        """One repository's tickets in lifecycle columns, read from GitHub.
+
+        Read-only and rate-limit-cheap enough to poll; the caching that makes
+        it so lives in `BoardReader`, which owns the whole projection.
+        """
+        import urllib.parse
+
+        _, _, query = path.partition("?")
+        wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        repo = urllib.parse.unquote(wanted.get("repo", ""))
+        try:
+            return Response.json(self.board.read(repo))
+        except BoardError as exc:
+            return Response.error(str(exc), 400, fix=exc.fix)
+        except Exception as exc:  # noqa: BLE001 - GitHub being down belongs on the page
+            # A repository that is not there yet is the normal state of a
+            # greenfield run's first minute, not a credentials problem.
+            if getattr(exc, "status", None) == 404:
+                return Response.error(
+                    f"{repo} does not exist yet", 404,
+                    fix="fire the run - it creates the repository, and this board follows",
+                )
+            return Response.error(
+                f"{type(exc).__name__}: {exc}", 502,
+                fix="is GITHUB_TOKEN exported in the console's shell, and does it reach this repo?",
+            )
+
 
 def _fix_for(exc: BaseException) -> str:
     """What to do about it, in doctor's sense: a failure that names no fix is
     a failure an operator has to go and research."""
+    # An exception that arrives carrying its own fix - `IntakeError`, like
+    # `SwarmRunError` - already knows better than any pattern below.
+    named = getattr(exc, "fix", "")
+    if isinstance(named, str) and named:
+        return named
     text = f"{type(exc).__name__}: {exc}".lower()
     base = SETTINGS.ollama_base_url
     if "connection" in text or "refused" in text or "connect" in text:

@@ -300,7 +300,7 @@ def test_a_heading_inside_a_goal_cannot_open_a_section(github):
 
     ledger = load_ledger(client)
     assert ledger.entries["wrapped"].goal == "first line\nFiles\nsecond line"
-    assert ledger.entries["wrapped"].files == ("src/swarm/wrapped.py",)
+    assert ledger.entries["wrapped"].files == ("src/swarm/wrapped.py", "src/swarm/test_wrapped.py")
 
 
 def test_a_fence_inside_a_goal_cannot_swallow_the_contract(github):
@@ -311,7 +311,7 @@ def test_a_fence_inside_a_goal_cannot_swallow_the_contract(github):
     write(client, task("fenced", goal="first line\n```python\nsecond line"))
 
     ledger = load_ledger(client)
-    assert ledger.entries["fenced"].files == ("src/swarm/fenced.py",)
+    assert ledger.entries["fenced"].files == ("src/swarm/fenced.py", "src/swarm/test_fenced.py")
     assert "```" not in ledger.entries["fenced"].goal
 
 
@@ -601,7 +601,10 @@ def test_normalise_strips_the_decoration_a_model_adds():
 
     assert rejected == ()
     assert drafts == (
-        Draft(task_id="retry-requests", goal="a goal", files=("src/a.py",), verify=VERIFY),
+        # `src/test_a.py` is the pytest-gate repair: a lone module under a pytest
+        # verify gains its test file, or the task is exit 5 by construction.
+        Draft(task_id="retry-requests", goal="a goal", files=("src/a.py", "src/test_a.py"),
+              verify=VERIFY),
     )
 
 
@@ -886,3 +889,69 @@ def test_a_declared_stack_round_trips_through_the_body():
     )
 
     assert parse_contract(7, drafts[0].body()).stack == "react"
+
+
+# --------------------------------------------------------------------------
+# The pytest-gate repair
+# --------------------------------------------------------------------------
+
+
+def test_a_pytest_gate_with_no_test_file_gains_one_beside_its_module():
+    """Observed on the first greenfield plan: a Goal demanding "the test must
+    assert ..." over a `## Files` of one module. A worker may only write the
+    listed files, so pytest collected nothing (exit 5) and the task burned its
+    whole retry budget on a contract that was unwinnable when written."""
+    drafts, _ = normalise(
+        [PlannedTask(id="record-expense", goal="store expenses", files=["expenses.py"])],
+        verify=VERIFY,
+    )
+
+    assert drafts[0].files == ("expenses.py", "test_expenses.py")
+
+
+def test_the_repair_keeps_the_test_beside_a_nested_module():
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["src/pkg/budget.py"])], verify=VERIFY
+    )
+
+    assert drafts[0].files == ("src/pkg/budget.py", "src/pkg/test_budget.py")
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        ["expenses.py", "test_expenses.py"],      # already collectable
+        ["tests/expenses_test.py", "expenses.py"],  # suffix convention counts too
+    ],
+)
+def test_a_task_that_already_carries_a_test_file_is_left_alone(files):
+    drafts, _ = normalise([PlannedTask(id="t", goal="g", files=files)], verify=VERIFY)
+
+    assert drafts[0].files == tuple(files)
+
+
+def test_a_lookalike_module_name_does_not_count_as_a_test_file():
+    """`contest_rules.py` neither starts with test_ nor ends with _test."""
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["contest_rules.py"])], verify=VERIFY
+    )
+
+    assert drafts[0].files == ("contest_rules.py", "test_contest_rules.py")
+
+
+def test_a_non_pytest_gate_is_not_repaired():
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["app.js"])], verify="npm test"
+    )
+
+    assert drafts[0].files == ("app.js",)
+
+
+def test_a_task_with_no_python_file_is_left_alone():
+    """Nothing sane to derive: docs and configs are covered by other tasks'
+    tests, and inventing `test_README.py` would be worse than the gap."""
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["README.md"])], verify=VERIFY
+    )
+
+    assert drafts[0].files == ("README.md",)

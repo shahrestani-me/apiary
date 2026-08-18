@@ -1278,3 +1278,38 @@ def test_a_denied_probe_does_not_stop_a_run():
 
     assert diagnosis.ok
     assert diagnosis.skipped
+
+
+# --------------------------------------------------------------------------
+# `swarm local` (#UI local mode)
+# --------------------------------------------------------------------------
+
+
+def test_ensure_local_repo_creates_a_repo_a_worker_can_branch_from(tmp_path):
+    """A fresh directory gets `git init` and one commit, because `base_branch`
+    needs a commit to name; an existing repository is returned untouched."""
+    import subprocess
+
+    from swarm.cli import ensure_local_repo
+
+    repo = ensure_local_repo(tmp_path / "demo")
+
+    assert (repo / ".git").is_dir()
+    head = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                          cwd=repo, capture_output=True, text=True, check=True)
+    assert head.stdout.strip() == "main"
+    marker = repo / "untouched.txt"
+    marker.write_text("mine")
+    assert ensure_local_repo(repo) == repo  # idempotent
+    assert marker.exists()                  # and it edited nothing
+
+
+def test_the_local_subcommand_parses_and_helps():
+    import subprocess
+    import sys
+
+    probe = subprocess.run([sys.executable, "-m", "swarm.cli", "local", "--help"],
+                           capture_output=True, text=True, timeout=30)
+
+    assert probe.returncode == 0, probe.stderr
+    assert "--max-rounds" in probe.stdout
