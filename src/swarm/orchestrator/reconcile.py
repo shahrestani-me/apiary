@@ -1411,6 +1411,17 @@ class Reconciler:
             proposer=self.proposer,
         )
         self._goal_rounds = goal.rounds
+        if getattr(goal, "extended", False) and hasattr(client, "invalidate_cache"):
+            # The gate just wrote follow-up issues through this client, and the
+            # next cycle's first act is to read them back. GitHub's conditional
+            # cache lags its writes (`invalidate_cache`'s own docstring records
+            # the planner hitting this), so without the flush the next read is
+            # answered 304 from the pre-write body, the ledger still looks
+            # exhausted, and the gate runs AGAIN - a second seven-minute
+            # assessment and a second plan of near-duplicate follow-ups instead
+            # of a dispatch. Observed live: cycle 22 planned #15-#17, cycle 23
+            # re-judged and started planning #18-#20 against the same gap.
+            client.invalidate_cache()
         return goal
 
     def _replan(self, client: Any, report: CycleReport, verdict: Any) -> Any:

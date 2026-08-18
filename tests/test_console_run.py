@@ -510,3 +510,14 @@ def test_the_swarm_routes_check_the_host_like_every_other_route():
 
     assert console.render("POST", "/swarm/start", evil, b"{}").status == 403
     assert console.render("GET", "/swarm/status?id=deadbeef", evil).status == 403
+
+
+def test_the_plan_exhausted_checkbox_reaches_the_command():
+    """The goal gate is right for autonomy and wrong for a bounded demo - the
+    strict local judge can keep planning follow-ups it never names a gap for.
+    The operator's off-switch must not require a terminal."""
+    on = build_argv({"objective": "x", "repo": "a/b", "no_goal_check": "1"}, exists=True)
+    off = build_argv({"objective": "x", "repo": "a/b", "no_goal_check": ""}, exists=True)
+
+    assert "--no-goal-check" in on
+    assert "--no-goal-check" not in off

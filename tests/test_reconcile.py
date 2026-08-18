@@ -1287,3 +1287,33 @@ def test_the_escalation_needs_no_model_no_daemon_and_no_github():
     referenced = set(infrastructure_streaks.__code__.co_names)
 
     assert not referenced & {"structured", "orchestrator_llm", "GitHubClient", "DockerCLI"}
+
+
+def test_a_gate_that_extended_flushes_the_cache_so_the_next_read_sees_its_issues(monkeypatch):
+    """GitHub's conditional cache lags its writes. The gate planned #15-#17,
+    the next cycle's ledger read was answered 304 from the pre-write body, the
+    ledger still looked exhausted - and the gate ran AGAIN: a second
+    seven-minute assessment and a plan of near-duplicate follow-ups instead of
+    a dispatch. Observed live. The fix is the one `invalidate_cache`'s own
+    docstring prescribes for the planner, applied to the other writer."""
+    from types import SimpleNamespace
+
+    calls: list = []
+
+    def spy(client, ledger, objective, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return SimpleNamespace(done=False, extended=True, rounds=1,
+                                   summary=lambda: "planned follow-ups")
+        return SimpleNamespace(done=True, extended=False, rounds=1,
+                               summary=lambda: "objective met")
+
+    monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
+
+    flushed: list[int] = []
+    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client.invalidate_cache = lambda: flushed.append(1)
+
+    reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(cycles=5)
+
+    assert flushed == [1], "flushed exactly once: after the extension, not after met"
