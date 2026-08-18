@@ -134,6 +134,8 @@ SWARM_SITE: dict[str, Any] = {
          "kind": "text", "placeholder": "", "value": ""},
         {"name": "auto_merge", "label": "Merge green pull requests automatically (admin override) — unchecked, every PR waits for a human",
          "kind": "check", "value": "1"},
+        {"name": "no_goal_check", "label": "Stop when the plan is exhausted — skip the goal gate that judges the objective and plans follow-up work (the run does exactly the tasks that were planned, no more)",
+         "kind": "check", "value": ""},
     ],
 }
 
@@ -194,6 +196,8 @@ def build_argv(values: Mapping[str, str], *, exists: bool) -> list[str]:
                                 fix=f"one of: {', '.join(sorted(KNOWN_STACKS))}, or leave it empty")
         argv += ["--stack", stack]
     argv += _cycles_flag(values, "--max-cycles")
+    if values.get("no_goal_check") == "1":
+        argv += ["--no-goal-check"]
     return argv
 
 
