@@ -84,7 +84,9 @@ Manual dry run against a real repo - reads only, writes nothing, spawns nothing:
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -113,7 +115,7 @@ from ..github.readiness import (
 )
 from ..run import TERMINAL_LABELS, Run, live_entries
 from ..worker.entrypoint import EXIT_OK
-from ..worker.result import ResultRecord, summarise_dir
+from ..worker.result import ResultRecord, summarise_dir, tail
 from .dispatcher import CLAIMED, REVIEW, Capacity, DispatchReport, Spawner, dispatch
 
 #: The two labels no other module owns, and therefore the only two spelled out
@@ -342,6 +344,16 @@ class Transition:
     task_id: str = ""
     attempt: int | None = None
     comment: str = ""
+    #: The failure-signature record that rides the same body `PATCH` as the
+    #: counter (§5). `blocker` is the signature of the failure this transition
+    #: is charging for and `streak` how many consecutive attempts have now
+    #: failed with it; both are only meaningful when `attempt` is written, and
+    #: a transition that consumes an attempt without setting them - a stale
+    #: claim, a failed check run, anything whose failure has no verify output
+    #: to sign - deliberately clears the record, which downstream reads as "no
+    #: previous blocker" and falls back to the pre-signature arithmetic.
+    blocker: str = ""
+    streak: int | None = None
     #: This move was caused by an infrastructure verdict (exit 2), whether it
     #: re-readied the issue or escalated it at the cap. Carried as a flag
     #: rather than sniffed back out of `reason`, because `infrastructure_streaks`
@@ -494,27 +506,268 @@ def _closed_verdict(state: IssueState) -> tuple[str, str]:
     return FAILED, f"closed as {reason} on GitHub"
 
 
+#: How much of a failed attempt's verify output travels into the retry comment.
+#: Half of `OUTPUT_TAIL_CHARS`, the bound the record itself carries: the comment
+#: is prompt fodder for the next attempt, whose whole context window is 16K
+#: tokens, and the useful line - the assertion, the traceback's last frame - is
+#: at the tail anyway.
+COMMENT_TAIL_CHARS = 2_000
+
+#: The two shapes of "this code imports something the container does not have",
+#: as CPython prints them. Deliberately this small: `diagnose` speaks only when
+#: it is sure, because a wrong diagnosis is repeated verbatim to the next
+#: attempt as though it were a fact.
+_MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
+_IMPORT_NAME_RE = re.compile(r"ImportError: cannot import name '[^']+' from '([^']+)'")
+
+
+def diagnose(verify_output: str) -> str:
+    """Classify a failed verify output into one actionable sentence, or say nothing.
+
+    The retry comment already carries the raw tail; this is the line above it
+    that tells the next attempt what to *do* about it. Only failures whose fix
+    is mechanical and certain are recognised - today that is a missing Python
+    module, the failure observed to burn three identical attempts on one issue
+    - and anything else returns the empty string, because a guessed diagnosis
+    would be repeated to the model as truth.
+
+    Pure, like the rest of the planning half of this module, so every
+    classification is testable as a string in and a string out.
+    """
+    for pattern in (_MISSING_MODULE_RE, _IMPORT_NAME_RE):
+        found = pattern.findall(verify_output or "")
+        if found:
+            # The import may name a submodule (`sqlalchemy.orm`); the thing to
+            # declare is the distribution's top-level package.
+            package = found[-1].split(".")[0]
+            return (
+                f"missing dependency {package!r}: declare it in requirements.txt "
+                "(installed before the verify runs), or use the standard library "
+                "instead"
+            )
+    return ""
+
+
+#: The signature of an attempt whose verify output was empty. A fixed word
+#: rather than a hash of the empty string, so the marker a human reads says
+#: what happened - and so the PR-closed-unmerged path, which has no output at
+#: all, signs consistently with itself and differently from any real failure.
+EMPTY_SIGNATURE = "no-output"
+
+#: How many hex characters of the digest a signature keeps. Enough that two
+#: different failures colliding is not a practical concern for a counter whose
+#: worst collision cost is giving up one retry early - §5's safe direction -
+#: and short enough to live in an HTML comment a human scrolls past.
+SIGNATURE_LENGTH = 10
+
+#: The line the failure's identity is read from, scanned from the tail: an
+#: exception line as CPython or pytest prints one (`ValueError: ...`,
+#: `E   AssertionError: ...`), matched loosely on the type's conventional
+#: suffixes because the alternative - hashing the whole tail - would make
+#: every signature unique the moment a timestamp or a tmp path appears in it.
+_EXCEPTION_LINE_RE = re.compile(
+    r"^\s*(?:E\s+)?[A-Za-z_][A-Za-z0-9_.]*"
+    r"(?:Error|Exception|Interrupt|Failure|Warning|Exit)\b.*$"
+)
+
+#: What gets stripped before hashing, in order: memory addresses, `line N`
+#: references, `file.py:N` locations, and any path-shaped token. Line numbers
+#: move when a model rewrites a file and paths carry attempt-specific tmp
+#: directories; neither changes *what* failed, and a signature that changed
+#: with them would renew a budget the blocker never released.
+_NORMALISERS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"0x[0-9a-fA-F]+"), "0xADDR"),
+    (re.compile(r"\bline \d+\b"), "line N"),
+    (re.compile(r":\d+"), ":N"),
+    (re.compile(r"\S*[/\\]\S*"), "<path>"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def signature(verify_output: str) -> str:
+    """One failed attempt's identity, as a short deterministic string.
+
+    This is what makes "the same failure again" a checkable fact rather than a
+    guess. Two attempts that fail for the same reason must sign identically
+    even when the incidentals move - a `ModuleNotFoundError` is the same
+    missing module whichever line imports it - and two attempts that fail for
+    different reasons must sign differently, because a *changed* failure is
+    the evidence that the previous blocker is gone and the retry budget
+    deserves renewing.
+
+    Three tiers, most confident first:
+
+    - `diagnose` recognised the failure: the diagnosis is the identity. It
+      already names the mechanical fact (`missing dependency 'sqlalchemy'`)
+      and nothing else, so line numbers and paths never enter the hash.
+    - Otherwise, the last exception-shaped line of the output, normalised:
+      addresses, line numbers and paths stripped, whitespace collapsed. The
+      tail because that is where CPython and pytest put the verdict.
+    - No such line: the last non-empty line, normalised the same way.
+
+    Empty output signs as `EMPTY_SIGNATURE`. Pure and string-in/string-out,
+    like `diagnose` above it and for the same reason: every classification is
+    testable as data.
+    """
+    text = (verify_output or "").strip()
+    if not text:
+        return EMPTY_SIGNATURE
+    identity = diagnose(text) or _failure_identity(text)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:SIGNATURE_LENGTH]
+
+
+def _failure_identity(text: str) -> str:
+    """The normalised line that names the failure. See `signature`."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if _EXCEPTION_LINE_RE.match(line):
+            return _normalise(line)
+    return _normalise(lines[-1])
+
+
+def _normalise(line: str) -> str:
+    """Strip the incidentals that move between attempts without the failure changing."""
+    line = re.sub(r"^\s*E\s+", "", line).strip()
+    for pattern, replacement in _NORMALISERS:
+        line = pattern.sub(replacement, line)
+    return line.strip()
+
+
+def retry_comment(attempt: int, reason: str, verify_output: str = "", *, renewal: str = "") -> str:
+    """The feedback a retry leaves behind, structured so a worker can find it.
+
+    The first line is the contract: it begins `apiary: attempt N failed`, which
+    is what `worker.entrypoint` greps the comment stream for before a retry.
+    Below it, the renewal notice when this failure differed from the last one
+    (`_retry_or_give_up` writes that sentence, because only it knows the
+    budgets), the diagnosis when `diagnose` recognised one, and the bounded
+    tail of the verify output in a fence - the same tail discipline the result
+    record follows, tightened to `COMMENT_TAIL_CHARS` because this text is
+    destined for a prompt rather than a directory.
+    """
+    parts = [f"apiary: attempt {attempt} failed. {reason}"]
+    if renewal:
+        parts.append(renewal)
+    finding = diagnose(verify_output)
+    if finding:
+        parts.append(f"Diagnosis: {finding}")
+    if (verify_output or "").strip():
+        clipped = tail(verify_output, COMMENT_TAIL_CHARS)
+        parts.append(f"Verify output (tail):\n```\n{clipped}\n```")
+    return "\n\n".join(parts)
+
+
 def _retry_or_give_up(
-    entry: LedgerEntry, reason: str, max_attempts: int
+    entry: LedgerEntry,
+    reason: str,
+    max_attempts: int,
+    *,
+    verify_output: str = "",
+    max_total_attempts: int | None = None,
 ) -> Transition:
-    """Consume an attempt, and decide whether any remain.
+    """Consume an attempt, and decide whether any remain. **The budget is per
+    blocker, not per task.**
 
     The increment is carried on the transition so it is persisted *before* the
     label goes back to `swarm:ready` (§5): a crash between the two costs an
     attempt rather than granting a free one, and a counter that can fail to
-    bound retries is worse than one that over-counts.
+    bound retries is worse than one that over-counts. The failure signature
+    and its streak ride the same transition and therefore the same body
+    `PATCH`, so the record cannot say one thing while the counter says another.
+
+    **Why the budget renews.** Issue #21 of the first live run failed three
+    times on the identical `ModuleNotFoundError` and was rightly capped - but
+    after a human fixed the environment and reset the counter, attempt four
+    failed on a *brand-new* SyntaxError and the orchestrator gave up again,
+    because the counter was back at its cap and could not see that the new
+    failure proved the old blocker gone. A different signature than the last
+    recorded one is progress by definition, so the consecutive-failure test
+    restarts. Same signature - or no signature recorded, which is every marker
+    written before the field existed - burns the budget down exactly as it
+    always did.
+
+    **The representation: `attempt` stays monotonic, `streak` counts the
+    blocker.** The alternative - resetting `attempt` on renewal and keeping a
+    separate total - was rejected because `attempt` is load-bearing far beyond
+    this function: it names result files, orders records against the ledger
+    (`record.attempt >= entry.attempt`), tells the worker it is a retry, and
+    §5's whole crash-ordering argument assumes it only ever goes up. So
+    `attempt` keeps counting every attempt honestly, the give-up test runs on
+    `streak`, and the hard bound runs on `attempt` itself: renewal cannot make
+    a task immortal, because a task that keeps failing *differently* still
+    spends from `max_total_attempts` (default three full per-blocker budgets)
+    and is given up whatever its latest signature says.
+
+    Both branches carry a comment. The give-up one is for the human the issue
+    just reached, and says *which* budget ran out - the same failure repeating
+    and the total being spent call for different humans doing different
+    things. The retry one is for the *next worker*; a renewal says so out
+    loud, so the run's transcript records that the previous blocker is gone.
+    `verify_output` is what the attempt's result record captured; the caller
+    that has none (a PR closed unmerged) leaves the comment to carry the
+    reason alone, and its signature is the fixed `EMPTY_SIGNATURE`.
     """
     attempt = entry.attempt + 1
     cap = max(int(max_attempts), 1)
-    if attempt >= cap:
+    total = SETTINGS.max_total_attempts_per_task if max_total_attempts is None else max_total_attempts
+    total_cap = max(int(total), cap)
+    sig = signature(verify_output)
+    renewed = bool(entry.blocker) and sig != entry.blocker
+    # An old marker carries no streak; the attempt counter is what the streak
+    # was before failures had signatures, so falling back to it preserves the
+    # pre-signature arithmetic exactly (the back-compat the tests pin).
+    previous_streak = entry.attempt if entry.streak is None else entry.streak
+    streak = 1 if renewed else previous_streak + 1
+
+    if attempt >= total_cap:
         return Transition(
             number=entry.number,
             from_label=entry.state_label,
             to_label=FAILED,
-            reason=f"{reason}; {attempt} attempt(s) made against a cap of {cap}",
+            reason=f"{reason}; {attempt} attempt(s) made against a total cap of {total_cap}",
             task_id=entry.task_id,
             attempt=attempt,
-            comment=f"apiary: giving up after {attempt} attempt(s). {reason}",
+            blocker=sig,
+            streak=streak,
+            comment=(
+                f"apiary: giving up after {attempt} attempt(s). {reason}\n\n"
+                f"The total retry budget is spent ({attempt} of {total_cap}, "
+                "SWARM_MAX_TOTAL_ATTEMPTS): the failures changed along the way - each "
+                "change renewed the per-blocker budget - but a task that keeps failing "
+                "in new ways is not converging, and a human should look at the whole "
+                "history rather than the latest error."
+            ),
+        )
+    # Not gated on `renewed`: a renewal restarts the streak at 1, so with a cap
+    # of 1 - the operator saying "never retry" - even a brand-new failure gives
+    # up here, exactly as it did before failures had signatures.
+    if streak >= cap:
+        return Transition(
+            number=entry.number,
+            from_label=entry.state_label,
+            to_label=FAILED,
+            reason=(
+                f"{reason}; {attempt} attempt(s) made, the last {streak} failing the "
+                f"same way against a cap of {cap}"
+            ),
+            task_id=entry.task_id,
+            attempt=attempt,
+            blocker=sig,
+            streak=streak,
+            comment=(
+                f"apiary: giving up after {attempt} attempt(s). {reason}\n\n"
+                f"The last {streak} attempt(s) failed the same way, so another retry "
+                "would buy the same failure again. If the blocker is fixed outside the "
+                f"task, move this back to `{READY}` - a retry that then fails "
+                "*differently* renews its own budget."
+            ),
+        )
+    renewal = ""
+    if renewed:
+        renewal = (
+            "A different failure than the last attempt - the previous blocker is "
+            f"gone, which is progress, so the retry budget is renewed (streak "
+            f"{streak} of {cap}, total {attempt} of {total_cap})."
         )
     return Transition(
         number=entry.number,
@@ -523,6 +776,9 @@ def _retry_or_give_up(
         reason=reason,
         task_id=entry.task_id,
         attempt=attempt,
+        blocker=sig,
+        streak=streak,
+        comment=retry_comment(attempt, reason, verify_output, renewal=renewal),
     )
 
 
@@ -535,6 +791,7 @@ def plan_reconcile(
     running: Collection[int] = (),
     labels: Mapping[int, frozenset[str]] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
+    max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
     infrastructure: Mapping[int, int] | None = None,
     infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
 ) -> ReconcilePlan:
@@ -606,6 +863,7 @@ def plan_reconcile(
                 entry,
                 record,
                 max_attempts,
+                max_total_attempts=max_total_attempts,
                 infrastructure_streak=infrastructure.get(entry.number, 0),
                 policy=infrastructure_policy,
             )
@@ -626,7 +884,10 @@ def plan_reconcile(
         if open_branches is not None and entry.branch not in open_branches:
             transitions.append(
                 _retry_or_give_up(
-                    entry, "its pull request was closed without merging", max_attempts
+                    entry,
+                    "its pull request was closed without merging",
+                    max_attempts,
+                    max_total_attempts=max_total_attempts,
                 )
             )
             if entry.number in live:
@@ -680,6 +941,7 @@ def _observe(
     record: ResultRecord,
     max_attempts: int,
     *,
+    max_total_attempts: int | None = None,
     infrastructure_streak: int = 0,
     policy: InfrastructurePolicy = InfrastructurePolicy(),
 ) -> tuple[Transition | None, Disposal]:
@@ -696,7 +958,18 @@ def _observe(
     detail = record.reason or record.outcome
     if record.consumes_attempt:
         return (
-            _retry_or_give_up(entry, f"worker exit {record.exit_code}: {detail}", max_attempts),
+            _retry_or_give_up(
+                entry,
+                f"worker exit {record.exit_code}: {detail}",
+                max_attempts,
+                # The record is the only place the gate's own words survive the
+                # container, and they are what the retry comment - and through
+                # it, the next attempt's prompt - is made of. The failure
+                # signature is computed from the same text, so "the same
+                # failure again" is judged on what the gate actually said.
+                verify_output=record.verify_output,
+                max_total_attempts=max_total_attempts,
+            ),
             Disposal(entry.number, f"worker exit {record.exit_code}"),
         )
     # Exit 2. The task never really ran, so the attempt is not consumed - a
@@ -772,6 +1045,13 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
             entry,
             state_label=transition.to_label,
             attempt=entry.attempt if transition.attempt is None else transition.attempt,
+            # The signature record mirrors the marker write exactly: a
+            # transition that wrote the counter wrote (or cleared) the record
+            # in the same patch, and one that left the counter alone left the
+            # record alone too. Folding anything else would hand the rest of
+            # the cycle a ledger disagreeing with the body it just patched.
+            blocker=entry.blocker if transition.attempt is None else transition.blocker,
+            streak=entry.streak if transition.attempt is None else transition.streak,
             labels=frozenset(entry.labels - {transition.from_label} | {transition.to_label}),
         )
     return replace(ledger, entries=entries)
@@ -782,7 +1062,9 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
 # --------------------------------------------------------------------------
 
 
-def rewrite_marker(body: str, task_id: str, attempt: int) -> str:
+def rewrite_marker(
+    body: str, task_id: str, attempt: int, *, blocker: str = "", streak: int | None = None
+) -> str:
     """Set the counter in the identity marker, preserving every other byte.
 
     §5's write rule, and the reason it is a body `PATCH` rather than a label: it
@@ -795,8 +1077,17 @@ def rewrite_marker(body: str, task_id: str, attempt: int) -> str:
     is a fenced example, which `ledger._parse_marker` correctly ignores - gets a
     fresh marker prepended, which is where the loader's own adoption puts it and
     which the parser reads first either way.
+
+    `blocker` and `streak` are the failure-signature record; the marker is
+    rewritten *from the arguments*, not merged with what it carried, so a
+    caller that does not pass them (`checks`, `mergeability`, recovery -
+    channels whose consumed attempt has no verify output to sign) clears the
+    record and the next failure is judged by the pre-signature arithmetic.
+    That direction is deliberate: a stale signature could renew a budget the
+    blocker never released, and §5 says the counter must over-bound, never
+    under-bound.
     """
-    marker = render_marker(task_id, attempt)
+    marker = render_marker(task_id, attempt, blocker=blocker, streak=streak)
     lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     fenced = False
     for index, line in enumerate(lines):
@@ -812,7 +1103,15 @@ def rewrite_marker(body: str, task_id: str, attempt: int) -> str:
     return f"{marker}\n\n{body}" if body else marker
 
 
-def bump_attempt(client: Any, number: int, task_id: str, attempt: int) -> None:
+def bump_attempt(
+    client: Any,
+    number: int,
+    task_id: str,
+    attempt: int,
+    *,
+    blocker: str = "",
+    streak: int | None = None,
+) -> None:
     """Persist the counter, re-reading the body immediately before the patch.
 
     Two API calls, and the re-read is the point: the body in the ledger was
@@ -820,10 +1119,18 @@ def bump_attempt(client: Any, number: int, task_id: str, attempt: int) -> None:
     their edit overwritten by a patch built from the stale copy. §5 requires the
     fresh read, and it is cheap because it happens only for an issue that just
     finished an attempt.
+
+    The failure signature travels in the same patch as the counter, which is
+    what keeps §5's crash-ordering argument intact for it: the record lands
+    before the label goes back to `swarm:ready`, so a crash between the two
+    costs an attempt with its signature recorded, never grants a retry whose
+    streak forgot what it was retrying.
     """
     issue = client.get_issue(number)
     body = issue.get("body") or ""
-    client.update_issue(number, body=rewrite_marker(body, task_id, attempt))
+    client.update_issue(
+        number, body=rewrite_marker(body, task_id, attempt, blocker=blocker, streak=streak)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -943,7 +1250,14 @@ def apply_plan(
     for transition in plan.transitions:
         try:
             if transition.attempt is not None and transition.task_id:
-                bump_attempt(client, transition.number, transition.task_id, transition.attempt)
+                bump_attempt(
+                    client,
+                    transition.number,
+                    transition.task_id,
+                    transition.attempt,
+                    blocker=transition.blocker,
+                    streak=transition.streak,
+                )
             client.add_labels(transition.number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
                 client.remove_label(transition.number, transition.from_label)
@@ -1109,6 +1423,10 @@ class Reconciler:
     capacity: Capacity | None = None
     interval_s: float = DEFAULT_INTERVAL_S
     max_attempts: int = SETTINGS.max_attempts_per_task
+    #: The hard ceiling across every failure mode. `max_attempts` bounds one
+    #: blocker and renews when the failure changes; this bounds the task, so a
+    #: run whose failures keep changing still ends (`SWARM_MAX_TOTAL_ATTEMPTS`).
+    max_total_attempts: int = SETTINGS.max_total_attempts_per_task
     dry_run: bool = False
     #: Injection points for the tests, and for nothing else. A loop that slept
     #: for real would make the pacing untestable, which is the half of the
@@ -1216,6 +1534,7 @@ class Reconciler:
             running=tuple(handles),
             labels=snapshot.labels(),
             max_attempts=self.max_attempts,
+            max_total_attempts=self.max_total_attempts,
             infrastructure=self._infrastructure,
             infrastructure_policy=self.infrastructure_policy,
         )

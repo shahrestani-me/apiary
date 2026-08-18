@@ -382,6 +382,23 @@ class GitHubClient:
         path = f"/repos/{self.repo}/issues/{number}/comments"
         return self._send_json("POST", self._url(path), {"body": body})
 
+    def list_issue_comments(self, number: int) -> list[dict[str, Any]]:
+        """Every comment on one issue, oldest first - GitHub's own order.
+
+        The read half of the channel `create_issue_comment` writes: the
+        reconciler posts an `apiary: attempt N failed` comment when it sends an
+        issue back to `swarm:ready`, and the worker running the retry reads it
+        back to learn what the previous attempt did wrong. Without this method
+        a retry sees only the issue body, which is exactly what the failed
+        attempt saw - so it fails the same way, three times, and the comments
+        explaining why are addressed to nobody.
+
+        Paginated like every other listing here, because an issue that has been
+        retried and argued over can carry more than one page - and the newest
+        comment, which is the one a retry wants, is on the last one.
+        """
+        return self._paginate(f"/repos/{self.repo}/issues/{number}/comments", None)
+
     # --- pull requests ----------------------------------------------------
 
     def delete_branch(self, branch: str) -> bool:

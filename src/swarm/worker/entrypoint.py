@@ -74,6 +74,7 @@ from ..github.ledger import (
 # v2's clones; a second error class for the same fact would only make callers
 # catch both.
 from ..run import RUN_ID_ENV
+from ..security import EGRESS_EXTRA_ENV
 from ..worktree import GitError
 from .edit import Applied, EditError, apply_edits, gather_context, propose_edits, read_writable
 
@@ -164,6 +165,33 @@ VERIFY_ENV_REQUIRED = (
 #: How much of the verify output travels onward. #17 puts it in the PR body and
 #: #29 writes it to disk, and neither wants a megabyte of pytest chatter.
 OUTPUT_TAIL_CHARS = 4_000
+
+#: The dependency manifests a worker may write whether or not its contract
+#: lists them. Declaring what its code needs is part of any implementation
+#: task, and a planner cannot foresee every import - the alternative, observed
+#: live, is a worker that writes `import sqlalchemy` into a container that has
+#: no sqlalchemy and no permitted way to say so. Python-only for now; a node
+#: manifest is one entry here plus an installer in `install_dependencies`, not
+#: a second rule.
+DEPENDENCY_MANIFESTS: tuple[str, ...] = ("requirements.txt",)
+PYTHON_MANIFEST = "requirements.txt"
+
+#: The install gets its own clock rather than sharing the verify command's:
+#: a resolver walking a heavy dependency tree is slow in a way a test suite is
+#: not, and a hung index - the proxy denying silently - must not be allowed to
+#: spend the whole container budget before the failure text exists.
+INSTALL_TIMEOUT_S = 300
+
+#: The first line of a retry-feedback comment, exactly as
+#: `orchestrator.reconcile.retry_comment` writes it. Matched by prefix rather
+#: than parsed, because the comment is prose for humans too and the only
+#: machine-read fact is "this is the reconciler describing a failed attempt".
+FEEDBACK_PREFIX = "apiary: attempt"
+
+#: How much of that comment is folded into the goal. The comment is already
+#: bounded at the writing end; this is the belt to that brace, because the goal
+#: shares a 16K-token window with every file the task may edit.
+FEEDBACK_MAX_CHARS = 3_000
 
 #: The image this container was created from, if the spawner said so. A worker
 #: cannot ask the daemon - it has no socket and no `docker` binary, which is the
@@ -567,6 +595,67 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
     return verdict.passed, output
 
 
+def install_dependencies(root: Path) -> str | None:
+    """Install the checkout's declared dependencies, if it declares any.
+
+    Runs before the verify command, because that is the only ordering under
+    which `requirements.txt` means anything: the manifest is how a task says
+    what its code imports, and a gate that runs against a bare interpreter
+    reads every declaration as a `ModuleNotFoundError`.
+
+    Returns `None` when there is nothing to install or the install succeeded,
+    and the failure text otherwise - which the caller folds into the run as a
+    FAILED verify. **Deliberately not `classify_verify`, and deliberately not
+    infrastructure.** A pip denied the network matches
+    `DENIED_EGRESS_SIGNATURES`, and classifying that as exit 2 would retry a
+    task forever whose real blocker never changes; the deny-by-default egress
+    is the operator's standing decision (`security.EGRESS_EXTRA_ENV`'s
+    rationale), so the failure is the task's to report and the retry comment's
+    to explain. The one thing this does add is the fix by name, because "403
+    Filtered" on its own tells an operator nothing about which knob exists.
+
+    Same execution shape as `run_verify` - shell, repo root, the filtered
+    environment - because the install must land in exactly the interpreter and
+    proxy configuration the verify command will run under.
+    """
+    manifest = root / PYTHON_MANIFEST
+    if not manifest.is_file():
+        return None
+    command = f"pip install -r {PYTHON_MANIFEST}"
+    print(f"  · installing dependencies: {command}")
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=INSTALL_TIMEOUT_S,
+            env=verify_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"dependency install timed out after {INSTALL_TIMEOUT_S}s: {command}"
+    except OSError as exc:
+        # The shell itself could not be started - the same verdict, for the
+        # same reason, as `run_verify`'s: nothing about the task ran.
+        raise InfrastructureError(f"could not run the dependency install: {exc}") from exc
+    if proc.returncode == 0:
+        return None
+
+    from .result import tail
+
+    output = tail(f"{proc.stdout}\n{proc.stderr}".strip(), OUTPUT_TAIL_CHARS)
+    failure = f"dependency install failed (exit {proc.returncode}): {command}\n{output}"
+    haystack = output.casefold()
+    if any(signature in haystack for signature in DENIED_EGRESS_SIGNATURES):
+        failure += (
+            "\n\nThe package index is not on the egress allowlist, so this install "
+            "fails identically every attempt. To allow it, restart the run with "
+            f"{EGRESS_EXTRA_ENV}=pypi.org,files.pythonhosted.org exported."
+        )
+    return failure
+
+
 # --------------------------------------------------------------------------
 # The run
 # --------------------------------------------------------------------------
@@ -578,6 +667,55 @@ def _fetch_contract(client: GitHubClient, issue: int) -> tuple[TaskContract, str
     except GitHubError as exc:
         raise InfrastructureError(f"reading issue #{issue}: {exc}") from exc
     return parse_contract(issue, payload.get("body")), payload.get("title") or ""
+
+
+def fetch_feedback(client: GitHubClient, issue: int) -> str:
+    """The latest retry-feedback comment on this issue, or nothing. Never raises.
+
+    The reconciler posts one `apiary: attempt N failed` comment per consumed
+    attempt (`orchestrator.reconcile.retry_comment`), so the newest is the
+    verdict on the attempt this run is retrying - the older ones are history it
+    already superseded. GitHub returns comments oldest first, hence the walk
+    from the end.
+
+    A fetch that fails is a retry without feedback, which is exactly what every
+    retry was before this method existed - degraded, said out loud, and never a
+    reason to burn the attempt: the comment is an aid, not a prerequisite.
+    Probed with `getattr` for the same reason the reconciler probes its comment
+    methods - an injected client that predates `list_issue_comments` is today's
+    behaviour, not an error.
+    """
+    lister = getattr(client, "list_issue_comments", None)
+    if lister is None:
+        return ""
+    try:
+        comments = lister(issue)
+    except GitHubError as exc:
+        print(f"! could not read retry feedback for #{issue}: {exc}", file=sys.stderr)
+        return ""
+    for payload in reversed(comments or []):
+        text = str(payload.get("body") or "")
+        if text.startswith(FEEDBACK_PREFIX):
+            return text[:FEEDBACK_MAX_CHARS]
+    return ""
+
+
+def _with_feedback(goal: str, feedback: str) -> str:
+    """One brief: what went wrong last time, then the task, clearly delimited.
+
+    The failure leads because the model reads top-down and the single most
+    important fact about a retry is that it *is* one - the same goal, handed to
+    the same model over the same base commit, reproduces the same code unless
+    something in the prompt has changed.
+    """
+    return (
+        "A PREVIOUS ATTEMPT AT THIS EXACT TASK FAILED. Read the failure report "
+        "below and do something different this time - repeating the same code "
+        "will fail the same way.\n\n"
+        f"{feedback}\n\n"
+        "--- end of failure report ---\n\n"
+        f"{goal}"
+    )
 
 
 def run_worker(
@@ -607,14 +745,29 @@ def run_worker(
     branch = f"swarm/issue-{issue}"
     task_id = contract.task_id or f"issue-{issue}"
 
+    # A retry gets told why the last attempt failed, or it is not a retry - it
+    # is the same attempt again. `attempt > 0` is the marker's own testimony
+    # that at least one was consumed, and it is checked before the fetch so a
+    # first attempt costs no comment listing at all.
+    goal = contract.goal
+    if contract.attempt > 0:
+        feedback = fetch_feedback(client, issue)
+        if feedback:
+            print(f"  · attempt {contract.attempt + 1}; folding in the failure report")
+            goal = _with_feedback(goal, feedback)
+
     root = prepare_checkout(clone_url, workspace / f"issue-{issue}", base_commit, branch)
 
     writable = read_writable(root, contract.files)
     readable = gather_context(root, contract.files)
     print(f"  · {len(writable)} file(s) to edit, {len(readable)} for context")
 
-    output = propose_edits(contract.goal, writable, readable, llm=editor)
-    applied: Applied = apply_edits(root, output.edits, contract.files)
+    output = propose_edits(goal, writable, readable, llm=editor)
+    # The declared set plus the dependency manifests: a worker may always say
+    # what its code needs, and refusing `requirements.txt` while installing it
+    # before the gate would make the install a rule the model cannot satisfy.
+    # Everything else keeps `apply_edits`' refusal semantics untouched.
+    applied: Applied = apply_edits(root, output.edits, (*contract.files, *DEPENDENCY_MANIFESTS))
     for path, reason in applied.refused:
         print(f"  ! refused {path}: {reason}", file=sys.stderr)
 
@@ -641,7 +794,15 @@ def run_worker(
     # infrastructure failure carries both rather than reporting an empty
     # command for a run that had already got as far as a green suite.
     try:
-        passed, verify_output = run_verify(root, contract.verify)
+        # Declared dependencies go in before the gate opens; a failed install
+        # IS the verify verdict, because it is the task's real blocker and the
+        # next retry's feedback. See `install_dependencies` for why it is a
+        # failed task and never infrastructure.
+        blocked = install_dependencies(root)
+        if blocked is not None:
+            passed, verify_output = False, blocked
+        else:
+            passed, verify_output = run_verify(root, contract.verify)
 
         commit = None
         if passed:

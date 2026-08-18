@@ -455,6 +455,19 @@ class Settings:
     max_rounds: int = int(_env("SWARM_MAX_ROUNDS", "8"))
     max_stalls: int = int(_env("SWARM_MAX_STALLS", "2"))
     max_attempts_per_task: int = int(_env("SWARM_MAX_ATTEMPTS", "3"))
+    # The hard ceiling across *every* failure mode. `max_attempts_per_task`
+    # bounds one blocker - the same failure repeating - and the reconciler
+    # renews that budget when a retry fails *differently*, because a changed
+    # failure is proof the previous blocker is gone (observed live: three
+    # identical ModuleNotFoundErrors were rightly capped, but the human-fixed
+    # fourth attempt failed on a brand-new SyntaxError and the run gave up one
+    # roll short). Renewal without a ceiling would let a task that keeps
+    # failing in new ways loop forever, so this is the bound on the whole
+    # sequence: three full per-blocker budgets by default, and the give-up at
+    # this cap fires whatever the signature says.
+    max_total_attempts_per_task: int = int(
+        _env("SWARM_MAX_TOTAL_ATTEMPTS", str(3 * int(_env("SWARM_MAX_ATTEMPTS", "3"))))
+    )
     # Two clocks, one inside the other, and only the outer one was ever the
     # binding constraint. `verify_timeout_s` bounds the gate; `worker_timeout_s`
     # bounds the whole container, which is the clone, one whole-file inference

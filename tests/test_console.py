@@ -214,6 +214,17 @@ def test_the_planner_prompt_names_no_task_counts():
         assert anchor not in prompt, f"a task-count anchor came back: {anchor!r}"
 
 
+def test_the_planner_is_told_how_dependencies_reach_a_worker():
+    """Third-party packages exist only through requirements.txt, installed
+    before the gate runs - the planner has to know that, or it plans tasks
+    whose imports fail identically on every attempt (observed live: issue #21
+    of the first wallet-tracker run, 3/3 attempts on one ModuleNotFoundError)."""
+    prompt = system_prompt(verify="pytest -q")
+
+    assert "requirements.txt" in prompt
+    assert "standard library" in prompt
+
+
 def test_the_planner_is_told_a_task_must_pass_the_gate_alone():
     """The other half: file-disjointness was the only rule about shape, so the
     model cut by layer. The first recorded run split implementation from tests,

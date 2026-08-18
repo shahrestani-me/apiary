@@ -70,7 +70,12 @@ never a fragment, never "... rest unchanged".
 Edit ONLY the files listed as editable. The read-only context is there to be
 imitated, not modified: an edit to any other path is discarded and the task
 fails. If a file should be created, include it with its full contents. Keep
-changes minimal and focused on the goal."""
+changes minimal and focused on the goal.
+
+Third-party packages exist for your code ONLY if they are declared in
+requirements.txt, which is installed before the verify command runs (when the
+operator has allowed the package index) - you may always edit requirements.txt,
+listed or not. Prefer the standard library when it suffices."""
 
 #: Per-file truncation, as in v1. A file past this is nearly always generated
 #: or vendored, and spending the window on it starves the files that matter.

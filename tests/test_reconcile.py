@@ -42,11 +42,20 @@ import pytest
 from fixtures.github import SentRequest, not_modified, page, response
 from swarm.containers.manager import DockerError, Handle
 from swarm.github.client import GitHubHTTPError
-from swarm.github.ledger import ContractError, LabelRepair, Ledger, LedgerEntry, render_marker
+from swarm.github.ledger import (
+    ContractError,
+    LabelRepair,
+    Ledger,
+    LedgerEntry,
+    parse_contract,
+    render_marker,
+)
 from swarm.github.readiness import IssueState
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity
 from swarm.orchestrator.reconcile import (
+    COMMENT_TAIL_CHARS,
     DEFAULT_INFRASTRUCTURE_CAP,
+    EMPTY_SIGNATURE,
     INFRASTRUCTURE_CAP_ENV,
     InfrastructurePolicy,
     infrastructure_streaks,
@@ -59,9 +68,12 @@ from swarm.orchestrator.reconcile import (
     Snapshot,
     Transition,
     apply_plan,
+    diagnose,
     fold,
     plan_reconcile,
+    retry_comment,
     rewrite_marker,
+    signature,
 )
 from swarm.run import Run
 from swarm.state import ProgressJudgement
@@ -83,12 +95,16 @@ def entry(
     *files: str,
     label: str = READY,
     attempt: int = 0,
+    blocker: str = "",
+    streak: int | None = None,
 ) -> LedgerEntry:
     return LedgerEntry(
         number=number,
         title=f"issue {number}",
         task_id=f"task-{number}",
         attempt=attempt,
+        blocker=blocker,
+        streak=streak,
         goal="do the thing",
         files=files or (f"src/mod{number}.py",),
         verify="python -m pytest -q",
@@ -106,13 +122,21 @@ def closed(number: int, reason: str | None = "completed") -> IssueState:
     return IssueState(number=number, state="closed", state_reason=reason)
 
 
-def record(issue: int, exit_code: int, *, attempt: int = 0, reason: str = "") -> ResultRecord:
+def record(
+    issue: int,
+    exit_code: int,
+    *,
+    attempt: int = 0,
+    reason: str = "",
+    verify_output: str = "",
+) -> ResultRecord:
     return ResultRecord(
         run_id=RUN_ID,
         issue=issue,
         attempt=attempt,
         exit_code=exit_code,
         reason=reason or "the verify command failed",
+        verify_output=verify_output,
     )
 
 
@@ -477,6 +501,317 @@ def test_a_records_verdict_is_not_applied_twice():
     )
 
     assert plan.transitions == ()
+
+
+# --------------------------------------------------------------------------
+# Retry feedback: diagnose() and the comment a retry leaves behind
+# --------------------------------------------------------------------------
+
+SQLALCHEMY_TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "app/models.py", line 1, in <module>\n'
+    "    import sqlalchemy\n"
+    "ModuleNotFoundError: No module named 'sqlalchemy'\n"
+)
+
+
+def test_a_missing_module_is_diagnosed_by_name():
+    finding = diagnose(SQLALCHEMY_TRACEBACK)
+
+    assert "missing dependency 'sqlalchemy'" in finding
+    assert "requirements.txt" in finding
+    assert "standard library" in finding
+
+
+def test_a_missing_submodule_names_the_top_level_package():
+    # The distribution to declare is `sqlalchemy`, not `sqlalchemy.orm`.
+    finding = diagnose("ModuleNotFoundError: No module named 'sqlalchemy.orm'")
+
+    assert "missing dependency 'sqlalchemy'" in finding
+
+
+def test_an_import_error_is_diagnosed_from_the_module_it_names():
+    finding = diagnose("ImportError: cannot import name 'Session' from 'sqlalchemy.orm'")
+
+    assert "missing dependency 'sqlalchemy'" in finding
+
+
+def test_unrecognised_output_yields_no_diagnosis():
+    # No guess: a wrong diagnosis is repeated to the next attempt as a fact.
+    assert diagnose("FAILED tests/test_calc.py::test_add - assert 3 == 4") == ""
+    assert diagnose("") == ""
+
+
+def test_a_retried_issue_carries_the_failure_as_a_comment():
+    """The defect this feature exists for: issue #21 of the first live run
+    failed 3/3 attempts on the identical ModuleNotFoundError, because a retry
+    posted nothing and the next worker saw only the issue body."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=0)),
+        results={4: record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
+        max_attempts=3,
+    )
+
+    transition = plan.transitions[0]
+    assert transition.to_label == READY
+    assert transition.comment.startswith("apiary: attempt 1 failed")
+    assert "worker exit 1" in transition.comment
+    assert "missing dependency 'sqlalchemy'" in transition.comment
+    # The evidence travels in a fence, so the worker can read it and a human
+    # can skim past it.
+    assert "```" in transition.comment
+    assert "ModuleNotFoundError" in transition.comment
+
+
+def test_a_retry_comment_without_verify_output_still_states_the_reason():
+    # The PR-closed-unmerged path has no record to quote; the reason is the
+    # whole feedback, and there is no empty fence dangling under it.
+    plan = plan_reconcile(
+        ledger(entry(4, label=REVIEW, attempt=0)),
+        open_branches=frozenset(),
+        max_attempts=3,
+    )
+
+    transition = plan.transitions[0]
+    assert transition.comment.startswith("apiary: attempt 1 failed")
+    assert "closed without merging" in transition.comment
+    assert "```" not in transition.comment
+
+
+def test_the_retry_comments_tail_is_bounded():
+    huge = "x" * (COMMENT_TAIL_CHARS * 3) + "\nModuleNotFoundError: No module named 'flask'"
+    comment = retry_comment(1, "worker exit 1: the verify command failed", huge)
+
+    assert len(comment) < COMMENT_TAIL_CHARS + 1_000
+    assert "earlier characters elided" in comment
+    # The diagnosis reads the whole output, not the clipped tail.
+    assert "missing dependency 'flask'" in comment
+
+
+def test_the_retry_comment_lands_on_the_issue_through_the_apply_path():
+    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED)),
+        results={4: record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
+        max_attempts=3,
+    )
+
+    report = apply_plan(client, plan)
+
+    assert report.uncommented == ()
+    number, text = client.comments[0]
+    assert number == 4
+    assert text.startswith("apiary: attempt 1 failed")
+    assert "missing dependency 'sqlalchemy'" in text
+
+
+# --------------------------------------------------------------------------
+# The retry budget is per blocker, not per task
+# --------------------------------------------------------------------------
+
+# Not diagnosable - `diagnose` knows nothing about SyntaxErrors - so this
+# exercises the normalised-tail tier of `signature`.
+SYNTAX_ERROR_OUTPUT = (
+    '  File "tests/test_wallet.py", line 7\n'
+    "    def test_balance(:\n"
+    "                     ^\n"
+    "SyntaxError: invalid syntax\n"
+)
+
+
+def test_the_same_failure_signs_identically_wherever_it_happened():
+    # The diagnosis is the identity: the same missing module is the same
+    # blocker even when the importing file and line have moved.
+    moved = SQLALCHEMY_TRACEBACK.replace("line 1", "line 88").replace("app/models.py", "src/db.py")
+
+    assert signature(SQLALCHEMY_TRACEBACK) == signature(moved)
+    assert signature(SQLALCHEMY_TRACEBACK) == signature(SQLALCHEMY_TRACEBACK)
+
+
+def test_paths_and_line_numbers_do_not_change_an_undiagnosed_signature():
+    a = "E   SyntaxError: invalid syntax (tests/test_wallet.py, line 12)"
+    b = "E   SyntaxError: invalid syntax (tests/test_ledger.py, line 30)"
+
+    assert signature(a) == signature(b)
+
+
+def test_different_failures_sign_differently():
+    assert signature(SQLALCHEMY_TRACEBACK) != signature(SYNTAX_ERROR_OUTPUT)
+    assert signature("E   AssertionError: assert 3 == 4") != signature(SYNTAX_ERROR_OUTPUT)
+
+
+def test_empty_output_signs_as_the_fixed_sentinel():
+    assert signature("") == EMPTY_SIGNATURE
+    assert signature("   \n  ") == EMPTY_SIGNATURE
+
+
+def test_a_different_failure_renews_the_retry_budget():
+    """The live defect this feature exists for: issue #21's environment was
+    fixed by hand, attempt 4 failed on a brand-new SyntaxError - proof the old
+    blocker was gone - and the orchestrator gave up anyway because the counter
+    was at its cap. A changed signature must renew the budget."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2, blocker=signature(SQLALCHEMY_TRACEBACK), streak=2)),
+        results={4: record(4, 1, attempt=2, verify_output=SYNTAX_ERROR_OUTPUT)},
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    # Attempt 3 of a 3-cap would have failed under the old arithmetic.
+    assert transition.to_label == READY
+    # The total keeps counting for honesty; the streak restarts.
+    assert (transition.attempt, transition.streak) == (3, 1)
+    assert transition.blocker == signature(SYNTAX_ERROR_OUTPUT)
+    # The machine-findable prefix is unchanged; the renewal is said out loud.
+    assert transition.comment.startswith("apiary: attempt 3 failed")
+    assert "previous blocker is gone" in transition.comment
+    assert "renewed" in transition.comment
+    assert "streak 1 of 3" in transition.comment
+    assert "total 3 of 9" in transition.comment
+
+
+def test_the_same_failure_repeating_gives_up_exactly_as_before():
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2, blocker=signature(SQLALCHEMY_TRACEBACK), streak=2)),
+        results={4: record(4, 1, attempt=2, verify_output=SQLALCHEMY_TRACEBACK)},
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    assert transition.to_label == FAILED
+    assert "cap of 3" in transition.reason
+    assert transition.comment.startswith("apiary: giving up after 3 attempt(s)")
+    assert "failed the same way" in transition.comment
+
+
+def test_an_old_marker_without_a_signature_behaves_exactly_as_before():
+    # Back-compat: no blocker recorded means no renewal, however new the
+    # failure looks - the pre-signature arithmetic on the attempt counter.
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2)),
+        results={4: record(4, 1, attempt=2, verify_output=SYNTAX_ERROR_OUTPUT)},
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.to_label, transition.attempt) == (FAILED, 3)
+    assert "cap of 3" in transition.reason
+
+
+def test_a_renewed_blocker_that_then_repeats_burns_its_own_budget():
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=3, blocker=signature(SYNTAX_ERROR_OUTPUT), streak=1)),
+        results={4: record(4, 1, attempt=3, verify_output=SYNTAX_ERROR_OUTPUT)},
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    assert transition.to_label == READY
+    assert (transition.attempt, transition.streak) == (4, 2)
+    # A repeat is not a renewal, so the comment must not claim progress.
+    assert "renewed" not in transition.comment
+
+
+def test_the_hard_cap_gives_up_whatever_the_signature_says():
+    # Failures that keep changing renew the per-blocker budget, but the total
+    # is bounded: a task failing a new way every time is not converging.
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=8, blocker=signature(SQLALCHEMY_TRACEBACK), streak=1)),
+        results={4: record(4, 1, attempt=8, verify_output=SYNTAX_ERROR_OUTPUT)},
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.to_label, transition.attempt) == (FAILED, 9)
+    assert "total cap of 9" in transition.reason
+    assert "total retry budget is spent" in transition.comment
+
+
+def test_a_cap_of_one_gives_up_even_on_a_renewed_failure():
+    # max_attempts=1 is the operator saying "never retry"; a renewal restarts
+    # the streak at 1, which is already at that cap.
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=1, blocker=signature(SQLALCHEMY_TRACEBACK), streak=1)),
+        results={4: record(4, 1, attempt=1, verify_output=SYNTAX_ERROR_OUTPUT)},
+        max_attempts=1,
+        max_total_attempts=9,
+    )
+
+    assert plan.transitions[0].to_label == FAILED
+
+
+def test_a_retry_with_no_output_signs_as_the_sentinel_and_burns_down():
+    # The PR-closed-unmerged path has nothing to sign; the sentinel keeps it
+    # consistent with itself, so closing the PR again is the same blocker.
+    plan = plan_reconcile(
+        ledger(entry(4, label=REVIEW, attempt=1, blocker=EMPTY_SIGNATURE, streak=1)),
+        open_branches=frozenset(),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    assert transition.to_label == READY
+    assert (transition.blocker, transition.streak) == (EMPTY_SIGNATURE, 2)
+
+
+def test_the_signature_is_persisted_in_the_marker_before_the_relabel():
+    client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED)),
+        results={4: record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
+        max_attempts=3,
+    )
+
+    apply_plan(client, plan)
+
+    sig = signature(SQLALCHEMY_TRACEBACK)
+    body_text = client.issues[4]["body"]
+    assert f"blocker={sig}" in body_text
+    assert "streak=1" in body_text
+    # §5's ordering, extended to the record that rides the same PATCH: the
+    # write lands before the label goes back to ready, so a crash between the
+    # two costs an attempt with its signature intact.
+    assert client.log.index("update_issue #4") < client.log.index(f"+{READY} #4")
+    # And it round-trips: the next cycle's loader reads the record back.
+    contract = parse_contract(4, body_text)
+    assert (contract.attempt, contract.blocker, contract.streak) == (1, sig, 1)
+
+
+def test_folding_a_signature_transition_updates_the_in_memory_ledger():
+    transition = Transition(
+        number=4,
+        from_label=CLAIMED,
+        to_label=READY,
+        reason="worker exit 1",
+        task_id="task-4",
+        attempt=1,
+        blocker="ab12cd34ef",
+        streak=1,
+    )
+
+    folded = fold(ledger(entry(4, label=CLAIMED)), [transition])
+
+    after = folded.entries["task-4"]
+    assert (after.attempt, after.blocker, after.streak) == (1, "ab12cd34ef", 1)
+
+
+def test_a_counter_bump_without_a_signature_clears_the_stale_record():
+    # checks, mergeability and recovery consume attempts through channels with
+    # no verify output to sign; rewriting the marker from their transitions
+    # clears the record, and the next failure is judged by the old arithmetic
+    # - the direction that can only give up early, never late (§5).
+    original = render_marker("task-4", 1, blocker="ab12cd34ef", streak=1)
+
+    updated = rewrite_marker(original, "task-4", 2)
+
+    assert updated.splitlines()[0] == render_marker("task-4", 2)
+    assert "blocker=" not in updated
 
 
 # --------------------------------------------------------------------------

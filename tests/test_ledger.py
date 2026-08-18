@@ -419,6 +419,80 @@ def test_a_marker_id_that_is_not_a_slug_is_malformed():
     assert caught.value.section == "marker"
 
 
+# --------------------------------------------------------------------------
+# The failure-signature fields: blocker= and streak=
+# --------------------------------------------------------------------------
+
+
+def test_a_marker_without_the_signature_fields_parses_exactly_as_before():
+    """Back-compat is the contract: every issue written before `blocker=`
+    existed must read as "no previous blocker recorded", which downstream is
+    the pre-signature arithmetic exactly."""
+    contract = parse_contract(19, contract_body(marker=render_marker("add-retry-logic", 2)))
+
+    assert (contract.attempt, contract.blocker, contract.streak) == (2, "", None)
+
+
+def test_the_signature_fields_round_trip_through_render_and_parse():
+    marker = render_marker("add-retry-logic", 3, blocker="ab12cd34ef", streak=2)
+    contract = parse_contract(20, contract_body(marker=marker))
+
+    assert contract.task_id == "add-retry-logic"
+    assert (contract.attempt, contract.blocker, contract.streak) == (3, "ab12cd34ef", 2)
+
+
+def test_render_marker_without_signature_fields_is_byte_identical_to_the_old_form():
+    # Every writer that predates the fields - the planner, adoption, checks'
+    # and recovery's counter bumps - must keep producing the marker existing
+    # bodies and tests carry.
+    assert render_marker("add-retry-logic", 2) == "<!-- apiary:task id=add-retry-logic attempt=2 -->"
+
+
+def test_unknown_marker_fields_are_tolerated_and_ignored():
+    """The worker reads the marker too (`worker.entrypoint` calls
+    `parse_contract` before doing anything), so a field only the reconciler
+    consumes - or one a future orchestrator invents - must never fail a
+    container over it."""
+    contract = parse_contract(
+        21,
+        contract_body(
+            marker="<!-- apiary:task id=add-retry-logic attempt=1 blocker=ab12cd34ef "
+            "streak=1 frobnicate=9 -->"
+        ),
+    )
+
+    assert (contract.task_id, contract.attempt) == ("add-retry-logic", 1)
+    assert (contract.blocker, contract.streak) == ("ab12cd34ef", 1)
+
+
+def test_an_unparseable_streak_reads_as_absent():
+    # Absent falls back to the attempt counter downstream - the safe direction,
+    # because it can only give up earlier, never later (§5's over-bounding).
+    contract = parse_contract(
+        22, contract_body(marker="<!-- apiary:task id=add-retry-logic attempt=2 streak=soon -->")
+    )
+
+    assert contract.streak is None
+
+
+def test_the_ledger_entry_carries_the_signature_record():
+    client = FakeClient(
+        [
+            issue(
+                60,
+                contract_body(
+                    marker=render_marker("add-retry-logic", 2, blocker="ab12cd34ef", streak=2)
+                ),
+            )
+        ]
+    )
+
+    ledger = load_ledger(client)
+
+    entry = ledger.entries["add-retry-logic"]
+    assert (entry.attempt, entry.blocker, entry.streak) == (2, "ab12cd34ef", 2)
+
+
 def test_slugify_matches_planned_task_id_shape():
     assert slugify("Read the task ledger from GitHub issues!") == "read-the-task-ledger-from-github-issues"
     assert len(slugify("x" * 200)) <= 64
