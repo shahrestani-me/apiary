@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import threading
 import time
 import traceback
@@ -61,6 +62,7 @@ from .capture import CAPTURE_ENV, Capture, Recorder
 from .config import ConfigError, SETTINGS
 from .console_board import BoardError, BoardReader
 from .console_intake import QUESTIONS as INTAKE_QUESTIONS
+from .console_projects import ProjectError, ProjectStore
 from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns
 
 __all__ = [
@@ -366,6 +368,7 @@ class Console:
     jobs: dict[str, Job] = field(default_factory=dict)
     runs: SwarmRuns = field(default_factory=SwarmRuns)
     board: BoardReader = field(default_factory=BoardReader)
+    projects: ProjectStore = field(default_factory=ProjectStore)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _running: str = ""
 
@@ -433,6 +436,12 @@ class Console:
             return self._swarm_board(path)
         if method == "GET" and path.startswith("/swarm/external"):
             return self._swarm_external(path)
+        if method == "GET" and path == "/projects":
+            return self._projects_list()
+        if method == "POST" and path == "/projects":
+            return self._projects_save(body)
+        if method == "GET" and path.startswith("/projects/history"):
+            return self._projects_history(path)
         return Response.error(f"no route for {method} {path}", 404)
 
     def _payload(self, body: bytes) -> tuple[Site, dict[str, str]]:
@@ -531,6 +540,24 @@ class Console:
                                   fix=exc.fix)
         except json.JSONDecodeError as exc:
             return Response.error(f"bad request body: {exc}", 400)
+        # A GitHub run that started is a project the operator will come back
+        # to, so it is written down here - the layer that owns the store -
+        # rather than inside `SwarmRuns`, which manages processes and should
+        # not learn bookkeeping. Local runs record a filesystem path in the
+        # repo field and are not projects. Best-effort, out loud: the run is
+        # already in flight, and a projects-file hiccup must not report a
+        # started run as a failure to start.
+        if values.get("local") != "1":
+            try:
+                self.projects.record_run(
+                    (values.get("repo") or "").strip(),
+                    objective=(values.get("objective") or "").strip(),
+                    stack=(values.get("stack") or "").strip(),
+                    verify=(values.get("verify") or "").strip(),
+                )
+            except Exception as exc:  # noqa: BLE001 - bookkeeping must not mask the run
+                print(f"! projects: could not record {values.get('repo')!r}: {exc}",
+                      file=sys.stderr)
         return Response.json(job.to_dict(), 202)
 
     def _swarm_stop(self, body: bytes) -> Response:
@@ -609,6 +636,52 @@ class Console:
                 f"{type(exc).__name__}: {exc}", 502,
                 fix="is GITHUB_TOKEN exported in the console's shell, and does it reach this repo?",
             )
+
+    # -- projects -----------------------------------------------------------
+    #
+    # Thin, like the swarm routes: what a project is, how the rows are
+    # ordered, and what makes a submission acceptable all live in
+    # `console_projects`, which is testable without a socket. Here is only the
+    # translation of `ProjectError` into the `{error, fix}` shape every other
+    # refusal on this page uses.
+
+    def _projects_list(self) -> Response:
+        try:
+            return Response.json({"projects": self.projects.list()})
+        except Exception as exc:  # noqa: BLE001 - an unreadable store belongs on the page
+            return Response.error(
+                f"{type(exc).__name__}: {exc}", 502,
+                fix=f"is {self.projects.path} readable and not corrupt?",
+            )
+
+    def _projects_save(self, body: bytes) -> Response:
+        try:
+            stored = self.projects.submit(json.loads(body or b"{}"))
+        except ProjectError as exc:
+            return Response.error(str(exc), 400, fix=exc.fix)
+        except json.JSONDecodeError as exc:
+            return Response.error(f"bad request body: {exc}", 400)
+        return Response.json(stored)
+
+    def _projects_history(self, path: str) -> Response:
+        """One project's prompts, newest first - each recorded run is one.
+
+        What the page shows when a project is selected: the objectives this
+        repository has already been asked for, read from the same run
+        artifacts `swarm runs` reads, so a run fired from a terminal is in
+        the history too and nothing is stored twice.
+        """
+        import urllib.parse
+
+        _, _, query = path.partition("?")
+        wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        repo = urllib.parse.unquote(wanted.get("repo", ""))
+        try:
+            return Response.json({"repo": repo, "prompts": self.projects.history(repo)})
+        except ProjectError as exc:
+            return Response.error(str(exc), 400, fix=exc.fix)
+        except Exception as exc:  # noqa: BLE001 - an unreadable runs root belongs on the page
+            return Response.error(f"{type(exc).__name__}: {exc}", 502)
 
 
 def _fix_for(exc: BaseException) -> str:

@@ -20,6 +20,7 @@ import time
 import pytest
 
 from swarm.console import Console
+from swarm.console_projects import ProjectStore
 from swarm.console_runs import (
     MERGE_OVERRIDE_ENV,
     PROVISION_TOKEN_ENV,
@@ -428,11 +429,21 @@ def test_the_swarm_tab_is_served_beside_the_sites_not_among_them():
     assert "objective" in names and "auto_merge" in names
 
 
-def test_the_start_route_streams_and_the_status_route_follows(tokens):
+def scratch_store(tmp_path) -> ProjectStore:
+    """A projects store that cannot touch the real `.swarm/projects.sqlite`.
+
+    Any console that *starts* a run records a project as a side effect, so
+    every test that reaches a successful start hands its console one of these.
+    """
+    return ProjectStore(path=tmp_path / "projects.sqlite", runs_root=tmp_path / "runs")
+
+
+def test_the_start_route_streams_and_the_status_route_follows(tokens, tmp_path):
     import json
 
     proc = FakeProc()
-    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True))
+    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True),
+                      projects=scratch_store(tmp_path))
 
     started = console.render(
         "POST", "/swarm/start", HOST,
@@ -463,11 +474,12 @@ def test_a_bad_form_is_a_400_with_the_fix_attached(tokens):
     assert body["fix"]
 
 
-def test_a_second_start_is_a_409(tokens):
+def test_a_second_start_is_a_409(tokens, tmp_path):
     import json
 
     proc = FakeProc()
-    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True))
+    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True),
+                      projects=scratch_store(tmp_path))
     payload = json.dumps({"values": {"objective": "x", "repo": "a/b"}}).encode()
     first = console.render("POST", "/swarm/start", HOST, payload)
 
@@ -484,13 +496,14 @@ def test_the_status_route_refuses_an_unknown_or_traversing_id():
     assert console.render("GET", "/swarm/status?id=../../etc", HOST).status == 400
 
 
-def test_a_reloaded_page_adopts_the_latest_run(tokens):
+def test_a_reloaded_page_adopts_the_latest_run(tokens, tmp_path):
     """A run fired before a reload - or by another session entirely - must be
     visible, whole log included, not an empty tab beside a working swarm."""
     import json
 
     proc = FakeProc()
-    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True))
+    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True),
+                      projects=scratch_store(tmp_path))
     assert console.render("GET", "/swarm/latest", HOST).status == 404  # before any run
 
     started = console.render("POST", "/swarm/start", HOST,
