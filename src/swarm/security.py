@@ -467,11 +467,21 @@ DEFAULT_EGRESS = EgressPolicy()
 
 
 def _hostname(value: str) -> str:
-    """`https://api.github.com:443/x` -> `api.github.com`. Lowercased."""
+    """`https://api.github.com:443/x` -> `api.github.com`. Lowercased.
+
+    The query and the fragment are cut before the userinfo `@` is, and the
+    order is the whole point. A URL may carry an `@` after `?` or `#` without
+    it delimiting userinfo at all, so splitting on `@` first reads
+    `https://attacker.example?x=@api.github.com` as `api.github.com` - a
+    hostname the predicate then admits while the request goes somewhere else.
+    Nothing enforces on this string but the proxy sees the real authority, so
+    the effect is a check that passes for a host tinyproxy blocks. Which is
+    worse than not checking, and is why the order is spelled out here.
+    """
     value = value.strip().lower()
     if "://" in value:
         value = value.split("://", 1)[1]
-    value = value.split("/", 1)[0].split("@")[-1]
+    value = value.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].split("@")[-1]
     if value.startswith("["):  # bracketed IPv6 literal
         return value.partition("]")[0] + "]"
     return value.split(":", 1)[0]

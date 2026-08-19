@@ -509,13 +509,47 @@ def test_an_unparseable_retry_after_falls_back_to_backoff():
     assert slept == [0.5]
 
 
-def test_a_reset_timestamp_is_honoured_when_there_is_no_retry_after(monkeypatch):
+def test_a_reset_timestamp_is_honoured_when_the_budget_is_actually_spent(monkeypatch):
     monkeypatch.setattr(time, "time", lambda: 1000.0)
     mcp, _, slept = connected(
-        raw(429, None, **{"X-RateLimit-Reset": "1012"}), rpc({"result": {"content": []}})
+        raw(429, None, **{"X-RateLimit-Reset": "1012", "X-RateLimit-Remaining": "0"}),
+        rpc({"result": {"content": []}}),
     )
     mcp.call_tool("create_comment")
     assert slept == [12.0]
+
+
+def test_a_reset_timestamp_with_budget_left_is_not_a_wait_instruction(monkeypatch):
+    """Plenty of servers report their limit on every response.
+
+    Read without the `Remaining` guard, "you have 4999 requests left" becomes
+    "sleep until the window rolls over" - and the window is an hour.
+    """
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    mcp, _, slept = connected(
+        raw(429, None, **{"X-RateLimit-Reset": "4600", "X-RateLimit-Remaining": "4999"}),
+        rpc({"result": {"content": []}}),
+    )
+    mcp.call_tool("create_comment")
+    assert slept == [0.5]
+
+
+def test_rate_limit_headers_on_a_5xx_do_not_replace_the_backoff(monkeypatch):
+    """A 5xx carrying rate-limit headers is still a 5xx.
+
+    Read as a wait instruction, the one failure the retry loop exists for
+    either sleeps out a whole rate window or - past `max_wait_s` - is raised as
+    a rate-limit error on the first attempt and never retried at all.
+    """
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    mcp, transport, slept = connected(
+        raw(500, None, **{"X-RateLimit-Reset": "2800", "X-RateLimit-Remaining": "0"}),
+        rpc({"result": {"content": []}}),
+    )
+    mcp.call_tool("create_comment")
+
+    assert slept == [0.5]
+    assert len(transport.sent) == 2
 
 
 def test_a_transport_failure_is_retried_and_then_named():
@@ -695,6 +729,23 @@ def test_a_multiline_data_field_is_joined():
     assert mcp.call_tool("create_comment").content == []
 
 
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\u0085"])
+def test_unicode_line_separators_inside_the_payload_do_not_break_framing(separator: str):
+    """All three are legal unescaped inside a JSON string.
+
+    `splitlines` breaks on them, so a tracker comment pasted out of a word
+    processor silently truncates the message - and the caller is told "no
+    message answered request id N", which points at everything except the
+    issue body that caused it.
+    """
+    body = (
+        'event: message\ndata: {"jsonrpc": "2.0", "id": %ID%, "result": '
+        '{"content": [{"type": "text", "text": "before' + separator + 'after"}]}}\n\n'
+    ).encode("utf-8")
+    mcp, _, _ = connected(lambda request: stream(request, body))
+    assert mcp.call_tool("create_comment").text == "before" + separator + "after"
+
+
 def test_an_answer_carrying_the_wrong_id_is_a_protocol_error():
     """Reading somebody else's answer as ours is the failure worth catching."""
     mcp, _, _ = connected(
@@ -785,6 +836,26 @@ def test_the_egress_check_ignores_the_inert_widening_variable(monkeypatch):
         McpClient("https://mcp.notatracker.example/mcp", "t")
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evil.example.com?x=@mcp.linear.app",
+        "https://evil.example.com#@mcp.linear.app",
+        "https://evil.example.com/?next=@mcp.linear.app",
+    ],
+)
+def test_an_at_sign_after_the_authority_does_not_forge_the_hostname(endpoint: str):
+    """An `@` past `?` or `#` does not delimit userinfo.
+
+    Split on it first and the check reads `mcp.linear.app` where the request
+    goes to `evil.example.com` - a check that passes for a host tinyproxy then
+    blocks, which its own docstring calls worse than not checking.
+    """
+    with pytest.raises(McpEgressBlocked) as caught:
+        McpClient(endpoint, "t")
+    assert caught.value.host == "evil.example.com"
+
+
 def test_the_allowlist_admits_the_linear_endpoint():
     """The positive control: the check can be passed, not only failed."""
     assert_endpoint_allowed(ENDPOINT)
@@ -849,33 +920,70 @@ def test_a_client_with_no_credential_sends_no_authorization_header():
 # --------------------------------------------------------------------------
 
 
-class FakePopen:
-    """A subprocess double over real in-memory pipes.
+class Fragment(bytes):
+    """A chunk written without the newline that ends a JSON-RPC message."""
 
-    Answers each request written to stdin according to `handler`, so the thing
-    under test is the framing - which line the reader takes and what it does
-    when the process stops answering.
+
+class ChunkedReader:
+    """A pipe that hands over one written chunk per `read`, then blocks.
+
+    Not `BytesIO`: the framing under test is what happens when a message
+    arrives in pieces, and a reader that always gets everything at once never
+    exercises it. `read` returning `b""` means the process is gone, which is
+    what a real pipe does at EOF.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[bytes] = []
+        self.closed_by_exit = False
+
+    def feed(self, chunk: bytes) -> None:
+        self.pending.append(chunk)
+
+    def read(self, size: int = -1) -> bytes:
+        if not self.pending:
+            # Only ever called after `select` said there were bytes, so an
+            # empty answer here means the far end is gone.
+            return b""
+        chunk = self.pending.pop(0)
+        if size is not None and size > 0 and len(chunk) > size:
+            self.pending.insert(0, chunk[size:])
+            return chunk[:size]
+        return chunk
+
+    def close(self) -> None:
+        self.pending.clear()
+
+
+class FakePopen:
+    """A subprocess double over a chunked pipe.
+
+    Answers each request written to stdin according to `handler`, so what is
+    under test is the framing - which line the reader takes, what it does with
+    a message split across reads, and what it does when the process stops
+    answering. A handler may raise, which is how a server that dies mid-write
+    is simulated.
     """
 
     def __init__(self, handler, *, exit_after: int | None = None) -> None:
-        self.stdin = io.BytesIO()
-        self.stdout = io.BytesIO()
+        self.stdout = ChunkedReader()
         self._handler = handler
         self._exit_after = exit_after
         self._served = 0
         self.terminated = False
         self.returncode: int | None = None
 
-        # Overridden so a write is answered immediately, in the same buffer the
-        # reader is about to read from.
         outer = self
 
-        class Stdin(io.BytesIO):
-            def write(self, data):  # type: ignore[override]
+        class Stdin:
+            def write(self, data: bytes) -> int:
                 outer._serve(data)
                 return len(data)
 
-            def flush(self):  # type: ignore[override]
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
                 return None
 
         self.stdin = Stdin()
@@ -883,13 +991,11 @@ class FakePopen:
     def _serve(self, data: bytes) -> None:
         if self._exit_after is not None and self._served >= self._exit_after:
             self.returncode = 1
+            self.stdout.closed_by_exit = True
             return
         self._served += 1
-        for line in self._handler(data):
-            position = self.stdout.tell()
-            self.stdout.seek(0, io.SEEK_END)
-            self.stdout.write(line + b"\n")
-            self.stdout.seek(position)
+        for piece in self._handler(data):
+            self.stdout.feed(piece if isinstance(piece, Fragment) else piece + b"\n")
 
     def poll(self):
         return self.returncode
@@ -926,10 +1032,23 @@ def stdio_client(monkeypatch):
     """A client over a fake local server, plus the `select` that pipes need."""
     import swarm.mcp.client as module
 
-    monkeypatch.setattr(module.select, "select", lambda r, w, x, t: (r, w, x))
+    def select_pipe(rlist, wlist, xlist, timeout):
+        """`select` over the fake pipe, honouring "nothing to read yet".
 
-    def build(handler=echo_handler, **kwargs):
-        process = FakePopen(handler, **kwargs)
+        A stub that always answered "ready" would make the stall test pass
+        through the EOF path instead of through the deadline, which is the
+        opposite of what it is checking.
+        """
+        stream = rlist[0]
+        if stream.pending or stream.closed_by_exit:
+            return rlist, wlist, xlist
+        time.sleep(min(timeout, 0.005))
+        return [], [], []
+
+    monkeypatch.setattr(module.select, "select", select_pipe)
+
+    def build(handler=echo_handler, *, exit_after=None, **kwargs):
+        process = FakePopen(handler, exit_after=exit_after)
         transport = StdioTransport(["github-mcp-server", "stdio"], spawn=lambda *a, **k: process)
         return McpClient(
             f"{STDIO_SCHEME}github-mcp-server",
@@ -937,6 +1056,7 @@ def stdio_client(monkeypatch):
             transport=transport,
             sleep=lambda _: None,
             retry=RetryPolicy(max_attempts=2, backoff_base_s=0.0, jitter=0.0),
+            **kwargs,
         ), process
 
     return build
@@ -994,6 +1114,89 @@ def test_close_terminates_the_local_server(stdio_client):
     mcp.connect()
     mcp.close()
     assert process.terminated
+
+
+def test_a_respawned_local_server_is_handshaked_before_the_retry(stdio_client):
+    """"Respawned on the next attempt" has to include the handshake.
+
+    Without it the retry lands on a fresh process that has never seen
+    `initialize`, which answers `-32002 received request before
+    initialization` - a crashed server reported as a rejected tool call. And
+    the client goes on believing it is connected, so every later call fails the
+    same way for the life of the object.
+    """
+    calls: list[str] = []
+
+    def dies_once(data: bytes) -> list[bytes]:
+        message = json.loads(data.decode("utf-8"))
+        calls.append(message["method"])
+        if message["method"] == "tools/call" and calls.count("tools/call") == 1:
+            raise BrokenPipeError("the server died")
+        return echo_handler(data)
+
+    mcp, _ = stdio_client(dies_once)
+    mcp.connect()
+    assert mcp.call_tool("issue_write").text == "tools/call"
+    # initialize, notify, the call that died, then the whole handshake again.
+    assert calls == [
+        "initialize",
+        "notifications/initialized",
+        "tools/call",
+        "initialize",
+        "notifications/initialized",
+        "tools/call",
+    ]
+
+
+def test_a_partial_line_from_a_stalled_server_still_times_out(stdio_client):
+    """`select` says "there are bytes", not "there is a line".
+
+    A `readline` here blocks until a newline that never comes, which is exactly
+    the hang the timeout was written to prevent, one layer down.
+    """
+
+    def half_a_message(data: bytes) -> list[bytes]:
+        message = json.loads(data.decode("utf-8"))
+        if message["method"] != "tools/call":
+            return echo_handler(data)
+        return [b'{"jsonrpc": "2.0", "id"']  # and then nothing
+
+    mcp, _ = stdio_client(half_a_message, timeout_s=0.05)
+    mcp.connect()
+    started = time.monotonic()
+    with pytest.raises(McpUnreachable, match="no answer to request"):
+        mcp.call_tool("issue_write")
+    # Two attempts at 50ms; a `readline` here would still be blocked.
+    assert time.monotonic() - started < 5.0
+
+
+def test_an_answer_split_across_reads_is_reassembled(stdio_client):
+    """The other half of hand-framing: a message may arrive in pieces."""
+
+    def in_pieces(data: bytes) -> list[bytes]:
+        message = json.loads(data.decode("utf-8"))
+        if message["method"] != "tools/call":
+            return echo_handler(data)
+        whole = json.dumps(
+            {"jsonrpc": "2.0", "id": message["id"], "result": {"content": [{"type": "text", "text": "whole"}]}}
+        ).encode()
+        return [Fragment(whole[:10]), whole[10:]]
+
+    mcp, _ = stdio_client(in_pieces)
+    assert mcp.call_tool("issue_write").text == "whole"
+
+
+def test_close_survives_a_local_server_that_cannot_be_terminated(stdio_client):
+    """A teardown failure must never be the exception that escapes a cycle."""
+    mcp, process = stdio_client()
+    mcp.connect()
+
+    def refuse():
+        raise OSError("no such process")
+
+    process.terminate = refuse
+    mcp.close()
+    assert mcp.server is None
 
 
 def test_a_binary_that_is_not_there_says_so():

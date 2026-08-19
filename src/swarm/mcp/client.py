@@ -76,6 +76,7 @@ Manual smoke test against a real server:
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -87,7 +88,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import IO, Any, Callable, Mapping, Protocol, Sequence
 
-from ..security import DEFAULT_EGRESS, EgressPolicy, assert_no_provision_token
+from ..security import DEFAULT_EGRESS, EgressPolicy, _hostname, assert_no_provision_token
 
 __all__ = [
     "McpError",
@@ -465,6 +466,13 @@ class UrllibTransport:
             raise McpTransportError(f"{method} {url}: {exc.reason}") from exc
         except TimeoutError as exc:
             raise McpTransportError(f"{method} {url}: timed out after {timeout}s") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            # A connection that died mid-body raises `IncompleteRead` from
+            # `read()`, which is neither of the two above and would otherwise
+            # travel straight past the retry loop's `except McpTransportError`
+            # - an interrupted download reported as a crash rather than as the
+            # transient failure it is.
+            raise McpTransportError(f"{method} {url}: {type(exc).__name__}: {exc}") from exc
 
 
 class StdioTransport:
@@ -603,32 +611,40 @@ class StdioTransport:
         server may emit log notifications and progress updates on the same pipe
         between the request and its answer, and a reader that took the first
         line would read one of those roughly whenever the server was chatty.
+
+        Framed by hand out of raw reads rather than by `readline`. `select`
+        answers "there are bytes", not "there is a line", and `readline` on a
+        server that wrote half a message and then stalled blocks until a
+        newline arrives - which is *the* hang this timeout exists to prevent,
+        reintroduced one layer down. A raw `read` on an unbuffered pipe returns
+        what is there, so the deadline is checked between every chunk.
         """
         deadline = time.monotonic() + timeout
+        buffer = b""
         while True:
+            while b"\n" in buffer:
+                line, _, buffer = buffer.partition(b"\n")
+                candidate = line.strip()
+                if candidate and _message_id(candidate) == request_id:
+                    return candidate
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.close()
                 raise McpTransportError(
                     f"{self.command[0]}: no answer to request {request_id} within {timeout}s"
                 )
-            # `select` on the pipe rather than a bare blocking `readline`,
-            # because a server that hangs must fail the cycle rather than the
-            # whole run. POSIX only, which is what the orchestrator image is.
+            # POSIX only, which is what the orchestrator image is.
             ready, _, _ = select.select([stdout], [], [], remaining)
             if not ready:
                 continue
-            line = stdout.readline()
-            if not line:
+            chunk = stdout.read(65536)
+            if not chunk:
                 self.close()
                 raise McpTransportError(
                     f"{self.command[0]}: the server exited before answering request {request_id}"
                 )
-            candidate = line.strip()
-            if not candidate:
-                continue
-            if _message_id(candidate) == request_id:
-                return candidate
+            buffer += chunk
 
 
 def _message_id(body: bytes) -> Any:
@@ -763,21 +779,17 @@ def assert_endpoint_allowed(endpoint: str, policy: EgressPolicy | None = None) -
     read by nothing that filters anything, so honouring it here would let this
     check pass for a host the proxy then blocks, which is worse than not
     checking at all.
+
+    The whole endpoint is handed to `allows`, and the hostname is extracted by
+    `security`'s own parser rather than by a copy here. A second opinion about
+    where a URL's authority ends is exactly the drift this check exists to
+    prevent: the two have to agree about
+    `https://attacker.example?x=@mcp.linear.app`, where an `@` appears without
+    delimiting userinfo at all.
     """
     host = _hostname(endpoint)
-    if not (policy or DEFAULT_EGRESS).allows(host):
+    if not (policy or DEFAULT_EGRESS).allows(endpoint):
         raise McpEgressBlocked(endpoint, host)
-
-
-def _hostname(endpoint: str) -> str:
-    """`https://mcp.linear.app:443/mcp` -> `mcp.linear.app`."""
-    value = endpoint.strip().lower()
-    if "://" in value:
-        value = value.split("://", 1)[1]
-    value = value.split("/", 1)[0].split("@")[-1]
-    if value.startswith("["):  # bracketed IPv6 literal
-        return value.partition("]")[0] + "]"
-    return value.split(":", 1)[0]
 
 
 # --------------------------------------------------------------------------
@@ -956,6 +968,7 @@ class McpClient:
                 "clientInfo": {"name": self._client_name, "version": self._client_version},
             },
             allow_reconnect=False,
+            handshaking=True,
         )
         info = payload if isinstance(payload, Mapping) else {}
         announced = info.get("serverInfo") or {}
@@ -971,7 +984,7 @@ class McpClient:
         # handshake that looked complete would make `connect` idempotent about
         # the wrong thing: every later call would return early, and the server
         # would go on refusing requests from a client it never saw initialize.
-        self._notify("notifications/initialized")
+        self._notify("notifications/initialized", handshaking=True)
         self._server = server
         return server
 
@@ -1000,9 +1013,16 @@ class McpClient:
         # A local server is a process, and the way to end one is to end it. It
         # has no session to DELETE and would read the attempt as a malformed
         # request.
-        stop = getattr(self._transport, "close", None)
-        if isinstance(self._transport, StdioTransport) and callable(stop):
-            stop()
+        # `Exception` rather than `McpError` on both branches, and the breadth
+        # is the point: a transport is allowed to raise its own library's
+        # errors - `http.client.IncompleteRead` on a truncated body, an OSError
+        # from a pipe - and none of them is worth ending the caller's cycle
+        # over when the caller is finishing anyway.
+        if isinstance(self._transport, StdioTransport):
+            try:
+                self._transport.close()
+            except Exception:
+                pass
             return
 
         if not session:
@@ -1015,7 +1035,7 @@ class McpClient:
                 None,
                 self._timeout_s,
             )
-        except McpError:
+        except Exception:
             pass
 
     def __enter__(self) -> McpClient:
@@ -1100,6 +1120,7 @@ class McpClient:
         params: Mapping[str, Any] | None = None,
         *,
         allow_reconnect: bool = True,
+        handshaking: bool = False,
     ) -> Any:
         """One JSON-RPC request/response pair, retried per `RetryPolicy`."""
         request_id = self._next_id
@@ -1109,7 +1130,7 @@ class McpClient:
             message["params"] = dict(params)
 
         try:
-            response = self._request(method, message)
+            response = self._request(method, message, handshaking=handshaking)
         except McpHTTPError as exc:
             # A 404 against a live session is the spec's way of saying the
             # session expired - servers are allowed to drop them, and a
@@ -1127,18 +1148,25 @@ class McpClient:
 
         return _rpc_result(method, response, message["id"])
 
-    def _notify(self, method: str, params: Mapping[str, Any] | None = None) -> None:
+    def _notify(
+        self, method: str, params: Mapping[str, Any] | None = None, *, handshaking: bool = False
+    ) -> None:
         """Send a notification - no id, and therefore no answer to wait for."""
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params:
             message["params"] = dict(params)
-        self._request(method, message)
+        self._request(method, message, handshaking=handshaking)
 
-    def _request(self, method: str, message: Mapping[str, Any]) -> Response:
+    def _request(
+        self, method: str, message: Mapping[str, Any], *, handshaking: bool = False
+    ) -> Response:
         """One POST, retried according to `RetryPolicy`.
 
         The whole retry decision lives here so there is exactly one place to
         read when asking why the orchestrator hammered somebody's tracker.
+
+        `handshaking` marks the two requests `connect` itself makes, which must
+        not try to reconnect: they are the reconnection.
         """
         body = json.dumps(message).encode("utf-8")
         url = self.endpoint
@@ -1146,6 +1174,19 @@ class McpClient:
 
         for attempt in range(1, self.retry.max_attempts + 1):
             last_attempt = attempt == self.retry.max_attempts
+
+            # A local server that died took the session with it, and the
+            # respawn `StdioTransport.start` performs on the next attempt is a
+            # process that has never seen `initialize`. Retrying straight into
+            # it gets `-32002 received request before initialization` - a tool
+            # call reported as rejected rather than as a server that crashed,
+            # and the client never recovers because it still believes it is
+            # connected. So the handshake is redone before the retry, which is
+            # what "respawned on the next attempt" has to mean to be worth
+            # anything.
+            if not handshaking and self._server is None:
+                self.connect()
+
             headers = dict(self._headers)
             if self._session_id:
                 headers[SESSION_HEADER] = self._session_id
@@ -1161,6 +1202,10 @@ class McpClient:
                 last_reason = str(exc)
                 if last_attempt:
                     raise McpUnreachable(url, last_reason, attempts=attempt) from exc
+                if isinstance(self._transport, StdioTransport):
+                    # The process is gone; so is everything it knew about us.
+                    self._session_id = None
+                    self._server = None
                 self._sleep(self._backoff(attempt))
                 continue
 
@@ -1189,7 +1234,12 @@ class McpClient:
                 # the answer, and the caller wants the error now.
                 raise McpHTTPError(response.status, "POST", url, response.body)
 
-            requested = _retry_after_s(response)
+            # Asked only of a 429. A 5xx carrying rate-limit headers is still a
+            # 5xx: reading them would replace the half-second backoff this
+            # failure wants with a wait until the rate window rolls over, and a
+            # transient server error is the one thing the retry loop is here
+            # for. `github/client.py` scopes the same question the same way.
+            requested = _retry_after_s(response) if response.status == 429 else None
             if last_attempt:
                 if response.status == 429:
                     raise McpRateLimitError(response.status, "POST", url, response.body, requested)
@@ -1277,6 +1327,13 @@ def _sse_messages(body: bytes) -> list[Mapping[str, Any]]:
     Deliberately forgiving: a `data:` line that is not JSON is skipped rather
     than raised on, because comment lines, keep-alives and `event:` names are
     ordinary traffic on this channel and none of them is an error.
+
+    Split on `\\n` rather than with `splitlines`, which also breaks on U+2028,
+    U+2029 and U+0085 - all three legal *unescaped* inside a JSON string, and
+    all three ordinary in tracker text pasted out of a word processor. Framing
+    a stream on characters the payload is allowed to contain drops the message
+    and reports it as "no message answered request id N", which points at
+    everything except the issue body that caused it.
     """
     messages: list[Mapping[str, Any]] = []
     buffer: list[str] = []
@@ -1293,7 +1350,7 @@ def _sse_messages(body: bytes) -> list[Mapping[str, Any]]:
         if isinstance(payload, Mapping):
             messages.append(payload)
 
-    for raw_line in body.decode("utf-8", "replace").splitlines():
+    for raw_line in body.decode("utf-8", "replace").split("\n"):
         line = raw_line.rstrip("\r")
         if not line:
             flush()
@@ -1322,7 +1379,12 @@ def _retry_after_s(response: Response) -> float | None:
         except ValueError:
             return None
     reset = response.header("X-RateLimit-Reset")
-    if reset:
+    # Only when the budget is actually spent, which is the guard
+    # `github/client.py` carries for the same header and the same reason.
+    # Plenty of servers report their limit on *every* response, so a reset
+    # timestamp read unconditionally turns "we have 4999 requests left" into
+    # "wait until the window rolls over" - and the wait is a whole window.
+    if reset and (response.header("X-RateLimit-Remaining") or "").strip() == "0":
         try:
             return max(0.0, float(reset.strip()) - time.time())
         except ValueError:
