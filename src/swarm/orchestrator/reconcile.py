@@ -1578,7 +1578,7 @@ class Reconciler:
         snapshot = Snapshot(self.client)
         # `adopt` writes a marker onto every hand-written issue (§2), which a
         # dry run promised not to do.
-        ledger = load_ledger(snapshot, adopt=not self.dry_run)
+        ledger = load_ledger(snapshot, adopt=not self.dry_run)  # type: ignore[arg-type]
 
         handles = self._handles()
         # Read once and shared with step 5: the judge's observation carries each
@@ -1683,7 +1683,11 @@ class Reconciler:
         dispatched: DispatchReport | None = None
         cycle_error = ""
         try:
-            readiness = apply_readiness(snapshot, ledger=ledger, dry_run=self.dry_run)
+            readiness = apply_readiness(
+                snapshot,  # type: ignore[arg-type]
+                ledger=ledger,
+                dry_run=self.dry_run,
+            )
         except DependencyCycleError as exc:
             # Nothing was written - readiness detects the ring before its first
             # call - and dispatching over an unresolved graph would run work

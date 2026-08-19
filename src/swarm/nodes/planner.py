@@ -115,7 +115,7 @@ import time
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
@@ -1063,7 +1063,7 @@ def write_plan(
     )
     ordered = order_drafts(drafts)  # before the first write, or not at all
 
-    actions = list(actions)
+    actions = list(actions)  # type: ignore[assignment]
     warnings: list[str] = []
     # Every entry's own state, so a closed issue is recognised as one: the
     # ledger reads issues in any state and `LedgerEntry` records the label, not
@@ -1088,11 +1088,11 @@ def write_plan(
 
         entry = ledger.entries.get(draft.task_id)
         if entry is None:
-            actions.append(_create(client, draft, refs, states))
+            actions.append(_create(client, draft, refs, states))  # type: ignore[attr-defined]
             if actions[-1].number is not None:
                 known[draft.task_id] = task_ref(actions[-1].number)
             continue
-        actions.append(
+        actions.append(  # type: ignore[attr-defined]
             _update(
                 client,
                 draft,
@@ -1107,7 +1107,9 @@ def write_plan(
     planned = {draft.task_id for draft in ordered}
     for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref):
         if task_id not in planned:
-            actions.append(_drop(client, entry, states, retire=retire_dropped))
+            actions.append(  # type: ignore[attr-defined]
+                _drop(client, entry, states, retire=retire_dropped)
+            )
 
     return PlanReport(client.repo, tuple(actions), tuple(warnings))
 
@@ -1394,7 +1396,7 @@ def _source(state: SwarmState, source: GitHubClient | str | None) -> GitHubClien
     # `repo` is not a declared `SwarmState` field yet - `state.py` belongs to
     # another ticket - so it is read defensively rather than indexed.
     repo = state.get("repo") if isinstance(state, Mapping) else None
-    return repo or None
+    return repo or None  # type: ignore[return-value]
 
 
 def _replan_prompt(existing: Mapping[str, TaskRecord]) -> str:
@@ -1423,7 +1425,9 @@ READ_BACK_ATTEMPTS = 6
 READ_BACK_DELAY_S = 1.0
 
 
-def _read_back(client: GitHubClient, report: PlanReport, *, sleep=time.sleep) -> Ledger:
+def _read_back(
+    client: GitHubClient, report: PlanReport, *, sleep: Callable[[float], object] = time.sleep
+) -> Ledger:
     """Re-read the tracker until it shows the plan that was just written.
 
     Re-reading at all is the point: `docs/architecture-v2.md` says GitHub wins
@@ -1484,7 +1488,7 @@ def draft_plan(
     verify: str | None = None,
     stack: str | None = None,
     files: Sequence[str] | None = None,
-    llm=None,
+    llm: Any = None,
 ) -> Plan:
     """One planning call, and nothing else - no ledger, no issues, no writes.
 
@@ -1508,7 +1512,7 @@ def plan_node(
     verify: str | None = None,
     stack: str | None = None,
     bootstrap: PlannedTask | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Plan (or replan) the objective, and write the result to the ledger.
 
     Returns the v1-shaped `tasks` dict either way. With a target repository

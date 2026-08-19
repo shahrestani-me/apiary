@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from ..config import SETTINGS
 from ..github.ledger import STATUS_BY_LABEL, Ledger
@@ -706,7 +706,7 @@ def judge(
 # --------------------------------------------------------------------------
 
 
-def judge_node(state: SwarmState) -> dict:
+def judge_node(state: SwarmState) -> dict[str, Any]:
     """v1's node, unchanged in signature: `graph.py` routes on what it returns.
 
     It observes the in-memory task ledger rather than the tracker, and holds no

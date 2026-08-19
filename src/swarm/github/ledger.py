@@ -896,7 +896,7 @@ def load_ledger(
     }
 
     if adopt:
-        for issue, entry in pending_adoption:
+        for issue, entry in pending_adoption:  # type: ignore[assignment]
             _adopt(client, issue, entry.task_id)
 
     return Ledger(
