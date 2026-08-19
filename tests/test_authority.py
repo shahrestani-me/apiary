@@ -469,7 +469,7 @@ def test_the_flag_silences_the_override_event_too(monkeypatch):
 
 
 def test_a_mistyped_state_source_stops_the_run(monkeypatch):
-    """Loud on garbage, unlike `APIARY_DERIVED_SHADOW`.
+    """Loud on garbage, unlike the shadow window's own flag was.
 
     That flag reads a typo as its default and argues the case: it decides
     whether an *observer* runs. This one decides who the orchestrator believes,
@@ -970,7 +970,7 @@ def test_the_previous_belief_is_seeded_from_the_label_only_for_a_task_never_seen
 def test_a_cycle_that_could_not_list_pull_requests_falls_back_to_the_labels():
     """`None` is "could not look" and it is not `{}`.
 
-    `checks.read_pulls` and `shadow.ShadowWindow.run` both keep the two apart,
+    `checks.read_pulls` and `observed.record_cycle` both keep the two apart,
     and the cost of conflating them is one level worse here than it is in the
     shadow: an empty listing read as the answer resolves every task in review to
     `eligible`, and the dispatcher then spawns a second worker over an open pull

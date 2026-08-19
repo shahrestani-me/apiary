@@ -145,7 +145,7 @@ REVIEW = "swarm:review"
 RESERVING_LABELS = frozenset({CLAIMED, REVIEW})
 
 #: The same two sets in ADR 0001's vocabulary, which is what this module reads
-#: since #147. The `_STATE` suffixes are `shadow.py`'s convention and exist for
+#: since #147. The `_STATE` suffixes are the shadow window's convention and exist for
 #: its reason: `CLAIMED` here is a `swarm:*` label and `claimed` is an internal
 #: state, and the one time those were confused every classification in that file
 #: silently stopped matching.
@@ -452,7 +452,7 @@ def plan_dispatch(
     to see both.
 
     `holding` is the tasks a container **exists** for, and it is consulted only
-    under the resolver. `orchestrator/shadow.py` argues the distinction and then
+    under the resolver. The shadow window argued the distinction and then
     hands this ticket the bill: ADR 0001's `claimed` is a *live* worker, so
     `derived.py` reads `docker ps --format {{.State}}` and a container that
     exited without writing a result reads as no claim at all. That is the true

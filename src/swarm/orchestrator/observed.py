@@ -1,32 +1,42 @@
 """Building a cycle's `Observation`, and recording it.
 
-**Split out of `orchestrator/shadow.py` (#152 c1), and the split is the point.**
-Two things lived in that module and only one of them is a migration instrument.
+**The window this was split out of is gone (#152).** #245 separated the two
+things that lived in `orchestrator/shadow.py`, and said why the split was worth
+doing on its own: only one of them was a migration instrument. The *window* -
+`ShadowWindow`, `classify`, `ShadowReport` - ran the resolver beside the label
+control plane to make #147's cutover checkable, and it died with the labels it
+compared against. That is this commit. Because the split landed first, removing
+it was deleting a file rather than dissecting one.
 
-The *window* — `ShadowWindow`, `classify`, `ShadowReport` — runs the resolver
-beside the label control plane and reports what disagrees. It exists to make
-#147's cutover checkable and it dies with the labels it compares against, which
-is `#152`'s AC5.
+The *recorder* - this module - outlives all of it, for a reason that has nothing
+to do with the cutover. `tests/fixtures/runs/README.md` names the missing
+recorder as the whole reason #145's replay corpus is synthesised, and a
+synthesised corpus proves the reducer self-consistent and nothing about reality.
+Every real run that writes `observed.jsonl` is a run the corpus harness can
+replay.
 
-The *recorder* — this module — outlives all of it. `tests/fixtures/runs/README.md`
-names the missing recorder as the whole reason #145's replay corpus is
-synthesised, and a synthesised corpus proves the reducer self-consistent and
-nothing about reality. Every real run that writes `observed.jsonl` is a run the
-corpus harness can replay, and that value has nothing to do with labels.
+Four things live here, and none of them reads anything:
 
-Keeping them in one file meant the deletion of the first could not be done
-without reading around the second. Now `shadow.py` imports from here, and the
-step that removes the window deletes a file rather than dissecting one.
+- `build_observation` turns the facts a cycle already computed into a
+  `derived.Observation`. There is no client in this module, which is what makes
+  "recording adds no API call" structural rather than a promise.
+- `observation_for` is the same thing from a finished `CycleReport`.
+- `observed_line` projects an `Observation` into one `observed.jsonl` line, in
+  the shape `tests/fixtures/corpus.py` loads.
+- `record_cycle` is the one call a cycle makes, and the only one with a policy in
+  it: a cycle that could not see records nothing.
 
-**Nothing here changed in the split.** The functions are the ones `shadow.py`
-had, moved verbatim; `shadow.py` re-exports them so every existing caller and
-every existing test is untouched. This module has no reference back to the
-window, which is what makes the eventual deletion a one-line import removal.
+`control_labels` is the fifth and the one with a date on it. The corpus format
+records what the control plane was left holding, as labels, and
+`tests/fixtures/runs/README.md` documents it that way - so it stays until the
+labels themselves go, which is the ticket that also decides what a `control`
+field means once there is no control plane to have one. Recording it is not
+believing it: nothing in a cycle reads this back.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from ..containers.manager import Handle
 from ..github.branches import parse_task_branch, task_branch
@@ -54,6 +64,7 @@ __all__ = [
     "build_observation",
     "observation_for",
     "observed_line",
+    "record_cycle",
 ]
 
 
@@ -374,3 +385,59 @@ def _issue_of(ref: TaskRef) -> int:
         return issue_number(ref)
     except ValueError:
         return 0
+
+
+# --------------------------------------------------------------------------
+# The one call a cycle makes
+# --------------------------------------------------------------------------
+
+
+def record_cycle(
+    report: CycleReport,
+    *,
+    record: Callable[..., Any] | None,
+    containers: Iterable[Handle] = (),
+    pulls: Mapping[str, PullState] | None = None,
+    results: Mapping[TaskRef, ResultRecord] | None = None,
+    result_names: Mapping[TaskRef, str] | None = None,
+    states: Mapping[TaskRef, IssueState] | None = None,
+    max_attempts: int = 3,
+    max_total_attempts: int = 9,
+    live_run_ids: Iterable[str] = (),
+) -> bool:
+    """Write one `observed.jsonl` line for a finished cycle.
+
+    **`pulls=None` is "this cycle could not look", and it is not `{}`.**
+    `checks.read_pulls` and `Snapshot.open_branches` both go to lengths to keep
+    those apart. An empty mapping read as the answer would record every task in
+    review as having no pull request, which is a corpus line that replays to a
+    world that never existed - worse than no line at all, because a fixture is
+    trusted. So a blind cycle records nothing and says so by returning `False`.
+
+    **This may raise, and the caller is where that is handled.**
+    `ShadowWindow.run` wrapped its whole body in one `except Exception`, and the
+    argument for it survives the window: this code reads a dozen attributes off
+    objects five other modules own, and the day one of them is renamed the right
+    outcome is a recorder that stops and says so rather than a run that dies
+    holding containers. What does not survive is putting the guard *here* - "have
+    I already given up" is run-scoped, the run is the caller's, and a flag on a
+    module-level function would be state shared between two `Reconciler`s. So
+    `Reconciler._record_observed` owns both the `try` and the flag, and this
+    function stays a projection.
+
+    Returns whether a line was written, so a caller can tell "nothing to record"
+    from "something went wrong" without reading its own stderr.
+    """
+    if record is None or pulls is None:
+        return False
+    observation = observation_for(
+        report,
+        containers=list(containers),
+        pulls=pulls,
+        results=results,
+        states=states,
+        budget=Budget(max_attempts=max_attempts, max_total_attempts=max_total_attempts),
+        live_run_ids=live_run_ids,
+    )
+    record(observed_line(observation, control_labels(report), result_names=result_names))
+    return True

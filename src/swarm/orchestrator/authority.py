@@ -345,15 +345,17 @@ SOURCES: tuple[str, ...] = (DERIVED, LABELS)
 WAITING: frozenset[str] = frozenset({ELIGIBLE, BLOCKED})
 
 #: Why a belief is not simply the resolver's verdict. The first three are ADR
-#: 0001's three non-derivable states, spelled the same as
-#: `orchestrator/shadow.py`'s classification kinds **and imported from here by
-#: it**, so a divergence the shadow explains and an override this module
-#: applies are recognisably the same phenomenon in `events.jsonl`.
+#: 0001's three non-derivable states. They were spelled to match the shadow
+#: window's classification kinds, which imported them from here, so that a
+#: divergence the shadow explained and an override this module applies read as
+#: the same phenomenon in `events.jsonl`. #152 removed the window; the spellings
+#: stay, because `events.jsonl` is append-only and `artifacts.DivergenceTally`
+#: still reads recorded runs by these names.
 INFRASTRUCTURE_CEILING = "infrastructure-ceiling"
 BUDGET_RENEWED = "budget-renewed"
 REVIVED = "revived"
-#: The other direction of the same rule, and it has no entry in `shadow.py`
-#: because the shadow window never had to decide anything. A task apiary gave up
+#: The other direction of the same rule, and the shadow window never had an
+#: entry for it, because that window never had to decide anything. A task apiary gave up
 #: on leaves **no code-host evidence at all** once its run directory is gone -
 #: results are per run (`Reconciler._results`) and `build_observation` reads
 #: branch names off *open* pull requests, so a task that failed three times with
@@ -395,11 +397,11 @@ _UNBOUNDED = 1_000_000_000
 
 
 def state_source(env: Mapping[str, str] | None = None) -> str:
-    """Which control plane decides. **Loud on garbage**, unlike the shadow flag.
+    """Which control plane decides. **Loud on garbage.**
 
-    `shadow.shadow_enabled` reads a mistyped value as its default and argues the
-    case: that flag decides whether an *observer* runs, and a `ValueError` out of
-    it would be a shadow taking down a cycle. This one decides who the
+    The shadow flag read a mistyped value as its default and argued the case:
+    that flag decided whether an *observer* ran, and a `ValueError` out of it
+    would have been a shadow taking down a cycle. This one decides who the
     orchestrator believes, so it belongs with `checks._env_flag` and
     `dispatcher._env_int` instead - an operator who typed `APIARY_STATE_SOURCE=lables`
     to get back to the old behaviour after a bad cutover must not silently get
@@ -569,8 +571,9 @@ class Belief:
     #: task id -> the internal state this orchestrator acts on.
     states: Mapping[str, str] = field(default_factory=dict)
     #: task id -> the internal state the `swarm:*` label is storing. Kept so a
-    #: divergence can be reported at the point of belief rather than only at
-    #: the end of the cycle, where the shadow window takes it.
+    #: divergence can be reported at the point of belief, which since #152 is the
+    #: only place it is reported at all - the shadow window that took it at the
+    #: end of the cycle is gone.
     stored: Mapping[str, str] = field(default_factory=dict)
     overrides: tuple[Override, ...] = ()
     #: task id -> what the orchestrator believed **last** cycle, with the label
@@ -699,7 +702,7 @@ class Belief:
         """Overlay states this cycle produced through something other than a
         transition. The three writers `fold` cannot see.
 
-        `shadow.control_labels` enumerates them and this is the same list from
+        `observed.control_labels` enumerates them and this is the same list from
         the other side: the readiness pass's verdicts, the dispatcher's claims
         and `planner.revive`, none of which is a `Transition` and none of which
         is folded back into the ledger. They matter here for one reason -
@@ -807,9 +810,9 @@ def believe(
 
     `observation=None` means the resolver was not asked - a cycle that could
     not list pull requests, or `source=labels`. It is **not** an empty
-    observation: `checks.read_pulls` and `shadow.ShadowWindow.run` both go to
+    observation: `checks.read_pulls` and `observed.record_cycle` both go to
     lengths to keep "could not look" apart from "nothing there", and the cost of
-    conflating them is one level worse here than it is in the shadow. A cycle
+    conflating them is one level worse here than it is in either. A cycle
     that read no pull requests and believed the resolver anyway would resolve
     every task in review to `eligible` and **dispatch a second worker over an
     open pull request's file set**. So a blind cycle falls back to the labels
@@ -1278,7 +1281,7 @@ def revived_tasks(report: Any) -> frozenset[str]:
     the only account of them.
 
     Read by two modules for two purposes and therefore living below both:
-    `orchestrator/shadow.py` needs it to build the control map a cycle actually
+    `orchestrator/observed.py` needs it to build the control map a cycle actually
     left behind, and `Reconciler` needs it to record the one attempt a revival
     grants. Typed loosely because a `CycleReport` lives in `reconcile`, which
     imports this module.

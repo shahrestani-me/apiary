@@ -10,11 +10,13 @@ false, the ADR is wrong and the labels are load-bearing.
 
 This module is the half of the answer that computes. It reads the code host,
 the container layer and the run artifacts, and it says what each task's state
-is. **Nothing here writes.** #146 wired it into the live cycle through
-`orchestrator/shadow.py`, which resolves every cycle beside the labels and
-records where the two disagree; #147 made the answer authoritative through
+is. **Nothing here writes.** #146 wired it into the live cycle through a shadow
+window that resolved every cycle beside the labels and recorded where the two
+disagreed; #147 made the answer authoritative through
 `orchestrator/authority.py`, which is the module that decides how much of it to
-believe. Nothing here reads a label to compute it, which is still the invariant
+believe, and #152 removed the window once there was no control plane left to
+shadow. `orchestrator/observed.py` is what remains of that wiring: it records a
+cycle's world so the run can be replayed. Nothing here reads a label to compute it, which is still the invariant
 the rest of this docstring is about.
 
 **Authoritative is not the same as sufficient.** `authority.py` joins this
@@ -823,6 +825,15 @@ def _merged_pull(ref: TaskRef, observation: Observation) -> PullRef | None:
 def diverge(
     resolution: Resolution, control: Mapping[str, str], *, cycle: int | None = None
 ) -> tuple[Divergence, ...]:
+    # NOTE (#152): the live caller is gone. The shadow window that compared this
+    # resolver against the label control plane every cycle was a migration
+    # instrument, #147 made the derived answer the deciding one, and #152 removed
+    # the control plane there was anything to diverge *from*. What still calls
+    # this is `tests/fixtures/corpus.py`, replaying runs recorded *before* that -
+    # which do carry a control map, because it was true when they were written.
+    # So this is now a statement about the archive rather than about a running
+    # system, and it stays until the corpus decides what a `control` field means
+    # for a run recorded after the labels.
     """Where this resolution and the control plane disagree, named one by one.
 
     `control` is keyed by task id and its values are already in the internal
@@ -904,8 +915,8 @@ def observe(
     either: the caller has already listed the containers, read the pulls and
     loaded the results, because a cycle does all three for its own reasons and a
     resolver that repeated them would double the API budget to answer a question
-    nobody has wired up yet. `orchestrator/shadow.py` is the caller (#146), and
-    it passes only facts the cycle already holds.
+    nobody has wired up yet. `orchestrator/observed.py` is the caller (#146),
+    and it passes only facts the cycle already holds.
 
     Branch names come in as strings and are parsed here, because
     `github/branches.parse_task_branch` answers `None` for everything apiary did

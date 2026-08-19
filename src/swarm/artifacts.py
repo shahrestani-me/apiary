@@ -859,15 +859,21 @@ PR_MERGED = "pr.merged"
 TASK_LANDED = "task.landed"
 TASK_NEEDS_HUMAN = "task.needs_human"
 
-#: The derived-state shadow window (#146). `state.shadow` is emitted once per
-#: shadowed cycle whether or not anything disagreed, and that is not redundancy:
-#: an event log with no `state.divergence` line in it is either a clean run or a
-#: run with `APIARY_DERIVED_SHADOW=0`, and epic #140's go/no-go - ten runs with
-#: no unexplained divergence - is not a gate at all if it cannot tell zero from
-#: unmeasured. `state.divergence` names one task, one cycle and both states, in
-#: apiary's own vocabulary on both sides, because #145's acceptance criteria
-#: refuse a count: "the resolver agreed 94% of the time" is compatible with
-#: every disagreement being on `needs-human`.
+#: The derived-state shadow window (#146). **Nothing emits these any more.**
+#: #152 removed the window: it compared the resolver against the label control
+#: plane, #147 made the resolver the deciding answer, and then there was no
+#: control plane left to compare against.
+#:
+#: The names stay, and so does the reader below, because `events.jsonl` is
+#: append-only and read back - a run recorded before #152 must still print
+#: (#152's seventh acceptance criterion), and a reader deleted alongside its
+#: writer turns every archived run into a traceback. What they meant, for anyone
+#: reading an old run: `state.shadow` was emitted once per shadowed cycle whether
+#: or not anything disagreed, so that a log with no `state.divergence` line in it
+#: could be told from an unmeasured one; `state.divergence` named one task, one
+#: cycle and both states, because #145's acceptance criteria refuse a count -
+#: "the resolver agreed 94% of the time" is compatible with every disagreement
+#: being on `needs-human`.
 STATE_SHADOW = "state.shadow"
 STATE_DIVERGENCE = "state.divergence"
 
@@ -1303,19 +1309,24 @@ def _log_name(handle: Handle) -> str:
 
 @dataclass(frozen=True)
 class DivergenceTally:
-    """What the derived-state shadow saw across one run (#146).
+    """What the derived-state shadow saw across one run (#146). **A reader of history.**
 
-    **`ran` is the field that matters, and it is not a count.** Zero
-    divergences and a shadow that never executed produce the same empty list of
-    `state.divergence` events, and epic #140's go/no-go is "ten consecutive runs
-    with zero unexplained divergences" - a gate that reads an unmeasured run as
-    a clean one passes on nothing at all. So `state.shadow` is emitted every
+    Kept after #152 deleted the window that wrote these events, for the reason
+    `STATE_SHADOW` gives: runs recorded before that ticket must still print, and
+    a new run simply reports `ran is False`. Everything below therefore describes
+    what an *archived* run holds.
+
+    **`ran` is the field that matters, and it is not a count.** Zero divergences
+    and a shadow that never executed produced the same empty list of
+    `state.divergence` events, and epic #140's go/no-go was "ten consecutive runs
+    with zero unexplained divergences" - a gate that reads an unmeasured run as a
+    clean one passes on nothing at all. So `state.shadow` was emitted every
     shadowed cycle and its presence is what `ran` reports.
 
-    `unexplained` rather than `total` is the number the gate reads.
-    `orchestrator/shadow.py` classifies each divergence against ADR 0001's three
-    non-derivable states and the cycle's own after-the-read actions, and an
-    expected divergence is evidence the model is right rather than a defect.
+    `unexplained` rather than `total` was the number the gate read: each
+    divergence was classified against ADR 0001's three non-derivable states and
+    the cycle's own after-the-read actions, and an expected divergence was
+    evidence the model was right rather than a defect.
     """
 
     ran: bool = False
@@ -1329,8 +1340,8 @@ class DivergenceTally:
     #: run that compared nothing - unmeasured reading as clean, which is the
     #: failure this whole tally exists to prevent, one level up. Without the
     #: second, a reader cannot tell how much of a clean window was the cycle
-    #: agreeing with its own arithmetic: see `orchestrator/shadow.py`'s
-    #: "What a clean window is, and is not, evidence of".
+    #: agreeing with its own arithmetic - the argument the deleted shadow
+    #: window made under "What a clean window is, and is not, evidence of".
     compared: int = 0
     independent: int = 0
     total: int = 0
@@ -1384,10 +1395,11 @@ class DivergenceTally:
             name = payload.get("event")
             if name == STATE_OVERRIDE:
                 # Deliberately **not** setting `ran`: an override is evidence
-                # about the cutover, not about the shadow window, and a run with
-                # `APIARY_DERIVED_SHADOW=0` still emits these. Reporting "the
-                # shadow ran" off them would put unmeasured back where the whole
-                # of this class exists to keep it out.
+                # about the cutover, not about the shadow window, and a run
+                # with the window switched off still emitted these - as does
+                # every run since #152 removed it. Reporting "the shadow ran" off
+                # them would put unmeasured back where the whole of this class
+                # exists to keep it out.
                 overrides += 1
                 kind = str(payload.get("kind") or "")
                 task = str(payload.get("task") or "")
@@ -1438,7 +1450,10 @@ class DivergenceTally:
         """The lines `swarm show` prints. Coverage first, because a divergence
         count with no coverage beside it is a number that cannot be read."""
         if not self.ran:
-            head = "derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)"
+            head = (
+                "derived shadow: not run (a run after #152 removed the window, "
+                "or one from before #146 added it)"
+            )
             return "\n".join([head, *self._override_lines()])
         if not self.compared:
             # Every other branch below would print "0 unexplained" for this,

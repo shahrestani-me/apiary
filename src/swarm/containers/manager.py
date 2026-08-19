@@ -231,7 +231,7 @@ RUNNING_STATE = "running"
 #: is a real window in which a container exists, is not running, and a task is
 #: legitimately claimed. `spawn` closes it by calling `start` in the same breath,
 #: but the value is named here rather than spelled at the one site that reads it
-#: (`orchestrator/shadow.py`, which reports the window as an expected divergence
+#: (the shadow window reported the create-to-start gap as an expected divergence
 #: rather than a finding): a second spelling of a state string is how two
 #: readings of the same daemon field drift apart.
 CREATED_STATE = "created"

@@ -110,7 +110,7 @@ from swarm.worker.result import ResultRecord, latest_named
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 
 #: Both names come from `swarm.artifacts` since #146, because a live run now
-#: writes both: the shadow window records `observed.jsonl` every cycle and drops
+#: writes both: the run recorder writes `observed.jsonl` every cycle and drops
 #: the manifest beside it. Two spellings of these would be the seam along which
 #: "a recorded run drops in with no code change" quietly stopped being true.
 MANIFEST_NAME = CORPUS_MANIFEST_NAME
@@ -349,7 +349,7 @@ def _cycle(
                 # The file holds a JSON number and `PullFact.number` is a
                 # `PullRef` since #208, so the loader mints - through
                 # `github/refs.pull_ref`, the only minter, exactly as a live
-                # listing does. `shadow.observed_line` un-mints on the way out,
+                # listing does. `observed.observed_line` un-mints on the way out,
                 # which is what keeps the recorded and the hand-written line the
                 # same shape.
                 number=pull_ref(int(one["number"])),
@@ -446,7 +446,7 @@ def _latest(named: Mapping[str, ResultRecord]) -> dict[int, ResultRecord]:
     **This is what makes the loader model a cycle rather than a directory.** A
     live cycle never sees a list of records: `Reconciler._results` hands it
     `summarise_dir(...).latest`, one record per task, and the recorder
-    (`shadow.observed_line`) writes the names of exactly those. The reduction
+    (`observed.observed_line`) writes the names of exactly those. The reduction
     here is the same function the recorder's side of the seam uses, so the two
     cannot drift - which is the property the old `_result_name` claimed and
     stopped having when #177 unpinned the filename from the `attempt` field.
