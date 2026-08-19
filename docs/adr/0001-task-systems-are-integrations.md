@@ -287,9 +287,14 @@ The independent comparisons are the tasks a cycle did *not* write, where the
 label is the accumulation of many earlier cycles over earlier observations and
 the derived state is one absolute reading of now. A cycle writes at most a small
 constant number of labels out of a ledger of N, so the independent share tends to
-`(N − O(1)) / N` — but it is counted rather than assumed:
-`orchestrator/shadow.py` reports it per cycle and `swarm show` totals it. A clean
-window with a small independent count is a weak result.
+`(N − O(1)) / N`. It **was** counted rather than assumed — the shadow window
+reported it per cycle and `swarm show` totalled it — and #244 deleted the window,
+which takes the count with it: it was derived from the `CycleReport`, and that is
+not in `observed.jsonl`. The two runs measured while the window existed came out
+at 8/12 and 47/48 independent, so the argument above holds in practice. A clean
+comparison with a small independent count is still a weak result; it is now a
+judgement rather than a printed number, and `docs/recording-runs.md` says so
+where an operator will be standing.
 
 ## Deterministic and model-driven MCP are different call sites
 
