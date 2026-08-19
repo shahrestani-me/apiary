@@ -165,13 +165,6 @@ DEFAULT_ZERO_CHECK_GRACE_S = 300.0
 ADMIN_OVERRIDE_ENV = "APIARY_MERGE_ADMIN_OVERRIDE"
 MERGE_METHOD_ENV = "APIARY_MERGE_METHOD"
 
-#: The delimiters of the retry-feedback block in an issue body. HTML comments,
-#: for `docs/issue-contract.md` §2's reason for putting identity in one: they
-#: are invisible in rendered markdown, survive edits above and below them, and
-#: are preserved verbatim by GitHub's editor.
-FEEDBACK_OPEN = "<!-- apiary:ci-failure -->"
-FEEDBACK_CLOSE = "<!-- /apiary:ci-failure -->"
-
 #: Every line of quoted CI output is indented by this much. Not decoration: a
 #: check log containing `## Verify` at column 0 would otherwise add a second
 #: `## Verify` section to the body and make the issue malformed
@@ -181,8 +174,12 @@ FEEDBACK_CLOSE = "<!-- /apiary:ci-failure -->"
 QUOTE_INDENT = "    "
 
 #: How much of a failure to carry. The same bound the worker's own record uses
-#: (`worker/result.tail`), because this text lands in an issue body that a human
-#: reads and a model is meant to be given, and a megabyte of CI log is neither.
+#: (`worker/result.tail`), because this text lands in a **comment** a human reads
+#: and a model is meant to be given, and a megabyte of CI log is neither. It used
+#: to land in the issue body; #249 stopped writing there and #250 gave it the
+#: channel the worker actually reads (`reconcile.retry_comment`, whose first line
+#: `worker.entrypoint.fetch_feedback` greps for). The bound is unchanged - the
+#: reason for it never depended on which of the two the text travelled in.
 FEEDBACK_CHARS = 4000
 
 #: Extensions a failing path may carry. An allow-list, because the shapes below
@@ -1099,11 +1096,18 @@ def _retry_or_give_up(
 def _quote(text: str) -> str:
     """CI output, indented so no line of it can be markdown or a section heading.
 
-    See `QUOTE_INDENT`. Applied everywhere the output is written - the body
-    block and both comments - because the hazard is the same in all three: a log
-    line reading `## Verify` at column 0 makes the issue malformed, and the
-    module that reports a CI failure must not be the one that corrupts the
-    contract while doing it.
+    See `QUOTE_INDENT`. Applied wherever this module writes the output itself,
+    which since #249 is the two escalation comments and no longer the body block
+    - the hazard is the same in each: a log line reading `## Verify` at column 0
+    makes the issue malformed, and the module that reports a CI failure must not
+    be the one that corrupts the contract while doing it.
+
+    **The retry comment neutralises the same hazard a different way**, and the
+    two are worth telling apart rather than unifying. `reconcile.retry_comment`
+    fences the output instead of indenting it, and its docstring argues the
+    split: a fence is right for the text a *model* is about to be handed, an
+    indent is right where the surrounding prose is a sentence to a human. Both
+    are safe; neither is a fallback for the other.
     """
     body = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not body:
