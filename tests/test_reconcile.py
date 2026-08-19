@@ -3385,7 +3385,28 @@ def test_the_transition_path_writes_labels_in_exactly_one_place():
 
 
 def believing(state: str, *, was: str | None = None, task: str = "task-4") -> Belief:
-    """A cycle that believes `state` about one task, whatever its label says."""
+    """A cycle that believes `state` about one task, whatever its label says.
+
+    **Constructed rather than resolved, and `swarm:done` is why that matters.**
+    Building the belief the real way - `authority.believe` over an observation -
+    looks more faithful and quietly destroys the disagreement these sweeps are
+    made of, for one label in particular. The landed ratchet (#214) never takes
+    `landed` back, and it seeds from the stored state, so `believe` over an issue
+    wearing `swarm:done` returns `landed` however the world reads:
+
+        label=swarm:done   -> believe() says landed   (agrees: no disagreement left)
+        label=swarm:ready  -> believe() says claimed  (disagrees: usable)
+
+    A fixture built that way passes against every mutant, because there is
+    nothing for the mutation to differ from. `CARRIED` picks `swarm:done`
+    deliberately - see its own note on collisions - so the two choices are only
+    compatible while the belief is a value rather than a resolution.
+
+    Anyone replacing this with `believe(...)` therefore has to change `CARRIED`
+    in the same edit, and the second half of that is easy to miss because the
+    suite stays green. Verified on `main` rather than reasoned about; it cost an
+    hour to find from the other end, in a fixture that did use `believe`.
+    """
     return Belief(states={task: state}, previous={task: was or state})
 
 
