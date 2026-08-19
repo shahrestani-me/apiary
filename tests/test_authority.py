@@ -163,7 +163,15 @@ def a_run(label: str, source: str, monkeypatch: pytest.MonkeyPatch) -> tuple[Any
 #: itself, because readiness owns both waiting states and recomputes them from
 #: the dependency graph every cycle. The other four it obeyed.
 WRONG_LABELS = (BLOCKED, CLAIMED, REVIEW, DONE, FAILED)
-OBEYED_LABELS = (CLAIMED, REVIEW, DONE, FAILED)
+#: `swarm:review` leaves this list for `swarm:blocked`'s reason - it is a fact
+#: about the old behaviour, not a hole in the flag. Pre-#147 rule 4 read
+#: `entry.state_label` directly and charged an attempt for a `swarm:review`
+#: whose branch was not in the open listing ("its pull request was closed
+#: without merging"). So the old machine did not *hold* a review label either;
+#: it read one with no pull request as a rejection and recycled the task. It
+#: cannot discriminate here, and the behaviour it does have is pinned by the
+#: dedicated test below.
+OBEYED_LABELS = (CLAIMED, DONE, FAILED)
 
 
 # --------------------------------------------------------------------------
@@ -271,6 +279,32 @@ def test_the_flag_puts_every_one_of_those_decisions_back(label, monkeypatch):
     # says this task is in flight or finished, so nothing spawns.
     assert edited[1].spawned == []
     assert edited[0].labels_on(TASK_ISSUE) == {label}
+
+
+def test_under_labels_a_review_label_with_no_pull_request_is_charged(monkeypatch):
+    """`swarm:review`'s arm of the criterion above, which is not "nothing happens".
+
+    Pre-#147, `plan_reconcile` rule 4 read `entry.state_label` on every cycle:
+
+        if entry.state_label != REVIEW: continue
+        if open_branches is not None and entry.branch not in open_branches:
+            _retry_or_give_up(entry, "its pull request was closed without merging")
+
+    So a human writing `swarm:review` onto a task with no open pull request was
+    told its pull request had been closed, and paid an attempt for it. That is
+    the behaviour this flag restores - obeying the label, not holding it.
+
+    Carrying the derived path's `remembered` overlay onto the labels path hid
+    this: `was` came from last cycle's belief rather than from the label, rule 4
+    never matched, and the task sat in `swarm:review` doing nothing. That looked
+    more like "the label is obeyed", and was in fact the cutover leaking through
+    the hatch meant to switch it off.
+    """
+    client, fleet, _ = a_run(REVIEW, LABELS, monkeypatch)
+
+    # Charged and recycled, exactly as before #147 - not held, not ignored.
+    assert client.labels_on(TASK_ISSUE) != {REVIEW}
+    assert fleet.spawned == [TASK_ISSUE]
 
 
 def test_the_flag_silences_the_override_event_too(monkeypatch):
@@ -518,6 +552,65 @@ def test_a_task_apiary_gave_up_on_is_not_resurrected_by_a_restart():
     # reason: with nothing in the store the same world resurrects the task.
     forgotten = belief(entry(4, label=FAILED), max_attempts=3)
     assert forgotten.state("task-4") == ELIGIBLE
+
+
+def test_a_total_cap_give_up_also_survives_a_restart():
+    """The branch the test above does not reach, and the one a restart takes.
+
+    `_retry_or_give_up` gives up two ways: the streak reaching `max_attempts`,
+    and the counter reaching `max_total_attempts`. The test above covers the
+    first, and it survives because `entry.streak` is stored.
+
+    The second is the one renewals produce, and it looked identical to a healthy
+    task: every new failure *signature* resets the streak to 1, so a task that
+    failed nine times with nine different blockers ends at `attempt=9,
+    streak=1`. Testing only the code host's count - which is zero in a fresh
+    process, because results are per-run and branch names come off open pull
+    requests - left that task reading `eligible`, relabelled `swarm:ready`, and
+    dispatched with a whole new budget over work apiary had already abandoned.
+    """
+    exhausted = entry(4, label=FAILED, attempt=9, streak=1)
+    held = believe(ledger(exhausted), world(exhausted), max_attempts=3, max_total_attempts=9)
+
+    assert held.state("task-4") == NEEDS_HUMAN
+    assert [one.kind for one in held.overrides] == [BUDGET_SPENT]
+    # The resolver really did read it as runnable - this is the overlay working,
+    # not the world happening to agree.
+    assert held.overrides[0].derived == ELIGIBLE
+
+    # The counterfactual: one attempt below the cap, same low streak, and the
+    # task is genuinely runnable. Without it this test would pass against a rule
+    # that simply never resurrects anything.
+    below = entry(4, label=FAILED, attempt=8, streak=1)
+    assert believe(
+        ledger(below), world(below), max_attempts=3, max_total_attempts=9
+    ).state("task-4") == ELIGIBLE
+
+
+def test_under_labels_this_cycles_label_beats_last_cycles_belief():
+    """`APIARY_STATE_SOURCE=labels` restores the *label read*, not a memory of it.
+
+    Before #147, `plan_reconcile`'s rules read `entry.state_label` directly on
+    every cycle. Carrying the derived path's `remembered` overlay onto the
+    labels path made last cycle's belief win, and the one event that tells the
+    two apart is a human editing a label mid-run - which is the single case this
+    flag exists for, and the action apiary's own give-up comment instructs.
+
+    Left in, rule 4 fires on the remembered `review` for a task a human has just
+    moved back to `swarm:ready`, consuming an attempt and posting a failure for
+    work that was rescheduled rather than failed.
+    """
+    moved = entry(4, label=READY)
+    held = believe(
+        ledger(moved),
+        None,
+        source=LABELS,
+        remembered={"task-4": REVIEW_STATE},
+    )
+
+    assert held.source == LABELS
+    assert held.previous["task-4"] == ELIGIBLE, "last cycle's belief overrode the label"
+    assert held.state("task-4") == ELIGIBLE
 
 
 def test_a_store_that_has_never_judged_a_task_gives_up_sooner_not_later():
