@@ -1025,6 +1025,23 @@ class ChecksReport:
     #: Comments this client had no method to post. `reconcile.post_comment`
     #: printed them instead.
     uncommented: tuple[int, ...] = ()
+    #: The commit each merge produced, as (issue number, sha) - GitHub's answer
+    #: to the `PUT .../merge`, which this module previously threw away.
+    #: Announcement only: nothing here reads it, and `pr.merged` (#141) is the
+    #: only consumer, because "which commit is this task now" is the one fact
+    #: about a landed task that the run directory could not otherwise recover.
+    #:
+    #: A tuple, like every other collection on this frozen record and for the
+    #: same reason: a `dict` field makes the generated `__hash__` raise, and a
+    #: frozen dataclass that cannot be hashed is frozen in name only. Absent for
+    #: a merge whose response carried no `sha` - `merge_pull_request` is typed
+    #: `Any` and a body-less 200 is a real answer.
+    merge_commits: tuple[tuple[int, str], ...] = ()
+
+    @property
+    def commit_by_issue(self) -> dict[int, str]:
+        """`merge_commits` as a lookup, for the one caller that wants one."""
+        return dict(self.merge_commits)
 
     @property
     def ok(self) -> bool:
@@ -1101,6 +1118,7 @@ def apply_checks(
     undeleted: list[str] = []
     failures: list[Failure] = []
     uncommented: list[int] = []
+    merge_commits: dict[int, str] = {}
 
     if dry_run:
         return ChecksReport(plan=plan)
@@ -1108,7 +1126,7 @@ def apply_checks(
     refused: set[int] = set()
     for merge in plan.merges:
         try:
-            client.merge_pull_request(
+            answer = client.merge_pull_request(
                 merge.pull,
                 merge_method=merge.merge_method,
                 sha=merge.sha or None,
@@ -1122,6 +1140,15 @@ def apply_checks(
             refused.add(merge.number)
             continue
         merged.append(merge.number)
+        # Whatever the merge answered, if it answered anything with a `sha`.
+        # Guarded rather than indexed: `merge_pull_request` is typed `Any`, a
+        # body-less response is a real answer, and a merge that *landed* must
+        # not be reported as a failure because the commit it produced could not
+        # be read back.
+        if isinstance(answer, Mapping):
+            commit = str(answer.get("sha") or "")
+            if commit:
+                merge_commits[merge.number] = commit
         if not merge.delete_branch:
             continue
         (deleted if delete_branch(client, merge.branch) else undeleted).append(merge.branch)
@@ -1154,6 +1181,7 @@ def apply_checks(
         failures=tuple(failures),
         undeleted=tuple(dict.fromkeys(undeleted)),
         uncommented=tuple(dict.fromkeys(uncommented)),
+        merge_commits=tuple(merge_commits.items()),
     )
 
 

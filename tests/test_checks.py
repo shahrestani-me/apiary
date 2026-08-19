@@ -55,6 +55,8 @@ from swarm.orchestrator.checks import (
     PENDING,
     PULLS_METHOD,
     CheckSet,
+    ChecksPlan,
+    ChecksReport,
     MergePolicy,
     PullState,
     apply_checks,
@@ -942,3 +944,59 @@ def test_the_two_extractors_agree_on_every_language(language):
     assert set(failing_paths(text)) <= set(mentioned_paths(text))
     for path in failures.EXPECTED[language]:
         assert path in mentioned_paths(text)
+
+
+# --------------------------------------------------------------------------
+# The commit a merge produced (#141)
+# --------------------------------------------------------------------------
+
+
+def test_the_merge_commit_is_kept_because_nothing_else_records_it():
+    """`pr.merged` names it, and "which commit is this task now" is the one
+    fact about a landed task the run directory could not otherwise recover -
+    the answer to `PUT .../merge` used to be discarded on the line that made it."""
+    client = FakeClient(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    assert report.merged == (23,)
+    assert report.commit_by_issue == {23: "deadbeef"}
+
+
+def test_a_merge_that_answered_with_no_body_is_still_a_merge():
+    """`merge_pull_request` is typed `Any` and a body-less 200 is a real
+    answer. A merge that *landed* must not be reported as a failure because the
+    commit it produced could not be read back."""
+
+    @dataclass
+    class SilentClient(FakeClient):
+        def merge_pull_request(self, number: int, **kwargs: Any) -> Any:
+            self.log.append(f"merge PR #{number}")
+            return None
+
+    client = SilentClient(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=pulls(pull(101, issue=23)),
+        checks={23: summarise_checks([run("test", "success")])},
+        now=NOW,
+    )
+
+    report = apply_checks(client, plan)
+
+    assert report.merged == (23,)
+    assert report.ok
+    assert report.commit_by_issue == {}
+
+
+def test_the_report_stays_hashable():
+    """Every collection on this frozen record is a tuple for this reason: a
+    `dict` field makes the generated `__hash__` raise, and a frozen dataclass
+    that cannot be hashed is frozen in name only."""
+    assert hash(ChecksReport(plan=ChecksPlan())) == hash(ChecksReport(plan=ChecksPlan()))

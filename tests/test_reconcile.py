@@ -66,7 +66,10 @@ from swarm.orchestrator.reconcile import (
     DONE,
     FAILED,
     READY,
+    CycleReport,
     Reconciler,
+    ReconcilePlan,
+    ReconcileReport,
     Snapshot,
     Transition,
     apply_plan,
@@ -77,6 +80,7 @@ from swarm.orchestrator.reconcile import (
     rewrite_marker,
     signature,
 )
+from swarm.orchestrator.lifecycle import lifecycle_events
 from swarm.run import Run
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
@@ -1775,3 +1779,645 @@ def test_a_gate_that_revived_keeps_the_loop_running_and_flushes_the_cache(monkey
     assert [report.finished for report in reports] == [False, True]
     assert len(reports) == 2, "the loop stopped on the cycle that revived"
     assert flushed == [1], "flushed exactly once: after the revival, not after met"
+
+
+
+
+# --------------------------------------------------------------------------
+# The per-task lifecycle (#141)
+# --------------------------------------------------------------------------
+#
+# A cycle is minutes long and `cycle.reconciled` is one sentence about it, so
+# everything an operator came to see - which task became eligible, which
+# container took it, what its gate said, when its pull request merged - used to
+# live and die inside a cycle. `orchestrator/lifecycle.py` announces it, and it
+# is driven from here because the loop is what produces the reports it projects.
+#
+# Three properties carry this section. **The announcement decides nothing**: it
+# runs on a finished `CycleReport`, after the writes and after the judge, and
+# the reconciler's plan is identical with and without it. **It never speaks the
+# tracker's vocabulary**: every payload is keyed by the task ref, and no issue
+# number or `swarm:*` label survives into one - `events.jsonl` is append-only,
+# so a payload written in label terms would be invalidated the day epic #140
+# removes the labels. And **derived facts and applied writes are sourced
+# differently**: eligibility is recomputed every cycle (ADR 0001) so it is
+# projected from the verdict and bounded by `once`, while a terminal label is
+# projected only from a transition that actually landed.
+
+MERGE_COMMIT = "5e1f00d" + "0" * 33
+
+
+@dataclass
+class LifecycleClient(FakeClient):
+    """A client far enough along to take one task all the way to merged."""
+
+    open_pulls: tuple[tuple[int, str], ...] = ()
+    check_runs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    heads: dict[int, str] = field(default_factory=dict)
+    merges: list[int] = field(default_factory=list)
+
+    def head_of(self, number: int) -> str:
+        return self.heads.get(number, f"{number:0>40x}")
+
+    def list_pull_requests(self, *, state: str = "open") -> list[dict[str, Any]]:
+        self.log.append(f"list_pull_requests {state}")
+        return [
+            {
+                "number": number,
+                "head": {"ref": ref, "sha": self.head_of(number)},
+                "base": {"ref": "main", "sha": BASE_COMMIT},
+                "updated_at": "2026-08-14T13:25:30+00:00",
+            }
+            for number, ref in self.open_pulls
+        ]
+
+    def get_pull_request(self, number: int) -> dict[str, Any]:
+        payload = next(p for p in self.list_pull_requests() if p["number"] == number)
+        return {**payload, "mergeable": True, "mergeable_state": "clean"}
+
+    def list_check_runs(self, ref: str) -> list[dict[str, Any]]:
+        self.log.append(f"list_check_runs {ref}")
+        return list(self.check_runs.get(ref, ()))
+
+    def merge_pull_request(self, number: int, **kwargs: Any) -> dict[str, Any]:
+        self.merges.append(number)
+        return {"merged": True, "sha": MERGE_COMMIT}
+
+
+def green(name: str = "ci") -> list[dict[str, Any]]:
+    return [{"name": name, "status": "completed", "conclusion": "success"}]
+
+
+def pending(name: str = "ci") -> list[dict[str, Any]]:
+    return [{"name": name, "status": "in_progress"}]
+
+
+def failing(name: str = "ci") -> list[dict[str, Any]]:
+    return [{"name": name, "status": "completed", "conclusion": "failure"}]
+
+
+def recorder() -> tuple[list[tuple[str, dict[str, Any]]], Callable[..., None]]:
+    """An `events` sink and the list it fills. The shape `RunArtifacts.event` has."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(name: str, **fields: Any) -> None:
+        seen.append((name, fields))
+
+    return seen, emit
+
+
+def names(seen: Iterable[tuple[str, dict[str, Any]]]) -> list[str]:
+    return [name for name, _ in seen]
+
+
+#: Four digits, and deliberately not a number any payload field could coincide
+#: with: the "no issue number survives" assertion below is only worth making
+#: against a number that cannot also be an attempt, an exit code or a PR.
+TASK_ISSUE = 4242
+TASK_REF = f"task-{TASK_ISSUE}"
+TASK_BRANCH = f"swarm/issue-{TASK_ISSUE}"
+TASK_PULL = 900
+
+
+def a_lifecycle_run(label: str = READY) -> tuple[LifecycleClient, FakeFleet, Reconciler, list]:
+    """One task, labelled the way the planner actually creates a dep-free one.
+
+    `swarm:ready`, not `swarm:blocked` - `nodes/planner.py` writes the state
+    label once, at creation, and picks `READY` whenever the blockers are
+    already met. So the root task of every plan, and "a run with one task"
+    verbatim from #141, never produces a readiness *transition* at all. A
+    fixture that seeded `swarm:blocked` would test a shape the planner only
+    emits for a task that has dependencies.
+    """
+    client = LifecycleClient(issues={TASK_ISSUE: issue_payload(TASK_ISSUE, label=label)})
+    fleet = FakeFleet()
+    seen, emit = recorder()
+    return client, fleet, reconciler(client, fleet, events=emit), seen
+
+
+def reaches_review(client: LifecycleClient, fleet: FakeFleet, checks: list) -> None:
+    """The worker finished: it moved its own label (#17) and left an open PR."""
+    client.issues[TASK_ISSUE]["labels"] = [{"name": REVIEW}]
+    client.open_pulls = ((TASK_PULL, TASK_BRANCH),)
+    client.check_runs = {client.head_of(TASK_PULL): checks}
+    fleet.handles.clear()
+
+
+def test_one_task_announces_its_whole_lifecycle_in_order(tmp_path):
+    """#141's first acceptance criterion, driven through the loop rather than
+    asserted on a hand-built report."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    reaches_review(client, fleet, green())
+    write_result(record(TASK_ISSUE, 0, attempt=0, reason="verified and committed"), tmp_path)
+    loop.cycle()
+
+    assert names(seen) == [
+        "task.eligible",
+        "task.claimed",
+        "task.result",
+        "pr.opened",
+        "pr.checks",
+        "pr.merged",
+        "task.landed",
+    ]
+    # "A reader builds a per-task timeline without joining on anything."
+    assert {fields["task"] for _, fields in seen} == {TASK_REF}
+    assert client.merges == [TASK_PULL]
+
+
+def test_a_task_created_ready_is_still_announced_eligible():
+    """The bug a `swarm:blocked` fixture hides.
+
+    `ReadinessPlan.transitions` is *verdicts that disagree with the label on the
+    issue*, and the planner already labelled this one `swarm:ready` - so a
+    projection of `transitions` announces nothing for the only task in a
+    one-task run. Eligibility is derived and recomputed each cycle (ADR 0001),
+    so it is projected from the verdict itself.
+    """
+    client, _, loop, seen = a_lifecycle_run(label=READY)
+
+    loop.cycle()
+
+    assert "task.eligible" in names(seen)
+
+
+def test_a_task_that_was_blocked_is_announced_when_its_dependency_lands():
+    """And the other direction still works: a task with a dependency is held at
+    `swarm:blocked` until readiness moves it."""
+    client, _, loop, seen = a_lifecycle_run(label=BLOCKED)
+    client.issues[TASK_ISSUE]["body"] = body(TASK_REF, blocked_by=[7])
+    client.issues[7] = issue_payload(7, label=DONE, state="closed", state_reason="completed")
+
+    loop.cycle()
+
+    eligible = [fields for name, fields in seen if name == "task.eligible"]
+    assert eligible and eligible[0]["depends_on"] == ["task-7"]
+
+
+def test_eligibility_is_announced_once_per_episode_not_once_per_cycle():
+    """It is a standing fact - true every cycle until the task is claimed - so
+    a projection with no memory would repeat it for the length of the queue."""
+    client, _, loop, seen = a_lifecycle_run()
+    # No fleet, so nothing is ever claimed and the task stays ready.
+    loop.fleet = None
+
+    loop.cycle()
+    loop.cycle()
+    loop.cycle()
+
+    assert names(seen) == ["task.eligible"]
+
+
+def test_an_infrastructure_retry_is_announced_eligible_again(tmp_path):
+    """The episode, not the attempt. Exit 2 consumes no attempt (§4), so the
+    re-dispatch is ready at the number already announced - a key on the attempt
+    would have been silent for exactly the failure mode that repeats."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
+    loop.cycle()
+
+    assert names(seen) == [
+        "task.eligible",
+        "task.claimed",
+        "task.result",
+        "task.eligible",
+        "task.claimed",
+    ]
+    # And the counter really did not move, which is what makes this the case a
+    # key on the attempt could not see.
+    assert [f["attempt"] for n, f in seen if n == "task.eligible"] == [0, 0]
+
+
+def test_each_announcement_carries_what_its_reader_came_for(tmp_path):
+    """The payloads, once, so the fields are pinned rather than implied by the
+    sequence above."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    reaches_review(client, fleet, green("build"))
+    write_result(record(TASK_ISSUE, 0, attempt=0), tmp_path)
+    loop.cycle()
+
+    payloads = dict(seen)
+    sha = client.head_of(TASK_PULL)
+
+    # Every payload names the cycle it belongs to, so a reader never has to
+    # bracket these between two `cycle.reconciled` lines to order them.
+    assert all("cycle" in fields for fields in payloads.values())
+    assert payloads["task.eligible"] == {
+        "cycle": 0,
+        "task": TASK_REF,
+        "attempt": 0,
+        # The root of a plan: nothing was ever blocking it.
+        "depends_on": [],
+    }
+    assert payloads["task.claimed"]["container"] == f"{TASK_ISSUE:0>64x}"[:12]
+    assert payloads["task.result"]["exit_code"] == 0
+    assert payloads["task.result"]["outcome"]
+    assert payloads["pr.opened"] == {
+        "cycle": 1,
+        "task": TASK_REF,
+        "pull": TASK_PULL,
+        "head_sha": sha,
+    }
+    assert payloads["pr.checks"] == {
+        "cycle": 1,
+        "task": TASK_REF,
+        "pull": TASK_PULL,
+        "head_sha": sha,
+        "state": "passed",
+        "check": "build",
+    }
+    assert payloads["pr.merged"] == {
+        "cycle": 1,
+        "task": TASK_REF,
+        "pull": TASK_PULL,
+        "merge_commit": MERGE_COMMIT,
+    }
+    assert payloads["task.landed"] == {"cycle": 1, "task": TASK_REF}
+
+
+def test_no_announcement_carries_an_issue_number_or_a_label_name(tmp_path):
+    """The reason #131 was retargeted into this ticket.
+
+    `events.jsonl` is append-only and read back by `swarm show`, so a payload
+    written in the vocabulary ADR 0001 removes would be invalidated by the rest
+    of epic #140 - the recorded runs, the board reducer and the board together.
+    Asserted over every value of every event of a task that *failed*, so the one
+    field carrying free prose - `task.needs_human.reason` - is inspected too.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.max_attempts = 1
+    loop.cycle()
+    reaches_review(client, fleet, failing())
+    write_result(record(TASK_ISSUE, 1, attempt=0), tmp_path)
+    loop.cycle()
+
+    assert "task.needs_human" in names(seen)
+    for name, fields in seen:
+        for key, value in fields.items():
+            assert value != TASK_ISSUE, f"{name}.{key} is the issue number"
+            if isinstance(value, str):
+                assert "swarm:" not in value, f"{name}.{key} names a label"
+                assert TASK_BRANCH not in value, f"{name}.{key} names the branch"
+
+
+def test_the_announcement_does_not_disturb_the_external_console_log(tmp_path):
+    """`console_external` folds *every* event looking for four keys, so a task
+    event that happened to carry one would print itself into the cycle log as
+    though it were a cycle."""
+    from swarm.console_external import _lines
+
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    fleet.handles.clear()
+    write_result(record(TASK_ISSUE, 1, attempt=1), tmp_path)
+    loop.cycle()
+
+    reserved = {"summary", "gate", "failures", "goal"}
+    assert seen
+    assert all(reserved.isdisjoint(fields) for _, fields in seen)
+    # And the same claim from the reader's side.
+    log = tmp_path / "events.jsonl"
+    log.write_text(
+        "".join(f'{{"event": "{name}"}}\n' for name in names(seen)), encoding="utf-8"
+    )
+    assert _lines(tmp_path) == []
+
+
+def test_the_announcement_reaches_events_jsonl_through_the_redactor(tmp_path, monkeypatch):
+    """#141 asks for these to go through the *existing* `RunArtifacts.event`
+    path, so they land in the run directory and are redacted like everything
+    else - not through a second writer that would have to remember to."""
+    import json
+
+    from swarm.artifacts import RunArtifacts
+
+    credential = "hunter2-not-a-recognisable-token-shape"
+    monkeypatch.setenv("GITHUB_TOKEN", credential)
+    run = Run.start(REPO, "prove the events land", run_id=RUN_ID)
+    artifacts = RunArtifacts.open(run, root=tmp_path)
+    client = LifecycleClient(issues={TASK_ISSUE: issue_payload(TASK_ISSUE, label=READY)})
+    loop = reconciler(client, FakeFleet(), events=artifacts.event)
+    loop.run = run
+
+    loop.cycle()
+    artifacts.event("task.needs_human", task="task-x", reason=f"token {credential} leaked")
+
+    events = [json.loads(line) for line in artifacts.events_path.read_text().splitlines()]
+    task_events = [e for e in events if e["event"].startswith(("task.", "pr."))]
+
+    assert [e["event"] for e in task_events] == [
+        "task.eligible",
+        "task.claimed",
+        "task.needs_human",
+    ]
+    # `run` and `ts` come from the writer, not from the projection.
+    assert all(e["run"] == RUN_ID and e["ts"] for e in task_events)
+    assert credential not in artifacts.events_path.read_text()
+
+
+# --- every writer of a terminal label --------------------------------------
+#
+# ADR 0001 makes `needs-human` the one state reported outbound and the one a
+# customer's tracker cannot infer, and four different modules write it. A
+# substrate that hears it from only some of them is not one #147 can read from.
+
+
+def a_report(
+    *,
+    applied: Iterable[Transition] = (),
+    entries: Iterable[LedgerEntry] = (),
+    recovered: Iterable[Transition] | None = None,
+    mergeability: Iterable[Transition] | None = None,
+) -> CycleReport:
+    """One finished cycle, as far as the announcement is concerned."""
+    return CycleReport(
+        index=0,
+        ledger=ledger(*entries),
+        result=ReconcileReport(plan=ReconcilePlan(), applied=tuple(applied)),
+        recovered=(
+            None
+            if recovered is None
+            else SimpleNamespace(
+                result=ReconcileReport(plan=ReconcilePlan(), applied=tuple(recovered))
+            )
+        ),
+        mergeability=(
+            None if mergeability is None else SimpleNamespace(applied=tuple(mergeability))
+        ),
+    )
+
+
+def escalation(reason: str = "attempts exhausted", attempt: int | None = 3) -> Transition:
+    return Transition(
+        ref=ref(4),
+        from_label=CLAIMED,
+        to_label=FAILED,
+        reason=reason,
+        task_id="task-4",
+        attempt=attempt,
+    )
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["applied", "recovered", "mergeability"],
+    ids=["the reconciler", "the recovery sweep", "the merge-ability gate"],
+)
+def test_every_writer_of_a_terminal_label_is_announced(where):
+    """The reconciler, the recovery sweep, mergeability and the check gate all
+    write `swarm:failed`; the check gate has its own test above."""
+    events = lifecycle_events(a_report(**{where: [escalation()]}))
+
+    assert [event.name for event in events] == ["task.needs_human"]
+    assert events[0].fields["task"] == "task-4"
+
+
+def test_a_failing_task_says_why_it_needs_a_human_and_that_it_paid_for_it():
+    """Exit 1 at the cap: the attempt was consumed, and the sentence says which
+    budget ran out."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2)),
+        results={ref(4): record(4, 1, attempt=2)},
+        max_attempts=3,
+    )
+    events = lifecycle_events(a_report(applied=plan.transitions, entries=[entry(4, label=FAILED)]))
+
+    assert [event.name for event in events] == ["task.needs_human"]
+    assert events[0].fields["task"] == "task-4"
+    assert events[0].fields["attempt_consumed"] is True
+    assert "attempt(s) made" in events[0].fields["reason"]
+
+
+def test_an_infrastructure_escalation_says_no_attempt_was_ever_consumed():
+    """§4's rule, announced rather than re-derived: exit 2 never consumes an
+    attempt, so the escalation at the cap consumed none either - which is the
+    difference between "this task is hard" and "this host is broken"."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=1)),
+        results=infra(4),
+        infrastructure={ref(4): DEFAULT_INFRASTRUCTURE_CAP - 1},
+    )
+    events = lifecycle_events(a_report(applied=plan.transitions))
+
+    assert events[0].name == "task.needs_human"
+    assert events[0].fields["attempt_consumed"] is False
+    # No counter on the payload: `Transition.attempt` is the value about to be
+    # written and `task.result.attempt` is the one that just ran, so carrying
+    # both would give a reader two events about one attempt disagreeing by one.
+    assert "attempt" not in events[0].fields
+    assert "infrastructure" in events[0].fields["reason"]
+
+
+def test_a_malformed_issue_reaching_a_human_is_deliberately_not_announced():
+    """§1.4's escalation is the one `swarm:failed` with no task ref: the issue
+    never parsed, so it is not in `Ledger.entries` at all. An event keyed on
+    nothing is not a timeline entry, and inventing a key from the issue number
+    is the thing this whole module refuses to do."""
+    malformed = Transition(
+        ref=ref(4), from_label=READY, to_label=FAILED, reason="malformed contract: no ## Goal"
+    )
+
+    assert lifecycle_events(a_report(applied=[malformed])) == ()
+
+
+def test_a_reason_that_quoted_a_branch_is_rewritten_into_the_task_ref():
+    """The one place the label vocabulary leaks into prose: the merge gate's
+    "no check run was ever created for swarm/issue-12" names a branch, and a
+    branch is an issue number."""
+    failed = Transition(
+        ref=ref(4),
+        from_label=REVIEW,
+        to_label=FAILED,
+        reason=f"no check run was ever created for swarm/issue-4; move it back to {READY}",
+        task_id="task-4",
+    )
+
+    events = lifecycle_events(a_report(applied=[failed], entries=[entry(4, label=REVIEW)]))
+
+    assert events[0].fields["reason"] == (
+        "no check run was ever created for task-4; move it back to eligible"
+    )
+
+
+def test_a_transition_github_refused_is_never_announced():
+    """`fold`'s rule, and for the same reason: a label write GitHub refused left
+    the task where it was, so announcing it would put a state in an append-only
+    log that the control plane never reached."""
+    planned = Transition(ref=ref(4), from_label=CLAIMED, to_label=DONE, reason="x", task_id="task-4")
+
+    # Planned, not applied.
+    assert lifecycle_events(a_report(applied=[], entries=[entry(4, label=CLAIMED)])) == ()
+    assert [e.name for e in lifecycle_events(a_report(applied=[planned]))] == ["task.landed"]
+
+
+# --- announced once, but only while it is the same occurrence ---------------
+
+
+def test_a_standing_fact_is_announced_once_rather_than_every_cycle(tmp_path):
+    """The results directory still holds last cycle's record and the pull
+    request is still open, so a projection with no memory would re-announce
+    both every fifteen seconds for the length of a review."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    # Pending, so nothing merges and the same facts survive into the next cycle.
+    reaches_review(client, fleet, pending())
+    write_result(record(TASK_ISSUE, 0, attempt=0), tmp_path)
+
+    mark = len(seen)
+    loop.cycle()
+    first = seen[mark:]
+    loop.cycle()
+
+    assert names(first) == ["task.result", "pr.opened", "pr.checks"]
+    assert seen[mark:] == first
+
+
+def test_a_check_name_is_announced_verbatim(tmp_path):
+    """The one field here whose text apiary did not author.
+
+    A check name is written by whoever wrote the target repository's workflow.
+    It cannot carry an apiary issue number, and it is precisely the string a
+    reader pastes into the CI UI - so it is not scrubbed, and a repository with
+    a check called `swarm/issue-4242` sees that name and not a task ref.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    reaches_review(client, fleet, pending(f"swarm/issue-{TASK_ISSUE}"))
+    loop.cycle()
+
+    checks = [f["check"] for name, f in seen if name == "pr.checks"]
+    assert checks == [f"swarm/issue-{TASK_ISSUE}"]
+
+
+def test_a_check_set_that_moved_is_announced_again(tmp_path):
+    """Once per *state*, not once per pull request: "pending" turning into
+    "failing" is the event somebody is waiting for."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    reaches_review(client, fleet, pending())
+    loop.cycle()
+    client.check_runs = {client.head_of(TASK_PULL): failing()}
+    loop.cycle()
+
+    assert [fields["state"] for name, fields in seen if name == "pr.checks"] == [
+        "pending",
+        "failing",
+    ]
+
+
+def test_a_retry_pushing_a_new_head_gets_its_own_check_announcements(tmp_path):
+    """The worker reuses the pull request it already opened (`worker/pr.py`), so
+    one PR number cycles pending -> failing -> pending across attempts. A key
+    without the head sha would announce the first attempt's gate and silently
+    swallow every later one."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    reaches_review(client, fleet, failing())
+    loop.cycle()
+    # Attempt two, same pull request, new head.
+    # The gate consumed an attempt and sent it back to `swarm:ready`; the next
+    # worker re-published onto the pull request it already had.
+    client.issues[TASK_ISSUE]["labels"] = [{"name": REVIEW}]
+    client.heads[TASK_PULL] = "b" * 40
+    client.check_runs = {"b" * 40: failing()}
+    loop.cycle()
+
+    checks = [(f["head_sha"], f["state"]) for name, f in seen if name == "pr.checks"]
+    assert checks == [(f"{TASK_PULL:0>40x}", "failing"), ("b" * 40, "failing")]
+
+
+def test_a_second_infrastructure_failure_at_the_same_attempt_is_announced(tmp_path):
+    """Exit 2 does not consume an attempt (§4), so the re-dispatch runs as the
+    same attempt and overwrites the same result file. A host that is broken
+    three times over is exactly what an operator needs to see, and a key on the
+    attempt alone would report it once."""
+    import datetime as dt
+
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    def infra_record(minute: int) -> ResultRecord:
+        moment = dt.datetime(2026, 8, 14, 14, minute, tzinfo=dt.timezone.utc)
+        return ResultRecord(
+            run_id=RUN_ID,
+            issue=TASK_ISSUE,
+            attempt=0,
+            exit_code=2,
+            reason="docker: no such image",
+            started_at=moment,
+            finished_at=moment,
+        )
+
+    write_result(infra_record(10), tmp_path)
+    loop.cycle()
+    write_result(infra_record(20), tmp_path)
+    loop.cycle()
+
+    assert names(seen).count("task.result") == 2
+
+
+# --- announcement only -----------------------------------------------------
+
+
+def test_announcing_changes_nothing_the_reconciler_decides(tmp_path):
+    """The whole claim of this ticket, asserted by running the cycle twice."""
+
+    def run(events: Any) -> tuple[list[str], set[str], list[str]]:
+        client = LifecycleClient(issues={TASK_ISSUE: issue_payload(TASK_ISSUE, label=READY)})
+        fleet = FakeFleet()
+        report = reconciler(client, fleet, events=events, artifacts=tmp_path).cycle()
+        return (
+            [str(t) for t in report.result.plan.transitions],
+            client.labels_on(TASK_ISSUE),
+            client.log,
+        )
+
+    quiet = run(None)
+    loud = run(recorder()[1])
+
+    assert quiet == loud
+
+
+def test_a_run_that_merges_by_hand_still_records_that_a_task_reached_review():
+    """`--no-merge` leaves the review queue to a human. The gate being off is
+    not a reason for the run directory to stop recording `pr.opened` - but the
+    check sets genuinely are not read, so `pr.checks` is silent."""
+    client, fleet, loop, seen = a_lifecycle_run(label=REVIEW)
+    client.open_pulls = ((TASK_PULL, TASK_BRANCH),)
+    client.check_runs = {client.head_of(TASK_PULL): green()}
+    loop.merge_gate = False
+
+    loop.cycle()
+
+    assert names(seen) == ["pr.opened"]
+    assert client.merges == []
+
+
+def test_a_dry_run_announces_the_derived_half_and_none_of_the_written_half():
+    """A dry run promised to change nothing, and it does not: eligibility is a
+    *derived* fact (ADR 0001 - "recomputed each cycle") and is true whether or
+    not the label was written, while every event sourced from an applied
+    transition is silent because nothing was applied. And it is bounded: two
+    dry cycles compute the same verdict and say it once."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.dry_run = True
+
+    loop.cycle()
+    loop.cycle()
+
+    assert names(seen) == ["task.eligible"]
+    assert client.labels_on(TASK_ISSUE) == {READY}

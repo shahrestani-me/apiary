@@ -1434,6 +1434,19 @@ class CycleReport:
         return "; ".join(parts)
 
 
+def _lifecycle_log() -> Any:
+    """`lifecycle.LifecycleLog`, imported at call time.
+
+    `lifecycle` imports this module - it projects a `CycleReport` and reads the
+    two terminal labels - so the dependency points that way and a top-level
+    import here would be a cycle. Same shape, and the same reason, as `checks`
+    and `mergeability` inside `cycle`.
+    """
+    from .lifecycle import LifecycleLog
+
+    return LifecycleLog()
+
+
 @dataclass
 class Reconciler:
     """The loop body, and the thing that paces it.
@@ -1524,6 +1537,14 @@ class Reconciler:
     #: the end is a run nobody can watch, and it is also how the merge gate's
     #: verdicts reach the operator while there is still time to act on them.
     on_cycle: Callable[[CycleReport], None] | None = None
+    #: Where the per-task lifecycle is announced (#141) - `RunArtifacts.event`
+    #: in a real run, so the events land in `events.jsonl` and are redacted like
+    #: everything else. `None` announces nothing, which is what a reconciler
+    #: with no run directory behind it should do. Separate from `on_cycle`
+    #: because the two answer different questions: `on_cycle` is one line per
+    #: cycle for whoever is watching, this is one event per task transition for
+    #: whoever reads the run back afterwards.
+    events: Callable[..., Any] | None = None
 
     _cycles: int = field(default=0, repr=False)
     #: The progress ledger, run-scoped. See the module docstring.
@@ -1537,6 +1558,11 @@ class Reconciler:
     #: granting a clean slate is the safe direction for a counter whose job is
     #: bounding one run.
     _infrastructure: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: Which task events have already been announced (#141). Run-scoped for the
+    #: same reason, and holding nothing a decision reads. Typed loosely and
+    #: built through a local import, for `merge_policy`'s reason: `lifecycle`
+    #: imports this module.
+    _lifecycle: Any = field(default_factory=_lifecycle_log, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1600,22 +1626,30 @@ class Reconciler:
             )
             ledger = fold(ledger, recovered.result.applied)
 
+        # Local, because `checks` imports this module: it is the policy over the
+        # state this one folds, so the dependency points this way and a
+        # top-level import would be a cycle.
+        from .checks import read_pulls
+
+        # Read outside the merge gate, and free: `open_branches()` above already
+        # forced `Snapshot`'s one pull-request listing, so this is a fold over
+        # payloads the cycle is holding. Outside the gate because a run merging
+        # by hand still wants `pr.opened` in its event log - the gate being off
+        # is not a reason for the run directory to stop recording that a task
+        # reached review.
+        pulls = read_pulls(snapshot)
+
         # The merge gate. Mergeability runs first and *subtracts* from the plan
         # checks built: a PR that is green against a base that has since moved
         # is not mergeable, and merging it would land work that never ran
         # against what it is landing on. `plan.admitted` is what survives.
         mergeability = None
         checks = None
+        check_runs: dict[int, Any] = {}
         if self.merge_gate:
-            # Local, because `checks` and `mergeability` both import this
-            # module: they are the policy over the state this one folds,
-            # so the dependency points this way and a top-level import
-            # would be a cycle.
-            from .checks import apply_checks, plan_checks, read_checks, read_pulls
+            from .checks import apply_checks, plan_checks, read_checks
             from .mergeability import run_mergeability
 
-            pulls = read_pulls(snapshot)
-            check_runs = {}
             if pulls is not None:
                 for entry in ledger.entries.values():
                     pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
@@ -1680,7 +1714,21 @@ class Reconciler:
             cycle_error=cycle_error,
             live=len(live_entries(ledger)),
         )
-        return self._judge(snapshot, report, results=results)
+        judged = self._judge(snapshot, report, results=results)
+        # Last, and on the grown report: the announcement (#141) is a projection
+        # of a cycle that has already decided, already written and already been
+        # judged, which is what makes "this changes no behaviour" a structural
+        # claim rather than a promise. The three facts it needs are passed
+        # rather than hung on `CycleReport`, so there is nothing on the report
+        # for a future rule to read - see `lifecycle.lifecycle_events`.
+        self._lifecycle.announce(
+            judged,
+            emit=self.events,
+            results=results,
+            pulls=pulls or {},
+            checks=check_runs,
+        )
+        return judged
 
     # --- step 5 ----------------------------------------------------------
 
