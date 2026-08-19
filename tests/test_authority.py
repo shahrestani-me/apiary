@@ -59,6 +59,7 @@ from swarm.orchestrator.authority import (
     STATE_SOURCE_ENV,
     UNRESOLVED,
     Belief,
+    Grant,
     believe,
     state_source,
 )
@@ -660,7 +661,12 @@ def test_a_revival_grants_exactly_one_attempt_and_then_lapses():
     escalated = believe(ledger(task), spent_world, max_attempts=3)
     assert escalated.state("task-4") == NEEDS_HUMAN
 
-    granted = believe(ledger(task), spent_world, max_attempts=3, revived={ref(4): 3})
+    # `Grant(attempt=3)` was a bare `3` before #200, which is the same grant in
+    # the shape that predates the lapse. Only the call changes here; what this
+    # test asserts about a revival that produces a result does not.
+    granted = believe(
+        ledger(task), spent_world, max_attempts=3, revived={ref(4): Grant(attempt=3)}
+    )
     assert granted.state("task-4") == ELIGIBLE
     assert [one.kind for one in granted.overrides] == [REVIVED]
 
@@ -671,9 +677,72 @@ def test_a_revival_grants_exactly_one_attempt_and_then_lapses():
         ledger(task),
         world(task, results=(record_fact(4, attempt=3),)),
         max_attempts=3,
-        revived={ref(4): 3},
+        revived={ref(4): Grant(attempt=3)},
     )
     assert lapsed.state("task-4") == NEEDS_HUMAN
+
+
+def test_a_revival_whose_attempt_left_no_result_lapses_on_the_dispatch():
+    """#200. The grant's other ending, and the one nothing on the code host says.
+
+    A granted attempt killed at `SWARM_WORKER_TIMEOUT`, or whose container was
+    reaped mid-cycle, writes **no result record and opens no pull request**. So
+    `attempts_spent` sits exactly where it was when the grant was made, the test
+    above ("the result carried the granted attempt") never fires, and the grant
+    suppressed the give-up for the rest of the run - `needs-human` rewritten
+    into a lenient state every cycle, and the task dispatched every cycle,
+    indefinitely.
+
+    Every other bound is inert on the same input, which is what makes it a trap
+    rather than a leak: `entry.attempt` moves only through `_retry_or_give_up`
+    and the infrastructure streak only through a transition, and both need the
+    artifact this failure is defined by not producing.
+
+    So the lapse is keyed on the dispatch. Same entry, same world, same code-host
+    count in both halves below - the *only* difference is apiary's own record of
+    having put a worker on it.
+    """
+    task = entry(4, label=FAILED, attempt=3, streak=3)
+
+    # Two worlds, because a revival reaches this module from two directions and
+    # the overlay that fires differs. Both are the *same* code-host evidence
+    # before and after the killed attempt: it wrote nothing, so nothing moved.
+    #
+    # (a) This run remembers the failures that got the task here - the result
+    #     from attempt 2 is still in the run directory, so the resolver reads
+    #     `needs-human` on its own arithmetic and the grant is what overrides it.
+    remembers = world(task, results=(record_fact(4, attempt=2),))
+    # (b) The goal gate revives across a restart: results are per run, so the
+    #     new process sees no attempt at all and the resolver reads `eligible`.
+    #     Here the grant is invisible and `budget-spent` is what has to bite.
+    resumed = world(task)
+
+    for unmoved in (remembers, resumed):
+        outstanding = believe(
+            ledger(task), unmoved, max_attempts=3, revived={ref(4): Grant(attempt=3)}
+        )
+        assert outstanding.state("task-4") == ELIGIBLE, "the grant is still buying its attempt"
+
+        spent = believe(
+            ledger(task),
+            unmoved,
+            max_attempts=3,
+            revived={ref(4): Grant(attempt=3, dispatched=True)},
+        )
+        assert spent.state("task-4") == NEEDS_HUMAN
+
+    # And where the resolver would have said `eligible`, the event log says
+    # *which* of the grant's two endings this was - "the code host accounts for
+    # 0 attempt(s)" on its own reads like the bug rather than the fix.
+    lapsed = believe(
+        ledger(task), resumed, max_attempts=3, revived={ref(4): Grant(attempt=3, dispatched=True)}
+    )
+    assert [one.kind for one in lapsed.overrides] == [BUDGET_SPENT]
+    assert "has lapsed" in lapsed.overrides[0].why
+
+    # The grant is spent once and stays spent: `Grant.spend` is idempotent, so a
+    # cycle that re-reports the same dispatch cannot un-lapse it.
+    assert Grant(attempt=3).spend().spend() == Grant(attempt=3, dispatched=True)
 
 
 def record_fact(issue: int, *, attempt: int, exit_code: int = 1) -> Any:

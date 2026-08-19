@@ -133,7 +133,15 @@ from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord, summarise_dir, tail
-from .authority import Belief, believe, label_state, revived_tasks, state_of, state_source
+from .authority import (
+    Belief,
+    Grant,
+    believe,
+    label_state,
+    revived_tasks,
+    state_of,
+    state_source,
+)
 # **Bare `CLAIMED` and `REVIEW` here are `swarm:*` labels; the `_STATE` pair are
 # ADR 0001's internal states.** `shadow.py`'s convention, imported for its
 # reason: the one time the two were confused, every classification in that file
@@ -1619,6 +1627,38 @@ def _shadow_window() -> Any:
     return ShadowWindow(enabled=shadow_enabled())
 
 
+def _dispatch_attempted(report: CycleReport) -> set[TaskRef]:
+    """Every task this cycle's dispatcher actually tried to run. #200's signal.
+
+    Both halves of `DispatchReport`, and the second half is the whole reason
+    this is not `_carry_forward`'s predicate. **That** function asks "is the
+    control plane holding a claim", so it counts only failures with `claimed`
+    set. This one asks "did the grant's one attempt get used up", and every
+    entry in `failed` answers yes: the dispatcher reached this task, resolved an
+    image or refused to, wrote a claim or could not, and either way it *tried*.
+
+    Reading it the narrower way leaves the loop open on the arm #200 names by
+    name. `dispatcher.dispatch` records `claimed=False` for a spawn failure whose
+    `release` provably undid the claim, and for a stack this host has no image
+    for - so a revived task with a missing image was claimed, released, and
+    re-dispatched every cycle for the rest of the run, four label writes a time,
+    with `DispatchReport.needs_judgement` False the whole while because a failed
+    dispatch is not a stall. A rule that has to classify *why* the attempt did
+    not run is a rule with an arm somebody forgot; "the orchestrator put this
+    task on the fleet" has none.
+
+    The one thing it does not count is a task the dispatcher never reached: a
+    fatal claim failure `break`s the loop, and everything behind it is still
+    `swarm:ready`, untouched, and not in `failed`.
+    """
+    dispatched = report.dispatched
+    if dispatched is None:
+        return set()
+    attempted = {item.entry.ref for item in dispatched.dispatched}
+    attempted |= {task_ref(int(failure.number)) for failure in dispatched.failed}
+    return attempted
+
+
 @dataclass
 class Reconciler:
     """The loop body, and the thing that paces it.
@@ -1773,12 +1813,20 @@ class Reconciler:
     #: `update_budget`, and seeded from the labels for a task never seen - see
     #: `authority.Belief.previous`.
     _believed: dict[str, str] = field(default_factory=dict, repr=False)
-    #: Tasks `planner.revive` returned to the run, and the attempt counter each
-    #: was at. A revival grants exactly one attempt and lapses when it is spent
-    #: (`authority._budget_spent`); without this the resolver re-escalates a
-    #: revived task on the same arithmetic that failed it, and the goal gate can
-    #: never unstick a run.
-    _revived: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: Every revival this run has granted, as `authority.Grant`s: the attempt
+    #: counter each was made at, and whether the one attempt it bought has been
+    #: spent. Without it the resolver re-escalates a revived task on the same
+    #: arithmetic that failed it, and the goal gate can never unstick a run.
+    #:
+    #: **Membership means "granted", not "outstanding"** (#200). A spent grant
+    #: stays here as a tombstone, because `authority` reports which of a
+    #: revival's two endings a task reached and cannot do that from an absence.
+    #: Spending one is this class's job rather than the resolver's: the dispatch
+    #: is the only evidence a dying worker cannot suppress, and this is the
+    #: thing that emits it. `_spend_revivals` records it, `_dispatch_attempted`
+    #: is the predicate, and `authority`'s module docstring argues why no other
+    #: counter bounds that input.
+    _revived: dict[TaskRef, Grant] = field(default_factory=dict, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -2075,6 +2123,9 @@ class Reconciler:
         # After `_judge`, because that is where both callers of `planner.revive`
         # run, and before the belief is carried forward, so a task revived this
         # cycle is already holding its granted attempt when the next one asks.
+        # Spending first and granting second, for the reason `_spend_revivals`
+        # gives: a re-revival is a new grant, not a spent one.
+        self._spend_revivals(judged)
         self._record_revivals(judged)
         self._believed = self._carry_forward(belief, judged)
         # Last, and on the grown report: the announcement (#141) is a projection
@@ -2193,18 +2244,38 @@ class Reconciler:
                     overlay[task] = CLAIMED_STATE
         return dict(carried.hold(overlay).states)
 
+    def _spend_revivals(self, report: CycleReport) -> None:
+        """Mark the grants this cycle put on the fleet. #200's whole fix.
+
+        Runs **before** `_record_revivals`, so a task revived again in the same
+        cycle that spent its previous grant gets a fresh one rather than an
+        already-spent one. The two cannot in fact collide - the sets are
+        disjoint by state, because a task dispatched this cycle is claimed and
+        the gate revives only failed ones - but the order is the one that stays
+        correct if that stops being true.
+
+        No result record is consulted here, deliberately: that is the class of
+        evidence #200 is about, and a third reading of it would fail on exactly
+        the input the first two already fail on.
+        """
+        if not self._revived:
+            return
+        for one in _dispatch_attempted(report) & self._revived.keys():
+            self._revived[one] = self._revived[one].spend()
+
     def _record_revivals(self, report: CycleReport) -> None:
         """Remember the one attempt each revival granted. See `_revived`.
 
         The counter is read *before* the revived task runs again, because
         `planner.revive` "deliberately resets nothing" - so the attempt on the
         entry is the one the revival is granting, and the grant lapses the
-        moment a result carries it (`authority._budget_spent`).
+        moment a result carries it *or* the moment a worker is dispatched on it
+        (`authority._budget_spent`, `_spend_revivals`).
         """
         for task in revived_tasks(report):
             entry = report.ledger.entries.get(task)
             if entry is not None:
-                self._revived[entry.ref] = entry.attempt
+                self._revived[entry.ref] = Grant(attempt=entry.attempt)
 
     # --- step 5 ----------------------------------------------------------
 

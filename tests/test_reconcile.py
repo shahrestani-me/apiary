@@ -2684,3 +2684,182 @@ def test_a_dry_run_announces_the_derived_half_and_none_of_the_written_half():
 
     assert names(seen) == ["task.eligible"]
     assert client.labels_on(TASK_ISSUE) == {READY}
+
+
+# --------------------------------------------------------------------------
+# A revival whose granted attempt leaves no artifact (#200)
+# --------------------------------------------------------------------------
+#
+# The failure direction here is an **infinite loop**, not an error, which is
+# why this is driven through `Reconciler.cycle` rather than asserted on a
+# belief. `authority._budget_spent` used to lapse a revival grant on one thing
+# only - the code host accounting for an attempt past the one it was granted at
+# - and that needs a result record or an attempt-numbered branch on an *open*
+# pull request. A granted attempt killed at `SWARM_WORKER_TIMEOUT`, or whose
+# container was reaped mid-cycle, writes neither.
+#
+# Every other bound is inert on the same input, which is what made it a trap
+# rather than a leak: `entry.attempt` moves only through `_retry_or_give_up`
+# and the infrastructure streak only through `infrastructure_streaks(...,
+# result.applied)`, and both need the artifact this failure is *defined by not
+# producing*. So the task was re-dispatched every cycle, indefinitely, with
+# nothing counting.
+
+
+def a_revived_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any, list]:
+    """One task apiary gave up on, which the goal gate then revives.
+
+    `swarm:failed` at attempt 3 with no store judgment, which is ADR 0002's own
+    fallback shape: the streak reads as the attempt counter, so the task is over
+    the per-blocker cap and under the total one - exactly the task
+    `goal._revive_abandoned` exists to return to a run.
+    """
+    from swarm.nodes.planner import IssueAction
+    from swarm.orchestrator.recovery import Recovery
+
+    client = LifecycleClient(
+        issues={TASK_ISSUE: issue_payload(TASK_ISSUE, label=FAILED, attempt=3)}
+    )
+    fleet = FakeFleet()
+    loop = reconciler(client, fleet, goal_gate=True, objective="make it work")
+    loop.artifacts = tmp_path
+    # The sweep is wired, because `cli.py` wires it unconditionally and it is
+    # the thing that *does* move a counter on this input - `recovery._release`
+    # consumes an attempt for a claim with nothing behind it. A harness without
+    # it measures a configuration no real run has, and would overstate the bug.
+    loop.recovery = Recovery(
+        client=client, run=loop.run, store=loop.store, max_attempts=loop.max_attempts
+    )
+    calls: list[int] = []
+
+    def gate(snapshot: Any, ledger_: Any, objective: str, **kwargs: Any) -> Any:
+        calls.append(1)
+        # What `planner.revive` does, and the whole of it: the state label goes
+        # back to `swarm:ready` and *nothing else is reset* - not the attempt
+        # counter, not the streak, not the blocker. Written through the client
+        # rather than the `Snapshot` the gate is handed, which is the same
+        # object one layer down.
+        client.issues[TASK_ISSUE]["labels"] = [{"name": READY}]
+        return SimpleNamespace(
+            done=False,
+            extended=False,
+            rounds=0,
+            revived=(IssueAction("revived", TASK_REF, TASK_ISSUE, reason="streak 3 of 3"),),
+            summary=lambda: "revived 1 failed task(s) with budget remaining",
+        )
+
+    monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", gate)
+    return client, fleet, loop, calls
+
+
+def test_a_revived_attempt_that_leaves_no_result_lapses_instead_of_looping(
+    tmp_path, monkeypatch
+):
+    """#200's acceptance criterion, and the loop is the assertion.
+
+    Revive, dispatch, kill the container **without a result record**, then keep
+    cycling. Before the fix the third cycle and every cycle after it dispatched
+    the task again, because the grant could only lapse on evidence the killed
+    worker never wrote.
+    """
+    client, fleet, loop, calls = a_revived_run(tmp_path, monkeypatch)
+
+    # 1. The ledger is exhausted, so the gate runs and revives. Nothing is
+    #    dispatched in the cycle that grants, because the revival happens in
+    #    step 5 - after dispatch.
+    loop.cycle()
+    assert fleet.spawned == []
+
+    # 2. The grant buys its one attempt: without it this cycle believes
+    #    `needs-human` (the streak is 3 against a cap of 3) and dispatches
+    #    nothing at all.
+    loop.cycle()
+    assert fleet.spawned == [TASK_ISSUE], "the revival bought exactly one attempt"
+
+    # The worker is killed at `SWARM_WORKER_TIMEOUT`. The container is gone and
+    # it wrote **nothing**: no result record under the run directory, no branch,
+    # no pull request. Every counter in the system is exactly where it was.
+    fleet.handles.clear()
+
+    for _ in range(4):
+        loop.cycle()
+        # Every attempt dies the same way, so a loop keeps finding a fresh
+        # container here rather than being held off by the last one.
+        fleet.handles.clear()
+
+    assert fleet.spawned == [TASK_ISSUE], (
+        "the grant lapsed on the dispatch: one revival, one attempt, then the "
+        "streak `planner.revive` never reset caps the task again"
+    )
+    assert calls == [1], "the gate ran once; a re-revival would be a second grant"
+    # And it stopped in the state a human is asked about, rather than by being
+    # quietly skipped: `needs-human` is what the dispatcher refuses to start.
+    from swarm.orchestrator.derived import NEEDS_HUMAN
+
+    assert loop._believed[TASK_REF] == NEEDS_HUMAN
+
+
+def test_a_revival_whose_spawn_never_ran_lapses_too(tmp_path, monkeypatch):
+    """The arm a narrower reading of the signal leaves looping.
+
+    `dispatcher.dispatch` records `claimed=False` for a spawn failure whose
+    `release` provably undid the claim, and for a stack this host has no image
+    for. So "the control plane is holding a claim" - which is what
+    `_carry_forward` asks - is False, the issue goes back to `swarm:ready`, and
+    a rule keyed on it would re-dispatch this task every cycle for the rest of
+    the run: claim, release, claim, release, four label writes a cycle, with
+    `DispatchReport.needs_judgement` False the whole time because a failed
+    dispatch is not a stall.
+
+    `_dispatch_attempted` counts it, because the grant buys one attempt and the
+    dispatcher spending it on a host that could not run it is still spending it.
+    The escalation is also the more useful answer: a human is told the task is
+    stuck, which is true, instead of nothing at all.
+    """
+    client, fleet, loop, _ = a_revived_run(tmp_path, monkeypatch)
+
+    def refuse(*args: Any, **kwargs: Any) -> Handle:
+        fleet.log.append("spawn #%d" % kwargs["issue"])
+        raise DockerError(["docker", "create"], 1, "no such image: apiary-worker:py")
+
+    fleet.spawn = refuse  # type: ignore[method-assign]
+
+    loop.cycle()
+    for _ in range(4):
+        loop.cycle()
+        fleet.handles.clear()
+
+    from swarm.orchestrator.derived import NEEDS_HUMAN
+
+    assert fleet.spawned == [TASK_ISSUE], "one refused spawn spent the grant"
+    assert loop._believed[TASK_REF] == NEEDS_HUMAN
+
+
+def test_a_revived_attempt_that_does_leave_a_result_is_unchanged(tmp_path, monkeypatch):
+    """The other ending, pinned here because #200 must not have moved it.
+
+    A revival that produces a result has always lapsed on the code host's own
+    count: the record carries the granted attempt, `attempts_spent` moves past
+    it, and the streak `planner.revive` never reset caps the task. Same fixture
+    and the same one granted attempt as above - the only difference is that the
+    worker wrote its record - so the two endings have to converge, and the
+    arithmetic itself is pinned in `test_authority`.
+    """
+    client, fleet, loop, _ = a_revived_run(tmp_path, monkeypatch)
+
+    loop.cycle()
+    loop.cycle()
+    assert fleet.spawned == [TASK_ISSUE]
+
+    # The granted attempt fails the way a worker is supposed to fail: exit 1,
+    # a result record carrying the attempt the revival granted.
+    write_result(record(TASK_ISSUE, 1, attempt=3, reason="the verify command failed"), tmp_path)
+    fleet.handles.clear()
+
+    for _ in range(4):
+        loop.cycle()
+
+    from swarm.orchestrator.derived import NEEDS_HUMAN
+
+    assert fleet.spawned == [TASK_ISSUE], "still exactly one attempt"
+    assert loop._believed[TASK_REF] == NEEDS_HUMAN
