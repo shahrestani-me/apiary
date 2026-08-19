@@ -46,7 +46,6 @@ from swarm.containers.manager import (
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry
 from swarm.github.refs import issue_number, task_ref
-from swarm.taskref import TaskRef
 from swarm.orchestrator import dispatcher
 from swarm.orchestrator.dispatcher import (
     CLAIMED,
@@ -58,6 +57,7 @@ from swarm.orchestrator.dispatcher import (
     held_files,
     plan_dispatch,
 )
+from swarm.taskref import TaskRef
 
 READY = "swarm:ready"
 BLOCKED = "swarm:blocked"

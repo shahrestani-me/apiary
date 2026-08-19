@@ -1685,7 +1685,7 @@ class Reconciler:
     # --- step 5 ----------------------------------------------------------
 
     def _judge(
-        self, client: Any, report: CycleReport, *, results: Mapping[int, ResultRecord]
+        self, client: Any, report: CycleReport, *, results: Mapping[TaskRef, ResultRecord]
     ) -> CycleReport:
         """Judge this cycle, and act on the judgement. Returns the report, grown.
 

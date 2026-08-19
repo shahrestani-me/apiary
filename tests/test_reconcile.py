@@ -53,7 +53,6 @@ from swarm.github.ledger import (
 from swarm.github.readiness import IssueState
 from swarm.github.refs import issue_number
 from swarm.github.refs import task_ref as ref
-from swarm.taskref import TaskRef
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity
 from swarm.orchestrator.reconcile import (
     COMMENT_TAIL_CHARS,
@@ -80,6 +79,7 @@ from swarm.orchestrator.reconcile import (
 )
 from swarm.run import Run
 from swarm.state import ProgressJudgement
+from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
 
 REPO = "shahrestani-me/apiary"
@@ -379,7 +379,9 @@ def test_an_issue_closed_by_hand_is_taken_out_of_the_run_and_its_worker_disposed
 
 
 def test_a_merged_pull_request_is_read_from_the_issue_it_closed():
-    plan = plan_reconcile(ledger(entry(4, label=REVIEW)), states={ref(4): closed(4)}, running=[ref(4)])
+    plan = plan_reconcile(
+        ledger(entry(4, label=REVIEW)), states={ref(4): closed(4)}, running=[ref(4)]
+    )
 
     # `Closes #<n>` means the merge closes the issue, so the cheap read already
     # carries the signal and nothing has to page through every PR ever opened.
@@ -410,7 +412,9 @@ def test_an_issue_a_human_already_marked_done_keeps_no_container():
 def test_a_container_whose_issue_left_the_ledger_is_disposed():
     # A human deleted the issue, or stripped its `swarm:*` label - either way
     # nothing will look at that work again and the clone is held for nobody.
-    plan = plan_reconcile(ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4), ref(9)])
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4), ref(9)]
+    )
 
     assert sorted(d.ref for d in plan.disposals) == [ref(4), ref(9)]
     assert "no longer in the ledger" in next(d for d in plan.disposals if d.ref == ref(9)).reason
@@ -988,7 +992,9 @@ def test_a_marker_quoted_inside_a_fence_is_not_the_one_rewritten():
 def test_a_landed_transition_is_folded_into_the_ledger_rather_than_re_read():
     entries = ledger(entry(4, label=CLAIMED, attempt=0))
 
-    folded = fold(entries, [Transition(ref(4), CLAIMED, READY, "exit 1", task_id="task-4", attempt=1)])
+    folded = fold(
+        entries, [Transition(ref(4), CLAIMED, READY, "exit 1", task_id="task-4", attempt=1)]
+    )
 
     # A second listing to observe our own writes is the one request that buys
     # nothing, and the dispatcher needs the freed capacity this cycle.
@@ -1001,7 +1007,8 @@ def test_a_landed_transition_is_folded_into_the_ledger_rather_than_re_read():
 def test_folding_a_transition_for_an_issue_outside_the_ledger_changes_nothing():
     entries = ledger(entry(4))
 
-    assert fold(entries, [Transition(ref(9), READY, FAILED, "malformed")]).entries == entries.entries
+    unrelated = [Transition(ref(9), READY, FAILED, "malformed")]
+    assert fold(entries, unrelated).entries == entries.entries
 
 
 # --------------------------------------------------------------------------
@@ -1066,7 +1073,9 @@ def test_a_container_that_will_not_die_does_not_stop_the_labels_from_moving():
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     fleet = FakeFleet(handles=running(4))
     fleet.dispose_error = DockerError(["docker", "rm"], 1, "daemon is not responding")
-    plan = plan_reconcile(ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4)])
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4)]
+    )
 
     report = apply_plan(client, plan, fleet=fleet, handles=running(4))
 
@@ -1078,7 +1087,9 @@ def test_a_container_that_will_not_die_does_not_stop_the_labels_from_moving():
 def test_a_dry_run_writes_nothing_at_all():
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     fleet = FakeFleet(handles=running(4))
-    plan = plan_reconcile(ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4)])
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4)]
+    )
 
     report = apply_plan(client, plan, fleet=fleet, handles=running(4), dry_run=True)
 
@@ -1410,6 +1421,28 @@ def test_an_exhausted_ledger_is_not_the_end_of_the_run_if_the_gate_extends(monke
     assert [report.finished for report in reports] == [False, True]
     assert len(reports) == 2, "the loop stopped at plan exhaustion"
     assert calls == ["make the thing work"] * 2
+
+
+def test_the_judge_is_handed_the_failure_text_the_cycle_just_read(tmp_path):
+    """The seam a retype can break in silence, so it is pinned (#142).
+
+    `_results()` and `judge.Observation.of` have to agree about what a task is
+    keyed on. They agreed on `int` before and agree on `TaskRef` now, and if
+    they ever stop, nothing raises: the lookup misses, every signal reads as
+    "no evidence", and the judge calls a looping run healthy on the strength of
+    a failure it could not see. Read off the observation the cycle stored,
+    because that is the object handed to `judge` - and on a cycle that changed
+    something, `judge` itself is deliberately not called.
+    """
+    client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    write_result(record(4, 1, reason="TypeError: cannot parse header"), tmp_path)
+
+    loop = reconciler(client, FakeFleet(), artifacts=tmp_path)
+    loop.cycle()
+
+    observed = loop._previous
+    assert observed is not None, "step 5 never observed the cycle"
+    assert "TypeError: cannot parse header" in observed.signals["task-4"].evidence
 
 
 def test_the_goal_gate_is_skipped_without_an_objective(monkeypatch, capsys):

@@ -571,7 +571,7 @@ def dispatch(
     base_commit: str,
     *,
     capacity: Capacity | None = None,
-    ready: Iterable[int] | None = None,
+    ready: Iterable[TaskRef] | None = None,
     dry_run: bool = False,
     images: StackImages | None = None,
 ) -> DispatchReport:

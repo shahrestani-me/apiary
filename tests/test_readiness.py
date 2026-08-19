@@ -521,7 +521,8 @@ def test_nothing_referenced_means_no_api_call_at_all():
 
 
 def test_find_cycle_returns_none_for_a_forest():
-    assert find_cycle({ref(1): refs([2]), ref(2): refs([3]), ref(3): (), ref(4): refs([3])}) is None
+    forest = {ref(1): refs([2]), ref(2): refs([3]), ref(3): (), ref(4): refs([3])}
+    assert find_cycle(forest) is None
 
 
 def test_a_reference_nobody_resolved_blocks_rather_than_passes():
