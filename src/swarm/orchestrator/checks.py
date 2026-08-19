@@ -93,6 +93,7 @@ from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
 from ..github.refs import issue_number
+from ..store import StoreError, TaskStore, record_judgement
 from ..worker.result import tail
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
@@ -1094,6 +1095,7 @@ def apply_checks(
     client: Any,
     plan: ChecksPlan,
     *,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> ChecksReport:
     """Merge, then relabel. Never raises for one issue; see `Failure`.
@@ -1107,10 +1109,15 @@ def apply_checks(
     `swarm:done` on the next cycle.
 
     Within a transition the order is `docs/issue-contract.md` §5 and
-    `reconcile.apply_plan`'s: the counter and the retry feedback are one body
-    `PATCH` written first, then the new label, then the old one. One patch
-    rather than two because both are edits to the same body, and a second read
-    between them is a window for a human's edit to be lost.
+    `reconcile.apply_plan`'s: the judgment is recorded, then the counter and the
+    retry feedback go out as one body `PATCH`, then the new label, then the old
+    one. One patch rather than two because both are edits to the same body, and
+    a second read between them is a window for a human's edit to be lost.
+
+    `store` is where the judgment that goes with the counter is recorded (#159).
+    `None` records none - for a caller exercising the label half alone - and
+    `Reconciler` always passes one, because an attempt consumed without its
+    signature recorded is an attempt that renews somebody's budget for free.
     """
     merged: list[int] = []
     applied: list[Transition] = []
@@ -1158,6 +1165,15 @@ def apply_checks(
         if transition is None or outcome.number in refused:
             continue
         try:
+            if transition.attempt is not None:
+                record_judgement(
+                    store,
+                    transition.ref,
+                    transition.attempt,
+                    blocker=transition.blocker,
+                    streak=transition.streak,
+                    renewals=transition.renewals,
+                )
             if transition.attempt is not None or outcome.feedback:
                 _patch_body(client, transition, outcome.feedback)
             # `Transition` is keyed on the task, and every call here addresses
@@ -1166,7 +1182,7 @@ def apply_checks(
             client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
                 client.remove_label(number, transition.from_label)
-        except GitHubError as exc:
+        except (GitHubError, StoreError) as exc:
             failures.append(Failure(outcome.number, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
@@ -1196,7 +1212,9 @@ def _patch_body(client: Any, transition: Transition, feedback: str) -> None:
 
     `rewrite_marker` is #22's, imported rather than reimplemented: two modules
     with their own idea of where the counter lives is how a counter stops
-    bounding anything.
+    bounding anything. It carries the counter and nothing else - the failure
+    signature that used to ride with it is written to apiary's own store by the
+    caller, immediately before this (#159).
     """
     number = issue_number(transition.ref)
     issue = client.get_issue(number)
@@ -1220,6 +1238,7 @@ def run_checks(
     policy: MergePolicy | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     now: dt.datetime | None = None,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> ChecksReport:
     """Read, decide, write. The whole module in one call.
@@ -1245,7 +1264,7 @@ def run_checks(
         max_attempts=max_attempts,
         now=now,
     )
-    return apply_checks(client, plan, dry_run=dry_run)
+    return apply_checks(client, plan, store=store, dry_run=dry_run)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docstring

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..state import TaskRecord, TaskStatus
+from ..store import TaskJudgement, TaskStore
 from ..taskref import TaskRef
 from .branches import task_branch
 from .client import GitHubClient
@@ -298,13 +299,23 @@ class LedgerEntry:
     depends_on: tuple[str, ...] = ()
     adopted: bool = False
     #: The last consumed attempt's failure signature and the length of the
-    #: consecutive run of it, straight from the marker's optional `blocker=`
-    #: and `streak=` fields. See `TaskContract` for what absent means; the
-    #: reconciler's `_retry_or_give_up` is the only consumer, and both fields
-    #: exist so a *different* failure can be recognised as the previous
-    #: blocker being gone.
+    #: consecutive run of it. **From apiary's own task store** since #159, not
+    #: from the issue body: a signature is apiary's judgment about its own
+    #: execution and `docs/adr/0002-apiary-owns-a-thin-task-store.md` is where
+    #: those live. `load_ledger` falls back to the marker's legacy `blocker=`
+    #: and `streak=` fields for a task the store has never judged, which is
+    #: what keeps an upgrade from resetting live budgets. See `TaskContract`
+    #: for what absent means; the reconciler's `_retry_or_give_up` is the only
+    #: consumer, and both fields exist so a *different* failure can be
+    #: recognised as the previous blocker being gone.
     blocker: str = ""
     streak: int | None = None
+    #: How many times this task's per-blocker budget has been renewed. From the
+    #: store, and never from the body - the marker never carried it. Reported
+    #: rather than decided on: see `store.TaskJudgement.renewals` for why
+    #: adding a third input to the give-up arithmetic would be a behaviour
+    #: change rather than an accounting field.
+    renewals: int = 0
     #: Whether the issue is closed on GitHub. The ledger reads `state="all"`
     #: because closed `swarm:done` issues anchor the dependency graph - which
     #: means a closed issue can still wear any state label, and a projection
@@ -472,10 +483,19 @@ def _parse_marker(
     A body quoting the canonical example - the contract doc's own §6, a planner
     explaining itself - must not have its example's identity adopted as its own.
 
-    Returns `(task_id, attempt, blocker, streak)`. The last two are the
-    optional failure-signature fields: a marker without them - every marker
-    written before they existed - reads as `("", None)`, and an unknown field
-    is ignored entirely, so a body written by a newer orchestrator parses
+    Returns `(task_id, attempt, blocker, streak)`. **The last two are read and
+    never written** (`render_marker`): #159 moved the failure signature into
+    apiary's own store, and this is the migration path off the old bodies.
+    Every issue in a repository that ran an older build still carries them, and
+    a build that stopped reading them would answer "no previous blocker" for
+    every one of those tasks at once - which grants each of them a fresh retry
+    budget, silently, on the first cycle after an upgrade. So they are read
+    whenever the store has nothing of its own to say (`load_ledger`), and they
+    leave the body the next time anything rewrites the marker.
+
+    A marker without them - every marker written before they existed, and every
+    marker written since they left - reads as `("", None)`, and an unknown
+    field is ignored entirely, so a body written by a newer orchestrator parses
     cleanly under an older one and vice versa. The tolerance is not an
     accident: the worker reads this marker too (`worker.entrypoint`), and a
     field only the reconciler consumes must never fail a container over it.
@@ -721,25 +741,27 @@ def parse_contract(number: int, body: str | None) -> TaskContract:
 # --------------------------------------------------------------------------
 
 
-def render_marker(
-    task_id: str, attempt: int = 0, *, blocker: str = "", streak: int | None = None
-) -> str:
+def render_marker(task_id: str, attempt: int = 0) -> str:
     """The identity line, in the one form every writer must emit.
 
-    `blocker` and `streak` are the optional failure-signature fields, and they
-    are emitted only when set: a caller that does not pass them - which is
-    every caller that predates them, and every writer that consumed an attempt
-    through a channel where the signature has no meaning (a stale claim, a
-    failed check run) - produces byte-for-byte the marker it always did, so an
-    old body round-trips unchanged and dropping the record deliberately falls
-    back to the pre-signature arithmetic downstream.
+    Two fields and no more. The marker used to carry `blocker=` and `streak=`
+    as well, and #159 moved them into apiary's own task store
+    (`docs/adr/0002-apiary-owns-a-thin-task-store.md`): a failure signature and
+    the streak of it are apiary's judgments about its own execution, not facts
+    the customer's tracker owns, and writing them into a customer's issue body
+    is the thing ADR 0001 exists to stop. `_parse_marker` still *reads* them,
+    because a repository that ran an older build has them in its bodies and a
+    build that stopped reading them would reset every task's retry budget on
+    the upgrade - but nothing writes them any more.
+
+    `attempt=` stays, and stays deliberately. The worker reads it: a worker is
+    a container with no socket and no view of the host, and it derives its
+    branch name and its result filename from that number
+    (`docs/issue-contract.md` §5). The store holds a *stamp* of which attempt
+    each judgment was recorded at, never a second copy of the counter, so
+    there is exactly one authority for it and no sync problem to write.
     """
-    fields = [f"id={task_id}", f"attempt={attempt}"]
-    if blocker:
-        fields.append(f"blocker={blocker}")
-    if streak is not None:
-        fields.append(f"streak={streak}")
-    return f"<!-- apiary:task {' '.join(fields)} -->"
+    return f"<!-- apiary:task id={task_id} attempt={attempt} -->"
 
 
 def slugify(title: str, *, limit: int = MAX_ID_LENGTH) -> str:
@@ -822,11 +844,64 @@ def _adopt(client: GitHubClient, issue: Mapping[str, Any], task_id: str) -> None
     client.update_issue(int(issue["number"]), body=f"{marker}\n\n{body}" if body else marker)
 
 
+def _judgements(store: TaskStore | None) -> Mapping[TaskRef, TaskJudgement]:
+    """One read of apiary's own store, or nothing when there is none.
+
+    Read once per `load_ledger` for `Snapshot`'s reason: every entry wants its
+    own judgment, and a per-entry lookup would be one round trip per issue
+    against the backend this seam exists to make remote.
+
+    `None` means "this caller has no store", which is every caller that only
+    wants the tracker's own facts - `load_tasks`, the console, a dry read from
+    `__main__`. Those see the legacy marker fields, which is exactly what they
+    saw before #159. A caller that *consumes attempts* must pass one, and
+    `Reconciler` requires it rather than defaulting it.
+    """
+    return {} if store is None else store.read()
+
+
+def _judged(entry: LedgerEntry, judgement: TaskJudgement | None) -> LedgerEntry:
+    """Put apiary's own judgment onto an entry the tracker's facts built.
+
+    Three cases, and the third is the one worth writing down.
+
+    - **No judgment.** The store has never ruled on this task, so the marker's
+      legacy `blocker=`/`streak=` stand - already on `entry` from the parse.
+      That is the upgrade path, and it is read-through rather than a write:
+      seeding the store here would put a write inside a read, and it buys
+      nothing, because the first thing that consumes an attempt writes the
+      store and rewrites the marker without the legacy fields anyway.
+    - **A judgment about this attempt.** It wins outright. The store is
+      authoritative for the signature; the body is not, and after the first
+      bump the body does not carry one.
+    - **A judgment about a different attempt.** Somebody moved the counter
+      underneath it - a human resetting it after fixing the environment is the
+      workflow ADR 0002 quotes, and "GitHub wins, every cycle, on every
+      disagreement" is `orchestrator/reconcile.py`'s oldest rule. The counter
+      stands as the tracker has it and the *signature* is dropped, because a
+      signature is a statement about one attempt and this is no longer that
+      attempt. Downstream that reads as "no previous blocker" and falls back to
+      the pre-signature arithmetic, which is precisely what a human who reset a
+      counter is asking for. The renewal count survives: it is a history of the
+      task, not a claim about one attempt.
+    """
+    if judgement is None:
+        return entry
+    resolved = judgement if judgement.matches(entry.attempt) else judgement.stale()
+    return replace(
+        entry,
+        blocker=resolved.blocker,
+        streak=resolved.streak,
+        renewals=resolved.renewals,
+    )
+
+
 def load_ledger(
     source: GitHubClient | str,
     *,
     state: str = "all",
     adopt: bool = True,
+    store: TaskStore | None = None,
 ) -> Ledger:
     """Read the tracker and build the ledger.
 
@@ -838,8 +913,17 @@ def load_ledger(
     one bad hand-written issue cannot stop a cycle - but they are never
     dispatched either, because they are not in `entries`. Duplicate ids *do*
     abort: there is no safe reading of that one.
+
+    **Two sources, and they never overlap.** The tracker supplies everything a
+    task *is* - goal, files, verify command, dependencies, labels, the attempt
+    counter the worker reads - and `store` supplies the things apiary decided
+    about running it. Because the store holds only fields the tracker never had,
+    the join is an assignment rather than a reconciliation
+    (`docs/adr/0002-apiary-owns-a-thin-task-store.md`), and `_judged` is all of
+    it. `store=None` reads the tracker alone; see `_judgements`.
     """
     client = _as_client(source)
+    judged = _judgements(store)
     issues = sorted(client.list_issues(state=state), key=lambda issue: int(issue["number"]))
 
     entries: dict[str, LedgerEntry] = {}
@@ -892,6 +976,7 @@ def load_ledger(
             adopted=adopted,
             closed=(issue.get("state") or "open") != "open",
         )
+        entry = _judged(entry, judged.get(entry.ref))
         entries[task_id] = entry
         numbers[task_id] = number
         if adopted:

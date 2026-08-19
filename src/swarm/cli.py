@@ -638,6 +638,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     from .orchestrator.recovery import Recovery
     from .containers.manager import StackImages
     from .orchestrator.reconcile import InfrastructurePolicy, Reconciler
+    from .store import SqliteTaskStore
 
     run = attachment.run
     # Resolved once, and every collaborator gets the same object. `source` is a
@@ -693,6 +694,15 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     update_policy = UpdatePolicy.from_env()
     infrastructure_policy = InfrastructurePolicy.from_env()
     images = StackImages.from_env()
+    # Per *project*, not per run, and therefore opened here rather than inside
+    # `RunArtifacts`: the retry budget a task has spent is a fact about the
+    # project across every run against it, and a store that started empty each
+    # time would hand every task a fresh budget on every invocation - a retry
+    # bound that bounds nothing (#159). It is opened before the reconciler for
+    # the same reason the policies are read here: a store that cannot be
+    # trusted must stop the run *before* a container is spawned, and
+    # `SqliteTaskStore.open` raises rather than degrading to an empty one.
+    store = SqliteTaskStore.open(run.repo)
     if args.no_merge:
         print("» merge policy: --no-merge; every pull request waits for a human")
     else:
@@ -700,12 +710,14 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         print(f"» {update_policy.summary()}")
     print(f"» {infrastructure_policy.summary()}")
     print(f"» {images.summary()}")
+    print(f"» {store.summary()}")
     if args.no_goal_check:
         print("» goal gate: off; the run stops when the plan is exhausted")
 
     reconciler = Reconciler(
         run=run,
         client=github,
+        store=store,
         # A commit, never a branch: a worker branching from whatever main
         # happened to be would verify against a tree nobody planned for. Empty
         # here meant the worker was dispatched with no base at all.
@@ -717,7 +729,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         # exit 2 does not - never fire in a real run however well they are
         # tested.
         artifacts=artifacts.results_dir,
-        recovery=Recovery(client=github, run=run, dry_run=args.dry_run),
+        recovery=Recovery(client=github, run=run, store=store, dry_run=args.dry_run),
         merge_gate=not args.no_merge,
         merge_policy=merge_policy,
         update_policy=update_policy,
@@ -740,7 +752,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         dry_run=args.dry_run,
     )
 
-    with reaper.guard(), artifacts:
+    with reaper.guard(), artifacts, store:
         # Containers a previous process left behind hold clones and disk, and
         # their run ids would otherwise be counted against this run's cap.
         swept = reaper.startup()

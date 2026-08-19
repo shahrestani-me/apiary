@@ -33,6 +33,7 @@ the request count is the client's own and not a stub's.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from types import SimpleNamespace
@@ -83,9 +84,12 @@ from swarm.orchestrator.reconcile import (
 )
 from swarm.orchestrator.lifecycle import lifecycle_events
 from swarm.run import Run
+from swarm.store import STORE_DIR_ENV, SqliteTaskStore, TaskJudgement
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
+
+from fixtures.markers import legacy_marker
 
 REPO = "shahrestani-me/apiary"
 RUN_ID = "apiary-20260814-142530-k3f9qz"
@@ -96,6 +100,26 @@ BLOCKED = "swarm:blocked"
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def store_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every store this module opens lands under `tmp_path`.
+
+    Autouse and unconditional, because the failure it prevents is silent: a
+    test that forgot to redirect the root would open the *operator's* store at
+    `.swarm/store`, read a real project's retry budgets and write test
+    judgments into them. Nothing would fail; the next real run would simply
+    believe something untrue about its own history.
+    """
+    root = tmp_path / "store"
+    monkeypatch.setenv(STORE_DIR_ENV, str(root))
+    return root
+
+
+def task_store() -> SqliteTaskStore:
+    """This repository's store, under whatever `store_root` redirected to."""
+    return SqliteTaskStore.open(REPO)
 
 
 def entry(
@@ -362,6 +386,10 @@ def reconciler(client: Any, fleet: Any = None, **kwargs: Any) -> Reconciler:
     # every other test here would otherwise pay `DEFAULT_INTERVAL_S` per cycle
     # to assert something that has nothing to do with the clock.
     kwargs.setdefault("sleep", lambda _seconds: None)
+    # Required rather than defaulted on `Reconciler`, so this is the one place
+    # a test can forget it - and a forgotten store is a `TypeError` here rather
+    # than a run that silently forgets what it decided.
+    kwargs.setdefault("store", task_store())
     return Reconciler(
         run=Run.start(REPO, "reconcile the ledger", run_id=RUN_ID),
         client=client,
@@ -859,27 +887,36 @@ def test_a_retry_with_no_output_signs_as_the_sentinel_and_burns_down():
     assert (transition.blocker, transition.streak) == (EMPTY_SIGNATURE, 2)
 
 
-def test_the_signature_is_persisted_in_the_marker_before_the_relabel():
+def test_the_signature_is_persisted_in_the_store_before_the_relabel():
+    """Where #154-#156 wrote the signature into the issue body, #159 writes it
+    into apiary's own store. The ordering guarantee is the one that matters and
+    it is unchanged: the record lands before the label goes back to ready, so a
+    crash between the two costs an attempt with its signature intact."""
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    store = task_store()
     plan = plan_reconcile(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
         max_attempts=3,
     )
 
-    apply_plan(client, plan)
+    apply_plan(client, plan, store=store)
 
     sig = signature(SQLALCHEMY_TRACEBACK)
-    body_text = client.issues[4]["body"]
-    assert f"blocker={sig}" in body_text
-    assert "streak=1" in body_text
-    # §5's ordering, extended to the record that rides the same PATCH: the
-    # write lands before the label goes back to ready, so a crash between the
-    # two costs an attempt with its signature intact.
+    held = store.read()[ref(4)]
+    assert (held.attempt, held.blocker, held.streak) == (1, sig, 1)
+    # The judgment is durable before the counter is, and the counter before the
+    # label: `update_issue` is the counter's write, so the store's must precede
+    # a body that already carries the bump.
+    assert "attempt=1" in client.issues[4]["body"]
     assert client.log.index("update_issue #4") < client.log.index(f"+{READY} #4")
-    # And it round-trips: the next cycle's loader reads the record back.
+    # And it is nowhere near the customer's issue - that is the whole point of
+    # ADR 0002.
+    body_text = client.issues[4]["body"]
+    assert "blocker=" not in body_text
+    assert "streak=" not in body_text
     contract = parse_contract(4, body_text)
-    assert (contract.attempt, contract.blocker, contract.streak) == (1, sig, 1)
+    assert (contract.attempt, contract.blocker, contract.streak) == (1, "", None)
 
 
 def test_folding_a_signature_transition_updates_the_in_memory_ledger():
@@ -902,15 +939,42 @@ def test_folding_a_signature_transition_updates_the_in_memory_ledger():
 
 def test_a_counter_bump_without_a_signature_clears_the_stale_record():
     # checks, mergeability and recovery consume attempts through channels with
-    # no verify output to sign; rewriting the marker from their transitions
-    # clears the record, and the next failure is judged by the old arithmetic
-    # - the direction that can only give up early, never late (§5).
-    original = render_marker("task-4", 1, blocker="ab12cd34ef", streak=1)
+    # no verify output to sign; their transition carries no signature, so the
+    # store is written with none and the next failure is judged by the old
+    # arithmetic - the direction that can only give up early, never late (§5).
+    client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    store = task_store()
+    store.write(TaskJudgement(ref=ref(4), attempt=1, blocker="ab12cd34ef", streak=1))
+    plan = ReconcilePlan(
+        transitions=(
+            Transition(
+                ref=ref(4),
+                from_label=CLAIMED,
+                to_label=READY,
+                reason="a stale claim, with nothing to sign",
+                task_id="task-4",
+                attempt=2,
+            ),
+        )
+    )
+
+    apply_plan(client, plan, store=store)
+
+    held = store.read()[ref(4)]
+    assert (held.attempt, held.blocker, held.streak) == (2, "", None)
+
+
+def test_a_marker_still_carrying_an_older_builds_signature_sheds_it_on_the_next_bump():
+    # The upgrade path: the parse still reads `blocker=`/`streak=` so a live
+    # repository's budgets survive the change, and the first rewrite takes them
+    # out of the body for good.
+    original = legacy_marker("task-4", 1, blocker="ab12cd34ef", streak=1)
 
     updated = rewrite_marker(original, "task-4", 2)
 
     assert updated.splitlines()[0] == render_marker("task-4", 2)
     assert "blocker=" not in updated
+    assert "streak=" not in updated
 
 
 # --------------------------------------------------------------------------

@@ -108,6 +108,7 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `APIARY_CAPTURE` | unset (off) | Record every model call — the prompt, the raw response, Ollama's own load/total durations, and the real exception when one ends it. Off by default because a prompt carries whole file bodies from the repo under test. `swarm run` prints one line when it is on. `swarm console` turns it on for itself. |
 | `APIARY_CAPTURE_MAX_CHARS` | `8192` | Per-field truncation for captures written during a run. The SHA-256 always covers the full text, so a truncated record still answers "did the prompt change between attempt 1 and attempt 3?". Console captures are never truncated. |
 | `APIARY_CONSOLE_DIR` | `.swarm/console` | Where `swarm console` writes its captures. A sibling of the artifacts root with its own variable — moving runs does not silently move these. |
+| `APIARY_STORE_DIR` | `.swarm/store` | Where apiary keeps its own judgments about its own execution — one SQLite file per project holding each task's failure signature, its streak and how often its retry budget was renewed ([ADR 0002](docs/adr/0002-apiary-owns-a-thin-task-store.md)). Per *project*, not per run: a store that started empty each run would hand every task a fresh retry budget every time. A store that is corrupt or belongs to another project stops the run with a named fix rather than being recreated, because an empty store reads as "nothing has ever failed". |
 
 ## Seeing what the model was asked
 
