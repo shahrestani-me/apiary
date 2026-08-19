@@ -69,6 +69,26 @@ Wiring this in front of `checks.apply_checks` - one call, taking the plan #23
 computed and returning the subset that may actually land - is a change to
 `orchestrator/reconcile.py`, which is outside this ticket's file set too.
 
+**Where the `TaskRef` line falls in this module, and why there (#174).** Every
+collection here that names *tasks* is ref-typed: `MergeabilityPlan.held`,
+`MergeabilityReport.updated` and `.uncommented`, `Failure.ref`,
+`BranchUpdate.ref`, `UpdateBudget.rounds`, and the `states`/`files` maps
+`plan_mergeability` takes. Two ints remain and neither is a task identity in
+disguise: `Decision.number`, which exists to address the GitHub API and is the
+code-host half ADR 0001 says stays GitHub-shaped, and `Mergeability.number`,
+which is a *pull request's* number read off `GET /pulls/{n}`.
+
+The rule is therefore "a task is a ref; an API address is a number", not "plans
+are refs and reports are numbers" - `recovery.RecoveryPlan.held` and
+`reconcile.Failure` were already on that side of it, and this module now agrees
+with them. `checks.py`'s own report surface - `Failure.number`,
+`ChecksReport.merged`, `.uncommented`, `ChecksPlan.escalated` - has *not* been
+moved, and that is the one place the line is drawn by scope rather than by the
+rule: those feed `ChecksReport.merge_commits` and `lifecycle.py`'s
+issue-numbered index, which #174 explicitly left to the follow-up. Anyone
+finishing that migration should expect this paragraph to lose its last
+sentence.
+
 Manual dry run against a real repo - reads only, updates nothing, merges
 nothing, writes nothing:
 
@@ -447,10 +467,9 @@ class Decision:
     going ahead this cycle.
     """
 
-    #: The issue this row is about, as GitHub numbers it: what
-    #: `apply_mergeability` addresses the comment API with, what `Failure` and
-    #: `MergeabilityPlan.held` print. ADR 0001's code-host half, which stays
-    #: GitHub-shaped.
+    #: The issue this row is about, as GitHub numbers it. Its one remaining job
+    #: is addressing the API: `apply_mergeability` posts this cycle's comment
+    #: with it. ADR 0001's code-host half, which stays GitHub-shaped.
     #:
     #: **`ref` below is the half that joins.** `_admit` matches these rows
     #: against `checks.Outcome`s to subtract the merges this gate is holding,
@@ -513,9 +532,14 @@ class MergeabilityPlan:
         return tuple(d.transition for d in self.decisions if d.transition is not None)
 
     @property
-    def held(self) -> tuple[int, ...]:
-        """Issues whose merge #23 planned and this cycle did not allow."""
-        return tuple(d.number for d in self.decisions if d.held)
+    def held(self) -> tuple[TaskRef, ...]:
+        """Tasks whose merge #23 planned and this cycle did not allow.
+
+        Ref-typed like `recovery.RecoveryPlan.held`, which is the other "what
+        this pass would not touch" collection in the orchestrator and was
+        already keyed this way. `str(ref)` is the adapter's spelling, so the
+        printed line is unchanged."""
+        return tuple(d.ref for d in self.decisions if d.held)
 
     @property
     def merges(self) -> tuple[Merge, ...]:
@@ -533,7 +557,7 @@ class MergeabilityPlan:
             f"{len(self.transitions)} transition(s)",
         ]
         if self.held:
-            parts.append("held: " + ", ".join(f"#{n}" for n in self.held))
+            parts.append("held: " + ", ".join(str(ref) for ref in self.held))
         if self.blind:
             parts.append("mergeability unreadable - nothing merged")
         return ", ".join(parts)
@@ -582,10 +606,13 @@ def plan_mergeability(
     """
     rules = policy or UpdatePolicy()
     spent = budget if budget is not None else UpdateBudget(cap=rules.max_update_rounds)
-    # `Ledger.by_ref` is the ledger's own ref index, and this module used to
-    # build a second one keyed on `entry.number` beside it (#174). Two indexes of
-    # one mapping is two things to keep in step, and the private one was the half
-    # that failed open.
+    # Still a private index - what changed is where its *keys* come from
+    # (#174). It used to be built independently, `{entry.number: entry}`, which
+    # is a second opinion about task identity that nothing keeps in step with
+    # the ledger's own; it is now derived from `Ledger.by_ref`, so the key
+    # vocabulary is the ledger's by construction and cannot drift from it. The
+    # local mapping remains because `by_ref` holds task ids and the loop below
+    # wants entries.
     entries = {ref: ledger.entries[task_id] for ref, task_id in ledger.by_ref.items()}
     seen = states or {}
     blind = checks.blind or states is None

@@ -394,7 +394,7 @@ def test_a_green_pull_request_behind_its_base_is_updated_and_not_merged():
     # The headline. "Checks passed on a stale base" is not mergeable, however
     # green the pull request looks, because nothing verified it against this base.
     assert plan.merges == ()
-    assert plan.held == (23,)
+    assert plan.held == (task_ref(23),)
     assert [str(u) for u in plan.updates] == [
         f"#23: update PR #101 ({branch(23)}) from main, round 1 of 3"
     ]
@@ -442,7 +442,7 @@ def test_two_green_pull_requests_merge_one_at_a_time():
     # Merging both would leave the second one stale the instant the first landed,
     # which under a strict status policy means it cannot merge at all.
     assert [m.number for m in plan.merges] == [23]
-    assert plan.held == (24,)
+    assert plan.held == (task_ref(24),)
     # Held is not failed: #24 is fine and goes next cycle.
     assert plan.transitions == ()
     assert task_ref(24) not in [t.ref for t in plan.admitted.transitions]
@@ -463,7 +463,7 @@ def test_the_pull_request_closest_to_starving_gets_the_merge_slot():
     # being given up on. Serving it first is what keeps the cap a bound nothing
     # normally reaches rather than the queue's natural end state.
     assert [m.number for m in plan.merges] == [24]
-    assert plan.held == (23,)
+    assert plan.held == (task_ref(23),)
 
 
 def test_a_repository_without_a_strict_policy_can_merge_more_than_one():
@@ -998,7 +998,7 @@ def test_one_pass_updates_the_stale_one_and_lets_the_fresh_one_through():
     # only make that update stale again.
     assert [m.number for m in report.plan.merges] == [23]
     assert client.updated == []
-    assert report.plan.held == (24,)
+    assert report.plan.held == (task_ref(24),)
 
 
 def test_one_pass_costs_one_pull_request_read_per_review_issue_and_nothing_else():

@@ -1405,10 +1405,21 @@ class CycleReport:
     replanned: Any | None = None
     #: `goal.GoalReport`, set only on the cycle where the ledger ran dry.
     goal: Any | None = None
-    #: A `DependencyCycleError` - the one readiness failure that aborts a pass
-    #: rather than joining its errors. Recorded rather than raised so the loop
-    #: reports it every cycle until a human breaks the ring, instead of the run
-    #: dying and taking its containers with it.
+    #: The one fault a cycle records instead of raising. Two reach it: a
+    #: `DependencyCycleError` from readiness - the one readiness failure that
+    #: aborts a pass rather than joining its errors - and a
+    #: `checks.UnresolvedJoin` from the merge gate (#174).
+    #:
+    #: Recorded rather than raised so the loop reports it every cycle until a
+    #: human fixes it, instead of the run dying and taking its containers with
+    #: it. For the merge gate there is a second reason: it runs after this
+    #: cycle's labels are already written, so an escape would lose the report
+    #: that says they were.
+    #:
+    #: **Set means this cycle dispatched nothing.** Readiness and dispatch are
+    #: skipped, because both faults say the same thing - the machinery that
+    #: decides what may land is not answering, and adding work to a queue that
+    #: cannot drain is how a stuck run goes on looking busy.
     cycle_error: str = ""
     live: int = 0
 
@@ -1716,9 +1727,10 @@ class Reconciler:
         # against what it is landing on. `plan.admitted` is what survives.
         mergeability = None
         checks = None
+        cycle_error = ""
         check_runs: dict[TaskRef, Any] = {}
         if self.merge_gate:
-            from .checks import apply_checks, plan_checks, read_checks
+            from .checks import UnresolvedJoin, apply_checks, plan_checks, read_checks
             from .mergeability import run_mergeability
 
             if pulls is not None:
@@ -1726,62 +1738,87 @@ class Reconciler:
                     pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
                     if pull is not None:
                         check_runs[entry.ref] = read_checks(snapshot, pull.ref)
-            checks_plan = plan_checks(
-                ledger,
-                pulls=pulls,
-                checks=check_runs,
-                # Without this the whole `MergePolicy` is whatever the dataclass
-                # defaults to, and `APIARY_MERGE_ADMIN_OVERRIDE=0` - the one
-                # setting that decides whether a human presses merge - silently
-                # does nothing.
-                policy=self.merge_policy,
-                max_attempts=self.max_attempts,
-            )
-            mergeability = run_mergeability(
-                snapshot,
-                ledger,
-                checks_plan,
-                pulls=pulls,
-                policy=self.update_policy,
-                budget=self.update_budget,
-                max_attempts=self.max_attempts,
-                # Both gates consume attempts of their own - a PR that will not
-                # rebase, a check run that failed - so both need somewhere to
-                # record the judgment that goes with the counter they bump.
-                store=self.store,
-                dry_run=self.dry_run,
-            )
-            checks = apply_checks(
-                snapshot, mergeability.plan.admitted, store=self.store, dry_run=self.dry_run
-            )
-            ledger = fold(ledger, checks.applied)
+            try:
+                checks_plan = plan_checks(
+                    ledger,
+                    pulls=pulls,
+                    checks=check_runs,
+                    # Without this the whole `MergePolicy` is whatever the
+                    # dataclass defaults to, and `APIARY_MERGE_ADMIN_OVERRIDE=0`
+                    # - the one setting that decides whether a human presses
+                    # merge - silently does nothing.
+                    policy=self.merge_policy,
+                    max_attempts=self.max_attempts,
+                )
+                mergeability = run_mergeability(
+                    snapshot,
+                    ledger,
+                    checks_plan,
+                    pulls=pulls,
+                    policy=self.update_policy,
+                    budget=self.update_budget,
+                    max_attempts=self.max_attempts,
+                    # Both gates consume attempts of their own - a PR that will
+                    # not rebase, a check run that failed - so both need
+                    # somewhere to record the judgment that goes with the
+                    # counter they bump.
+                    store=self.store,
+                    dry_run=self.dry_run,
+                )
+                checks = apply_checks(
+                    snapshot, mergeability.plan.admitted, store=self.store, dry_run=self.dry_run
+                )
+            except UnresolvedJoin as exc:
+                # Recorded rather than allowed to escape, for
+                # `DependencyCycleError`'s reason and one more of its own.
+                #
+                # This gate runs *after* `apply_plan` wrote this cycle's labels
+                # and after the recovery sweep. An exception leaving `cycle`
+                # here is thrown before `CycleReport` exists, so `on_cycle`
+                # never fires and the run directory never learns that those
+                # writes happened - a loud failure that erases its own
+                # evidence, which is a strange thing for #174 of all tickets to
+                # ship. It also takes the fleet's containers with it.
+                #
+                # Nothing of this gate's own is lost by catching it: the join
+                # fails while the plan is still being *computed*, so no merge
+                # was issued and no label of this gate's was written.
+                # `mergeability` and `checks` stay `None`, which is the same
+                # shape a cycle with the gate switched off reports, and the
+                # ledger is left unfolded because there is nothing to fold.
+                mergeability = None
+                checks = None
+                cycle_error = str(exc)
+                print(f"! the merge gate could not resolve a join: {exc}", file=sys.stderr)
+            else:
+                ledger = fold(ledger, checks.applied)
 
         readiness: ReadinessPlan | None = None
         dispatched: DispatchReport | None = None
-        cycle_error = ""
-        try:
-            readiness = apply_readiness(
-                snapshot,  # type: ignore[arg-type]
-                ledger=ledger,
-                dry_run=self.dry_run,
-            )
-        except DependencyCycleError as exc:
-            # Nothing was written - readiness detects the ring before its first
-            # call - and dispatching over an unresolved graph would run work
-            # whose prerequisites can never land.
-            cycle_error = str(exc)
-        else:
-            if self.fleet is not None:
-                dispatched = dispatch(
-                    snapshot,
-                    self.fleet,
-                    ledger,
-                    self.base_commit,
-                    capacity=self.capacity,
-                    ready=readiness.ready,
+        if not cycle_error:
+            try:
+                readiness = apply_readiness(
+                    snapshot,  # type: ignore[arg-type]
+                    ledger=ledger,
                     dry_run=self.dry_run,
-                    images=self.images,
                 )
+            except DependencyCycleError as exc:
+                # Nothing was written - readiness detects the ring before its
+                # first call - and dispatching over an unresolved graph would
+                # run work whose prerequisites can never land.
+                cycle_error = str(exc)
+            else:
+                if self.fleet is not None:
+                    dispatched = dispatch(
+                        snapshot,
+                        self.fleet,
+                        ledger,
+                        self.base_commit,
+                        capacity=self.capacity,
+                        ready=readiness.ready,
+                        dry_run=self.dry_run,
+                        images=self.images,
+                    )
 
         report = CycleReport(
             index=index,

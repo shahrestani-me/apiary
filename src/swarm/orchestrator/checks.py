@@ -250,10 +250,21 @@ class UnresolvedJoin(RuntimeError):
       it never inspected. The module's entire purpose, switched off with no log
       line saying so.
 
-    So the miss raises. That aborts the cycle - loud, recoverable, and what a
-    wiring bug deserves - where both fail-open alternatives write a label
-    nobody afterwards can tell from a real one. #174 is the ticket; #142 is why
-    the shape recurs, because a `dict.get` default is how a retype ships green.
+    So the miss raises, where both fail-open alternatives write a label nobody
+    afterwards can tell from a real one. #174 is the ticket; #142 is why the
+    shape recurs, because a `dict.get` default is how a retype ships green.
+
+    **Raised here, recorded by the caller.** `Reconciler.cycle` catches this
+    one and puts it on `CycleReport.cycle_error`, exactly as it does a
+    `DependencyCycleError`, and skips dispatch for the cycle. That is not the
+    catch these gates exist to prevent - it is the opposite. The merge gate
+    runs *after* a cycle's labels are written, so an exception escaping `cycle`
+    would be thrown before `CycleReport` exists: `on_cycle` would never fire
+    and the run directory would never learn that those writes happened. A loud
+    failure that erases its own evidence is not an improvement on a silent one.
+    So the rule is that this must never be *defaulted*, not that it must never
+    be handled - which is also what #174's acceptance criterion asks for:
+    "raises **or** is explicitly handled".
 
     **`RuntimeError`, deliberately not `LookupError`.** The failure it reports
     *is* a failed lookup, so `LookupError` reads as the natural base - and that
@@ -776,11 +787,21 @@ def plan_checks(
     **`checks` must carry every issue this loop reaches, and a miss raises.**
     The caller reads a check set for exactly the entries selected below - in
     `swarm:review`, with an open pull request - so the two sets are the same set
-    or somebody has broken the wiring. There is no default to fall back on:
-    `CheckSet()` reads as `EMPTY`, and `EMPTY` past its grace period escalates
-    the issue to `swarm:failed`. That is `UnresolvedJoin`'s first bullet and
-    #174's headline - a healthy task marked as needing a human because its
-    check runs could not be looked up.
+    or somebody has broken the wiring.
+
+    The default this replaced was `CheckSet()`, which reads as `EMPTY`, and
+    `EMPTY` past its grace period escalates the issue to `swarm:failed` - #174's
+    headline, a healthy task marked as needing a human because its check runs
+    could not be looked up. A *neutral* stand-in does exist in the type, and it
+    is worth saying why it is not used: `CheckSet(unreadable=True)` reads as
+    `PENDING`, which is what `read_checks` returns when GitHub could not be
+    asked, and it escalates nothing. But it is the right answer to a different
+    question. "GitHub did not answer" is a fact about this cycle that the next
+    cycle re-reads; "the map I was handed has no key for this task" is a fact
+    about the code, and mapping it to `PENDING` parks the task in
+    `swarm:review` every cycle for the rest of the run with nothing anywhere
+    saying why. That is the same disease as the escalation, only quieter - so
+    the miss is raised and `Reconciler.cycle` records it where a human sees it.
 
     Issues with no open PR are skipped rather than decided: that is #22's row -
     it reads a `swarm:review` issue whose branch has no open PR as a PR closed
