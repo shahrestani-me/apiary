@@ -96,6 +96,48 @@ from .nodes.planner import plan_node
 from .run import Attachment, RunError, start_run
 
 
+# `swarm local`'s help is the place a user chooses this runner, so it is the
+# place its missing capabilities are named. The command reads as a convenience
+# ("a local checkout, no GitHub") and is in fact the one path that executes
+# model-written code outside every defence `docs/security.md` argues for; a
+# help string that says only "no GitHub" sells a security decision as a
+# networking one.
+LOCAL_DESCRIPTION = """\
+The v1 graph against a local checkout: worktrees instead of issues, merges
+instead of pull requests, host Ollama, no GitHub.
+
+It is also the runner with no sandbox. `swarm run` executes model-written code
+inside a container on a filtered network, and judges it on neutral ground in
+CI. This command runs the verify command through a shell on this machine, in a
+worktree of code a model has just written, with this shell's environment and
+its network. None of docs/security.md applies to it.\
+"""
+
+LOCAL_CAPABILITIES = """\
+what this runner gives up, against `swarm run`:
+
+                          swarm run    swarm local
+    container sandbox     yes          no
+    egress policy         yes          no
+    pull request + CI     yes          no
+    merge queue           yes          no
+
+Run it only against a repository, and on a machine, you would let an untrusted
+script loose in - and pass --unsandboxed to say that you have. See
+docs/security.md, "7. The local runner is outside all of it".\
+"""
+
+# The one sentence `--unsandboxed` exists to make somebody read. Kept next to
+# the help text it repeats so the two cannot drift.
+LOCAL_REFUSAL = (
+    "swarm local has no sandbox: it runs the verify command through a shell on "
+    "this host, in a worktree of model-written code, with this shell's "
+    "environment and its network. No container, no egress filter, no CI gate. "
+    "Pass --unsandboxed to accept that, or use `swarm run` for the sandboxed "
+    "path (docs/security.md, section 7)."
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="swarm")
     # Subcommands from the start, even with one of them: #29 adds `swarm runs`
@@ -214,12 +256,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     local = sub.add_parser(
         "local",
-        help="run the v1 graph against a local checkout: worktrees + host Ollama, no GitHub",
+        help=("run against a local checkout with no sandbox: model-written code "
+              "is executed on this host, unconfined (needs --unsandboxed)"),
+        description=LOCAL_DESCRIPTION,
+        epilog=LOCAL_CAPABILITIES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     local.add_argument(
         "--repo",
         required=True,
         help="path to a local git repository (created and initialised if missing)",
+    )
+    local.add_argument(
+        "--unsandboxed",
+        action="store_true",
+        help="accept that this run has no container, no egress filter and no CI "
+             "gate; without it the command refuses to start",
     )
     local.add_argument(
         "--objective",
@@ -422,7 +474,22 @@ def _local(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     `object.__setattr__` - one documented mutation at the one entrypoint that
     owns the run, not a pattern. The alternative (reloading `config` and every
     module that imported from it) breaks whichever module reloaded first.
+
+    **And it is unsandboxed.** `nodes/verifier.py` runs `verify_command` with
+    `shell=True` on this host, in a worktree the model has just written into -
+    so the whole of `docs/security.md` (container, egress filter, scrubbed
+    verify environment, CI on neutral ground) is absent here, not weakened.
+    That is a legitimate thing to want on a machine you are willing to spend,
+    and it is not a thing anyone should get by reaching for the convenient
+    subcommand: `--unsandboxed` is refused-by-default rather than
+    warned-about, because a warning printed after the run has started is read
+    once the code has already executed.
     """
+    if not args.unsandboxed:
+        # A `ConfigError` is a `ValueError`, so `main`'s handler renders this
+        # as one line and exit 1, the same as every other precondition.
+        raise ConfigError(LOCAL_REFUSAL)
+
     objective = _text(args.objective, "--objective", parser)
     repo = ensure_local_repo(Path(args.repo))
     object.__setattr__(SETTINGS, "repo_path", str(repo))
@@ -435,6 +502,9 @@ def _local(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     print(f"» local run  repo {repo}  verify: {SETTINGS.verify_command}")
     print("» no GitHub: worktrees instead of issues, merges instead of pull requests")
+    print("! unsandboxed: the verify command runs on this host, in a worktree of "
+          "model-written code, with no container and no egress filter",
+          file=sys.stderr)
     graph = build_graph()
     seen = 0
     final: dict = {}

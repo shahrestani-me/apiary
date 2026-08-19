@@ -26,6 +26,11 @@ unrelated repo" true; the egress filter is what makes "and nothing else at all"
 true; and neither says anything about the third row, which is why token
 *handling* gets as much of this document as token *scoping*.
 
+**All of it describes `swarm run`.** The other runner, `swarm local`, has none
+of these four layers — it executes model-written code on the host, unconfined,
+and no part of this document is true of it. §7 says what that means, and what
+the command now does about saying so itself.
+
 ---
 
 ## 1. The token
@@ -466,6 +471,61 @@ to `docker`, `Dockerfile` installs only git, and `DOCKER_HOST` is useless withou
 a binary to honour it. That is #21's Dockerfile change, not this ticket's, but it
 is the first thing to hit when the socket proxy is first exercised end to end.
 
+
+---
+
+## 7. The local runner is outside all of it
+
+`swarm local` is a second runner over the same repository, and everything above
+is absent from it — not weakened, absent.
+
+| | `swarm run` | `swarm local` |
+|---|---|---|
+| Container sandbox | yes | **no** |
+| Egress policy | yes | **no** |
+| Scrubbed verify environment | yes | **no** |
+| Pull request and CI gate | yes | **no** |
+| Merge queue | yes | **no** |
+
+It builds the v1 LangGraph pipeline (`graph.py`) rather than the v2 reconcile
+loop, and that pipeline reaches none of `containers/`, `worker/pr.py`,
+`orchestrator/checks.py`, `orchestrator/mergeability.py` or `security.py`. The
+verify command ends up in `nodes/verifier.py`, which is:
+
+```python
+subprocess.run(SETTINGS.verify_command, shell=True, cwd=worktree, ...)
+```
+
+A shell, on this host, in a worktree a model has just written into, inheriting
+the invoking shell's environment. §2's token handling, §3's allowlist and §3's
+`verify_env` filter are all somewhere else. Whatever the model wrote runs with
+everything the person who typed the command has, including a `GITHUB_TOKEN`
+that happens to be exported — nothing on this path filters an environment,
+because there is no container boundary for one to be filtered across.
+
+That is not a defect in the local runner. It is what "worktrees and host Ollama,
+no GitHub" means once it is said in capability terms instead of convenience
+ones — and saying it the convenient way was the defect, because
+`docs/architecture-v2.md`'s third constraint ("a worker container executes
+LLM-generated code") is the entire reason the other four sections exist.
+
+**So the runner declares it** — [ADR 0003](adr/0003-orchestration-framework-is-a-detail.md)'s
+decision 4, a runner declares its capabilities and the choice is presented in
+those terms. `swarm local` refuses to start without
+`--unsandboxed`; its `--help` carries the table above; and the run repeats one
+sentence of it on stderr as it starts. The flag turns nothing off — there is no
+sandbox for it to disable — and it grants nothing. It exists so that nobody
+arrives on this path without having read one line saying what the path is.
+
+**What it is still for.** A throwaway repository, on a machine and in a shell
+you are willing to spend: the case it was built for, which was GitHub being
+down or a network not being wanted. What it is not for is a checkout whose
+contents matter, a shell holding credentials, or an objective written by
+someone other than the person running it.
+
+Whether the local runner remains supported at all is a separate question, and
+open — ADR 0003 leaves it with the maintainer under "Still open". This section
+is what holds while it does exist.
 
 ## The boot key
 

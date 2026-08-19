@@ -1313,3 +1313,73 @@ def test_the_local_subcommand_parses_and_helps():
 
     assert probe.returncode == 0, probe.stderr
     assert "--max-rounds" in probe.stdout
+
+
+def test_the_local_help_names_the_capability_it_gives_up():
+    """The help is where a runner is chosen, so it is where the missing
+    sandbox is stated - not in a document the chooser has no reason to open.
+
+    The assertions are on the capabilities by name rather than on prose,
+    because the prose is allowed to be rewritten and the four rows are not.
+    """
+    import subprocess
+    import sys
+
+    probe = subprocess.run([sys.executable, "-m", "swarm.cli", "local", "--help"],
+                           capture_output=True, text=True, timeout=30)
+
+    assert probe.returncode == 0, probe.stderr
+    help_text = probe.stdout.lower()
+    for capability in ("container sandbox", "egress policy",
+                       "pull request + ci", "merge queue"):
+        assert capability in help_text, capability
+    assert "--unsandboxed" in help_text
+    # And the top-line help, which is all `swarm --help` shows.
+    top = subprocess.run([sys.executable, "-m", "swarm.cli", "--help"],
+                         capture_output=True, text=True, timeout=30)
+    assert "no sandbox" in top.stdout.lower(), top.stdout
+
+
+def test_local_refuses_to_start_without_the_unsandboxed_flag(tmp_path, capsys):
+    """The gate is a refusal rather than a warning: a warning is read after
+    the model's code has already run, which is the moment it stops helping.
+
+    `--repo` names a directory that does not exist, so reaching
+    `ensure_local_repo` would create it - and the absence of that directory is
+    the assertion that nothing ran.
+    """
+    target = tmp_path / "never-created"
+
+    code = main(["local", "--repo", str(target), "--objective", "anything"])
+
+    assert code == 1
+    assert not target.exists()
+    err = capsys.readouterr().err
+    assert "--unsandboxed" in err
+    assert "no sandbox" in err.lower()
+
+
+def test_the_flag_is_the_only_thing_in_front_of_a_local_run(tmp_path, monkeypatch):
+    """Passing it gets straight to the run, so the gate cannot quietly become
+    a second precondition that refuses for some unrelated reason."""
+    reached = []
+
+    def _sentinel(path):
+        reached.append(path)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(cli, "ensure_local_repo", _sentinel)
+
+    with pytest.raises(RuntimeError, match="stop here"):
+        cli._local(
+            argparse.Namespace(
+                unsandboxed=True,
+                repo=str(tmp_path / "demo"),
+                objective="anything",
+                verify=None,
+                max_rounds=None,
+            ),
+            cli.build_parser(),
+        )
+
+    assert reached
