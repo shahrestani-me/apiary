@@ -41,6 +41,7 @@ import pytest
 
 from fixtures.github import SentRequest, not_modified, page, response
 from swarm.containers.manager import DockerError, Handle
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import (
     ContractError,
@@ -894,7 +895,7 @@ def test_a_pull_request_closed_without_merging_returns_the_issue_to_the_pool():
 def test_an_open_pull_request_is_left_alone():
     plan = plan_reconcile(
         ledger(entry(4, label=REVIEW)),
-        open_branches=frozenset({"swarm/issue-4"}),
+        open_branches=frozenset({task_branch(ref(4), 0)}),
     )
 
     assert plan.transitions == ()
@@ -903,7 +904,7 @@ def test_an_open_pull_request_is_left_alone():
 def test_a_published_workers_container_is_disposed_without_waiting_for_the_merge():
     plan = plan_reconcile(
         ledger(entry(4, label=REVIEW)),
-        open_branches=frozenset({"swarm/issue-4"}),
+        open_branches=frozenset({task_branch(ref(4), 0)}),
         results={ref(4): record(4, 0)},
         running=[ref(4)],
     )
@@ -1335,20 +1336,20 @@ def test_a_reconciler_holds_nothing_a_restart_would_need(fake_github):
 
 
 def test_the_snapshot_falls_through_to_the_client_for_anything_it_does_not_shape():
-    client = PullAwareClient(issues={4: issue_payload(4)}, open_pulls=("swarm/issue-4",))
+    client = PullAwareClient(issues={4: issue_payload(4)}, open_pulls=(task_branch(ref(4), 0),))
     snapshot = Snapshot(client)
 
     # The probe for a method the client has not grown yet must see the client's
     # own answer. A wrapper that answered for it would turn a method that is
     # merely missing into one that can never be found.
-    assert snapshot.open_branches() == frozenset({"swarm/issue-4"})
+    assert snapshot.open_branches() == frozenset({task_branch(ref(4), 0)})
     with pytest.raises(AttributeError):
         getattr(snapshot, COMMENT_METHOD)
 
     # The listing is wrapped rather than delegated, so a cycle's collaborators
     # share one read - but the wrapper exists only because this client does
     # have the method, and it answers with the client's own data.
-    assert [p["head"]["ref"] for p in getattr(snapshot, PULLS_METHOD)()] == ["swarm/issue-4"]
+    assert [p["head"]["ref"] for p in getattr(snapshot, PULLS_METHOD)()] == [task_branch(ref(4), 0)]
 
 
 def test_a_client_that_cannot_list_pull_requests_still_cannot():
@@ -1875,7 +1876,7 @@ def names(seen: Iterable[tuple[str, dict[str, Any]]]) -> list[str]:
 #: against a number that cannot also be an attempt, an exit code or a PR.
 TASK_ISSUE = 4242
 TASK_REF = f"task-{TASK_ISSUE}"
-TASK_BRANCH = f"swarm/issue-{TASK_ISSUE}"
+TASK_BRANCH = task_branch(ref(TASK_ISSUE), 0)
 TASK_PULL = 900
 
 
@@ -1895,10 +1896,17 @@ def a_lifecycle_run(label: str = READY) -> tuple[LifecycleClient, FakeFleet, Rec
     return client, fleet, reconciler(client, fleet, events=emit), seen
 
 
-def reaches_review(client: LifecycleClient, fleet: FakeFleet, checks: list) -> None:
-    """The worker finished: it moved its own label (#17) and left an open PR."""
+def reaches_review(
+    client: LifecycleClient, fleet: FakeFleet, checks: list, *, attempt: int = 0
+) -> None:
+    """The worker finished: it moved its own label (#17) and left an open PR.
+
+    `attempt` names the branch the worker pushed, because #144 gives each
+    attempt its own (`apiary/<ref>-attempt-<n>`). A caller driving a second
+    attempt has to say so, exactly as a real second worker would.
+    """
     client.issues[TASK_ISSUE]["labels"] = [{"name": REVIEW}]
-    client.open_pulls = ((TASK_PULL, TASK_BRANCH),)
+    client.open_pulls = ((TASK_PULL, task_branch(ref(TASK_ISSUE), attempt)),)
     client.check_runs = {client.head_of(TASK_PULL): checks}
     fleet.handles.clear()
 
@@ -2232,13 +2240,16 @@ def test_a_malformed_issue_reaching_a_human_is_deliberately_not_announced():
 
 def test_a_reason_that_quoted_a_branch_is_rewritten_into_the_task_ref():
     """The one place the label vocabulary leaks into prose: the merge gate's
-    "no check run was ever created for swarm/issue-12" names a branch, and a
-    branch is an issue number."""
+    "no check run was ever created for <branch>" names a branch, and for this
+    adapter a branch carries an issue number (#144 encodes `#4` as `%234`)."""
     failed = Transition(
         ref=ref(4),
         from_label=REVIEW,
         to_label=FAILED,
-        reason=f"no check run was ever created for swarm/issue-4; move it back to {READY}",
+        reason=(
+            f"no check run was ever created for {task_branch(ref(4), 0)}; "
+            f"move it back to {READY}"
+        ),
         task_id="task-4",
     )
 
@@ -2289,16 +2300,16 @@ def test_a_check_name_is_announced_verbatim(tmp_path):
     A check name is written by whoever wrote the target repository's workflow.
     It cannot carry an apiary issue number, and it is precisely the string a
     reader pastes into the CI UI - so it is not scrubbed, and a repository with
-    a check called `swarm/issue-4242` sees that name and not a task ref.
+    a check named exactly like a worker branch sees that name and not a task ref.
     """
     client, fleet, loop, seen = a_lifecycle_run()
     loop.artifacts = tmp_path
     loop.cycle()
-    reaches_review(client, fleet, pending(f"swarm/issue-{TASK_ISSUE}"))
+    reaches_review(client, fleet, pending(TASK_BRANCH))
     loop.cycle()
 
     checks = [f["check"] for name, f in seen if name == "pr.checks"]
-    assert checks == [f"swarm/issue-{TASK_ISSUE}"]
+    assert checks == [TASK_BRANCH]
 
 
 def test_a_check_set_that_moved_is_announced_again(tmp_path):
@@ -2319,19 +2330,20 @@ def test_a_check_set_that_moved_is_announced_again(tmp_path):
 
 
 def test_a_retry_pushing_a_new_head_gets_its_own_check_announcements(tmp_path):
-    """The worker reuses the pull request it already opened (`worker/pr.py`), so
-    one PR number cycles pending -> failing -> pending across attempts. A key
-    without the head sha would announce the first attempt's gate and silently
-    swallow every later one."""
+    """One task's gate can report twice, and the second report must not be
+    swallowed by the first. #144 changed how the second attempt gets there - it
+    pushes `apiary/<ref>-attempt-1` and opens its own pull request rather than
+    force-pushing the one attempt 0 opened - but the announcement key is what is
+    under test, and a key without the head sha would announce the first
+    attempt's gate and silently swallow every later one."""
     client, fleet, loop, seen = a_lifecycle_run()
     loop.artifacts = tmp_path
     loop.cycle()
     reaches_review(client, fleet, failing())
     loop.cycle()
-    # Attempt two, same pull request, new head.
-    # The gate consumed an attempt and sent it back to `swarm:ready`; the next
-    # worker re-published onto the pull request it already had.
-    client.issues[TASK_ISSUE]["labels"] = [{"name": REVIEW}]
+    # Attempt two: the gate consumed an attempt and sent the issue back to
+    # `swarm:ready`, and the next worker published from the attempt-1 branch.
+    reaches_review(client, fleet, failing(), attempt=1)
     client.heads[TASK_PULL] = "b" * 40
     client.check_runs = {"b" * 40: failing()}
     loop.cycle()

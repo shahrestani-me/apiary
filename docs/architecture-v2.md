@@ -140,7 +140,7 @@ runs it again on neutral ground.
 
 ```
 create (labeled apiary.run=<id>, apiary.issue=<n>)
-  → clone repo at base commit, checkout swarm/issue-<n>
+  → clone repo at base commit, checkout apiary/<ref>-attempt-<n>
   → read issue contract
   → edit loop against host Ollama
   → run Verify command

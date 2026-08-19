@@ -46,6 +46,7 @@ from swarm.containers.manager import (
     Handle,
     Limits,
 )
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
 from swarm.github.readiness import BLOCKED, READY, IssueState
@@ -57,8 +58,10 @@ from swarm.orchestrator.recovery import (
     Recovery,
     RecoveryPlan,
     holders,
+    in_flight,
     live_runs,
     plan_recovery,
+    unrecognised,
 )
 from swarm.run import RUN_LABEL, Run
 
@@ -90,6 +93,15 @@ def entry(number: int, *, label: str = CLAIMED, attempt: int = 0) -> LedgerEntry
         state_label=label,
         labels=frozenset({label}),
     )
+
+
+def branch(number: int, attempt: int = 0) -> str:
+    """The head ref a worker for `(number, attempt)` pushed - built, not spelled.
+
+    Spelling it out would make these tests assert the encoding rather than the
+    behaviour, and the encoding is `test_branches.py`'s subject.
+    """
+    return task_branch(ref(number), attempt)
 
 
 def ledger(*entries: LedgerEntry, **kwargs: Any) -> Ledger:
@@ -391,14 +403,79 @@ def test_without_a_run_of_its_own_only_declared_runs_are_live():
 
 
 # --------------------------------------------------------------------------
+# What the branch names alone say (#144)
+# --------------------------------------------------------------------------
+
+
+def test_in_flight_reconstructs_tasks_and_attempts_from_branch_names_alone():
+    """ADR 0001's promise, with nothing else in the room: no ledger, no label,
+    no local memory - a list of names off a remote, and the pairs come back."""
+    found = in_flight([branch(4, 0), branch(7, 2), "main"])
+
+    assert {ref: found[ref].attempt for ref in found} == {ref(4): 0, ref(7): 2}
+
+
+def test_the_furthest_attempt_wins_because_a_task_owns_one_branch_per_attempt():
+    """A retry is a new branch (#144), so a ref legitimately owns several and
+    only the newest speaks for where the task is now. An older attempt's branch
+    outliving its pull request is history, not a contradiction to resolve."""
+    found = in_flight([branch(4, 2), branch(4, 0), branch(4, 1)])
+
+    assert found[ref(4)].attempt == 2
+
+
+def test_branches_from_before_this_ticket_are_reported_rather_than_parsed():
+    """The migration case. A repository that was mid-run when the naming changed
+    holds `swarm/issue-<n>` branches, and a sweep that silently ignored them is
+    indistinguishable from one that found nothing in flight at all."""
+    names = ["swarm/issue-4", branch(7, 0), "renovate/urllib3-2.x"]
+
+    assert in_flight(names).keys() == {ref(7)}
+    assert unrecognised(names) == ("renovate/urllib3-2.x", "swarm/issue-4")
+
+
+def test_a_sweep_says_how_many_branch_names_it_could_not_read():
+    plan = plan_recovery(
+        ledger(entry(4)), open_branches=frozenset({"swarm/issue-4"})
+    )
+
+    assert plan.unrecognised == ("swarm/issue-4",)
+    assert "1 branch name(s) not apiary's" in plan.summary()
+    # And the claim is still released, because nothing readable is behind it.
+    assert plan.released == plan.transitions
+
+
+# --------------------------------------------------------------------------
 # The worker that finished and died
 # --------------------------------------------------------------------------
+
+
+def test_a_claim_is_matched_to_its_pull_request_by_ref_not_by_current_attempt():
+    """The reason the name carries a pair rather than a ref alone.
+
+    `LedgerEntry.branch` is rebuilt from a counter, and this sweep runs after a
+    crash - the one moment the counter and the branch on the remote can disagree.
+    Matching by name would leave a claim looking abandoned while its finished
+    work sits in an open pull request, and release it: a second container over
+    the top of a PR somebody may already be reading."""
+    plan = plan_recovery(
+        ledger(entry(4, attempt=2)),
+        open_branches=frozenset({branch(4, attempt=1)}),
+    )
+
+    assert plan.published == plan.transitions
+    assert plan.transitions[0].to_label == REVIEW
+    # The name in the reason is the one on the remote, not the entry's, because
+    # that is the branch a human goes and looks at.
+    assert branch(4, attempt=1) in plan.transitions[0].reason
+
+
 
 
 def test_a_claim_with_an_open_pull_request_moves_forward_to_review():
     plan = plan_recovery(
         ledger(entry(4, attempt=1)),
-        open_branches=frozenset({"swarm/issue-4"}),
+        open_branches=frozenset({branch(4, attempt=1)}),
     )
 
     transition = plan.transitions[0]
@@ -418,7 +495,7 @@ def test_a_live_container_outranks_an_open_pull_request():
         ledger(entry(4)),
         containers=[handle(4, run.id)],
         live_run_ids=live_runs(run),
-        open_branches=frozenset({"swarm/issue-4"}),
+        open_branches=frozenset({branch(4)}),
     )
 
     # A worker that has pushed may still be running - it labels, it writes its
@@ -443,7 +520,7 @@ def test_an_unreadable_pull_request_list_does_not_leave_the_claim_unreachable():
 def test_the_review_path_is_taken_once_pull_requests_can_be_listed():
     client = PullAwareClient(
         issues={4: issue_payload(4, attempt=1)},
-        open_pulls=("swarm/issue-4",),
+        open_pulls=(branch(4, attempt=1),),
     )
 
     report = recovery(client).startup()

@@ -18,11 +18,11 @@ opinionated git defaults (`init.defaultBranch`, `commit.gpgsign`, hooks) as it
 does on a bare CI runner.
 
     def test_worker_pushes(scratch_repo):
-        scratch_repo.branch("swarm/issue-7")
+        scratch_repo.branch("apiary/%237-attempt-0")
         scratch_repo.write("calc.py", "def add(a, b):\\n    return a + b\\n")
         scratch_repo.commit("fix add")
         scratch_repo.push()
-        assert "swarm/issue-7" in scratch_repo.remote_branches()
+        assert "apiary/%237-attempt-0" in scratch_repo.remote_branches()
 """
 
 from __future__ import annotations

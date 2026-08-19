@@ -524,8 +524,10 @@ def _create_repository(client: GitHubClient, plan: ProvisionPlan) -> dict[str, A
         "allow_squash_merge": True,
         "allow_merge_commit": False,
         "allow_rebase_merge": False,
-        # Every task branch is `swarm/issue-<n>` and is dead the moment it
-        # merges; without this the branch list grows by one per task forever.
+        # Every task branch is `apiary/<ref>-attempt-<n>` and is dead the
+        # moment it merges; without this the branch list grows by one per
+        # attempt forever - #144 gave each attempt its own name, so the count
+        # that used to be one per task is now one per try at it.
         "delete_branch_on_merge": True,
     }
     path = "/user/repos" if _owner_is_viewer(client, plan.owner) else f"/orgs/{plan.owner}/repos"
@@ -742,7 +744,7 @@ def _ci_workflow(verify_command: str, *, stack: str = "python", branch: str = "m
     the argument was that the initial commit lands directly on the default
     branch and must produce a check run there. That is still true and the
     filter still allows it - what the filter removes is the *second* run every
-    PR push paid for, once for `push` on `swarm/issue-<n>` and once for
+    PR push paid for, once for `push` on the worker's branch and once for
     `pull_request`. Roughly 20 issues x ~1.3 attempts x 2 runs is ~52 CI runs
     per objective, each with a cold install, on billed private repositories.
 

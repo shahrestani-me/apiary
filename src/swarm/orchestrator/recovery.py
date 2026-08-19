@@ -83,11 +83,48 @@ already correct, and moving it on a guess can only make things worse. Here the
 subject is a `swarm:claimed` issue already known to have nothing behind it, so
 the states are not symmetrical. Holding it would leave the ticket's own
 acceptance criterion unmet with today's client, which has no
-`list_pull_requests` at all. Releasing when the worker had in fact published
-costs one redundant attempt and nothing else: the branch is derived from the
-issue number, `POST /pulls` for a head that already has an open PR is a 422
-rather than a second PR (`worker/pr.py`), and the retry updates the PR that
-exists. Recovery converges either way; holding does not converge at all.
+`list_pull_requests` at all.
+
+What releasing costs changed with #144 and is worth restating rather than
+leaving as a stale claim. It used to cost one redundant attempt and nothing
+else: one branch served every attempt, so `POST /pulls` for a head that already
+had an open PR was a 422 and the retry updated the pull request that existed.
+An attempt now has a branch of its own, so a retry dispatched over a worker that
+had in fact published opens a *second* pull request rather than updating the
+first, and a human has to close the one the crash orphaned.
+
+That is still the better side of the trade, and narrowly so rather than by a
+wide margin. The path needs a client that cannot list pull requests at all -
+today's can, so the readable path above catches this case and moves the label
+forward without spending anything. Holding instead does not converge at all: the
+claim stays, nothing is running behind it, and no later sweep has any more
+information than this one did. And a second pull request that overlaps a
+finished one is at least *visible*, where the alternative - updating the older
+pull request's title and body while its head still points at the previous
+attempt's commit - would put a description in front of a reviewer that does not
+describe the code underneath it.
+
+## The branch name is the primary source; the label is the fallback
+
+ADR 0001 makes agent execution state derived rather than stored, and #144 put
+the two facts a crash destroys into the one artefact that survives it: a branch
+named `apiary/<ref>-attempt-<n>` says which task it is for and how much budget
+it has spent. So the row above that decides "the worker published and died"
+now matches on the **ref parsed out of an open pull request's head branch**
+(`github/branches.parse_task_branch`), not on `LedgerEntry.branch`.
+
+The difference is the whole reason the name carries a pair. `entry.branch`
+names the ticket's *current* attempt, rebuilt from a counter this very sweep may
+be about to move; the head branch on the remote names the attempt that actually
+pushed. Comparing the two as strings is right until they disagree, and the case
+where they disagree is a crash - which is the only case this module runs for.
+
+`swarm:claimed` is still what selects the entries this pass considers, and that
+is deliberate rather than unfinished: epic #140 removes the label store in T6,
+and until it does the label is the fallback that keeps this sweep working on a
+repository whose branches predate #144. Those branches do not parse and are not
+guessed at - they are counted onto `RecoveryPlan.unrecognised` and reported,
+for the reason every other refusal in this module is reported.
 
 This module removes no container, on any path. If a claim is stale because its
 run died, the container that run left behind is #20's to sweep, and doing it
@@ -107,6 +144,7 @@ from typing import Any, Collection, Iterable, Mapping
 
 from ..config import SETTINGS
 from ..containers.manager import DockerCLI, Handle, Redactor, find_containers
+from ..github.branches import TaskBranch, parse_task_branch
 from ..github.client import GitHubClient
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY, IssueState
@@ -167,6 +205,42 @@ def holders(containers: Iterable[Handle], live: Collection[str]) -> dict[TaskRef
     return found
 
 
+def in_flight(branches: Iterable[str]) -> dict[TaskRef, TaskBranch]:
+    """Task ref -> the furthest attempt any of `branches` was pushed for.
+
+    The derivation ADR 0001 promises: hand it the head refs of a repository's
+    open pull requests and it reconstructs which tasks got as far as a worker,
+    and how many attempts each of them cost, with no ledger, no label and no
+    local memory involved.
+
+    Furthest rather than first because a ref can legitimately own more than one
+    branch - one per attempt - and only the newest speaks for where the task is
+    now. An older attempt's branch outliving its pull request is not a
+    contradiction to resolve, it is history.
+    """
+    found: dict[TaskRef, TaskBranch] = {}
+    for name in branches:
+        parsed = parse_task_branch(name)
+        if parsed is None:
+            continue
+        seen = found.get(parsed.ref)
+        if seen is None or parsed.attempt > seen.attempt:
+            found[parsed.ref] = parsed
+    return found
+
+
+def unrecognised(branches: Iterable[str]) -> tuple[str, ...]:
+    """The names this parser could not read, sorted, for reporting only.
+
+    Branches from before #144, and any a human pushed. Named rather than
+    dropped: a sweep that silently ignored a branch it did not understand is
+    indistinguishable from one that found nothing, and the first time that
+    matters is a migration - a repository mid-run when the naming changed,
+    where every claim looks abandoned and every one of them is not.
+    """
+    return tuple(sorted(name for name in branches if parse_task_branch(name) is None))
+
+
 def _is_run_id(value: str) -> bool:
     try:
         validate_run_id(value)
@@ -211,6 +285,11 @@ class RecoveryPlan:
     #: does not suppress a rule - see the module docstring - but a released
     #: claim that might have had a PR behind it is worth saying out loud.
     blind: bool = False
+    #: Head branches this pass could not read a `(ref, attempt)` out of. Every
+    #: one of them is a pull request no claim can ever be matched against, so
+    #: they are the difference between "nothing was in flight" and "something
+    #: was, on a name from before #144".
+    unrecognised: tuple[str, ...] = ()
 
     @property
     def released(self) -> tuple[Transition, ...]:
@@ -238,6 +317,8 @@ class RecoveryPlan:
         ]
         if self.blind:
             parts.append("pull request state unreadable")
+        if self.unrecognised:
+            parts.append(f"{len(self.unrecognised)} branch name(s) not apiary's")
         return ", ".join(parts)
 
 
@@ -298,6 +379,11 @@ def plan_recovery(
     """
     states = states or {}
     live = holders(containers, live_run_ids)
+    # The derived half (#144). `open_branches` is a set of head refs, and every
+    # one that parses names a task and an attempt - which is what lets a claim
+    # be matched to the pull request behind it without either of them having to
+    # agree with a counter this pass may be about to move.
+    published = in_flight(open_branches or ())
 
     transitions: list[Transition] = []
     held: list[Held] = []
@@ -325,14 +411,21 @@ def plan_recovery(
         # 3. The worker got as far as a pull request and died before it could
         #    write `swarm:review` (`worker/pr.py` labels last, deliberately).
         #    The work exists; moving the label forward is all that is left.
-        if open_branches is not None and entry.branch in open_branches:
+        #
+        #    Matched on the ref inside the head branch rather than on
+        #    `entry.branch`, for the module docstring's reason: the name on the
+        #    remote is the attempt that actually pushed, and the entry's is
+        #    whatever the counter currently says. A string comparison agrees
+        #    with that right up until a crash, and a crash is when this runs.
+        branch = published.get(entry.ref) if open_branches is not None else None
+        if branch is not None:
             transitions.append(
                 Transition(
                     ref=entry.ref,
                     from_label=entry.state_label,
                     to_label=REVIEW,
                     reason=(
-                        f"{entry.branch} has an open pull request; "
+                        f"{branch} has an open pull request; "
                         f"the worker died before relabelling"
                     ),
                     task_id=entry.task_id,
@@ -347,6 +440,7 @@ def plan_recovery(
         transitions=tuple(transitions),
         held=tuple(held),
         blind=open_branches is None,
+        unrecognised=unrecognised(open_branches or ()),
     )
 
 
@@ -514,8 +608,10 @@ __all__ = [
     "RecoveryPlan",
     "RecoveryReport",
     "holders",
+    "in_flight",
     "live_runs",
     "plan_recovery",
+    "unrecognised",
 ]
 
 

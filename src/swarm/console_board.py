@@ -31,10 +31,20 @@ board polling every few seconds inside a PAT's rate budget. "Pending" and
 "failing" are never cached - both are exactly the states a poll exists to
 watch change.
 
-**PRs are matched by branch, not guessed.** A worker's branch is
-`swarm/issue-<n>` (`LedgerEntry.branch`), so one `list_pull_requests` per
-poll associates every ticket with its pull request by head ref - the same
-addressing `worker/pr.py` uses to find its own PR.
+**PRs are matched by the task ref inside the branch name, not by the name.**
+One `list_pull_requests` per poll associates every ticket with its pull request
+by head ref, and since #144 that head ref is `apiary/<ref>-attempt-<n>`
+(`github/branches.py`), which the board parses back into a `(ref, attempt)`
+pair. Matching the pair's ref rather than comparing against `LedgerEntry.branch`
+is the difference between a board that keeps working and one that blanks:
+`LedgerEntry.branch` names the ticket's *current* attempt, so the moment the
+counter moves - a pull request closed unmerged, a claim recovered - a
+string comparison stops finding the PR that is right there. The ref is the half
+of the name that does not move.
+
+Branches from before #144 do not parse, and a ticket whose only pull request is
+on one shows no PR link. That is said out loud in `notes` rather than left to
+look like a ticket nobody opened a PR for.
 """
 
 from __future__ import annotations
@@ -44,8 +54,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from .github.branches import BRANCH_PREFIX, parse_task_branch
 from .github.client import GitHubClient
 from .github.ledger import LedgerEntry, load_ledger
+from .taskref import TaskRef
 
 __all__ = ["BoardError", "BoardReader", "COLUMNS", "COLUMN_BY_LABEL"]
 
@@ -111,20 +123,43 @@ class BoardReader:
         # succeeds, and a board that errored outright would hide the five
         # columns the ledger alone can still fill.
         notes: list[str] = []
+        blind = False
         try:
             pulls = client.list_pull_requests(state="all")
         except Exception as exc:  # noqa: BLE001 - degrade and say so, never guess
             pulls = []
+            blind = True
             notes.append(
                 f"pull requests are unreadable ({type(exc).__name__}); PR links and the "
                 f"Verified column are blind - grant the token 'Pull requests: read'"
             )
-        by_head = {pr["head"]["ref"]: pr for pr in reversed(pulls)}
+        # Reversed so the *first* pull request GitHub listed wins, which is
+        # its newest: a ticket that has been through more than one attempt now
+        # has more than one branch, hence more than one pull request, and the
+        # board wants the live one.
+        by_ref: dict[TaskRef, Mapping[str, Any]] = {}
+        legacy = 0
+        for pull in reversed(pulls):
+            head = str((pull.get("head") or {}).get("ref") or "")
+            parsed = parse_task_branch(head)
+            if parsed is None:
+                # Everything else on the remote: a human's branch, and the
+                # `swarm/issue-<n>` branches #144 stopped minting. Only the
+                # second kind is worth a note - the first is somebody's work.
+                legacy += head.startswith("swarm/issue-")
+                continue
+            by_ref[parsed.ref] = pull
+        if legacy:
+            notes.append(
+                f"{legacy} pull request(s) are on pre-#144 `swarm/issue-<n>` branches; "
+                f"their tickets show no PR link until they are reopened on a "
+                f"`{BRANCH_PREFIX}` branch"
+            )
 
         columns: dict[str, list[dict[str, Any]]] = {key: [] for key, _ in COLUMNS}
         failed: list[dict[str, Any]] = []
         for entry in sorted(ledger.entries.values(), key=lambda e: e.ref):
-            pr = by_head.get(entry.branch)
+            pr = by_ref.get(entry.ref)
             card = self._card(repo, entry, pr)
             if entry.state_label == "swarm:failed":
                 #: Open only. The strip's title is "needs a human", and a
@@ -137,7 +172,13 @@ class BoardReader:
                 continue
             column = COLUMN_BY_LABEL.get(entry.state_label, "backlog")
             if column == "merged":
-                ci = "none" if notes else self._post_merge_ci(client, repo, entry.number, pr)
+                # `blind`, not "are there any notes": the Verified column is
+                # unreachable only when the pull request list could not be read
+                # at all. A note about something else - a ticket still on a
+                # pre-#144 branch - says nothing about the merge commits of the
+                # tickets that did match, and parking all of them in "merged"
+                # for it would hide a whole repository's post-merge CI.
+                ci = "none" if blind else self._post_merge_ci(client, repo, entry.number, pr)
                 if ci == "green":
                     column = "verified"
                 else:

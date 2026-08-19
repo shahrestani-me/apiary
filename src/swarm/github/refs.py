@@ -19,9 +19,11 @@ container to carry the ref itself; that is a container-layer ticket).
 
 What no caller may do is reach for `issue_number` to *decide* something - to
 sort, to compare, or to derive a name - because that is a module assuming refs
-are numeric, which is exactly what the ADR says no core module may do. Note that
-`#42` is not a branch-safe token, so the ticket that puts the ref in a branch
-name will need a third function here rather than a number to interpolate.
+are numeric, which is exactly what the ADR says no core module may do. `#42` is
+not a branch-safe token either, and this module once expected to grow a third
+function for that; #144 put it in `github/branches.py` instead, because the
+encoding there escapes bytes rather than knowing a spelling, and it carries an
+attempt counter - which is not a property of a ref and has no business here.
 """
 
 from __future__ import annotations
