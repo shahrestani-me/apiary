@@ -32,7 +32,7 @@ import datetime as dt
 import json
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -56,14 +56,18 @@ from swarm.worker.entrypoint import (
 )
 from swarm.worker.result import (
     RESULT_DIR_ENV,
+    RESULT_GLOB,
     SCHEMA_VERSION,
+    UNSTAMPED,
     ResultError,
     ResultRecord,
+    RunSummary,
     from_worker,
     has_result,
     load_results,
     next_attempt,
     read_result,
+    record_order,
     record_path,
     report,
     result_dir,
@@ -439,6 +443,118 @@ def test_an_empty_directory_summarises_to_nothing(tmp_path):
 
     assert summary.attempts == 0 and summary.consumed == 0
     assert load_results(tmp_path) == ()
+
+
+# --------------------------------------------------------------------------
+# "Latest" is a time, not a filename
+# --------------------------------------------------------------------------
+
+
+#: The moment this section's records start finishing at. One per minute after.
+_BASE = dt.datetime(2026, 8, 14, 14, 0, tzinfo=dt.timezone.utc)
+
+
+def dead_host(minute: int) -> ResultRecord:
+    """One mechanical failure, stamped the way `from_worker` stamps every record.
+
+    All at `attempt=0`, because that is what exit 2 means: the task never ran,
+    so §4 consumes no attempt and the retry runs at the same number. The only
+    field that separates two of these is when they finished.
+    """
+    return a_record(
+        attempt=0,
+        exit_code=EXIT_INFRASTRUCTURE,
+        reason="docker: no such image",
+        started_at=_BASE + dt.timedelta(minutes=minute),
+        finished_at=_BASE + dt.timedelta(minutes=minute),
+    )
+
+
+def test_eleven_records_for_one_issue_still_have_a_newest(artifacts):
+    """Eleven, because ten sorts correctly by accident and eleven does not.
+
+    Exit 2 consumes no attempt, so every record here says `attempt: 0` and
+    `write_result` bumps only the filename. From the eleventh, the directory
+    listing runs `0 1 10 2 3 4 5 6 7 8 9` - so a `latest` that broke its ties on
+    file order returned `attempt-9.json`, the tenth-from-last record, and went
+    on returning it however many more the host wrote (#218).
+    """
+    for minute in range(11):
+        write_result(dead_host(minute), artifacts)
+
+    # The premise, asserted rather than assumed: file order is not write order.
+    assert [p.name for p in sorted(artifacts.glob(RESULT_GLOB))][:4] == [
+        f"issue-{ISSUE}-attempt-0.json",
+        f"issue-{ISSUE}-attempt-1.json",
+        f"issue-{ISSUE}-attempt-10.json",
+        f"issue-{ISSUE}-attempt-2.json",
+    ]
+
+    newest = summarise_dir(artifacts).latest[ISSUE]
+
+    assert newest.finished_at == _BASE + dt.timedelta(minutes=10)
+    # Content, not position: this is the key the reconciler's freshness guard
+    # compares, and pinning on a stale record is what silenced the run.
+    assert newest.identity == dead_host(10).identity
+
+
+def test_the_attempt_still_outranks_the_clock(artifacts):
+    """Ordering is `(issue, attempt, when)`, in that order.
+
+    The attempt is what the reconciler retires records by
+    (`record.attempt >= entry.attempt`), and the container's clock and the
+    host's are not the same clock - so a later timestamp does not get to
+    promote a record the counter has already left behind.
+    """
+    write_result(replace(dead_host(0), attempt=3), artifacts)
+    write_result(replace(dead_host(9), attempt=1), artifacts)
+
+    newest = summarise_dir(artifacts).latest[ISSUE]
+
+    assert newest.attempt == 3
+
+
+def test_a_record_that_names_no_moment_sorts_first(artifacts):
+    """The stated fallback, and the conservative direction.
+
+    `stamped_at` is `None` only for hand-written JSON - `from_worker` and
+    `synthesise` both stamp `finished_at` - so a record without one is the sort
+    of thing that arrives by hand-edit. It sorts at `UNSTAMPED`, before every
+    record that can say when it was written, which means it never becomes the
+    verdict a run acts on while a real record is present.
+    """
+    unstamped = a_record(attempt=0, exit_code=EXIT_TASK_FAILED)
+    assert unstamped.stamped_at is None
+    assert record_order(unstamped)[2] == UNSTAMPED
+
+    write_result(dead_host(5), artifacts)
+    write_result(unstamped, artifacts)
+
+    assert summarise_dir(artifacts).latest[ISSUE].exit_code == EXIT_INFRASTRUCTURE
+
+    # `finished_at` first, `started_at` only as a fallback: the moment the
+    # verdict was reached is what "newest" means.
+    both = a_record(started_at=_BASE, finished_at=_BASE + dt.timedelta(minutes=1))
+    assert both.stamped_at == both.finished_at
+    assert a_record(started_at=_BASE).stamped_at == _BASE
+
+
+def test_latest_does_not_depend_on_the_order_it_was_handed(artifacts):
+    """`RunSummary` is a plain dataclass, so `records` can arrive in any order.
+
+    The old `>=` on `attempt` alone made every record for one issue a tie and
+    read the answer off whichever the caller put last. That was right because
+    `summarise` sorts - and wrong for exactly the input that mattered.
+    """
+    records = [dead_host(minute) for minute in range(11)]
+    newest = dead_host(10)
+
+    for arrangement in (records, list(reversed(records)), [records[5], newest, records[2]]):
+        assert summarise(arrangement).latest[ISSUE].identity == newest.identity
+        # And unsorted, straight into the dataclass: `latest` no longer reads
+        # its answer off the position of anything.
+        unsorted = RunSummary(run_id=RUN_ID, records=tuple(arrangement))
+        assert unsorted.latest[ISSUE].identity == newest.identity
 
 
 # --------------------------------------------------------------------------

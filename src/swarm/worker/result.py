@@ -54,6 +54,17 @@ retries is worse than one that over-counts. Unknown exit codes (a `137` from
 the OOM killer, a `143` from a stop) are charged for the same reason: giving up
 early puts a human in front of the problem, and looping forever does not.
 
+**"Latest" is a time, not a filename.** Two records can claim one attempt -
+an exit 2 consumes none (§4), so a host broken repeatedly writes several
+records that all say `attempt: 0`, and `write_result` bumps the *filename* on
+collision while the record inside keeps testifying about attempt 0. Which of
+those is newest cannot come from the directory listing: `issue-N-attempt-10`
+sorts before `-2` lexicographically, so from the eleventh record onward file
+order and write order disagree and a reader that trusted the listing pinned on
+the tenth-from-last (#218). So the order is `(issue, attempt, stamped_at)` -
+see `record_order` for why the attempt stays ahead of the clock, and `UNSTAMPED`
+for where a record that names no moment goes.
+
 **Reading is forgiving; writing is atomic.** The write goes to a temporary file
 in the same directory and is renamed into place, because the process doing it
 is the one being killed on a timer and half a JSON object is worse than none.
@@ -245,6 +256,23 @@ class ResultRecord:
         return hashlib.blake2s(canonical.encode(), digest_size=16).hexdigest()
 
     @property
+    def stamped_at(self) -> dt.datetime | None:
+        """When this record says its attempt ended, or `None` if it does not say.
+
+        `finished_at` first: it is the moment the verdict was reached, which is
+        what "newest" means to anything asking which of two records to act on.
+        `started_at` is the fallback rather than an equal, because two attempts
+        of one task can only overlap if something spawned two containers for it,
+        and in that case the one that finished later is still the later verdict.
+
+        `None` is reachable only by hand-written JSON - `from_worker` and
+        `synthesise` are the only constructors in `src/` and both stamp
+        `finished_at` with `datetime.now` when the caller leaves it out - and
+        `UNSTAMPED` is where such a record sorts.
+        """
+        return self.finished_at or self.started_at
+
+    @property
     def duration_s(self) -> float | None:
         if self.started_at is None or self.finished_at is None:
             return None
@@ -333,6 +361,51 @@ def tail(text: str, limit: int = OUTPUT_TAIL_CHARS) -> str:
     if not text or len(text) <= limit:
         return text or ""
     return f"[apiary] {len(text) - limit} earlier characters elided\n{text[-limit:]}"
+
+
+# --------------------------------------------------------------------------
+# Which of two records is newer
+# --------------------------------------------------------------------------
+
+
+#: Where a record that names no moment sorts: before every record that does.
+#:
+#: The direction is the conservative one. `latest` hands its answer to the
+#: reconciler, and a record with no timestamp is one nothing in `src/` can
+#: write - it arrives by hand-edit or from a future field this version cannot
+#: read. Sorting it first means it never displaces a record that can say when
+#: it was written; sorting it last would let one hand-edited file become the
+#: verdict a run acts on, which is the failure `to_dict`'s derived-keys note is
+#: already written against.
+#:
+#: Two records that both name no moment are still tied, and the tie falls back
+#: to the order they were read in - which is the directory listing, and
+#: therefore unspecified. That is the honest answer: nothing in either record
+#: says which came first.
+UNSTAMPED = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def record_order(record: ResultRecord) -> tuple[int, int, dt.datetime]:
+    """Sort key: which issue, then which attempt, then when it finished.
+
+    **The attempt stays ahead of the clock**, for two reasons. It is what the
+    reconciler already retires records by (`record.attempt >= entry.attempt`),
+    so an ordering that could put a lower attempt last would disagree with its
+    only consumer. And the two clocks in play - a container's and the host's
+    that synthesises for it - are not the same clock, so skew between them
+    would decide across attempts, where the attempt counter already knows the
+    answer. Inside one attempt there is no counter to ask and the timestamps
+    are almost always from the same process anyway, which is exactly where a
+    tie-break is needed and where one is safe.
+
+    That is the whole of #218's fix: the third element used to be the file's
+    position in a sorted glob, and `issue-N-attempt-10.json` sorts between
+    `-1` and `-2`. With eleven or more records for one issue - reachable
+    because exit 2 consumes no attempt while `write_result` still bumps the
+    filename - the listing put attempt-9's record last and `latest` returned
+    it forever after.
+    """
+    return (record.issue, record.attempt, record.stamped_at or UNSTAMPED)
 
 
 # --------------------------------------------------------------------------
@@ -567,12 +640,16 @@ def read_result(path: str | Path) -> ResultRecord:
 
 
 def load_results(directory: str | Path) -> tuple[ResultRecord, ...]:
-    """Every readable record in a directory, ordered by issue then attempt.
+    """Every readable record in a directory, in `record_order`.
 
     Unreadable ones are reported on stderr and skipped. The alternative - one
     truncated file raising out of the summary - loses the other thirty-nine
     records to protect nothing, and the run this happened to is precisely the
     run somebody is trying to understand.
+
+    The glob is still sorted, but only to make the read deterministic: what a
+    record *is* comes from its fields, and `record_order` sorts on those. The
+    filename cannot be trusted for order - see `record_order`.
 
     The `.tmp` files `write_result` renames from are invisible here: they do not
     match the glob, so a partial write in flight cannot be read as a result.
@@ -583,7 +660,7 @@ def load_results(directory: str | Path) -> tuple[ResultRecord, ...]:
             records.append(read_result(path))
         except ResultError as exc:
             print(f"! skipping {path.name}: {exc}", file=sys.stderr)
-    return tuple(sorted(records, key=lambda record: (record.issue, record.attempt)))
+    return tuple(sorted(records, key=record_order))
 
 
 def report(
@@ -676,11 +753,25 @@ class RunSummary:
 
     @property
     def latest(self) -> dict[int, ResultRecord]:
-        """Issue number -> its highest-numbered attempt. Where each task stands."""
+        """Issue number -> its newest record. Where each task stands.
+
+        Newest by `record_order`, asked directly rather than inferred from
+        position. The `>=` used to compare `attempt` alone, which made every
+        record for one issue a tie and left the answer to whichever the input
+        happened to put last. `summarise` sorts, so that was almost always
+        right - and wrong for exactly the run it mattered in, where eleven
+        files for one issue arrived from a sorted glob in the order
+        0 1 10 2 3 ... 9 (#218). Comparing the whole key instead makes this
+        property true of any `records`, in any order.
+
+        `>=` rather than `>` keeps the old tie-break: among records that order
+        identically - same attempt, same moment, or no moment at all - the last
+        one seen wins.
+        """
         newest: dict[int, ResultRecord] = {}
         for record in self.records:
             current = newest.get(record.issue)
-            if current is None or record.attempt >= current.attempt:
+            if current is None or record_order(record) >= record_order(current):
                 newest[record.issue] = record
         return newest
 
@@ -696,9 +787,7 @@ class RunSummary:
 
 def summarise(records: Iterable[ResultRecord], *, run_id: str | None = None) -> RunSummary:
     """Fold records into a summary. Pure; `load_results` is the half that touches disk."""
-    ordered: Sequence[ResultRecord] = tuple(
-        sorted(records, key=lambda record: (record.issue, record.attempt))
-    )
+    ordered: Sequence[ResultRecord] = tuple(sorted(records, key=record_order))
     resolved = run_id if run_id is not None else (ordered[0].run_id if ordered else "")
     return RunSummary(run_id=resolved, records=tuple(ordered))
 

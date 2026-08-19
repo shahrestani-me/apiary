@@ -2782,6 +2782,70 @@ def test_the_retrys_own_failure_is_a_second_verdict_and_counts(tmp_path):
     assert loop._infrastructure == {ref(TASK_ISSUE): 2}
 
 
+def test_eleven_mechanical_failures_do_not_silence_the_task(tmp_path):
+    """The stall #218 is about, driven end to end. Eleven, because ten is fine.
+
+    Exit 2 consumes no attempt, so every one of these records says `attempt: 0`
+    and `write_result` bumps only the filename - `issue-N-attempt-0.json`,
+    `-1`, ... `-10`. A sorted glob puts `-10` third, between `-1` and `-2`, so
+    `RunSummary.latest` used to hand the reconciler the record from `-9` from
+    the eleventh failure onward. #209's freshness guard had already stamped that
+    record's identity, so `fresh` was `False` on that cycle and on every cycle
+    after it: no transition, no disposal, no escalation, forever.
+
+    **The failing direction is silence**, which is why the streak is asserted
+    and why the loop runs past ten. A version with the bug reaches 10 and then
+    stops counting while the host keeps dying; asserting anything about three
+    records proves nothing at all.
+
+    The cap is lifted out of the way rather than left at its default: this is a
+    claim about the eleventh *observation*, and the default cap escalates at
+    three, which is a different mechanism reaching a different right answer.
+    Eleven mechanical failures on one task is what #203 existed to make
+    visible, and a run reaches it - a human who moves an escalated issue back
+    to `swarm:ready`, as the escalation comment tells them to, resets the
+    streak and not the directory.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.infrastructure_policy = InfrastructurePolicy(cap=99)
+
+    def the_host_dies_again(minute: int) -> None:
+        # A real worker stamps `finished_at` with `datetime.now`, so each of
+        # these is its own verdict about the host - the property
+        # `test_two_verdicts_from_one_host_are_two_identities` pins.
+        record = replace(dead_host(), finished_at=_FIRST + dt.timedelta(minutes=minute))
+        write_result(record, tmp_path)
+        alive(fleet)
+        loop.cycle()
+
+    loop.cycle()  # dispatch, attempt 0
+    for minute in range(11):
+        the_host_dies_again(minute)
+
+    # Eleven failures, eleven verdicts. Ten would pass with the bug in place.
+    assert loop._infrastructure == {ref(TASK_ISSUE): 11}
+    # And the run is still moving rather than sitting on a stale record: the
+    # eleventh observation re-readied the task and disposed the container that
+    # failed. Twelve announcements, because the first cycle announced the task
+    # ready before dispatching it, and all at attempt 0 - §4 consumes none.
+    assert [f["attempt"] for n, f in seen if n == "task.eligible"] == [0] * 12
+    assert len(fleet.disposed) == 11
+    # The whole reason the file order stopped being trustworthy, spelled out so
+    # a reader does not have to believe the arithmetic above.
+    names = sorted(p.name for p in tmp_path.glob("issue-*-attempt-*.json"))
+    assert names[2] == f"issue-{TASK_ISSUE}-attempt-10.json"
+
+    # The other half of the claim: the stall was permanent, not an off-by-one at
+    # eleven. A stale pin never comes unstuck, because the identity it settled on
+    # stays stamped - so a version with the bug counts 10 here too, whatever
+    # happens to the host next.
+    the_host_dies_again(11)
+    the_host_dies_again(12)
+
+    assert loop._infrastructure == {ref(TASK_ISSUE): 13}
+
+
 # --- announcement only -----------------------------------------------------
 
 
