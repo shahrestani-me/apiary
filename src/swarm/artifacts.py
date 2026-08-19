@@ -685,8 +685,8 @@ CONTAINER_LOGGED = "container.logged"
 #:
 #: **They speak apiary's own vocabulary, never the tracker's.** Every one of
 #: them is keyed by the *task ref* - the slug `Transition.task_id` already
-#: carries - and the states they name are ADR 0001's five internal ones, not the
-#: `swarm:*` labels that happen to store them today. `events.jsonl` is
+#: carries - and the states they name are apiary's own internal ones (ADR
+#: 0001's, plus `blocked`), not the `swarm:*` labels that store them today. `events.jsonl` is
 #: append-only and read back (`RunMetrics.from_events`, `console_external`), so
 #: a run recorded now is still readable after epic #140 has removed the labels;
 #: an issue number or a label name baked in here would have invalidated every

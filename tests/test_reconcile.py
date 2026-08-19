@@ -1957,7 +1957,7 @@ def test_a_task_that_was_blocked_is_announced_when_its_dependency_lands():
     assert eligible and eligible[0]["depends_on"] == ["task-7"]
 
 
-def test_eligibility_is_announced_once_per_attempt_not_once_per_cycle():
+def test_eligibility_is_announced_once_per_episode_not_once_per_cycle():
     """It is a standing fact - true every cycle until the task is claimed - so
     a projection with no memory would repeat it for the length of the queue."""
     client, _, loop, seen = a_lifecycle_run()
@@ -1969,6 +1969,29 @@ def test_eligibility_is_announced_once_per_attempt_not_once_per_cycle():
     loop.cycle()
 
     assert names(seen) == ["task.eligible"]
+
+
+def test_an_infrastructure_retry_is_announced_eligible_again(tmp_path):
+    """The episode, not the attempt. Exit 2 consumes no attempt (§4), so the
+    re-dispatch is ready at the number already announced - a key on the attempt
+    would have been silent for exactly the failure mode that repeats."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
+    loop.cycle()
+
+    assert names(seen) == [
+        "task.eligible",
+        "task.claimed",
+        "task.result",
+        "task.eligible",
+        "task.claimed",
+    ]
+    # And the counter really did not move, which is what makes this the case a
+    # key on the attempt could not see.
+    assert [f["attempt"] for n, f in seen if n == "task.eligible"] == [0, 0]
 
 
 def test_each_announcement_carries_what_its_reader_came_for(tmp_path):
@@ -2136,7 +2159,7 @@ def a_report(
 
 def escalation(reason: str = "attempts exhausted", attempt: int | None = 3) -> Transition:
     return Transition(
-        number=4,
+        ref=ref(4),
         from_label=CLAIMED,
         to_label=FAILED,
         reason=reason,
@@ -2164,7 +2187,7 @@ def test_a_failing_task_says_why_it_needs_a_human_and_that_it_paid_for_it():
     budget ran out."""
     plan = plan_reconcile(
         ledger(entry(4, label=CLAIMED, attempt=2)),
-        results={4: record(4, 1, attempt=2)},
+        results={ref(4): record(4, 1, attempt=2)},
         max_attempts=3,
     )
     events = lifecycle_events(a_report(applied=plan.transitions, entries=[entry(4, label=FAILED)]))
@@ -2182,7 +2205,7 @@ def test_an_infrastructure_escalation_says_no_attempt_was_ever_consumed():
     plan = plan_reconcile(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results=infra(4),
-        infrastructure={4: DEFAULT_INFRASTRUCTURE_CAP - 1},
+        infrastructure={ref(4): DEFAULT_INFRASTRUCTURE_CAP - 1},
     )
     events = lifecycle_events(a_report(applied=plan.transitions))
 
@@ -2201,7 +2224,7 @@ def test_a_malformed_issue_reaching_a_human_is_deliberately_not_announced():
     nothing is not a timeline entry, and inventing a key from the issue number
     is the thing this whole module refuses to do."""
     malformed = Transition(
-        number=4, from_label=READY, to_label=FAILED, reason="malformed contract: no ## Goal"
+        ref=ref(4), from_label=READY, to_label=FAILED, reason="malformed contract: no ## Goal"
     )
 
     assert lifecycle_events(a_report(applied=[malformed])) == ()
@@ -2212,7 +2235,7 @@ def test_a_reason_that_quoted_a_branch_is_rewritten_into_the_task_ref():
     "no check run was ever created for swarm/issue-12" names a branch, and a
     branch is an issue number."""
     failed = Transition(
-        number=4,
+        ref=ref(4),
         from_label=REVIEW,
         to_label=FAILED,
         reason=f"no check run was ever created for swarm/issue-4; move it back to {READY}",
@@ -2230,7 +2253,7 @@ def test_a_transition_github_refused_is_never_announced():
     """`fold`'s rule, and for the same reason: a label write GitHub refused left
     the task where it was, so announcing it would put a state in an append-only
     log that the control plane never reached."""
-    planned = Transition(number=4, from_label=CLAIMED, to_label=DONE, reason="x", task_id="task-4")
+    planned = Transition(ref=ref(4), from_label=CLAIMED, to_label=DONE, reason="x", task_id="task-4")
 
     # Planned, not applied.
     assert lifecycle_events(a_report(applied=[], entries=[entry(4, label=CLAIMED)])) == ()
@@ -2258,6 +2281,24 @@ def test_a_standing_fact_is_announced_once_rather_than_every_cycle(tmp_path):
 
     assert names(first) == ["task.result", "pr.opened", "pr.checks"]
     assert seen[mark:] == first
+
+
+def test_a_check_name_is_announced_verbatim(tmp_path):
+    """The one field here whose text apiary did not author.
+
+    A check name is written by whoever wrote the target repository's workflow.
+    It cannot carry an apiary issue number, and it is precisely the string a
+    reader pastes into the CI UI - so it is not scrubbed, and a repository with
+    a check called `swarm/issue-4242` sees that name and not a task ref.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    reaches_review(client, fleet, pending(f"swarm/issue-{TASK_ISSUE}"))
+    loop.cycle()
+
+    checks = [f["check"] for name, f in seen if name == "pr.checks"]
+    assert checks == [f"swarm/issue-{TASK_ISSUE}"]
 
 
 def test_a_check_set_that_moved_is_announced_again(tmp_path):

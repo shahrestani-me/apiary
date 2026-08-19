@@ -1626,10 +1626,6 @@ class Reconciler:
             )
             ledger = fold(ledger, recovered.result.applied)
 
-        # The merge gate. Mergeability runs first and *subtracts* from the plan
-        # checks built: a PR that is green against a base that has since moved
-        # is not mergeable, and merging it would land work that never ran
-        # against what it is landing on. `plan.admitted` is what survives.
         # Local, because `checks` imports this module: it is the policy over the
         # state this one folds, so the dependency points this way and a
         # top-level import would be a cycle.
@@ -1643,6 +1639,10 @@ class Reconciler:
         # reached review.
         pulls = read_pulls(snapshot)
 
+        # The merge gate. Mergeability runs first and *subtracts* from the plan
+        # checks built: a PR that is green against a base that has since moved
+        # is not mergeable, and merging it would land work that never ran
+        # against what it is landing on. `plan.admitted` is what survives.
         mergeability = None
         checks = None
         check_runs: dict[int, Any] = {}

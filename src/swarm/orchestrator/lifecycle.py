@@ -59,6 +59,7 @@ from ..artifacts import (
     TASK_RESULT,
 )
 from ..github.readiness import BLOCKED, READY
+from ..taskref import TaskRef
 from ..worker.result import ResultRecord
 from .checks import CheckSet, PullState
 from .dispatcher import CLAIMED, REVIEW
@@ -152,7 +153,7 @@ class TaskEvent:
 def lifecycle_events(
     report: CycleReport,
     *,
-    results: Mapping[int, ResultRecord] | None = None,
+    results: Mapping[TaskRef, ResultRecord] | None = None,
     pulls: Mapping[str, PullState] | None = None,
     checks: Mapping[int, CheckSet] | None = None,
 ) -> tuple[TaskEvent, ...]:
@@ -174,8 +175,21 @@ def lifecycle_events(
     pulls = pulls or {}
     checks = checks or {}
 
-    entries = {entry.number: entry for entry in report.ledger.entries.values()}
-    refs = {number: entry.task_id for number, entry in entries.items() if entry.task_id}
+    # Keyed by `TaskRef`, which is what everything the projection reads is
+    # keyed by since #142 - the results directory, the container lookup, the
+    # readiness graph and `Transition` itself. `slugs` is the one translation
+    # this module makes, and it makes it in that direction on purpose: a
+    # `TaskRef` is the *tracker's* handle (GitHub mints `#42`), and #141 is the
+    # ticket that says a payload may not carry one.
+    entries = {entry.ref: entry for entry in report.ledger.entries.values()}
+    slugs = {ref: entry.task_id for ref, entry in entries.items() if entry.task_id}
+    # And by issue number, because two things this reads are still spelled that
+    # way: the merge gate (`checks.py` addresses pull requests and issues, both
+    # of which GitHub numbers) and a branch name quoted in prose. #142 retyped
+    # the internal model; the code-host half is GitHub-shaped and ADR 0001 says
+    # it stays that way.
+    by_issue = {entry.number: entry for entry in entries.values()}
+    by_number = {number: entry.task_id for number, entry in by_issue.items() if entry.task_id}
     events: list[TaskEvent] = []
 
     def emit(name: str, once: tuple[Any, ...] | None = None, **fields: Any) -> None:
@@ -188,8 +202,8 @@ def lifecycle_events(
     #    from a transition, because the outcome that moves no label - exit 0,
     #    whose `claimed -> review` belongs to the worker (#17) - is the one an
     #    operator is most often waiting for.
-    for number, record in sorted(results.items()):
-        task = refs.get(number, "")
+    for ref, record in sorted(results.items()):
+        task = slugs.get(ref, "")
         if not task:
             continue
         emit(
@@ -198,7 +212,7 @@ def lifecycle_events(
             # consecutive infrastructure failures are two records at the same
             # attempt number written to the same filename - and a broken host
             # saying so three times is precisely what an operator needs to see.
-            (task, record.attempt, _stamp(record)),
+            once=(task, record.attempt, _stamp(record)),
             task=task,
             attempt=record.attempt,
             exit_code=record.exit_code,
@@ -206,50 +220,58 @@ def lifecycle_events(
             duration_s=record.duration_s,
         )
 
-    events += _landed_or_human(report.result.applied, refs, report.index)
+    events += _landed_or_human(report.result.applied, slugs, by_number, report.index)
     if report.recovered is not None:
         # A claim with no container behind it, released or escalated at the cap.
         # `.result.applied` rather than the `.applied` shorthand, because that is
         # the attribute `Reconciler.cycle` folds from - one spelling, so a
         # recovery report shape that satisfies the loop satisfies this too.
-        events += _landed_or_human(report.recovered.result.applied, refs, report.index)
+        events += _landed_or_human(
+            report.recovered.result.applied, slugs, by_number, report.index
+        )
 
     # 2. The merge gate, in the order it ran: mergeability decides what may
     #    merge against the base as it is now, then checks merges it.
-    for number, entry in sorted(entries.items()):
+    for ref, entry in sorted(entries.items()):
         pull = pulls.get(entry.branch)
-        task = refs.get(number, "")
+        task = slugs.get(ref, "")
         if pull is None or not task:
             continue
         emit(
             PR_OPENED,
-            (task, pull.number),
+            once=(task, pull.number),
             task=task,
             pull=pull.number,
             head_sha=pull.sha,
         )
 
     for number, check_set in sorted(checks.items()):
-        entry = entries.get(number)
-        task = refs.get(number, "")
+        entry = by_issue.get(number)
+        task = by_number.get(number, "")
         pull = pulls.get(entry.branch) if entry is not None else None
         if not task or pull is None:
             continue
         state = check_set.verdict
         # Which check decided it. One name rather than the three lists, because
         # the question this answers is "what is this pull request waiting on".
-        # Scrubbed like any other prose: the name is written by whoever wrote
-        # the target repository's workflow, so it is the one field here whose
-        # text apiary did not author.
+        #
+        # **Verbatim, and it is the one field here that is.** The name was
+        # written by whoever wrote the target repository's workflow, so it
+        # cannot carry an apiary issue number, and it is precisely the string a
+        # reader pastes into the CI UI to find the run. Scrubbing it would
+        # silently rename a check somebody happened to call `swarm:lint`.
         names = check_set.failed or check_set.pending or check_set.succeeded or ("",)
-        deciding = scrub(names[0], refs)
+        deciding = names[0]
         emit(
             PR_CHECKS,
             # The head as well as the pull request. A retry reuses the open PR
             # (`worker/pr.py`), so one number cycles pending -> failing ->
             # pending across attempts, and a key without the sha would announce
             # the first attempt's gate and silently swallow every later one.
-            (task, pull.number, pull.sha, state, deciding),
+            # `PullState.sha` can be empty - the listing is the source and a
+            # payload without a head is a real answer - and the key then
+            # degrades to the coarse form rather than failing.
+            once=(task, pull.number, pull.sha, state, deciding),
             task=task,
             pull=pull.number,
             head_sha=pull.sha,
@@ -258,29 +280,30 @@ def lifecycle_events(
         )
 
     if report.mergeability is not None:
-        events += _landed_or_human(report.mergeability.applied, refs, report.index)
+        events += _landed_or_human(report.mergeability.applied, slugs, by_number, report.index)
 
     gate = report.checks
     if gate is not None:
         landed = set(gate.merged)
+        commits = gate.commit_by_issue
         for merge in gate.plan.merges:
-            task = refs.get(merge.number, "")
+            task = by_number.get(merge.number, "")
             if merge.number not in landed or not task:
                 continue
             emit(
                 PR_MERGED,
                 task=task,
                 pull=merge.pull,
-                merge_commit=gate.commit_by_issue.get(merge.number, ""),
+                merge_commit=commits.get(merge.number, ""),
             )
-        events += _landed_or_human(gate.applied, refs, report.index)
+        events += _landed_or_human(gate.applied, slugs, by_number, report.index)
 
     # 3. Readiness and dispatch, last, because that is when they ran. A task
     #    that failed this cycle and went back to `swarm:ready` is claimed again
     #    in the next one, and the log should read in that order.
     if report.readiness is not None:
         for verdict in report.readiness.verdicts:
-            entry = entries.get(verdict.number)
+            entry = entries.get(verdict.ref)
             if not verdict.ready or not verdict.task_id or entry is None:
                 continue
             emit(
@@ -291,10 +314,16 @@ def lifecycle_events(
                 # root task of every plan - and "a run with one task", which is
                 # #141's own criterion - never produces a readiness
                 # *transition* at all. Eligibility is derived and recomputed
-                # each cycle (ADR 0001), so it is projected from the verdict
-                # and bounded by the attempt it was computed for: a retry is a
-                # new occurrence and says so.
-                (verdict.task_id, entry.attempt),
+                # each cycle (ADR 0001), so it is projected from the verdict.
+                #
+                # The key is the task, and `LifecycleLog` forgets it when the
+                # task is claimed - so this is once per *episode of being
+                # eligible*, not once per run and not once per attempt. Keying
+                # on the attempt looked right and was not: exit 2 consumes no
+                # attempt (§4), so the re-dispatch is ready at the number
+                # already announced, and a goal-gate revival resets nothing at
+                # all. Both would have been silent.
+                once=(verdict.task_id,),
                 task=verdict.task_id,
                 attempt=entry.attempt,
                 # Every dependency this task declared, all of which are
@@ -321,12 +350,21 @@ def lifecycle_events(
 
 
 def _stamp(record: ResultRecord) -> str:
-    """What distinguishes two records that share an attempt number."""
+    """What distinguishes two records that share an attempt number.
+
+    Both timestamps are optional on `ResultRecord` - a record synthesised from
+    a container log has neither - so for those the key degrades to the attempt
+    alone and a second infrastructure failure at that attempt is announced
+    once. The degraded case is the one the field cannot fix, not a bug in it.
+    """
     return f"{record.started_at}/{record.finished_at}"
 
 
 def _landed_or_human(
-    transitions: Iterable[Transition], refs: Mapping[int, str], cycle: int
+    transitions: Iterable[Transition],
+    slugs: Mapping[TaskRef, str],
+    by_number: Mapping[int, str],
+    cycle: int,
 ) -> list[TaskEvent]:
     """`task.landed` and `task.needs_human`, from transitions that **landed**.
 
@@ -343,11 +381,13 @@ def _landed_or_human(
     """
     events: list[TaskEvent] = []
     for transition in transitions:
-        task = transition.task_id or refs.get(transition.number, "")
+        task = transition.task_id or slugs.get(transition.ref, "")
         if not task:
             continue
         if transition.to_label == DONE:
-            events.append(TaskEvent(TASK_LANDED, {"cycle": cycle, "task": task}))
+            events.append(
+                TaskEvent(TASK_LANDED, {"cycle": cycle, "task": task}, once=(task,))
+            )
         elif transition.to_label == FAILED:
             events.append(
                 TaskEvent(
@@ -355,7 +395,7 @@ def _landed_or_human(
                     {
                         "cycle": cycle,
                         "task": task,
-                        "reason": scrub(transition.reason, refs),
+                        "reason": scrub(transition.reason, by_number),
                         # §4's rule, reported rather than re-derived: exit 2
                         # never consumes an attempt, and neither does an
                         # escalation raised on a failure no attempt could fix.
@@ -368,6 +408,10 @@ def _landed_or_human(
                         # would mis-pair them.
                         "attempt_consumed": transition.attempt is not None,
                     },
+                    # A task lands, or reaches a human, once. Four modules write
+                    # a terminal label and they are disjoint today - but that is
+                    # an invariant four files away, and the key makes it local.
+                    once=(task,),
                 )
             )
     return events
@@ -400,6 +444,13 @@ class LifecycleLog:
                 if key in self._announced:
                     continue
                 self._announced.add(key)
+            # Claiming a task ends its episode of being eligible, so the next
+            # time it is ready - a retry, a revival - is a new occurrence and
+            # is announced again. Done here rather than in the projection
+            # because it is the only thing in this module that remembers
+            # anything, and `lifecycle_events` stays pure.
+            if event.name == TASK_CLAIMED:
+                self._announced.discard((TASK_ELIGIBLE, event.fields["task"]))
             fresh.append(event)
         if emit is not None:
             for event in fresh:
