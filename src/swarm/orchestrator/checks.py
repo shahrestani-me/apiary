@@ -85,7 +85,7 @@ import datetime as dt
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from ..config import SETTINGS
@@ -1025,6 +1025,13 @@ class ChecksReport:
     #: Comments this client had no method to post. `reconcile.post_comment`
     #: printed them instead.
     uncommented: tuple[int, ...] = ()
+    #: The commit each merge produced, by issue number - GitHub's answer to the
+    #: `PUT .../merge`, which this module previously threw away. Announcement
+    #: only: nothing here reads it, and `pr.merged` (#141) is the only consumer,
+    #: because "which commit is this task now" is the one fact about a landed
+    #: task that the run directory could not otherwise recover. Absent for a
+    #: client whose merge returns no `sha`, which the tests' doubles do.
+    merge_commits: Mapping[int, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -1101,6 +1108,7 @@ def apply_checks(
     undeleted: list[str] = []
     failures: list[Failure] = []
     uncommented: list[int] = []
+    merge_commits: dict[int, str] = {}
 
     if dry_run:
         return ChecksReport(plan=plan)
@@ -1108,7 +1116,7 @@ def apply_checks(
     refused: set[int] = set()
     for merge in plan.merges:
         try:
-            client.merge_pull_request(
+            answer = client.merge_pull_request(
                 merge.pull,
                 merge_method=merge.merge_method,
                 sha=merge.sha or None,
@@ -1122,6 +1130,14 @@ def apply_checks(
             refused.add(merge.number)
             continue
         merged.append(merge.number)
+        # Whatever the merge answered, if it answered anything with a `sha`.
+        # Guarded rather than indexed: the doubles in the tests return `None`,
+        # and a merge that landed must not be reported as a failure because the
+        # commit it produced could not be read back.
+        if isinstance(answer, Mapping):
+            commit = str(answer.get("sha") or "")
+            if commit:
+                merge_commits[merge.number] = commit
         if not merge.delete_branch:
             continue
         (deleted if delete_branch(client, merge.branch) else undeleted).append(merge.branch)
@@ -1154,6 +1170,7 @@ def apply_checks(
         failures=tuple(failures),
         undeleted=tuple(dict.fromkeys(undeleted)),
         uncommented=tuple(dict.fromkeys(uncommented)),
+        merge_commits=merge_commits,
     )
 
 

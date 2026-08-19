@@ -93,6 +93,16 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterable, Mapping, Protocol
 
+from ..artifacts import (
+    PR_CHECKS,
+    PR_MERGED,
+    PR_OPENED,
+    TASK_CLAIMED,
+    TASK_ELIGIBLE,
+    TASK_LANDED,
+    TASK_NEEDS_HUMAN,
+    TASK_RESULT,
+)
 from ..config import SETTINGS
 from ..containers.manager import ContainerError, Handle, StackImages
 from ..github.client import GitHubClient, GitHubError
@@ -128,6 +138,19 @@ from .dispatcher import CLAIMED, REVIEW, Capacity, DispatchReport, Spawner, disp
 #: decides what "finished" means, and resumption depends on that answer.
 DONE = "swarm:done"
 FAILED = "swarm:failed"
+
+#: ADR 0001's internal workflow, keyed by the label that happens to store it
+#: today. The five states on the right are apiary's own and identical for every
+#: customer; the six strings on the left are a storage detail that epic #140
+#: removes. Everything announced to `events.jsonl` (#141) speaks the right-hand
+#: column, so a recorded run stays readable once the left-hand one is gone.
+INTERNAL_STATE = {
+    READY: "eligible",
+    CLAIMED: "claimed",
+    REVIEW: "review",
+    DONE: "landed",
+    FAILED: "needs-human",
+}
 
 #: Seconds between the *starts* of two cycles, not between one ending and the
 #: next beginning. A cycle that took longer than this does not then sleep on top
@@ -305,6 +328,43 @@ def _label_names(issue: Mapping[str, Any]) -> frozenset[str]:
     for label in issue.get("labels") or ():
         names.append(label.get("name", "") if isinstance(label, Mapping) else str(label))
     return frozenset(name for name in names if name)
+
+
+@dataclass(frozen=True)
+class PullFacts:
+    """The two things an announcement needs to name a pull request.
+
+    Deliberately not `checks.PullState`: that module imports this one, so a
+    top-level import would be a cycle, and the merge gate's richer record
+    carries a draft flag and a timestamp that only its own rules read. This is
+    the announcement's half - a number and the head it is at.
+    """
+
+    number: int
+    sha: str = ""
+
+
+def read_pull_facts(snapshot: Any) -> dict[str, PullFacts]:
+    """Open pull requests by head ref, from the listing the cycle already made.
+
+    Free: `Snapshot.pull_requests` caches, and `open_branches()` has already
+    forced it by the time this is called. Read outside the merge gate on
+    purpose - a run merging by hand still wants `pr.opened` in its event log,
+    and the gate being off is not a reason for the run directory to stop
+    recording that a task reached review.
+    """
+    facts: dict[str, PullFacts] = {}
+    for payload in snapshot.pull_requests():
+        head = payload.get("head") or {}
+        ref = str(head.get("ref") or "")
+        try:
+            number = int(payload.get("number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not ref or not number:
+            continue
+        facts.setdefault(ref, PullFacts(number=number, sha=str(head.get("sha") or "")))
+    return facts
 
 
 # --------------------------------------------------------------------------
@@ -1360,6 +1420,18 @@ class CycleReport:
     #: dying and taking its containers with it.
     cycle_error: str = ""
     live: int = 0
+    #: What the cycle *saw*, as opposed to what it decided. Carried so the
+    #: lifecycle announcement (#141) can name a worker's exit code, a pull
+    #: request and a check set without re-reading anything - all three are facts
+    #: this cycle already had in hand and then threw away. **No rule reads
+    #: them**, and none may: a decision taken from a field on the report is a
+    #: decision taken after the plan was computed, which is the one property
+    #: `plan_reconcile` being pure exists to guarantee. Keyed by issue number
+    #: (`results`, `check_sets`) and by head ref (`pulls`), because that is how
+    #: their producers key them; the announcement translates to the task ref.
+    results: Mapping[int, ResultRecord] = field(default_factory=dict)
+    pulls: Mapping[str, PullFacts] = field(default_factory=dict)
+    check_sets: Mapping[int, Any] = field(default_factory=dict)
 
     @property
     def plan(self) -> ReconcilePlan:
@@ -1432,6 +1504,281 @@ class CycleReport:
             parts.append(f"error: {self.cycle_error}")
         parts.append(f"{self.live} live issue(s)")
         return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# The announcement
+# --------------------------------------------------------------------------
+#
+# A cycle is minutes long, and `cycle.reconciled` - one summary sentence per
+# cycle - is all that survives of it. Every state worth watching (a task became
+# eligible, a container took it, its gate spoke, its pull request merged) starts
+# and ends inside a cycle, so an operator reading `events.jsonl` afterwards can
+# see that a run happened and not what happened in it.
+#
+# **This announces; it does not decide.** Everything below is a projection of a
+# `CycleReport` that has already been computed and already been written to
+# GitHub. Nothing here is consulted by a rule, nothing here changes a label, and
+# `cycle.reconciled` is untouched - which is the whole reason the projection is
+# a pure function taking a finished report rather than a hook inside the loop.
+#
+# **The vocabulary is apiary's own.** Every payload is keyed by the task ref
+# `Transition.task_id` already carries, and the states it names are ADR 0001's
+# five internal ones. Not the issue number, and not the `swarm:*` label: the log
+# is append-only and read back, so a payload written in the label vocabulary
+# would be invalidated by the rest of epic #140 removing the labels - the exact
+# reason #131 was retargeted into this ticket.
+
+#: A branch name carries the issue number because addressing needs one
+#: (`LedgerEntry.branch`), so prose quoting a branch smuggles the number into a
+#: payload that is meant to be joinable on the task ref alone. Both it and any
+#: label name are translated on the way out.
+_BRANCH_RE = re.compile(r"\bswarm/issue-(\d+)\b")
+_LABEL_RE = re.compile(r"\bswarm:([a-z_]+)\b")
+
+
+def internal_state(label: str) -> str:
+    """The internal state a `swarm:*` label is storing. See `INTERNAL_STATE`."""
+    return INTERNAL_STATE.get(label, label.split(":", 1)[-1])
+
+
+def scrub(text: str, refs: Mapping[int, str]) -> str:
+    """Rewrite a human sentence into the internal vocabulary.
+
+    The reasons the reconciler and the merge gate write are for a human, and two
+    of them quote the things this ticket exists to keep out of the log: the
+    branch (`swarm/issue-12`, which is an issue number) and the label
+    (`swarm:ready`, which epic #140 deletes). A task ref the ledger cannot
+    resolve becomes a neutral phrase rather than the number, because a number
+    that survives *because* the ledger lost the task is the worst case, not the
+    exempt one.
+    """
+
+    def branch(match: re.Match[str]) -> str:
+        return refs.get(int(match.group(1)), "another task in this run")
+
+    return _LABEL_RE.sub(
+        lambda match: internal_state(match.group(0)), _BRANCH_RE.sub(branch, text)
+    )
+
+
+@dataclass(frozen=True)
+class TaskEvent:
+    """One thing that happened to one task, ready for `RunArtifacts.event`.
+
+    `once` is the identity of the *occurrence*, for the events whose source is a
+    standing fact rather than a change: the results directory still holds last
+    cycle's record, the pull request is still open, the check set still says
+    pending. `None` means the source only speaks when something moved - a
+    readiness transition, a dispatch, a merge - and re-announcing it would take
+    a second occurrence to produce.
+    """
+
+    name: str
+    fields: Mapping[str, Any]
+    once: tuple[Any, ...] | None = None
+
+
+def lifecycle_events(report: CycleReport) -> tuple[TaskEvent, ...]:
+    """Project one finished cycle onto the per-task lifecycle. Pure.
+
+    The order is the cycle's own: reconcile, then the merge gate, then readiness
+    and dispatch - so a single task's log reads
+    `eligible -> claimed -> result -> pr.opened -> pr.checks -> pr.merged ->
+    landed` across the cycles that produced it, and a retry reads
+    `result -> claimed` in that order within one.
+    """
+    ledger = report.ledger
+    entries = {entry.number: entry for entry in ledger.entries.values()}
+    refs = {number: entry.task_id for number, entry in entries.items() if entry.task_id}
+    events: list[TaskEvent] = []
+
+    def ref(number: int) -> str:
+        return refs.get(number, "")
+
+    # 1. What the workers said. Read from the results directory rather than from
+    #    a transition, because the outcome that moves no label - exit 0, whose
+    #    `claimed -> review` belongs to the worker - is the one an operator is
+    #    most often waiting for. `once` on the attempt, because the record stays
+    #    on disk and would otherwise be announced every cycle until the retry.
+    for number, record in sorted(report.results.items()):
+        task = ref(number)
+        if not task:
+            continue
+        events.append(
+            TaskEvent(
+                TASK_RESULT,
+                {
+                    "task": task,
+                    "attempt": record.attempt,
+                    "exit_code": record.exit_code,
+                    "outcome": record.outcome,
+                    "duration_s": record.duration_s,
+                },
+                once=(task, record.attempt),
+            )
+        )
+
+    events += _terminal_events(report.result.applied, refs)
+
+    # 2. The merge gate, in the order it ran.
+    for number, entry in sorted(entries.items()):
+        pull = report.pulls.get(entry.branch)
+        task = ref(number)
+        if pull is None or not task:
+            continue
+        events.append(
+            TaskEvent(
+                PR_OPENED,
+                {"task": task, "pull": pull.number, "head_sha": pull.sha},
+                once=(task, pull.number),
+            )
+        )
+
+    for number, checks in sorted(report.check_sets.items()):
+        entry = entries.get(number)
+        task = ref(number)
+        pull = report.pulls.get(entry.branch) if entry is not None else None
+        if not task or pull is None:
+            continue
+        state = checks.verdict
+        # Which check decided it. One name rather than the three lists, because
+        # the question this answers is "what is this pull request waiting on",
+        # and the lists are in the run's container logs either way.
+        deciding = (checks.failed or checks.pending or checks.succeeded or ("",))[0]
+        events.append(
+            TaskEvent(
+                PR_CHECKS,
+                {"task": task, "pull": pull.number, "state": state, "check": deciding},
+                once=(task, pull.number, state, deciding),
+            )
+        )
+
+    gate = report.checks
+    if gate is not None:
+        landed = set(gate.merged)
+        for merge in gate.plan.merges:
+            task = ref(merge.number)
+            if merge.number not in landed or not task:
+                continue
+            events.append(
+                TaskEvent(
+                    PR_MERGED,
+                    {
+                        "task": task,
+                        "pull": merge.pull,
+                        "merge_commit": gate.merge_commits.get(merge.number, ""),
+                    },
+                )
+            )
+        events += _terminal_events(gate.applied, refs)
+
+    # 3. Readiness and dispatch, last, because that is when they ran. A task
+    #    that failed this cycle and was put back to `swarm:ready` is claimed
+    #    again in this same cycle, and the log should say so in that order.
+    if report.readiness is not None:
+        for verdict in report.readiness.transitions:
+            if not verdict.ready or not verdict.task_id:
+                continue
+            entry = entries.get(verdict.number)
+            events.append(
+                TaskEvent(
+                    TASK_ELIGIBLE,
+                    {
+                        "task": verdict.task_id,
+                        # What discharged the last dependency: the refs this
+                        # task was waiting on, all of which are now satisfied -
+                        # that is what made this verdict `ready`. Already task
+                        # refs; `ledger` resolves `## Blocked by` numbers when
+                        # it loads.
+                        "discharged": list(entry.depends_on) if entry is not None else [],
+                        "from_state": internal_state(verdict.current_label),
+                    },
+                )
+            )
+
+    if report.dispatched is not None:
+        for sent in report.dispatched.dispatched:
+            if not sent.entry.task_id:
+                continue
+            events.append(
+                TaskEvent(
+                    TASK_CLAIMED,
+                    {
+                        "task": sent.entry.task_id,
+                        "attempt": sent.entry.attempt,
+                        "container": sent.handle.id[:12],
+                        "image": sent.handle.image or "",
+                    },
+                )
+            )
+
+    return tuple(events)
+
+
+def _terminal_events(
+    transitions: Iterable[Transition], refs: Mapping[int, str]
+) -> list[TaskEvent]:
+    """`task.landed` and `task.needs_human`, from transitions that **landed**.
+
+    Applied rather than planned, for `fold`'s reason: a label write GitHub
+    refused left the task where it was, and announcing it would put a state in
+    the log that the control plane never reached.
+    """
+    events: list[TaskEvent] = []
+    for transition in transitions:
+        task = transition.task_id or refs.get(transition.number, "")
+        if not task:
+            continue
+        if transition.to_label == DONE:
+            events.append(TaskEvent(TASK_LANDED, {"task": task}))
+        elif transition.to_label == FAILED:
+            events.append(
+                TaskEvent(
+                    TASK_NEEDS_HUMAN,
+                    {
+                        "task": task,
+                        "reason": scrub(transition.reason, refs),
+                        # §4's rule, reported rather than re-derived: exit 2
+                        # never consumes an attempt, and neither does an
+                        # escalation the merge gate raised on a failure no
+                        # attempt could fix. `attempt is None` is precisely
+                        # "this transition wrote no counter".
+                        "attempt_consumed": transition.attempt is not None,
+                        "attempt": transition.attempt,
+                    },
+                )
+            )
+    return events
+
+
+@dataclass
+class LifecycleLog:
+    """Announces a cycle's task events, once each, through whatever `emit` is.
+
+    Run-scoped, for the same reason `Reconciler._infrastructure` is: "have I
+    said this already" is a question about a sequence, and a restart announcing
+    a task's standing facts once more is the harmless direction - the log is
+    append-only and every payload carries the occurrence it belongs to.
+    """
+
+    emit: Callable[..., Any] | None = None
+    _announced: set[tuple[Any, ...]] = field(default_factory=set, repr=False)
+
+    def announce(self, report: CycleReport) -> tuple[TaskEvent, ...]:
+        """Emit this cycle's fresh events, and return them."""
+        fresh: list[TaskEvent] = []
+        for event in lifecycle_events(report):
+            if event.once is not None:
+                key = (event.name, *event.once)
+                if key in self._announced:
+                    continue
+                self._announced.add(key)
+            fresh.append(event)
+        if self.emit is not None:
+            for event in fresh:
+                self.emit(event.name, **event.fields)
+        return tuple(fresh)
 
 
 @dataclass
@@ -1524,6 +1871,14 @@ class Reconciler:
     #: the end is a run nobody can watch, and it is also how the merge gate's
     #: verdicts reach the operator while there is still time to act on them.
     on_cycle: Callable[[CycleReport], None] | None = None
+    #: Where the per-task lifecycle is announced (#141) - `RunArtifacts.event`
+    #: in a real run, so the events land in `events.jsonl` and are redacted like
+    #: everything else. `None` announces nothing, which is what a reconciler
+    #: with no run directory behind it should do. Separate from `on_cycle`
+    #: because the two answer different questions: `on_cycle` is one line per
+    #: cycle for whoever is watching, this is one event per task transition for
+    #: whoever reads the run back afterwards.
+    events: Callable[..., Any] | None = None
 
     _cycles: int = field(default=0, repr=False)
     #: The progress ledger, run-scoped. See the module docstring.
@@ -1537,6 +1892,9 @@ class Reconciler:
     #: granting a clean slate is the safe direction for a counter whose job is
     #: bounding one run.
     _infrastructure: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: Which task events have already been announced (#141). Run-scoped for the
+    #: same reason, and holding nothing a decision reads.
+    _lifecycle: LifecycleLog = field(default_factory=LifecycleLog, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1606,6 +1964,7 @@ class Reconciler:
         # against what it is landing on. `plan.admitted` is what survives.
         mergeability = None
         checks = None
+        check_runs: dict[int, Any] = {}
         if self.merge_gate:
             # Local, because `checks` and `mergeability` both import this
             # module: they are the policy over the state this one folds,
@@ -1615,7 +1974,6 @@ class Reconciler:
             from .mergeability import run_mergeability
 
             pulls = read_pulls(snapshot)
-            check_runs = {}
             if pulls is not None:
                 for entry in ledger.entries.values():
                     pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
@@ -1679,8 +2037,23 @@ class Reconciler:
             recovered=recovered,
             cycle_error=cycle_error,
             live=len(live_entries(ledger)),
+            results=results,
+            # From the listing `open_branches()` already forced, so this is a
+            # dictionary comprehension rather than a request - and it is read
+            # outside the merge gate on purpose, so a run merging by hand still
+            # records that its tasks reached review.
+            pulls=read_pull_facts(snapshot),
+            check_sets=check_runs,
         )
-        return self._judge(snapshot, report, results=results)
+        judged = self._judge(snapshot, report, results=results)
+        # Last, and on the grown report: the announcement is a projection of a
+        # cycle that has already decided and already written, which is what
+        # makes "#141 changes no behaviour" a structural claim rather than a
+        # promise. `emit` is re-read each cycle so a caller may wire it after
+        # construction, as the tests do.
+        self._lifecycle.emit = self.events
+        self._lifecycle.announce(judged)
+        return judged
 
     # --- step 5 ----------------------------------------------------------
 

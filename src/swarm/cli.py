@@ -731,6 +731,12 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         verify=verify,
         goal_gate=not args.no_goal_check,
         on_cycle=_report_cycle(artifacts),
+        # The per-task lifecycle (#141), straight onto `events.jsonl` and
+        # therefore through the same redactor as everything else in the run
+        # directory. `_report_cycle` still writes `cycle.reconciled`, unchanged:
+        # one is the cycle a human is watching, the other is the timeline a
+        # reader reconstructs afterwards.
+        events=artifacts.event,
         dry_run=args.dry_run,
     )
 
