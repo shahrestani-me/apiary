@@ -74,8 +74,15 @@ because there is nothing to ask.
 
 ## What this module does not do
 
-It does not run anything. Epic #128 step 1 is a plan becoming work. Turning
-work into workers is the next button, and `SwarmRuns` already knows how.
+It does not run anything, and after #130 that is a statement about this module
+rather than about the button. Provisioning ends at a repository with a backlog;
+`Console._build` then hands that repository to `SwarmRuns`, which supervises the
+reconcile loop exactly as the swarm tab does - a child process running the real
+`swarm run`, stopped with the `SIGINT` that lets `cli._loop` dispose its
+containers. Keeping the two apart is what lets a run that will not start be
+reported *on a build that succeeded*: the repository and its issues are real
+either way, and a build that called itself failed because the loop could not
+begin would be describing the wrong thing.
 """
 
 from __future__ import annotations
@@ -84,7 +91,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
-from .console_runs import PROVISION_TOKEN_ENV, SwarmRunError, assert_tokens
+from .console_runs import PROVISION_TOKEN_ENV, SWARM_SITE, SwarmRunError, assert_tokens
 from .github.ledger import DEFAULT_STACK, KNOWN_STACKS
 from .state import Plan
 
@@ -171,6 +178,14 @@ class BuildReport:
     a build that wrote six issues out of eight tasks is not a success with a
     footnote — it is two silently missing pieces of work unless the page says
     so.
+
+    **Two keys the page reads are not fields here**: `Console._start_run` adds
+    `run` (the supervised run this build started) or `run_error` (why it could
+    not) to the dictionary `to_dict` returns. They are deliberately not on this
+    class - a `BuildReport` is what provisioning produced, and this module does
+    not know that runs exist, which is the separation `## What this module does
+    not do` rests on. Recorded here anyway, because the wire shape the front
+    end parses is otherwise stated in one file and extended in another.
     """
 
     repo: str
@@ -203,6 +218,18 @@ class BuildReport:
 # The form
 # --------------------------------------------------------------------------
 
+def _from_swarm(name: str) -> dict[str, Any]:
+    """One of the swarm tab's field descriptors, by name, copied not retyped.
+
+    So that the cap and the merge policy this form offers cannot drift from the
+    ones `swarm run` offers - which is a promise a comment cannot keep.
+    """
+    for field in SWARM_SITE["fields"]:
+        if field["name"] == name:
+            return dict(field)
+    raise KeyError(f"the swarm tab has no {name!r} field")
+
+
 #: Served under its own key on `/sites`, exactly as `SWARM_SITE` is and for the
 #: same reason: nothing that iterates model-call sites may pick up a form with
 #: no prompt behind it.
@@ -216,14 +243,17 @@ class BuildReport:
 BUILD_SITE: dict[str, Any] = {
     "key": "build",
     "kind": "build",
-    "label": "Start building — this plan, as a repository",
+    "label": "Start building — this plan, as a repository, and then a running swarm",
     "blurb": (
-        "Creates a new GitHub repository and writes the plan above into it as issues — "
-        "the tasks on this screen, with these ids, these goals and these files. The model "
-        "is not asked again. Nothing is created until the token and image checks pass, and "
-        "any task that cannot become an issue is listed here rather than dropped. The only "
-        "issue written that is not on this screen is the project scaffold, and only while "
-        "the box below is ticked."
+        "Creates a new GitHub repository, writes the plan above into it as issues — "
+        "the tasks on this screen, with these ids, these goals and these files — and then "
+        "starts the swarm on it: one worker per ready issue, a pull request per task, "
+        "cycle after cycle until the objective is met, the cap below is hit, or you press "
+        "Stop. Pull requests wait for you unless you tick the merge box. "
+        "The model is not asked to plan again. Nothing is created until the token and "
+        "image checks pass, and any task that cannot become an issue is listed here rather "
+        "than dropped. The only issue written that is not on this screen is the project "
+        "scaffold, and only while the box below is ticked."
     ),
     "fields": [
         {"name": "owner", "label": "Owner — the GitHub account or organisation to create it under",
@@ -236,8 +266,30 @@ BUILD_SITE: dict[str, Any] = {
          "kind": "check", "value": "1"},
         {"name": "bootstrap", "label": "Write the project-scaffold issue first — one extra issue that creates the initial project, with every task above blocked on it. Without it the first cycle dispatches every task against an empty repository, each worker inventing its own project.",
          "kind": "check", "value": "1"},
-        {"name": "verify", "label": "Verify command (optional; default: the placeholder gate, which the first pull request replaces)",
+        {"name": "verify", "label": "Verify command — CI runs exactly this and only its exit code is believed. Leave it blank and the repository keeps the placeholder gate (`test -f README.md`), which no worker can ever replace: rewriting `.github/workflows` needs the `workflows` permission, and the work key is forbidden it.",
          "kind": "text", "placeholder": "python -m pytest -q", "value": ""},
+        # The two fields that belong to the *run*, not to the repository, and
+        # they are here rather than on a second form because #130 made this one
+        # button do both. Taken from the swarm tab's own descriptor rather than
+        # retyped: `assert_tokens`' docstring names the failure mode of the
+        # alternative - "two descriptions of one problem is how the fix for it
+        # goes stale on the copy nobody edited" - and a build offering a
+        # different cap or a differently worded merge policy would be the
+        # second set of defaults the ticket says not to grow.
+        _from_swarm("max_cycles"),
+        # ...with one deliberate divergence, and it is a safety default rather
+        # than a preference. On the swarm tab the operator has usually typed a
+        # gate, or is attaching to a repository that already has a real one.
+        # Here the field above is optional and blank is the common case, so the
+        # required check is `test -f README.md` - and, per that label, stays
+        # that way for the life of the repository. Shipping this ticked would
+        # mean one press of Start building merges model-written code into a
+        # protected `main` behind a check that asserts a README exists, without
+        # the operator having chosen it. Unticked is the conservative
+        # direction, the same argument `public` two fields up makes for itself:
+        # every pull request waits for a human until someone ticks this on
+        # purpose.
+        dict(_from_swarm("auto_merge"), value=""),
     ],
 }
 

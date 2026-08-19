@@ -121,7 +121,14 @@ swarm console
 One page on `http://127.0.0.1:8117`. Type the human turn of a prompt, fire it at
 the same local Ollama a run uses, and read the schema-constrained answer, the raw
 response, the timings, and — when it breaks — the real exception beside the prompt
-that caused it. No GitHub token, no Docker, no repository, no nine-minute run.
+that caused it. The model-call tabs need no GitHub token, no Docker, no repository
+and no nine-minute run.
+
+The page is more than that now. The swarm tab runs the real thing — and since
+#130 the planner tab's **Start building** provisions a repository from a plan you
+have read, writes it up as issues, and starts the swarm on it, with a live log and
+a Stop that disposes the run's containers. Those parts do need a token and a
+Docker daemon, and they create things on GitHub.
 
 Two call sites are exposed: `propose_edits`, the worker's whole-file generation,
 and `choose_stack`, which answers in seconds and is the cheapest way to prove the

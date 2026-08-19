@@ -40,6 +40,16 @@ stopped helping. The `swarm` tab (`console_runs.py`) execs the real CLI as a
 subprocess and streams its log to the page - repository, issues, workers,
 pull requests, merges, the goal verdict - without this module gaining any
 pipeline logic of its own.
+
+**And one decision that is this module's, deliberately.** #129 gave the planner
+tab a Start building button that provisions a repository and writes the plan
+into it as issues; #130 made that button go on to *run* it. The provisioning
+half lives in `console_build`, the supervision half in `console_runs`, and the
+line joining them is `_start_run` here - because it is the only place that
+holds both a finished `BuildReport` and the `SwarmRuns` that will watch the
+child. What it decides is small and worth finding: which repository the run
+attaches to, that it must not be asked to provision a second one, and that a
+run which will not start leaves the build finished rather than failed.
 """
 
 from __future__ import annotations
@@ -64,7 +74,7 @@ from .console_board import BoardError, BoardReader
 from .console_build import BUILD_SITE, BUILD_SITE_KEY, BuildError, Builder
 from .console_intake import QUESTIONS as INTAKE_QUESTIONS
 from .console_projects import ProjectError, ProjectStore
-from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns
+from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns, check_run_values
 
 __all__ = [
     "ASSETS",
@@ -112,6 +122,11 @@ class ConsoleBusy(ConsoleError):
     Its own type because two routes raise it now - a model call and a build -
     and the alternative was each of them re-deriving "is something running,
     and what do I say if it is" from `_running`. See `Console._claim`.
+
+    Not every busy refusal on this page is one of these: the two #130 added
+    (`_swarm_build` refusing while a run is live, `_swarm_start` refusing while
+    a build is) are about `SwarmRuns`' latch rather than this one, and answer
+    in the same `{error, fix}` shape without borrowing this type's meaning.
     """
 
     def __init__(self, message: str, *, fix: str = "") -> None:
@@ -427,11 +442,20 @@ class Console:
                 fix=f"open http://{DEFAULT_HOST}:{self.port}/ directly",
             )
 
-        if method == "GET" and path in ("/", "/index.html"):
+        # The route is the path *without* the query, and every exact match
+        # below is against it. `do_GET` hands over `self.path` verbatim, so
+        # matching the whole string meant `/?debug=1` - the documented way to
+        # bring the tab strip back, and therefore the only way to reach the
+        # planner tab and Start building - answered "no route for GET
+        # /?debug=1". The routes that read a query parse it themselves out of
+        # `path`, which is why they keep it.
+        route = path.partition("?")[0]
+
+        if method == "GET" and route in ("/", "/index.html"):
             return Response.html(page())
-        if method == "GET" and path in ASSET_TYPES:
-            return Response(200, asset(path.lstrip("/")).encode("utf-8"), ASSET_TYPES[path])
-        if method == "GET" and path == "/sites":
+        if method == "GET" and route in ASSET_TYPES:
+            return Response(200, asset(route.lstrip("/")).encode("utf-8"), ASSET_TYPES[route])
+        if method == "GET" and route == "/sites":
             return Response.json({"sites": [s.to_dict() for s in SITES.values()],
                                   # Its own key, not a fourth entry in `sites`:
                                   # nothing that iterates model-call sites may
@@ -444,19 +468,19 @@ class Console:
                                   "models": {"orchestrator": SETTINGS.orchestrator_model,
                                              "worker": SETTINGS.worker_model,
                                              "base_url": SETTINGS.ollama_base_url}})
-        if method == "POST" and path == "/prompt":
+        if method == "POST" and route == "/prompt":
             return self._prompt(body)
-        if method == "POST" and path == "/run":
+        if method == "POST" and route == "/run":
             return self._run(body)
         if method == "GET" and path.startswith("/status"):
             return self._status(path)
-        if method == "POST" and path == "/swarm/build":
+        if method == "POST" and route == "/swarm/build":
             return self._swarm_build(body)
-        if method == "POST" and path == "/swarm/start":
+        if method == "POST" and route == "/swarm/start":
             return self._swarm_start(body)
-        if method == "POST" and path == "/swarm/stop":
+        if method == "POST" and route == "/swarm/stop":
             return self._swarm_stop(body)
-        if method == "GET" and path == "/swarm/latest":
+        if method == "GET" and route == "/swarm/latest":
             latest = self.runs.latest()
             return Response.json(latest) if latest else Response.error("no runs yet", 404)
         if method == "GET" and path.startswith("/swarm/status"):
@@ -465,9 +489,9 @@ class Console:
             return self._swarm_board(path)
         if method == "GET" and path.startswith("/swarm/external"):
             return self._swarm_external(path)
-        if method == "GET" and path == "/projects":
+        if method == "GET" and route == "/projects":
             return self._projects_list()
-        if method == "POST" and path == "/projects":
+        if method == "POST" and route == "/projects":
             return self._projects_save(body)
         if method == "GET" and path.startswith("/projects/history"):
             return self._projects_history(path)
@@ -584,6 +608,23 @@ class Console:
     # `{error, fix}` shape every other refusal on this page uses.
 
     def _swarm_start(self, body: bytes) -> Response:
+        # The other direction of `_swarm_build`'s gate, and it is not symmetry
+        # for its own sake. A build spends minutes provisioning before it asks
+        # for the single run slot; a Fire pressed on the swarm tab in that
+        # window takes the slot, and the build's own `_start_run` is then
+        # refused into `run_error` - leaving a repository and a written backlog
+        # with no swarm on it, which is exactly the "a human has to go and
+        # delete it" cost the build-side gate was added to avoid.
+        with self._lock:
+            running = self.jobs.get(self._running) if self._running else None
+            building = running is not None and running.site == BUILD_SITE_KEY
+        if building:
+            return Response.error(
+                "a build is in flight, and the run it is about to start needs the "
+                "slot this one would take", 409,
+                fix="wait for it to finish - it starts its own run when the "
+                    "issues are written",
+            )
         try:
             values = {k: str(v) for k, v in (json.loads(body or b"{}").get("values") or {}).items()}
             job = self.runs.start(values)
@@ -610,7 +651,7 @@ class Console:
             except Exception as exc:  # noqa: BLE001 - bookkeeping must not mask the run
                 print(f"! projects: could not record {values.get('repo')!r}: {exc}",
                       file=sys.stderr)
-        return Response.json(job.to_dict(), 202)
+        return Response.json(self.runs.status(job.id), 202)
 
     # -- Start building ---------------------------------------------------
 
@@ -638,6 +679,23 @@ class Console:
             return Response.error(f"bad request body: {exc}", 400)
 
         values = {k: str(v) for k, v in (data.get("values") or {}).items()}
+        # Free here, expensive afterwards - `console_build`'s own ordering rule,
+        # applied to the fields the *run* needs. They are only read by
+        # `_start_run`, minutes later and after a repository exists, so a blank
+        # objective or a cap reading "ten" bought a repository and a backlog
+        # and then failed to run. `Builder` cannot catch either: it derives its
+        # prompt from the plan's reasoning when the objective is blank, so it
+        # succeeds precisely where the run cannot.
+        #
+        # `check_run_values` rather than the same checks retyped: the refusals
+        # and their fixes belong to `target` and `_cycles_flag`, and a second
+        # copy here is the one that would still say "leave it empty" after the
+        # original learned to say something else. The repository is not checked
+        # - this build is about to create it.
+        try:
+            check_run_values(dict(values, repo="owner/name"))
+        except SwarmRunError as exc:
+            return Response.error(str(exc), 400, fix=exc.fix)
         try:
             source = self.jobs.get(validate_capture_id(str(data.get("plan", ""))))
         except ConsoleError as exc:
@@ -652,6 +710,24 @@ class Console:
                 f"call {source.id} is a {source.site} call in state {source.state!r}, "
                 "which is not a plan", 400,
                 fix="press Start building on a finished planner call",
+            )
+
+        # The latch `_claim` holds covers what runs *in this process*, and a
+        # build's own work ends the moment the issues are written - the loop it
+        # then starts is a child, watched by `SwarmRuns`. So a second Start
+        # building would sail past `_claim` while the first build's swarm was
+        # still working, provision a second repository, and only then be
+        # refused by `SwarmRuns.start` - with a repository and a backlog left
+        # over for a human to delete. The gate has to be here, before anything
+        # is created, and it has to name the live run: "something is already
+        # running" that does not say what is not a refusal anyone can act on.
+        if (live := self.runs.live()) is not None:
+            where = live.progress.get("repo") or live.id
+            return Response.error(
+                f"the swarm is already building {where}, and a second build would "
+                f"create a second repository and a second run against the same "
+                f"workers and the same Ollama", 409,
+                fix=f"stop the run on {where} first, or wait for it to finish",
             )
 
         try:
@@ -679,6 +755,7 @@ class Console:
         try:
             report = self.builder.run(result, values).to_dict()
             self._record(report, values)
+            self._start_run(report, values)
             state = "done"
         except BuildError as exc:
             error = {"type": "BuildError", "message": str(exc), "fix": exc.fix,
@@ -692,6 +769,72 @@ class Console:
             job.state = state
             with self._lock:
                 self._running = ""
+
+    def _start_run(self, report: dict[str, Any], values: Mapping[str, str]) -> None:
+        """Hand the repository that now exists to the swarm, and follow it.
+
+        The whole of #130's first criterion, and almost none of its code: the
+        supervision it asks for - a child running the real `swarm run`, its log
+        streamed to the page, `SIGINT` on Stop so `cli._loop` disposes the run's
+        containers on the way out - is `SwarmRuns`, already built for the swarm
+        tab and already the thing a terminal would do. Reimplementing the loop
+        in this process would mean a second assembly of the fleet, the reaper
+        and the three policies, which the ticket names as the thing not to grow.
+
+        `exists=True` is not an optimisation. `SwarmRuns.start` otherwise asks
+        GitHub whether the repository is there, and a repository created
+        seconds ago is exactly the one GitHub is most likely to answer 404
+        about - which would send this run down the greenfield branch and
+        provision a **second** repository over the backlog just written. This
+        console created it; there is nothing to ask.
+
+        Best-effort, and out loud in the report rather than as an exception: by
+        this line the repository and its issues are real. A build that called
+        itself failed because Docker was down would be describing the wrong
+        thing, and would send an operator looking for a repository that is
+        sitting there waiting for `swarm run --repo ...`.
+        """
+        try:
+            job = self.runs.start(
+                {
+                    # The repository the provisioner reported, never the form's
+                    # owner/name guess: `ProvisionPlan` derives a name when the
+                    # field is blank, and the run has to attach to what exists.
+                    "repo": report["repo"],
+                    "objective": (values.get("objective") or "").strip(),
+                    # The gate in the commit that now exists, for the reason
+                    # `Builder.run` gives for writing it into every `## Verify`.
+                    "verify": report["verify_command"],
+                    "stack": report["stack"],
+                    "max_cycles": values.get("max_cycles", ""),
+                    "auto_merge": values.get("auto_merge", ""),
+                },
+                known_to_exist=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - a build that worked must not read as failed
+            # Both halves, always. The exception's own fix names the cause -
+            # a missing token, the wrong venv - and the second sentence names
+            # the thing the operator would otherwise go looking for: a
+            # repository that exists, with its backlog written, waiting.
+            pickup = (
+                f"the repository and its issues are there - "
+                f"`swarm run --repo {report['repo']} --objective ...` picks the work up"
+            )
+            own = getattr(exc, "fix", "")
+            report["run_error"] = {
+                "error": f"{type(exc).__name__}: {exc}",
+                "fix": f"{own}; {pickup}" if own else pickup,
+            }
+            print(f"! build: {report['repo']} was created, but the run did not start: {exc}",
+                  file=sys.stderr)
+            return
+        # The page follows this exactly as it follows a run fired from the
+        # swarm tab - same `/swarm/status`, same Stop button, same view. Read
+        # back through `status`, which takes `SwarmRuns`' lock: the watcher
+        # thread is already appending log lines, and a snapshot taken beside it
+        # can pair a `lines` slice with a `next` cursor past its end - which
+        # costs the page the run's first lines, silently.
+        report["run"] = self.runs.status(job.id)
 
     def _record(self, report: Mapping[str, Any], values: Mapping[str, str]) -> None:
         """File the new repository as a project, before the verdict is published.

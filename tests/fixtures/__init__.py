@@ -1,7 +1,7 @@
 """Shared test fixtures.
 
-Two doubles live here, and every test that needs one should import it rather
-than grow its own:
+The shared doubles live here, and every test that needs one should import it
+rather than grow its own:
 
 - `fixtures.github` - a fake `Transport` for `swarm.github.client`: canned
   responses, a record of every request, and constructors for the failures that
@@ -10,8 +10,13 @@ than grow its own:
 - `fixtures.repo` - a scratch git repository in a temp directory, with seeded
   commits, a working `pytest` target and a bare repo standing in for `origin`,
   so clone/branch/push paths are exercisable with no network.
+- `fixtures.docker` - a Docker daemon answering `ps`, `logs` and `rm` from a
+  container table, parsing `--filter` for real, so container selection and
+  disposal are testable with no daemon.
+- `fixtures.procs` - a `subprocess.Popen` whose output and exit the test
+  scripts, for the console's supervision of a real `swarm run` child.
 
-`tests/conftest.py` exposes both as pytest fixtures (`fake_github`,
+`tests/conftest.py` exposes the first two as pytest fixtures (`fake_github`,
 `scratch_repo`) and registers the `docker`, `network` and `ollama` markers that
 gate everything these doubles exist to avoid needing.
 
