@@ -100,6 +100,7 @@ from ..nodes.planner import (
 )
 from ..run import TERMINAL_LABELS
 from ..state import ObjectiveAssessment, Plan
+from ..taskref import TaskRef
 
 #: How many follow-up rounds one run may plan for itself. See the docstring;
 #: this is `replan.MAX_REPLANS`'s bound applied to the other end of the loop,
@@ -173,8 +174,16 @@ class Assessment:
     #: A model was asked and could not answer. Not the same as "not met" - see
     #: the module docstring - and the caller must not plan from it.
     unresolved: bool = False
-    #: The issues that stopped this being assessed at all, if any.
-    abandoned: tuple[int, ...] = ()
+    #: The tasks that stopped this being assessed at all, if any - named by
+    #: ref, not by issue number. This is the module's one *cross-module*
+    #: identity join: the tuple is built from the ledger in `assess` and
+    #: matched back against it in `_revive_abandoned`, so the two sides must
+    #: agree on what identity is. #142 made that `TaskRef` everywhere the
+    #: internal model decides anything; this field was the residue. It is
+    #: typed rather than merely conventional because the failure is silent:
+    #: a set of ints tested against `entry.ref` matches nothing, revives
+    #: nothing, and logs nothing about not having done so.
+    abandoned: tuple[TaskRef, ...] = ()
 
     @property
     def actionable(self) -> bool:
@@ -186,7 +195,7 @@ class Assessment:
         if self.unresolved:
             parts.append("assessment unavailable")
         if self.abandoned:
-            parts.append("abandoned: " + ", ".join(f"#{n}" for n in self.abandoned))
+            parts.append("abandoned: " + ", ".join(str(ref) for ref in self.abandoned))
         if self.missing:
             parts.append(f"{len(self.missing)} gap(s)")
         return f"{', '.join(parts)}: {self.reason}"
@@ -261,7 +270,7 @@ def assess(
             met=False,
             reason=FAILED,
             missing=tuple(f"#{entry.number} {entry.title}" for entry in gave_up),
-            abandoned=tuple(entry.number for entry in gave_up),
+            abandoned=tuple(entry.ref for entry in gave_up),
         )
 
     landed = shipped(ledger)
@@ -396,6 +405,14 @@ def _revive_abandoned(
     """Revive every abandoned task the orchestrator may safely retry. See
     `close_the_loop` for the rule; this is only its per-issue application.
 
+    The selection is a join on `TaskRef`, matching the tuple `assess` built
+    from this same ledger. Both sides are refs deliberately: a set miss
+    returns rather than raises, so an identity join keyed on the wrong type
+    revives nobody and reports nothing. That shape shipped green once already
+    during #142 - a ref-keyed `Reconciler._results()` read with an int, which
+    took the judgement path out with every test passing - and it is why the
+    tests for this function assert on the join and not just on the revival.
+
     The open/closed read is one issue listing (`resolve_states`), and it is the
     load-bearing check: a closed failed issue was shut by a human or retired by
     the planner, and relabelling it would be the orchestrator arguing with the
@@ -407,7 +424,7 @@ def _revive_abandoned(
     and no writes, which this function simply does not count as a revival.
     """
     wanted = set(assessment.abandoned)
-    entries = [entry for entry in abandoned(ledger) if entry.number in wanted]
+    entries = [entry for entry in abandoned(ledger) if entry.ref in wanted]
     states = resolve_states(client, [entry.ref for entry in entries])
     actions: list[IssueAction] = []
     for entry in entries:

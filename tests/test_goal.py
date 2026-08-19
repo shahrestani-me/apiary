@@ -34,12 +34,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import pytest
 
 from fixtures.github import REPO, response
 from swarm.github.ledger import Ledger, LedgerEntry
+from swarm.github.refs import task_ref
 from swarm.nodes.planner import PlanError, PlanReport, render_body, write_plan
 from swarm.orchestrator.goal import (
     EMPTY,
@@ -49,11 +50,13 @@ from swarm.orchestrator.goal import (
     MAX_ROUNDS,
     NO_TASKS,
     Assessment,
+    _revive_abandoned,
     assess,
     close_the_loop,
     shipped,
 )
 from swarm.state import ObjectiveAssessment, Plan, PlannedTask
+from swarm.taskref import TaskRef
 
 READY = "swarm:ready"
 CLAIMED = "swarm:claimed"
@@ -258,7 +261,7 @@ def test_an_abandoned_task_stops_the_gate_and_is_named() -> None:
     assert not verdict.met
     assert not verdict.consulted
     assert not verdict.actionable
-    assert verdict.abandoned == (2,)
+    assert verdict.abandoned == (task_ref(2),)
     assert verdict.reason == FAILED_REASON
     assert any("#2" in line for line in verdict.missing)
 
@@ -419,6 +422,122 @@ def test_only_the_revivable_failed_tasks_are_revived() -> None:
     # closure here would be the gate declaring work superseded that it is
     # about to retry.
     assert client.closed == []
+
+
+# --------------------------------------------------------------------------
+# The join: `Assessment.abandoned` against the ledger, keyed on the ref
+# --------------------------------------------------------------------------
+#
+# The four tests below pin the identity join `_revive_abandoned` performs,
+# because it is the one failure in this module that cannot announce itself. A
+# set membership test answers False for a key of the wrong type exactly as it
+# does for a key that is simply absent, so a join that has drifted apart does
+# not raise, does not log, and does not revive - it just quietly stops finding
+# anything, and the run resigns asking a human to do a relabel the orchestrator
+# knew was safe. #142 shipped that shape green once already (`_results()` went
+# ref-keyed while a consumer still passed an int), which is why the assertions
+# here are on the join rather than on "revival still works": the assessment is
+# built independently of `assess`, from a ref minted by the GitHub adapter, so
+# either side of the join reverting to an int number makes them fail.
+
+
+def test_the_revival_join_matches_the_ledger_on_the_ref() -> None:
+    """The positive direction, built the way a caller would have to build it:
+    a ref from the only minter there is (`github/refs.task_ref`), never an
+    issue number. If `Assessment.abandoned` or `_revive_abandoned`'s match
+    reverts to `entry.number`, this assessment names nothing the ledger
+    recognises and the revival silently does nothing - so this fails."""
+    client = RevivalClient(issues=[open_issue(2), open_issue(3)])
+
+    revived = _revive_abandoned(
+        client,
+        ledger(
+            entry(1, label=DONE),
+            entry(2, label=FAILED, attempt=5, streak=3),
+            entry(3, label=FAILED, attempt=5, streak=3),
+        ),
+        Assessment(abandoned=(task_ref(2),)),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    # #2 was named and is revived; #3 is just as revivable and was not named,
+    # so it is untouched. Both halves matter: the first fails if the join stops
+    # matching, the second fails if it stops discriminating and the function
+    # quietly revives every abandoned entry in the ledger instead.
+    assert [action.number for action in revived] == [2]
+    assert client.added == [(2, (READY,))]
+    assert client.removed == [(2, FAILED)]
+    assert [number for number, _ in client.comments] == [2]
+
+
+def test_a_ref_no_ledger_entry_carries_revives_nothing() -> None:
+    """The failing direction, and the silent one. An assessment naming a ref
+    the ledger does not carry must produce no revival and, above all, no write
+    - a gate that relabels on a miss is worse than one that misses."""
+    client = RevivalClient(issues=[open_issue(2)])
+
+    revived = _revive_abandoned(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
+        Assessment(abandoned=(task_ref(404),)),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert revived == ()
+    assert not client.wrote
+
+
+def test_an_issue_number_is_not_a_ref_and_matches_nothing() -> None:
+    """The regression this ticket exists for, asserted as the property that
+    makes the type load-bearing rather than decorative.
+
+    An `int` where a `TaskRef` belongs is not a type error at runtime and not a
+    lookup error either: `2 in {TaskRef("#2")}` is simply False. So the wrong
+    key revives nothing and reports nothing, and the only place that fact can
+    be caught is a test that puts the wrong key in on purpose. Should either
+    side of the join ever go back to matching on `entry.number`, this starts
+    finding #2 and fails - which is the point of it."""
+    client = RevivalClient(issues=[open_issue(2)])
+    wrong_key = cast(tuple[TaskRef, ...], (2,))
+
+    revived = _revive_abandoned(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
+        Assessment(abandoned=wrong_key),
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert revived == ()
+    assert not client.wrote
+
+
+def test_the_abandoned_refs_survive_the_round_trip_from_assess() -> None:
+    """End to end, and the reason the join is worth typing at all: the tuple
+    `assess` builds is the tuple `_revive_abandoned` can match, and the summary
+    a human reads still spells the ref `#2` exactly as the issue number did."""
+    verdict = assess(
+        OBJECTIVE,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
+        oracle=Never(),
+    )
+
+    assert verdict.abandoned == (task_ref(2),)
+    assert all(isinstance(ref, TaskRef) for ref in verdict.abandoned)
+    assert "abandoned: #2" in verdict.summary()
+
+    client = RevivalClient(issues=[open_issue(2)])
+    revived = _revive_abandoned(
+        client,
+        ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
+        verdict,
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    assert [action.number for action in revived] == [2]
 
 
 # --------------------------------------------------------------------------
