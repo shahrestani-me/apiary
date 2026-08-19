@@ -109,7 +109,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from pydantic import BaseModel
 
-from .config import SETTINGS, TRACKER_CONFIG_ENV, Settings
+from .config import SETTINGS, TRACKER_CONFIG_ENV, ConfigError, Settings
 from .containers.manager import (
     DEFAULT_STACK_IMAGES,
     STACK_LABEL,
@@ -122,7 +122,7 @@ from .containers.manager import (
 )
 from .github.client import GitHubClient, GitHubError, GitHubHTTPError
 from .github.labels import SWARM_LABELS, list_label_names
-from .llm import orchestrator_llm, structured, worker_llm
+from .llm import BEDROCK, OLLAMA, OPENAI, orchestrator_llm, structured, worker_llm
 from .mcp.client import McpAuthError, McpEgressBlocked, McpError, ServerInfo, ToolSpec
 from .mcp.contract import (
     CAPABILITIES,
@@ -161,6 +161,27 @@ class DoctorError(RuntimeError):
     """A probe could not answer. Never a verdict - verdicts are `Check`s."""
 
 
+class MissingCredential(DoctorError):
+    """No credential at all was found for a provider that needs one.
+
+    Its own type because the remedy is different from every other reachability
+    failure: there is nothing to check, expire or re-scope - something has to
+    be exported or configured. Against a local Ollama this state cannot exist,
+    which is why it arrived with the remote providers rather than before them.
+    """
+
+
+class InvalidCredential(DoctorError):
+    """A credential was found and the provider rejected it.
+
+    Distinct from `MissingCredential` because the two read identically in a log
+    and share no remedy: one is "set it", the other is "the one you set is
+    expired, mistyped, or lacks the permission this call needs". Both are
+    common, and telling an operator to export a variable they have already
+    exported is exactly the moved-hour-of-confusion this module exists to end.
+    """
+
+
 # --------------------------------------------------------------------------
 # Verdicts
 # --------------------------------------------------------------------------
@@ -172,10 +193,23 @@ SKIP = "skip"
 #: Check names. Constants because a test addresses a check by name and an
 #: operator greps for one; a renamed literal in three places is a rename that
 #: only two of them get.
-CHECK_OLLAMA_TARGET = "ollama.target"
-CHECK_OLLAMA_REACHABLE = "ollama.reachable"
-CHECK_OLLAMA_MODELS = "ollama.models"
-CHECK_OLLAMA_SCHEMA = "ollama.schema"
+#: The four model checks. Named for the *question* rather than for Ollama,
+#: because since ADR 0006 the configured provider may not be Ollama - and this
+#: module's own docstring says a check "that reports `ollama.models: failed`
+#: has moved the hour of confusion rather than removing it". A doctor
+#: reporting on a provider you are not using does exactly that.
+#:
+#: The meanings are stable across providers and the Ollama implementations
+#: moved rather than changed:
+#:
+#:   target     - where will this dial, and which source decided
+#:   reachable  - can it be reached, credentials included
+#:   available  - are the configured models actually available to this account
+#:   schema     - does schema-forced output actually constrain these models
+CHECK_MODEL_TARGET = "model.target"
+CHECK_MODEL_REACHABLE = "model.reachable"
+CHECK_MODEL_AVAILABLE = "model.available"
+CHECK_MODEL_SCHEMA = "model.schema"
 CHECK_TOKEN = "github.token"
 CHECK_BOOT_TOKEN = "github.boot-token"
 CHECK_REPO = "github.repo"
@@ -211,7 +245,7 @@ _MARK = {OK: "ok  ", FAIL: "FAIL", SKIP: "skip"}
 _NAME_WIDTH = max(
     len(name)
     for name in (
-        CHECK_OLLAMA_TARGET, CHECK_OLLAMA_REACHABLE, CHECK_OLLAMA_MODELS, CHECK_OLLAMA_SCHEMA,
+        CHECK_MODEL_TARGET, CHECK_MODEL_REACHABLE, CHECK_MODEL_AVAILABLE, CHECK_MODEL_SCHEMA,
         CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI, CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON,
         CHECK_TRACKER_CONFIG, CHECK_TRACKER_REACHABLE, CHECK_TRACKER_AUTH, CHECK_TRACKER_TOOLS,
@@ -453,6 +487,92 @@ def _fetch(url: str, timeout_s: float) -> bytes:
         return response.read()
 
 
+class Unlistable(DoctorError):
+    """This provider will not enumerate its catalogue for this account.
+
+    A skip, never a failure. Listing is a *different permission* from calling
+    on every remote provider - an account routinely holds the second without
+    the first - so a denied listing says nothing about whether the configured
+    model works, and the schema probe answers that with a real call anyway.
+    Reporting it as a failure would send an operator to fix an entitlement they
+    do not need.
+    """
+
+
+@dataclass
+class RemoteInference:
+    """The probe for a provider that is somewhere else.
+
+    Deliberately thin. It answers the two questions the local probe answers -
+    can this be reached, and is the model there - in terms a remote provider
+    can actually answer, and it delegates the third to exactly the same code
+    path `HostInference` uses, because the schema probe must exercise the
+    client the orchestrator and the workers really get.
+
+    **It reads a credential's presence, never its value.** `spec.credential` is
+    a sentence about where the credential comes from, and that is all this
+    module ever holds - which is what keeps a doctor report safe to paste into
+    an issue.
+    """
+
+    env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+
+    def _specs(self) -> list[Any]:
+        from .models import ROLES as MODEL_ROLES, resolve  # noqa: PLC0415 - lazy
+
+        return [resolve(role, env=self.env).spec for role in MODEL_ROLES]
+
+    def version(self) -> str:
+        """Can this be dialled at all - credentials included?
+
+        Constructing the client is the probe, and on these providers that is
+        not a formality: the OpenAI client refuses to exist without a key, and
+        `langchain-aws` resolves the AWS credential chain in a field validator.
+        So a client that builds is a credential that was found, and building it
+        costs no inference and no request.
+
+        Telling apart *missing* from *rejected* is the point. `llm.py` raises
+        `ConfigError` for both, so the distinction is made on the text - which
+        is honest about being a heuristic, and errs toward `MissingCredential`
+        only when the message says something is not set.
+        """
+        from .llm import PROVIDERS  # noqa: PLC0415 - lazy, like every provider import
+
+        answers: list[str] = []
+        for spec in self._specs():
+            if spec.provider == OLLAMA:
+                continue
+            try:
+                PROVIDERS[spec.provider].build(spec, None)
+            except ConfigError as exc:
+                message = str(exc)
+                if "is not set" in message or "needs a region" in message:
+                    raise MissingCredential(message) from exc
+                raise InvalidCredential(message) from exc
+            except Exception as exc:  # noqa: BLE001 - same reason as `schema_probe`
+                raise DoctorError(f"{type(exc).__name__}: {exc}") from exc
+            answers.append(f"reachable as {spec.credential}")
+        return "; ".join(answers) or "nothing remote configured"
+
+    def installed(self) -> list[str]:
+        """Refused, always, and that is the honest answer rather than a stub.
+
+        Enumerating a remote catalogue costs a second permission, returns
+        hundreds of entries on one provider and needs a separate SDK client on
+        the other - and it would still not answer the question anyone asks,
+        which is "does *my* model work". `check_model_schema` answers that with
+        one real call, and this stays a skip with a reason attached.
+        """
+        raise Unlistable(
+            "listing a remote catalogue is a separate permission from calling a model; "
+            "the schema check below proves the configured model with one real call"
+        )
+
+    def schema_probe(self, role: str) -> str:
+        """Identical to the local one, deliberately - see `HostInference`."""
+        return HostInference.schema_probe(self, role)  # type: ignore[arg-type]
+
+
 # --------------------------------------------------------------------------
 # The checks
 # --------------------------------------------------------------------------
@@ -472,6 +592,112 @@ LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1", "[::1]")
 #: check exists for. It names three things because the mistake has three parts:
 #: which variable this process reads, where the *server's* bind address belongs
 #: instead, and why compose spells its own override differently.
+def _endpoint(spec: Any) -> str:
+    """Where a spec will dial, in one phrase.
+
+    Per provider, because the answer is a different kind of thing each time - a
+    URL an operator can curl, a hosted API with a well-known name, a regional
+    service. "Where will this dial" is the question `model.target` exists to
+    answer, and answering it as "the model server" for all three would be the
+    Ollama-shaped report this ticket removes.
+    """
+    if spec.provider == OLLAMA:
+        return spec.option("base_url") or SETTINGS.ollama_base_url
+    if spec.provider == BEDROCK:
+        region = spec.option("region") or "no region"
+        return f"bedrock-runtime.{region}.amazonaws.com"
+    return spec.option("base_url") or "api.openai.com"
+
+
+def _credential_fix(spec: Any) -> str:
+    """The remedy for "there is no credential", per provider.
+
+    Three shapes, and only one of them is "export a variable" - which is why
+    the fix is built here rather than written once with the variable name
+    interpolated into it.
+    """
+    if spec.provider == BEDROCK:
+        return (
+            "configure AWS for this shell - `aws sso login --profile <name>` or an instance "
+            "role - and name it with SWARM_<ROLE>_MODEL_OPTIONS=\"profile=<name>,region=<region>\", "
+            "or export AWS_PROFILE / AWS_REGION. `pip install -e \".[bedrock]\"` if the SDK "
+            "is missing"
+        )
+    if spec.provider == OPENAI:
+        return (
+            "export OPENAI_API_KEY (or name another variable with "
+            "SWARM_<ROLE>_MODEL_OPTIONS=\"api_key_env=<NAME>\"), and "
+            "`pip install -e \".[openai]\"` if the SDK is missing"
+        )
+    return _TARGET_FIX
+
+
+def _unreachable_fix(spec: Any, settings: Settings) -> str:
+    """The remedy for "it did not answer", per provider."""
+    if spec.provider == OLLAMA:
+        return (
+            "start the server - `ollama serve`, or launch the Ollama app - and "
+            f"confirm with `curl {settings.ollama_base_url}/api/version`. "
+            "It runs on the HOST, never in a container: Docker Desktop has no "
+            "Metal passthrough (docs/architecture-v2.md)"
+        )
+    return (
+        f"check network egress to {_endpoint(spec)} and that the provider is not in an "
+        f"outage; the credential itself was accepted, so this is the path rather than "
+        f"the permission"
+    )
+
+
+def _missing_model_fix(role: str, spec: Any) -> str:
+    """The third credential verdict: valid credential, no access to this model.
+
+    On Ollama the remedy is a download. On a remote provider it is an
+    entitlement somebody grants in a console, and telling an operator to pull
+    something would be advice they cannot act on.
+    """
+    variable = f"SWARM_{role.upper()}_MODEL"
+    if spec.provider == OLLAMA:
+        return f"ollama pull {spec.model}  (or point the role elsewhere: {variable})"
+    if spec.provider == BEDROCK:
+        return (
+            f"request access to {spec.model} for this account in the Bedrock console - model "
+            f"access is granted per model and per region, and {spec.credential} has a valid "
+            f"credential without it. Or point the role elsewhere: {variable}"
+        )
+    return (
+        f"this account has no access to {spec.model}; check the model name and the "
+        f"organisation's allowed models, or point the role elsewhere: {variable}"
+    )
+
+
+def _schema_fix(role: str, spec: Any) -> str:
+    """Why schema-forced output failed, per provider - three different causes.
+
+    Ollama's is a model or a server too old for format-constrained decoding.
+    Bedrock's is most often a model that does not serve `json_schema` at all,
+    which is why `llm.py` leaves `method` an option. OpenAI's is a model
+    predating the Structured Outputs API.
+    """
+    variable = f"SWARM_{role.upper()}_MODEL"
+    if spec.provider == OLLAMA:
+        return (
+            f"`ollama show {spec.model}` - a model without structured-output support "
+            f"cannot orchestrate; set {variable} to one that has it, and check "
+            f"`ollama --version` (format-constrained decoding needs a recent server)"
+        )
+    if spec.provider == BEDROCK:
+        return (
+            f"not every model on Bedrock serves json_schema. Try "
+            f"SWARM_{role.upper()}_MODEL_OPTIONS=\"method=function_calling\", or set "
+            f"{variable} to a model that does - every orchestrator call is a structured() "
+            f"call, so a model that cannot be constrained cannot hold this role"
+        )
+    return (
+        f"{spec.model} may predate the Structured Outputs API; set {variable} to a model "
+        f"that supports strict json_schema - every orchestrator call is a structured() call"
+    )
+
+
 _TARGET_FIX = (
     "Ollama spells the server's bind address and the client's target with the same "
     "OLLAMA_HOST, and config.py reads it as the target. Give this process a URL - "
@@ -527,6 +753,12 @@ class Doctor:
     github: GitHubClient | None = None
     docker: DockerCLI | None = None
     inference: Inference | None = None
+    #: The probe for every provider that is not Ollama. Same shape and same
+    #: reason as `inference`, and left unset in production - a test that needed
+    #: an AWS account or an OpenAI key to reach a verdict is a test that runs
+    #: nowhere. Built on first use rather than in `__post_init__`, so a fully
+    #: local installation never constructs one.
+    remote: Inference | None = None
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     which: Callable[[str], str | None] = shutil.which
     in_container: bool | None = None
@@ -613,17 +845,17 @@ class Doctor:
         and be told about the next. Only checks whose prerequisite failed are
         skipped, and they say which prerequisite.
         """
-        target = self.check_ollama_target()
+        target = self.check_model_target()
         # Reachability chains off the target rather than being asked anyway: a
         # bind address produces a connection error that names `ollama serve`,
         # and following that advice fixes nothing. One problem, one verdict.
-        reachable = self._after(target, CHECK_OLLAMA_REACHABLE, self.check_ollama_reachable)
-        models = self._after(reachable, CHECK_OLLAMA_MODELS, self.check_models)
+        reachable = self._after(target, CHECK_MODEL_REACHABLE, self.check_model_reachable)
+        models = self._after(reachable, CHECK_MODEL_AVAILABLE, self.check_model_available)
         checks: list[Check] = [
             target,
             reachable,
             models,
-            self._after(models, CHECK_OLLAMA_SCHEMA, self.check_schema),
+            self._after(models, CHECK_MODEL_SCHEMA, self.check_model_schema),
         ]
 
         token = self.check_token()
@@ -682,33 +914,119 @@ class Doctor:
             return check()
         return Check.skipped(name, f"not attempted: {prior.name} did not pass")
 
-    # --- ollama ---------------------------------------------------------
+    # --- the models -----------------------------------------------------
+    #
+    # Four checks, dispatched by provider. The Ollama implementations moved
+    # here rather than changing: `_target_ollama` still carries the whole
+    # bind-address-versus-client-target argument, because that trap is Ollama's
+    # own and no other provider has it.
+    #
+    # Two roles, and they may be on two different providers - the epic's whole
+    # premise is that the answer is genuinely different for each, since the
+    # orchestrator emits a few hundred tokens of schema-constrained JSON and the
+    # worker emits whole files. So every check below iterates roles and groups
+    # by provider, rather than asking one question about "the model server".
 
-    def check_ollama_target(self) -> Check:
-        """Is the configured URL something a *client* can dial?
+    def _resolved(self) -> list[tuple[str, Any, Any]]:
+        """`(role, spec, resolution)` per role, or a raised `ConfigError`.
+
+        Never cached across a run: `swarm doctor` is short-lived, and a value
+        memoised before the checks run would be a second place for the four
+        checks below to disagree with each other about what is configured.
+        """
+        from .models import ROLES as MODEL_ROLES, resolve  # noqa: PLC0415 - lazy, see `_probe`
+
+        return [
+            (role, (r := resolve(role, env=self.env, settings=self.settings)).spec, r)
+            for role in MODEL_ROLES
+        ]
+
+    def _inference_for(self, provider: str) -> Inference:
+        """The probe for one provider.
+
+        Named `_inference_for` rather than `_probe`, which is already this
+        class's tracker-handshake cache - two different probes, and one name
+        for both is how a method quietly shadows a field.
+
+        `self.inference` is the Ollama seam and stays exactly what it was, so
+        every existing test that hands one over keeps working unchanged.
+        Remote providers get `self.remote`, which is the same shape and the
+        same reason - the interesting logic here is the wording of the
+        verdicts, and a test that needs an AWS account to reach it is a test
+        that runs nowhere.
+        """
+        if provider == OLLAMA:
+            assert self.inference is not None  # set in __post_init__
+            return self.inference
+        if self.remote is None:
+            self.remote = RemoteInference(env=self.env)
+        return self.remote
+
+    # -- target ----------------------------------------------------------
+
+    def check_model_target(self) -> Check:
+        """Where will each role dial, and which source decided?
 
         Costs no I/O and runs before the reachability check, because when this
-        one is wrong the reachability failure is a connection error that reads
-        like a stopped server and sends the reader to `ollama serve`.
+        one is wrong the reachability failure reads like something else
+        entirely - a stopped server, an expired key - and sends the reader
+        after the wrong thing.
+
+        Reporting the *source* is new with ADR 0006 and is the half an operator
+        cannot otherwise discover: a model can now come from an argument, an
+        environment variable, a file written by a console session last week, or
+        a built-in default, and only the first two are visible from a shell.
         """
-        url = self.settings.ollama_base_url
+        try:
+            resolved = self._resolved()
+        except ConfigError as exc:
+            return Check.failed(
+                CHECK_MODEL_TARGET,
+                f"the configured model cannot be read: {exc}",
+                fix="fix the SWARM_*_MODEL variables named above, or unset them to fall "
+                    "back to the built-in local defaults",
+            )
+
+        problems: list[Check] = []
+        lines: list[str] = []
+        for role, spec, resolution in resolved:
+            if spec.provider == OLLAMA:
+                bad = self._target_ollama(spec)
+                if bad is not None:
+                    problems.append(bad)
+                    continue
+            lines.append(f"{role} -> {spec.label} via {_endpoint(spec)}, from {resolution.source}"
+                         + (f" ({resolution.detail})" if resolution.detail else ""))
+        if problems:
+            return problems[0]
+        return Check.passed(CHECK_MODEL_TARGET, "; ".join(lines))
+
+    def _target_ollama(self, spec: Any) -> Check | None:
+        """Ollama's own trap, unchanged, and still the only provider with it.
+
+        `OLLAMA_HOST` answers two different questions with one value: to the
+        server it is a bind address, to a client it is a target. Those coincide
+        on a laptop running both and diverge on exactly the machines this
+        project is built for.
+        """
+        url = spec.option("base_url") or self.settings.ollama_base_url
         host = _hostname(url)
 
         if "://" not in url:
             return Check.failed(
-                CHECK_OLLAMA_TARGET,
+                CHECK_MODEL_TARGET,
                 f"OLLAMA_HOST={url!r} has no scheme, which is the shape of a bind address",
                 fix=_TARGET_FIX,
             )
         if host in WILDCARD_HOSTS:
             return Check.failed(
-                CHECK_OLLAMA_TARGET,
+                CHECK_MODEL_TARGET,
                 f"OLLAMA_HOST={url!r} names a wildcard bind address; a client cannot dial it",
                 fix=_TARGET_FIX,
             )
         if self.in_container and host in LOOPBACK_HOSTS:
             return Check.failed(
-                CHECK_OLLAMA_TARGET,
+                CHECK_MODEL_TARGET,
                 f"OLLAMA_HOST={url!r} is this container's own loopback, and Ollama "
                 f"runs on the host (docs/architecture-v2.md, first constraint)",
                 fix=(
@@ -717,91 +1035,141 @@ class Doctor:
                     f"the container's OLLAMA_HOST"
                 ),
             )
-        return Check.passed(CHECK_OLLAMA_TARGET, f"client target is {url}")
+        return None
 
-    def check_ollama_reachable(self) -> Check:
-        assert self.inference is not None  # set in __post_init__
-        try:
-            version = self.inference.version()
-        except DoctorError as exc:
-            return Check.failed(
-                CHECK_OLLAMA_REACHABLE,
-                f"no answer from {self.settings.ollama_base_url}: {exc}",
-                fix=(
-                    "start the server - `ollama serve`, or launch the Ollama app - and "
-                    f"confirm with `curl {self.settings.ollama_base_url}/api/version`. "
-                    "It runs on the HOST, never in a container: Docker Desktop has no "
-                    "Metal passthrough (docs/architecture-v2.md)"
-                ),
-            )
-        return Check.passed(
-            CHECK_OLLAMA_REACHABLE, f"ollama {version} at {self.settings.ollama_base_url}"
-        )
+    # -- reachable -------------------------------------------------------
 
-    def check_models(self) -> Check:
-        assert self.inference is not None
-        try:
-            installed = self.inference.installed()
-        except DoctorError as exc:
-            return Check.failed(
-                CHECK_OLLAMA_MODELS,
-                f"could not list models: {exc}",
-                fix=f"`ollama list` against {self.settings.ollama_base_url} reproduces this",
-            )
+    def check_model_reachable(self) -> Check:
+        """Can each configured provider be reached, credentials included?
 
-        wanted = self._wanted_models()
-        missing = [(role, model) for role, model in wanted if not _has_model(installed, model)]
-        if missing:
-            return Check.failed(
-                CHECK_OLLAMA_MODELS,
-                ", ".join(f"{model} ({role}) is not pulled" for role, model in missing),
-                fix=(
-                    "; ".join(f"ollama pull {model}" for _, model in missing)
-                    + "  (or point the role elsewhere: "
-                    + ", ".join(f"SWARM_{role.upper()}_MODEL" for role, _ in missing)
-                    + ")"
-                ),
-            )
-        return Check.passed(
-            CHECK_OLLAMA_MODELS,
-            ", ".join(f"{model} ({role})" for role, model in wanted),
-        )
-
-    def check_schema(self) -> Check:
-        """Does schema-forced JSON actually constrain these models?
-
-        The whole orchestrator is `structured()` calls. A model that accepts
-        the `format` parameter and then ignores it produces empty plans and
-        unparseable judgements, which is indistinguishable from a planner bug
-        and is where an afternoon goes.
-
-        This is the one check that costs real inference - two model loads, and
-        with `OLLAMA_MAX_LOADED_MODELS=1` a swap between them - so it is the
-        one with an off switch.
+        For a remote provider "no key" and "bad key" are different verdicts and
+        both are common. Telling an operator to export a variable they have
+        already exported is precisely the moved-hour-of-confusion this module
+        exists to end, so the two arrive here as different exception types and
+        leave as different fixes.
         """
-        assert self.inference is not None
-        if not self.probe_schema:
-            return Check.skipped(CHECK_OLLAMA_SCHEMA, "not attempted: --skip-schema")
+        try:
+            providers = {spec.provider: spec for _, spec, _ in self._resolved()}
+        except ConfigError:
+            return Check.skipped(
+                CHECK_MODEL_REACHABLE, f"not attempted: {CHECK_MODEL_TARGET} did not pass"
+            )
 
-        results: list[str] = []
-        for role, model in self._wanted_models():
+        answers: list[str] = []
+        for provider, spec in providers.items():
             try:
-                results.append(f"{model} ({role}) {self.inference.schema_probe(role)}")
-            except DoctorError as exc:
+                answers.append(f"{provider} {self._inference_for(provider).version()}")
+            except MissingCredential as exc:
                 return Check.failed(
-                    CHECK_OLLAMA_SCHEMA,
-                    f"{model} ({role}) did not return the requested schema: {exc}",
+                    CHECK_MODEL_REACHABLE,
+                    f"{provider} has no credential: {exc}",
+                    fix=_credential_fix(spec),
+                )
+            except InvalidCredential as exc:
+                return Check.failed(
+                    CHECK_MODEL_REACHABLE,
+                    f"{provider} rejected the credential it was given: {exc}",
                     fix=(
-                        f"`ollama show {model}` - a model without structured-output support "
-                        f"cannot orchestrate; set SWARM_{role.upper()}_MODEL to one that has "
-                        f"it, and check `ollama --version` (format-constrained decoding needs "
-                        f"a recent server)"
+                        f"the credential for {spec.credential} is set but not accepted - it is "
+                        f"expired, mistyped, or lacks the permission this call needs. It is not "
+                        f"missing, so exporting it again will not help"
                     ),
                 )
-        return Check.passed(CHECK_OLLAMA_SCHEMA, "; ".join(results))
+            except DoctorError as exc:
+                return Check.failed(
+                    CHECK_MODEL_REACHABLE,
+                    f"no answer from {_endpoint(spec)}: {exc}",
+                    fix=_unreachable_fix(spec, self.settings),
+                )
+        return Check.passed(CHECK_MODEL_REACHABLE, ", ".join(answers))
+
+    # -- available -------------------------------------------------------
+
+    def check_model_available(self) -> Check:
+        """Are the configured models actually available to this account?
+
+        The third of the three credential verdicts: a key can be present, valid
+        and still have no access to *this* model - which on a remote provider is
+        an entitlement somebody grants in a console, not something an operator
+        can fix by pulling anything.
+        """
+        try:
+            wanted = self._resolved()
+        except ConfigError:
+            return Check.skipped(
+                CHECK_MODEL_AVAILABLE, f"not attempted: {CHECK_MODEL_TARGET} did not pass"
+            )
+
+        served: list[str] = []
+        for role, spec, _ in wanted:
+            try:
+                installed = self._inference_for(spec.provider).installed()
+            except Unlistable as exc:
+                # Not a failure. A provider that will not enumerate its catalogue
+                # says nothing about whether *this* model works, and the schema
+                # probe below answers that question with a real call anyway.
+                served.append(f"{spec.label} ({role}) not listable: {exc}")
+                continue
+            except DoctorError as exc:
+                return Check.failed(
+                    CHECK_MODEL_AVAILABLE,
+                    f"could not list {spec.provider} models: {exc}",
+                    fix=_unreachable_fix(spec, self.settings),
+                )
+            if not _has_model(installed, spec.model):
+                return Check.failed(
+                    CHECK_MODEL_AVAILABLE,
+                    f"{spec.model} ({role}) is not available to this {spec.provider} account",
+                    fix=_missing_model_fix(role, spec),
+                )
+            served.append(f"{spec.label} ({role})")
+        return Check.passed(CHECK_MODEL_AVAILABLE, ", ".join(served))
+
+    # -- schema ----------------------------------------------------------
+
+    def check_model_schema(self) -> Check:
+        """Does schema-forced output actually constrain these models?
+
+        The one check that matters most, and it is unchanged in purpose: the
+        whole orchestrator is `structured()` calls, and a model that accepts the
+        constraint and then ignores it produces empty plans and unparseable
+        judgements - indistinguishable from a planner bug, and where an
+        afternoon goes.
+
+        It now runs against whichever provider is configured, which makes it the
+        check that carries the most weight after ADR 0006: Ollama constrains
+        *decoding* so the model cannot wander off-format, while a remote strict
+        schema is a different mechanism with a different failure mode. Whether
+        that mechanism holds is #259's question, and this is where an operator
+        asks it about their own account.
+
+        Still the one check that costs real inference, and still the one with an
+        off switch.
+        """
+        if not self.probe_schema:
+            return Check.skipped(CHECK_MODEL_SCHEMA, "not attempted: --skip-schema")
+        try:
+            wanted = self._resolved()
+        except ConfigError:
+            return Check.skipped(
+                CHECK_MODEL_SCHEMA, f"not attempted: {CHECK_MODEL_TARGET} did not pass"
+            )
+
+        results: list[str] = []
+        for role, spec, _ in wanted:
+            try:
+                results.append(f"{spec.label} ({role}) {self._inference_for(spec.provider).schema_probe(role)}")
+            except DoctorError as exc:
+                return Check.failed(
+                    CHECK_MODEL_SCHEMA,
+                    f"{spec.label} ({role}) did not return the requested schema: {exc}",
+                    fix=_schema_fix(role, spec),
+                )
+        return Check.passed(CHECK_MODEL_SCHEMA, "; ".join(results))
 
     def _wanted_models(self) -> list[tuple[str, str]]:
-        return [(role, getattr(self.settings, attr)) for role, (attr, _) in ROLES.items()]
+        """`(role, model)`, kept for readers that only want the names."""
+        return [(role, spec.model) for role, spec, _ in self._resolved()]
 
     # --- github ---------------------------------------------------------
 
