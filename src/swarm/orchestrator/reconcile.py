@@ -133,7 +133,7 @@ from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord, summarise_dir, tail
-from .authority import Belief, believe, label_state, revived_tasks, state_source
+from .authority import Belief, believe, label_state, revived_tasks, state_of, state_source
 # **Bare `CLAIMED` and `REVIEW` here are `swarm:*` labels; the `_STATE` pair are
 # ADR 0001's internal states.** `shadow.py`'s convention, imported for its
 # reason: the one time the two were confused, every classification in that file
@@ -882,8 +882,13 @@ FINISHED_STATES = frozenset({LANDED, NEEDS_HUMAN})
 
 
 def _now(entry: LedgerEntry, believed: Belief | None) -> str:
-    """What this task **is**, as the cycle's authority has it (#147)."""
-    return believed.state(entry.task_id) if believed is not None else label_state(entry.state_label)
+    """What this task **is**, as the cycle's authority has it (#147).
+
+    `authority.state_of` under a local name, kept because `_was` reads better
+    beside a `_now` than beside an import - the branch itself is spelled once,
+    over there, where every other module asks it too.
+    """
+    return state_of(entry, believed)
 
 
 def _was(
@@ -1916,6 +1921,13 @@ class Reconciler:
                 containers=handles.values(),
                 states=states,
                 open_branches=snapshot.open_branches(),
+                # This cycle's belief, already folded by `apply_plan`'s writes -
+                # not the one `believe` returned. A release consumes an attempt,
+                # so the sweep must not act on a claim the reconciler has just
+                # moved off, and it must not act on a label a human edited
+                # either (#147). `Recovery.startup` passes none and keeps
+                # reading the label, which is the only record it has.
+                believed=belief,
             )
             ledger = fold(ledger, recovered.result.applied)
             belief = belief.fold(recovered.result.applied)
@@ -2055,7 +2067,11 @@ class Reconciler:
             cycle_error=cycle_error,
             live=len(live_entries(ledger)),
         )
-        judged = self._judge(snapshot, report, results=results)
+        # `belief`, as it stands *here* - folded by `apply_plan`, the recovery
+        # sweep and the merge gate - rather than the one `believe` returned at
+        # the top. The gate reads the ledger this cycle ends with, so it must
+        # read the belief that ledger goes with (`fold`'s rule).
+        judged = self._judge(snapshot, report, results=results, believed=belief)
         # After `_judge`, because that is where both callers of `planner.revive`
         # run, and before the belief is carried forward, so a task revived this
         # cycle is already holding its granted attempt when the next one asks.
@@ -2193,7 +2209,12 @@ class Reconciler:
     # --- step 5 ----------------------------------------------------------
 
     def _judge(
-        self, client: Any, report: CycleReport, *, results: Mapping[TaskRef, ResultRecord]
+        self,
+        client: Any,
+        report: CycleReport,
+        *,
+        results: Mapping[TaskRef, ResultRecord],
+        believed: Belief | None = None,
     ) -> CycleReport:
         """Judge this cycle, and act on the judgement. Returns the report, grown.
 
@@ -2225,7 +2246,7 @@ class Reconciler:
             # ledger non-empty again, and the next stall check needs a previous
             # reading that includes the issues this gate just wrote.
             self._previous = observation
-            return replace(report, goal=self._close(client, report))
+            return replace(report, goal=self._close(client, report, believed))
 
         verdict = None
         replanned = None
@@ -2240,11 +2261,11 @@ class Reconciler:
             )
             self._stalls = verdict.stalls
             if verdict.stalled:
-                replanned = self._replan(client, report, verdict)
+                replanned = self._replan(client, report, verdict, believed)
         self._previous = observation
         return replace(report, verdict=verdict, replanned=replanned)
 
-    def _close(self, client: Any, report: CycleReport) -> Any:
+    def _close(self, client: Any, report: CycleReport, believed: Belief | None = None) -> Any:
         """The goal gate. Local import for `checks`' reason - `goal` imports the
         planner, which is a heavier graph than a cycle that never ends should
         pay for on every import of this module."""
@@ -2270,6 +2291,11 @@ class Reconciler:
             verify=self.verify or None,
             oracle=self.assessor,
             proposer=self.proposer,
+            # The gate partitions the ledger into done / failed / live, and it
+            # is the partition the run's exit code is computed from (#147). A
+            # `swarm:failed` typed onto merged work used to end the run asking
+            # for a human about a task that had landed.
+            believed=believed,
         )
         self._goal_rounds = goal.rounds
         wrote = (
@@ -2295,7 +2321,9 @@ class Reconciler:
             client.invalidate_cache()
         return goal
 
-    def _replan(self, client: Any, report: CycleReport, verdict: Any) -> Any:
+    def _replan(
+        self, client: Any, report: CycleReport, verdict: Any, believed: Belief | None = None
+    ) -> Any:
         from .replan import replan
 
         result = replan(
@@ -2306,6 +2334,10 @@ class Reconciler:
             replans=self._replans,
             verify=self.verify or None,
             proposer=self.proposer,
+            # Nothing in the replan branches on this. It decides how each task
+            # is *named* in the brief the model reads, and a `swarm:*` string in
+            # a prompt is the vocabulary #141 and epic #140 are removing.
+            believed=believed,
         )
         if result.replanned:
             # `replan` zeroes the stall count on a successful rewrite, because

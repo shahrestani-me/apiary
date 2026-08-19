@@ -1531,7 +1531,9 @@ def test_recovery_is_handed_containers_not_issue_numbers(fake_github):
     seen: dict = {}
 
     class SpyRecovery:
-        def sweep(self, ledger, *, containers=None, states=None, open_branches=None):
+        def sweep(
+            self, ledger, *, containers=None, states=None, open_branches=None, believed=None
+        ):
             seen["containers"] = list(containers or ())
             return SimpleNamespace(result=SimpleNamespace(applied=()))
 

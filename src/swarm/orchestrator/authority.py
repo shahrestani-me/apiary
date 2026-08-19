@@ -15,6 +15,19 @@ relabelled while its green pull request sat open was silently un-mergeable. They
 ask `in_review` below, with the same `None`-reads-the-label default everything
 else here has.
 
+The stale-claim sweep, the goal gate and the replan brief are the rest of it,
+and they are the same argument a second time. `recovery.plan_recovery` selected
+`swarm:claimed` and a release **consumes an attempt**, so a label somebody typed
+mid-run did not merely mislead the orchestrator - it spent the task's budget,
+and at the cap escalated it to a human. `goal.py` partitioned the ledger into
+done / failed / live by label, which is the partition a run's exit code is
+computed from: a `swarm:failed` on merged work ended the run asking about a task
+that had landed. `replan.brief` decides nothing at all and is here for the other
+half of epic #140 - it put a `swarm:*` string into a prompt, and a model reads
+the vocabulary it is shown as the run's own. All three take `believed`, all
+three read the label when it is `None`, and `tests/test_authority.py` §7 is the
+pair each of them is held to.
+
 Labels keep being written and keep being compared. #152 removes the writes;
 this ticket changes only who is *believed*, which is why the observable proof
 that it happened is a task whose label a human edits mid-run: the orchestrator
@@ -204,6 +217,7 @@ __all__ = [
     "label_state",
     "revived_tasks",
     "source_summary",
+    "state_of",
     "state_source",
 ]
 
@@ -284,6 +298,31 @@ def state_source(env: Mapping[str, str] | None = None) -> str:
     return value
 
 
+def state_of(entry: Any, believed: Belief | None = None) -> str:
+    """What state is this task in? **The** function this module's docstring means.
+
+    "There is exactly one function in this package that answers 'what state is
+    this task in', every decision path calls it, and with `labels` it returns
+    `lifecycle.internal_state` of the label and nothing else" - so it is spelled
+    once, here, and every module that decides on a state asks it rather than
+    reimplementing the two-line branch. `in_review` below is the first caller
+    and is now a comparison against this rather than a second copy of it.
+
+    `believed=None` reads the label, which is every caller outside
+    `Reconciler.cycle`: the `__main__` dry runs, and `APIARY_STATE_SOURCE=labels`
+    by way of a `Belief` whose states are the labels anyway.
+
+    The answer is always in the **internal** vocabulary, both sides, which is
+    what makes a caller's comparison one comparison rather than one per source.
+    That is safe because `INTERNAL_STATE` is one-to-one over the six `swarm:*`
+    labels and `internal_state` falls back to the suffix, so no two labels a
+    caller could be distinguishing collapse into one state here.
+    """
+    if believed is None:
+        return _internal(entry.state_label)
+    return believed.state(entry.task_id)
+
+
 def in_review(entry: Any, believed: Belief | None = None) -> bool:
     """Is this task in review - as the cycle's authority has it, or as its label?
 
@@ -299,9 +338,7 @@ def in_review(entry: Any, believed: Belief | None = None) -> bool:
     which fact each is: the label is a record of `worker/pr.py` having opened a
     pull request, and the derived state is that pull request being open now.
     """
-    if believed is None:
-        return bool(_internal(entry.state_label) == REVIEW)
-    return believed.holds(entry.task_id, REVIEW)
+    return state_of(entry, believed) == REVIEW
 
 
 def source_summary(source: str | None = None) -> str:

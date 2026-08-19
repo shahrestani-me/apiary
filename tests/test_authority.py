@@ -1,6 +1,6 @@
 """The cutover (#147): the resolver decides, and the flag takes it back.
 
-Six things this suite exists to hold down, in the order they would hurt.
+Seven things this suite exists to hold down, in the order they would hurt.
 
 1. **A label edited mid-run changes nothing.** The observable proof the cutover
    happened, and #147's own acceptance criterion. Driven through
@@ -26,6 +26,11 @@ Six things this suite exists to hold down, in the order they would hurt.
 6. **A container that exists still blocks a dispatch.** `derived.py` reads
    liveness and is right to; a dispatcher deciding whether to *act* has to read
    existence, which is the one thing the label carried for free.
+7. **The criterion is larger than #147's file list.** The stale-claim sweep, the
+   goal gate and the replan brief were left reading `entry.state_label` because
+   that list did not name them - and the first of the three answered a
+   hand-edited label by *spending a retry*, which is the one thing #147's
+   acceptance criterion says in as many words must not happen.
 
 The doubles come from `test_reconcile`, for `test_shadow`'s reason: they are
 what drive a real cycle end to end, and a second copy would be a second thing to
@@ -71,18 +76,26 @@ from swarm.orchestrator.derived import (
 from swarm.orchestrator.derived import (
     REVIEW as REVIEW_STATE,
 )
+from swarm.orchestrator.derived import PullFact
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity, plan_dispatch
+from swarm.orchestrator.goal import FAILED as GAVE_UP
+from swarm.orchestrator.goal import IN_FLIGHT, abandoned, assess, live, shipped
 from swarm.orchestrator.reconcile import DONE, FAILED, plan_reconcile
+from swarm.orchestrator.recovery import plan_recovery
+from swarm.orchestrator.replan import brief
 from swarm.store import STORE_DIR_ENV
 from swarm.worker.result import write_result
 
+from test_goal import Says, met  # the goal gate's scripted oracle
 from test_reconcile import (  # the doubles that drive a real cycle
     TASK_ISSUE,
+    TASK_PULL,
     a_lifecycle_run,
     entry,
     ledger,
     record,
 )
+from test_replan import stalled  # a verdict that has already refused to be one
 
 
 @pytest.fixture(autouse=True)
@@ -877,3 +890,161 @@ def test_a_belief_advances_by_the_writes_that_landed_and_by_nothing_else():
     # about the entries this one left waiting rather than the ones it found.
     assert held.waiting() == {"task-4"}
     assert held.fold([Applied()]).waiting() == frozenset()
+
+
+# --------------------------------------------------------------------------
+# 7. The three modules #147's file list did not name
+# --------------------------------------------------------------------------
+#
+# #147 enumerated three files and a merge gate, and the criterion it wrote down
+# is larger than that list: *a label a human edits mid-run must not change what
+# the orchestrator does*. Three modules were left reading `entry.state_label`
+# because the list did not name them, and each of them decides something the
+# criterion is plainly about - a retry budget, a run's exit code, and the words
+# a model is shown. Each gets the same pair below: the edit changes nothing
+# under `derived`, and changes the answer under `labels`.
+
+
+def a_hand_edited(label: str, was: str, **facts: Any) -> tuple[Any, Belief, Belief]:
+    """One task wearing `label`, a world that disagrees, and both beliefs.
+
+    The two beliefs come from **one** ledger and **one** observation, which is
+    what makes each pair below a comparison of who is believed rather than of
+    two different runs - `shadow.py`'s rule, and `believe`'s own.
+
+    `was` is what this process believed last cycle, and it is not decoration:
+    `believe` seeds `Belief.previous` from the label for a task it has never
+    seen, so an edit made without it is *seeding* rather than overriding. #147's
+    criterion is about a label edited **mid-run**, and this is what mid-run
+    means - the same point `a_run` makes one cycle at a time for the tests that
+    drive a whole loop. The `labels` arm ignores it deliberately (see
+    `believe`), which is the behaviour the hatch is restoring.
+    """
+    task = entry(4, label=label)
+    book = ledger(task)
+    seen = world(task, **facts)
+    return (
+        book,
+        believe(book, seen, remembered={task.task_id: was}),
+        believe(book, seen, source=LABELS),
+    )
+
+
+def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():
+    """`recovery.py`, and the sharpest form of the criterion in this package.
+
+    Releasing a stale claim **consumes an attempt** (`recovery._release`), so
+    before this the sweep answered a label a human typed by spending a retry off
+    a task that had never run - and, at the cap, by escalating it to a human. It
+    is the one place a mid-run edit cost budget rather than a cycle.
+
+    Under the resolver a claim is a *running container*, there is none, and the
+    entry is not the sweep's to speak about at all.
+    """
+    book, derived, labels = a_hand_edited(CLAIMED, ELIGIBLE)
+
+    swept = plan_recovery(book, containers=(), believed=derived)
+    assert swept.transitions == ()
+    # Not silently ignored either: nothing here holds it, because nothing here
+    # selected it. The task is `eligible`, and the dispatcher picks it up.
+    assert swept.held == ()
+    assert derived.state("task-4") == ELIGIBLE
+
+    obeyed = plan_recovery(book, containers=(), believed=labels)
+    assert [str(one) for one in obeyed.transitions] == [
+        "#4: swarm:claimed -> swarm:ready, attempt 1 "
+        "(claimed with no live container behind it)"
+    ]
+    # The budget, which is the half a transition's `str` does not show and the
+    # only half a user feels.
+    assert [one.attempt for one in obeyed.transitions] == [1]
+
+    # And `believed=None` - `Recovery.startup`, the `__main__` dry run - is the
+    # labels arm exactly, which is what "every existing caller is unchanged"
+    # has to mean for a module whose other entry point runs before any belief
+    # exists.
+    assert plan_recovery(book, containers=()).transitions == obeyed.transitions
+
+
+def test_a_failed_label_typed_onto_merged_work_no_longer_resigns_the_run():
+    """`goal.py`: the gate partitions the ledger into done / failed / live.
+
+    A `swarm:failed` typed onto a task whose pull request merged put it on the
+    wrong side of that partition, and the wrong side is not cosmetic here: the
+    abandoned arithmetic is a *refusal*, so the run ended asking a human about a
+    task that had landed, with the objective never assessed at all.
+    """
+    book, derived, labels = a_hand_edited(
+        FAILED, REVIEW_STATE, pulls=(PullFact(number=TASK_PULL, ref=ref(4), merged=True),)
+    )
+    assert derived.state("task-4") == LANDED
+
+    assert [one.task_id for one in shipped(book, derived)] == ["task-4"]
+    assert abandoned(book, derived) == ()
+    assert live(book, derived) == ()
+
+    oracle = Says(met())
+    assert assess("ship it", book, oracle=oracle, believed=derived).met
+    # The model was shown the merged task as shipped, which is the whole of what
+    # the assessment is computed from.
+    assert "task-4" in oracle.asked[0][1][1]
+
+    resigned = assess("ship it", book, oracle=Says(met()), believed=labels)
+    assert not resigned.met
+    assert resigned.reason == GAVE_UP
+    assert resigned.abandoned == (ref(4),)
+
+
+def test_a_done_label_typed_onto_an_open_pull_request_no_longer_assesses_early():
+    """`goal.py`'s other side: `live` is what stops the gate judging mid-run.
+
+    The refusal exists because "an objective assessed against a half-landed run"
+    is an answer nobody can act on. A `swarm:done` a human typed made the ledger
+    read exhausted, and the gate assessed - and could declare the run met - over
+    a task whose pull request was still open.
+    """
+    book, derived, labels = a_hand_edited(
+        DONE, CLAIMED_STATE, pulls=(PullFact(number=TASK_PULL, ref=ref(4)),)
+    )
+    assert derived.state("task-4") == REVIEW_STATE
+
+    assert [one.task_id for one in live(book, derived)] == ["task-4"]
+    assert shipped(book, derived) == ()
+
+    held = assess("ship it", book, oracle=Says(met()), believed=derived)
+    assert not held.met
+    assert held.reason.startswith(IN_FLIGHT)
+    assert not held.consulted, "no model is worth swapping in for a half-landed run"
+
+    assert assess("ship it", book, oracle=Says(met()), believed=labels).met
+
+
+def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
+    """`replan.py`, and the one call site here that is not a decision.
+
+    Nothing branches on this string; it is a word in a prompt. It is in scope
+    for the same epic all the same - `swarm:*` is a storage detail #141 and #140
+    are deleting, and a prompt is the worst place to leave one, because the
+    model reads the vocabulary as the run's own and re-emits it.
+
+    The mid-run edit is here too, for the same reason it is everywhere else in
+    this file: a `swarm:failed` typed onto merged work described that task to
+    the planner as abandoned, and `REPLAN_SUFFIX` asks the model to re-emit
+    every id it is shown.
+    """
+    book, derived, labels = a_hand_edited(
+        FAILED, REVIEW_STATE, pulls=(PullFact(number=TASK_PULL, ref=ref(4), merged=True),)
+    )
+    verdict = stalled()
+
+    _, tracked = brief(book, verdict, derived)
+    assert "task-4 (landed):" in tracked
+    assert "swarm:" not in tracked
+
+    _, under_the_labels = brief(book, verdict, labels)
+    assert "task-4 (needs-human):" in under_the_labels
+
+    # `believed=None` prints the label verbatim rather than translating it: this
+    # is a string in a prompt, so "unchanged" has to mean the same characters.
+    _, unchanged = brief(book, verdict)
+    assert "task-4 (swarm:failed):" in unchanged
