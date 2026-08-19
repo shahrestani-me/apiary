@@ -51,6 +51,12 @@ pre { margin:0; padding:12px; background:var(--bg); border:1px solid var(--line)
 .empty { color:var(--muted); font-size:13.5px; }
 .file + .file { margin-top:11px; }
 .file summary { cursor:pointer; font-family:var(--mono); font-size:12.5px; padding:3px 0; }
+.buildform { margin:10px 0 12px; }
+.buildform label { display:block; margin:12px 0 5px; font-size:12.5px; color:var(--muted); }
+.buildform input { width:100%; box-sizing:border-box; padding:7px 9px;
+                   border:1px solid var(--line); border-radius:7px;
+                   background:var(--bg); color:var(--fg); font-size:13px; }
+.buildform .checkline label { margin:0; }
 .checkline { display:flex; gap:8px; align-items:flex-start; margin:14px 0 5px;
              font-size:12.5px; color:var(--muted); cursor:pointer; }
 .checkline input { width:auto; margin-top:2px; accent-color:var(--accent); }

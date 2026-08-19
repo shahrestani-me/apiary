@@ -15,6 +15,14 @@
   //: the raw run form. A variable rather than storage: the choice should
   //: survive tab switches, not page reloads.
   var wizardMode = "describe";
+  //: The Start building form, as served under its own key on /sites. Null on
+  //: an older backend, in which case the plan card renders exactly as it did
+  //: and the button never appears.
+  var buildSite = null;
+  //: What has been typed into it, kept outside the card: the card is redrawn
+  //: on every poll tick of a running build, and a redraw that discarded the
+  //: owner would be the same bug `typed` exists to prevent one layer down.
+  var buildTyped = {};
   var $ = function (id) { return document.getElementById(id); };
 
   function el(tag, cls, text) {
@@ -239,6 +247,18 @@
       fix.appendChild(el("code", null, e.fix));
       body.appendChild(fix);
     }
+    //: Doctor refuses to construct a failing check without a fix, so every
+    //: entry here has one. Listed rather than folded into the headline: the
+    //: fix for "no docker daemon" and the fix for "no worker image" are
+    //: different commands, and a preflight that showed only the first would
+    //: send the operator back for the second one at a time.
+    (e.checks || []).forEach(function (c) {
+      var line = el("p", "fix");
+      line.appendChild(el("strong", null, c.name + ": "));
+      line.appendChild(el("span", null, c.detail + " — "));
+      line.appendChild(el("code", null, c.fix));
+      body.appendChild(line);
+    });
     if (e.traceback) {
       var d = el("details");
       d.appendChild(el("summary", null, "traceback"));
@@ -268,8 +288,155 @@
     return card("the call", body);
   }
 
-  function resultCard(site, r) {
+  //: Only ever a github.com URL over TLS, parsed rather than prefix-matched.
+  //: The console builds these server-side from a validated slug and an
+  //: integer, so nothing here can fire today - but `href` is the one sink on
+  //: this page that executes a string, and a payload that ever carried a
+  //: `javascript:` URL would find every other defence spent on textContent.
+  //: Parsing is what makes it a real check: a prefix test says yes to
+  //: `github.com.example.net`, and `URL` does not.
+  function link(text, url) {
+    var parsed = null;
+    try { parsed = new URL(String(url)); } catch (e) { parsed = null; }
+    if (!parsed || parsed.protocol !== "https:" || parsed.hostname !== "github.com") {
+      return el("span", null, text);
+    }
+    var a = el("a", null, text);
+    a.href = parsed.href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    return a;
+  }
+
+  //: The plan's own fields, drawn inside the plan card rather than in the tab
+  //: form: what is being approved is *this* decomposition, and a form for it
+  //: living anywhere else would be a button that outlived the thing it acts on.
+  function buildForm() {
+    var box = el("div", "buildform");
+    buildSite.fields.forEach(function (f) {
+      var kept = buildTyped[f.name];
+      if (f.kind === "check") {
+        var wrap = el("label", "checkline");
+        var check = el("input");
+        check.type = "checkbox";
+        check.name = "build_" + f.name;
+        check.checked = (kept !== undefined ? kept : f.value) === "1";
+        check.onchange = function () { buildTyped[f.name] = check.checked ? "1" : ""; };
+        wrap.appendChild(check);
+        wrap.appendChild(el("span", null, f.label));
+        box.appendChild(wrap);
+        return;
+      }
+      box.appendChild(el("label", null, f.label));
+      var node = el("input");
+      node.name = "build_" + f.name;
+      node.placeholder = f.placeholder || "";
+      node.value = kept !== undefined ? kept : (f.value || "");
+      node.oninput = function () { buildTyped[f.name] = node.value; };
+      box.appendChild(node);
+    });
+    return box;
+  }
+
+  function buildValues() {
+    var out = {};
+    buildSite.fields.forEach(function (f) {
+      out[f.name] = buildTyped[f.name] !== undefined ? buildTyped[f.name] : (f.value || "");
+    });
+    //: The objective the plan was drafted from, which is what the repository
+    //: is generated from. Read off the planner tab rather than retyped: the
+    //: two must be the same string or the repository describes one project
+    //: and its backlog decomposes another.
+    out.objective = (typed.planner || {}).objective || "";
+    return out;
+  }
+
+  //: The plan card's action. `planId` is the id of the call that produced the
+  //: plan on screen, and it is the whole payload: the server writes the tasks
+  //: it returned under that id, so nothing between here and GitHub can put a
+  //: different decomposition in front of the one the operator read.
+  function startBuilding(planId, button) {
+    //: Disabled for the round trip, because the window between the click and
+    //: the 202 is exactly long enough to click again - and the second click
+    //: would be refused by the server's single flight rather than ignored,
+    //: putting a 409 on screen for something the operator did not mean to do.
+    button.disabled = true;
+    //: The refusal lands *under* the plan rather than replacing it: the fixable
+    //: ones are all form fields (an owner, a stack, a token), and a page that
+    //: threw the decomposition away to show them would make the operator run
+    //: the planner again to get back to the button.
+    api("/swarm/build", { plan: planId, values: buildValues() }).then(function (r) {
+      if (!r.ok) {
+        button.disabled = false;
+        $("out").appendChild(errorCard({ type: "refused", message: r.body.error,
+                                         fix: r.body.fix, checks: r.body.checks }));
+        return;
+      }
+      clearTimeout(timer);
+      pollBuild(r.body.id);
+    });
+  }
+
+  function pollBuild(id) {
+    api("/status?id=" + encodeURIComponent(id)).then(function (res) {
+      var job = res.body;
+      if (job.state === "running") {
+        show([buildWaiting(job)]);
+        timer = setTimeout(function () { pollBuild(id); }, 1000);
+        return;
+      }
+      show([job.state === "error" ? errorCard(job.error) : buildCard(job.result)]);
+    });
+  }
+
+  function buildWaiting(job) {
     var body = el("div");
+    body.appendChild(el("p", null, "creating the repository and writing the issues — "
+                                  + job.elapsed_s + "s elapsed"));
+    body.appendChild(el("p", "empty",
+      "The model is not being asked anything; this is GitHub's pace, one issue per task."));
+    return card("building", body);
+  }
+
+  //: What now exists. The repository first, then one row per issue, then -
+  //: with equal weight, which is the point - every task that could not become
+  //: one. A build that wrote six issues from eight tasks is not a success with
+  //: a footnote, and a page that only listed the six would be the silence #129
+  //: names as the failing direction.
+  function buildCard(r) {
+    var body = el("div");
+    var head = el("p");
+    head.appendChild(el("strong", null, "repository "));
+    head.appendChild(link(r.repo, r.html_url));
+    body.appendChild(head);
+    body.appendChild(el("p", "empty",
+      r.default_branch + " · stack " + r.stack + " · verified by " + r.verify_command));
+
+    (r.issues || []).forEach(function (i) {
+      var row = el("div", "file");
+      row.appendChild(link("#" + i.number, i.url));
+      row.appendChild(el("span", null, "  " + i.task_id + " — " + i.title));
+      body.appendChild(row);
+    });
+
+    (r.rejected || []).forEach(function (t) {
+      var row = el("p", "fix");
+      row.appendChild(el("strong", null, "not written: "));
+      row.appendChild(el("span", null, t.task_id + " — " + t.reason));
+      body.appendChild(row);
+    });
+    (r.warnings || []).forEach(function (w) {
+      body.appendChild(el("p", "empty", w));
+    });
+
+    var title = r.repo + " · " + (r.issues || []).length + " issue(s)";
+    if ((r.rejected || []).length) title += ", " + r.rejected.length + " task(s) not written";
+    return card(title, body, (r.rejected || []).length ? "err" : null);
+  }
+
+  function resultCard(site, r, planId) {
+    var body = el("div");
+    if (site === "build") return buildCard(r);
     if (site === "stack") {
       body.appendChild(el("pre", null, r.stack));
       return card("answer", body);
@@ -290,6 +457,17 @@
         ));
         body.appendChild(d);
       });
+      //: The action lives on the plan it acts on, and appears only when the
+      //: backend offers the form: an older one serves no `build` key and this
+      //: card is exactly what it always was.
+      if (buildSite && planId) {
+        body.appendChild(el("h2", null, "start building"));
+        body.appendChild(el("p", "empty", buildSite.blurb));
+        body.appendChild(buildForm());
+        var go = el("button", "tab", "Start building");
+        go.onclick = function (e) { e.preventDefault(); startBuilding(planId, go); };
+        body.appendChild(go);
+      }
       return card("plan · " + (r.tasks || []).length + " task(s)", body);
     }
     if (!r.edits || !r.edits.length) {
@@ -323,7 +501,8 @@
       }
       $("go").disabled = false;
       show([
-        job.state === "error" ? errorCard(job.error) : resultCard(job.site, job.result),
+        job.state === "error" ? errorCard(job.error)
+                              : resultCard(job.site, job.result, job.id),
         job.capture ? captureCard(job.capture) : null,
         promptNode
       ]);
@@ -1105,6 +1284,7 @@
     //: First, so it is the default: running the swarm is what the console is
     //: opened for; the model-call tabs are the debugger behind it.
     if (res.body.swarm) sites.unshift(res.body.swarm);
+    buildSite = res.body.build || null;
     //: Never clobber a tab the operator has already chosen. This resolves once
     //: at load, but a slow response and a fast click put the selection back on
     //: the first site while leaving the other one's form on screen.
