@@ -406,7 +406,7 @@ def test_a_failed_call_lands_on_the_page_with_a_named_fix(console, monkeypatch):
     """Doctor refuses to report a failing check without naming its fix
     (`Check.__post_init__`). A console that renders a bare traceback would be
     the same failure this epic exists to remove, one layer up."""
-    def explode(_values):
+    def explode(_values, _spec=None):
         raise ConnectionRefusedError("connection refused")
 
     monkeypatch.setitem(SITES, "stack", dataclasses.replace(SITES["stack"], run=explode))
@@ -858,3 +858,200 @@ def test_a_disposed_worker_says_where_its_log_went_rather_than_erroring():
 
     assert "this worker has been disposed" in script
     assert "the worker has not printed anything yet" in script
+
+
+# --------------------------------------------------------------------------
+# Choosing a model (#266)
+# --------------------------------------------------------------------------
+#
+# The part the whole epic is for. Switching models used to be an export and a
+# restart, which in practice meant nobody tried the alternative and the choice
+# never got revisited.
+#
+# The mistake these tests exist to prevent is conflating the two controls. "Set
+# the default" persists and affects every subsequent run; "override this one
+# call" persists nothing. An operator who wanted to *try* Terra once and
+# accidentally repointed every future run has been badly served.
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    """A model store nobody else can see, installed process-wide."""
+    from swarm.models import ModelStore, store as install
+
+    previous = install(ModelStore(path=tmp_path / "models.json"))
+    yield previous
+    install(ModelStore(path=tmp_path / "models.json"))
+
+
+def test_the_page_says_which_model_each_role_will_use_and_which_rung_chose_it(console, store):
+    """Showing the source is what makes the saved default discoverable at all:
+    it is the one rung an operator cannot see from a shell."""
+    answer = body(console.render("GET", "/models", HOST))
+
+    for role in ("orchestrator", "worker"):
+        assert answer["roles"][role]["label"].startswith("ollama:")
+        assert answer["roles"][role]["source"]
+        assert answer["roles"][role]["credential"]
+
+
+def test_the_page_lists_the_providers_it_could_offer(console, store):
+    answer = body(console.render("GET", "/models", HOST))
+
+    names = {p["name"] for p in answer["providers"]}
+    assert {"ollama", "openai", "bedrock"} <= names
+    # And each provider's own options, so the page can say what `region` is
+    # without knowing that Bedrock has one.
+    bedrock = next(p for p in answer["providers"] if p["name"] == "bedrock")
+    assert {o["name"] for o in bedrock["options"]} >= {"profile", "region"}
+
+
+def test_setting_a_default_persists_it_and_a_fresh_reader_sees_it(console, store, tmp_path):
+    from swarm.models import ModelStore
+
+    saved = console.render(
+        "POST", "/models", HOST,
+        json.dumps({"role": "worker", "model": "bedrock:gpt-5.6-luna",
+                    "options": "region=eu-west-1,profile=acme"}).encode(),
+    )
+
+    assert saved.status == 200
+    assert body(saved)["roles"]["worker"]["label"] == "bedrock:gpt-5.6-luna"
+    # A running process cannot rewrite its own environment, so the whole point
+    # is that a *later* process reads this.
+    reopened = ModelStore(path=tmp_path / "models.json").load("worker")
+    assert reopened.model == "gpt-5.6-luna"
+    assert reopened.option("region") == "eu-west-1"
+
+
+def test_a_default_can_be_cleared_from_the_page(console, store):
+    console.render("POST", "/models", HOST,
+                   json.dumps({"role": "worker", "model": "bedrock:gpt-5.6-luna",
+                               "options": "region=eu-west-1"}).encode())
+
+    cleared = body(console.render("POST", "/models", HOST,
+                                  json.dumps({"role": "worker", "model": ""}).encode()))
+
+    assert "worker" not in cleared["saved"]
+
+
+def test_an_unwritable_default_is_refused_with_a_fix_rather_than_saved(console, store):
+    refused = console.render("POST", "/models", HOST,
+                             json.dumps({"role": "worker", "model": "bedrock:x",
+                                         "options": "regoin=eu-west-1"}).encode())
+
+    assert refused.status == 400
+    assert "regoin" in body(refused)["error"]
+    assert body(refused)["fix"]
+
+
+def test_an_unknown_role_is_refused(console, store):
+    refused = console.render("POST", "/models", HOST,
+                             json.dumps({"role": "judge", "model": "x"}).encode())
+
+    assert refused.status == 400
+
+
+def test_a_per_call_override_never_becomes_the_default(console, store, checkout):
+    """The distinction the whole page is built around. Firing one call at a
+    chosen model must leave the next run exactly where it was."""
+    before = body(console.render("GET", "/models", HOST))["roles"]["worker"]["label"]
+
+    started = console.render(
+        "POST", "/run", HOST,
+        json.dumps({
+            "site": "edits",
+            "values": {"root": str(checkout), "files": "README.md", "goal": "x"},
+            "model": {"model": "bedrock:gpt-5.6-luna", "options": "region=eu-west-1"},
+        }).encode(),
+    )
+
+    assert started.status == 202
+    # The job says which model it will use, before the call has even finished.
+    assert body(started)["model"] == "bedrock:gpt-5.6-luna"
+    assert body(started)["overridden"] is True
+    after = body(console.render("GET", "/models", HOST))["roles"]["worker"]["label"]
+    assert after == before, "a one-call override repointed the default"
+
+
+def test_a_call_with_no_override_is_labelled_as_the_default(console, store, checkout):
+    started = console.render(
+        "POST", "/run", HOST,
+        json.dumps({"site": "edits",
+                    "values": {"root": str(checkout), "files": "README.md", "goal": "x"}}).encode(),
+    )
+
+    assert body(started)["overridden"] is False
+    assert body(started)["model"].startswith("ollama:")
+
+
+def test_a_site_that_could_not_honour_an_override_refuses_it(console, store):
+    """`plan` and `intake` build their models several layers down. A control an
+    operator could change without the change taking effect would be worse than
+    no control at all, so the refusal is explicit rather than silent."""
+    refused = console.render(
+        "POST", "/run", HOST,
+        json.dumps({"site": "planner", "values": {"objective": "x"},
+                    "model": {"model": "bedrock:gpt-5.6-luna"}}).encode(),
+    )
+
+    assert refused.status == 400
+    assert "does not take a per-call model" in body(refused)["error"]
+
+
+def test_only_the_sites_that_can_honour_an_override_advertise_one(console):
+    sites = {s["key"]: s for s in body(console.render("GET", "/sites", HOST))["sites"]}
+
+    assert sites["edits"]["overridable"] is True
+    assert sites["stack"]["overridable"] is True
+    assert sites["planner"]["overridable"] is False
+
+
+def test_single_flight_still_holds_whatever_model_the_second_call_names(console, store, checkout):
+    """The refusal is about the slot, not about the model. A second call naming
+    a *remote* model is refused exactly as a second local one is - it would
+    otherwise look like a way around a latch that exists for good reasons."""
+    payload = {"site": "edits",
+               "values": {"root": str(checkout), "files": "README.md", "goal": "x"}}
+    console.render("POST", "/run", HOST, json.dumps(payload).encode())
+
+    second = console.render(
+        "POST", "/run", HOST,
+        json.dumps(dict(payload, model={"model": "bedrock:gpt-5.6-luna",
+                                        "options": "region=eu-west-1"})).encode(),
+    )
+
+    assert second.status == 409
+    assert "already in flight" in body(second)["error"]
+
+
+def test_a_missing_credential_says_so_where_a_bad_ollama_call_says_so_today(console):
+    """`_fix_for` used to answer every failure with "start Ollama" - advice
+    about a server the operator is not using."""
+    from swarm.console import _fix_for
+
+    fix = _fix_for(ConfigError("OPENAI_API_KEY is not set, and the openai provider cannot dial"))
+
+    assert "ollama serve" not in fix
+    assert "api key" in fix.lower()
+    assert "model.reachable" in fix, "the page and `swarm doctor` should say the same thing"
+
+
+def test_an_aws_failure_is_not_answered_with_ollama_advice(console):
+    from swarm.console import _fix_for
+
+    fix = _fix_for(ConfigError("bedrock could not authenticate as aws profile 'acme'"))
+
+    assert "aws sso login" in fix
+    assert "ollama" not in fix.lower()
+
+
+def test_a_missing_provider_extra_is_answered_with_the_install(console):
+    from swarm.console import _fix_for
+
+    fix = _fix_for(ConfigError(
+        "the bedrock provider needs the `langchain-aws` package, which apiary "
+        "does not install by default"
+    ))
+
+    assert "pip install" in fix

@@ -23,6 +23,21 @@
   //: on every poll tick of a running build, and a redraw that discarded the
   //: owner would be the same bug `typed` exists to prevent one layer down.
   var buildTyped = {};
+  //: What each role resolves to, as served by /models: the label, and which of
+  //: the four rungs decided it. The source is the half an operator cannot see
+  //: from a shell - a default saved by a console session last week looks
+  //: exactly like a built-in until something says so.
+  var models = null;
+  //: The per-call override, per site. Emphatically NOT the saved default: this
+  //: affects one call and nothing else, and the page keeps the two apart
+  //: everywhere they appear. An operator who wanted to *try* a model once and
+  //: accidentally repointed every future run has been badly served.
+  var override = {};
+  //: Finished result cards an operator asked to keep, newest first. This is
+  //: what makes "the same prompt at two models, both answers on screen" work:
+  //: the page is single-flight, so the two calls are sequential, and without
+  //: pinning the second would erase the first.
+  var pinned = [];
   var $ = function (id) { return document.getElementById(id); };
 
   function el(tag, cls, text) {
@@ -187,6 +202,11 @@
     $("peek").style.display = swarm ? "none" : "";
     $("go").textContent = describing ? "Propose a setup"
                           : swarm ? "Run the swarm" : "Fire";
+    //: Drawn here rather than at each of `drawForm`'s six call sites, so the
+    //: override box cannot outlive the form it belongs to - a stale one would
+    //: sit under a site that does not accept an override and quietly do
+    //: nothing when fired.
+    drawOverride();
   }
 
   //: Whether the strip stays off screen. Only when the swarm view exists to
@@ -227,6 +247,9 @@
     var out = $("out");
     out.textContent = "";
     nodes.filter(Boolean).forEach(function (n) { out.appendChild(n); });
+    //: Pinned comparisons live below whatever is current, oldest last, so the
+    //: newest answer is always the one at the top of the page.
+    pinned.forEach(function (n) { out.appendChild(n); });
   }
 
   function promptCard(p) {
@@ -528,12 +551,10 @@
         return;
       }
       $("go").disabled = false;
-      show([
-        job.state === "error" ? errorCard(job.error)
-                              : resultCard(job.site, job.result, job.id),
-        job.capture ? captureCard(job.capture) : null,
-        promptNode
-      ]);
+      var answer = job.state === "error" ? errorCard(job.error)
+                                         : resultCard(job.site, job.result, job.id);
+      var stamp = modelStamp(job);
+      show([stamp, answer, job.capture ? captureCard(job.capture) : null, promptNode]);
     });
   }
 
@@ -1674,6 +1695,162 @@
     });
   }
 
+  //: Which model answered, and - when there is one to compare against - the
+  //: button that keeps this answer on screen while the next one is fired. The
+  //: whole of "the same prompt at two models, both results side by side": the
+  //: page is single-flight, so the two calls are sequential and the first
+  //: would otherwise be erased by the second.
+  function modelStamp(job) {
+    if (!job.model) return null;
+    var body = el("div", "modelstamp");
+    body.appendChild(el("code", null, job.model));
+    body.appendChild(el("span", "meta", job.overridden ? "this call only" : "the saved/current default"));
+    if (job.capture) {
+      var c = job.capture;
+      var bits = [];
+      if (c.total_s !== null && c.total_s !== undefined) bits.push(c.total_s + "s");
+      //: An unread provider's blank is said out loud rather than shown as a
+      //: zero - #268's whole point, carried up to the screen where the
+      //: comparison is actually made.
+      else if (c.timings_from === "unrecognised") bits.push("no timing recorded");
+      if (c.total_tokens) bits.push(c.total_tokens + " tokens");
+      if (bits.length) body.appendChild(el("span", "meta", "· " + bits.join(" · ")));
+    }
+    var keep = el("button", "ghost", "Keep for comparison");
+    keep.title = "Pin this answer below, then fire the same prompt at another model.";
+    keep.onclick = function (e) {
+      e.preventDefault();
+      keep.disabled = true;
+      keep.textContent = "kept";
+      var copy = $("out").cloneNode(true);
+      //: The rendered nodes, not the payload: a pinned card must keep showing
+      //: exactly what was on screen, and re-deriving it from the job would
+      //: quietly re-render it under whatever the model bar says *now*.
+      var box = el("div", "card pinned");
+      box.appendChild(el("h2", null, "kept · " + job.model));
+      Array.prototype.slice.call(copy.childNodes).forEach(function (n) {
+        if (n.className && n.className.indexOf("pinned") >= 0) return;
+        box.appendChild(n);
+      });
+      pinned.unshift(box);
+      $("out").appendChild(box);
+    };
+    body.appendChild(keep);
+    return card(null, body, "stamp");
+  }
+
+  // ---- which model, and choosing another ----------------------------------
+  //
+  // Two controls, deliberately distinct, and the page never lets them look
+  // alike. "Set default" persists and affects every subsequent run - the
+  // "choose remote and then use it" case. "This call only" persists nothing -
+  // the "try it before I commit" case. Conflating them is the obvious mistake.
+
+  function roleFor(site) { return site && site.key === "edits" ? "worker" : "orchestrator"; }
+
+  function drawModels() {
+    var bar = $("modelbar");
+    if (!bar || !models) return;
+    bar.textContent = "";
+    ["orchestrator", "worker"].forEach(function (role) {
+      var info = models.roles[role] || {};
+      //: Two lines per role, not one. What is true and what can be changed are
+      //: different kinds of thing, and a single row of "role · model · source ·
+      //: credential · two inputs · two buttons" wraps at every window width -
+      //: which put "Set default" on a line of its own, separated from the model
+      //: it would set.
+      var group = el("div", "modelgroup");
+      var row = el("div", "modelrow");
+      row.appendChild(el("span", "rolename", role));
+      if (info.error) {
+        row.appendChild(el("span", "bad", info.error));
+        group.appendChild(row);
+        bar.appendChild(group);
+        return;
+      }
+      row.appendChild(el("code", null, info.label));
+      //: The source, always, and the detail when there is one. "from saved
+      //: default (/path/models.json)" is the line that makes last week's
+      //: console click discoverable at all.
+      row.appendChild(el("span", "meta", "from " + info.source
+                       + (info.detail ? " (" + info.detail + ")" : "")));
+      if (info.credential) row.appendChild(el("span", "meta", "· " + info.credential));
+
+      var box = el("input", "modelinput");
+      box.placeholder = info.label;
+      box.title = "provider:model - e.g. bedrock:gpt-5.6-luna, or a bare name for ollama";
+      var opts = el("input", "modelopts");
+      opts.placeholder = "region=eu-west-1,profile=acme";
+      opts.title = "provider options, name=value comma separated";
+      var save = el("button", "ghost", "Set default");
+      save.title = "Persisted. Every subsequent run uses this until it is cleared.";
+      save.onclick = function (e) {
+        e.preventDefault();
+        save.disabled = true;
+        api("/models", { role: role, model: box.value, options: opts.value })
+          .then(function (r) {
+            save.disabled = false;
+            if (!r.ok) { show([errorCard({ type: "refused", message: r.body.error,
+                                           fix: r.body.fix })]); return; }
+            models = r.body;
+            drawModels();
+          });
+      };
+      var clear = el("button", "ghost", "Clear");
+      clear.title = "Forget the saved default for this role and fall back to the environment "
+                  + "or the built-in.";
+      clear.onclick = function (e) {
+        e.preventDefault();
+        api("/models", { role: role, model: "" }).then(function (r) {
+          if (r.ok) { models = r.body; drawModels(); }
+        });
+      };
+      var controls = el("div", "modelrow controls");
+      controls.appendChild(box);
+      controls.appendChild(opts);
+      controls.appendChild(save);
+      if (models.saved && models.saved[role]) controls.appendChild(clear);
+      group.appendChild(row);
+      group.appendChild(controls);
+      bar.appendChild(group);
+    });
+  }
+
+  function drawOverride() {
+    var box = $("override");
+    if (!box) return;
+    box.textContent = "";
+    if (!current || !current.overridable) return;
+    var role = roleFor(current);
+    var kept = override[current.key] || { model: "", options: "" };
+    var head = el("span", "meta", "Try one call against another model — nothing is saved. "
+                                + "Leave empty to use the " + role + " default.");
+    var name = el("input", "modelinput");
+    name.placeholder = (models && models.roles[role] ? models.roles[role].label : "provider:model");
+    name.value = kept.model;
+    name.oninput = function () {
+      override[current.key] = { model: name.value, options: opts.value };
+    };
+    var opts = el("input", "modelopts");
+    opts.placeholder = "region=eu-west-1";
+    opts.value = kept.options;
+    opts.oninput = function () {
+      override[current.key] = { model: name.value, options: opts.value };
+    };
+    box.appendChild(head);
+    box.appendChild(name);
+    box.appendChild(opts);
+  }
+
+  //: Kept out of `values()` on purpose: the override is not a field of the
+  //: site, it is a fact about the call, and mixing it into the typed values
+  //: would send it to `/prompt` as though the prompt depended on it.
+  function overrideFor(site) {
+    var kept = override[site.key];
+    if (!site.overridable || !kept || !kept.model.trim()) return null;
+    return { model: kept.model.trim(), options: kept.options || "" };
+  }
+
   function fire() {
     if (current.kind === "swarm") {
       if (wizardMode === "describe" && intakeSite()) intakeFire();
@@ -1683,6 +1860,8 @@
     $("go").disabled = true;
     clearTimeout(timer);
     var payload = { site: current.key, values: values() };
+    var chosen = overrideFor(current);
+    if (chosen) payload.model = chosen;
     api("/prompt", payload).then(function (p) {
       var promptNode = p.ok ? promptCard(p.body) : null;
       if (!p.ok) { $("go").disabled = false; show([errorCard({ type: "bad input",
@@ -1724,8 +1903,14 @@
     //: is the swarm whenever hideTabs() answers yes - it was just unshifted.
     if (hideTabs()) current = sites[0];
     var m = res.body.models;
-    $("models").textContent = "worker " + m.worker + "  ·  orchestrator " + m.orchestrator
-                            + "  ·  " + m.base_url;
+    //: The resolved half, when the backend serves it. An older backend serves
+    //: only the three flat keys and the header renders exactly as it did.
+    models = m.resolved || null;
+    $("models").textContent = models
+      ? ("worker " + models.roles.worker.label + "  ·  orchestrator "
+         + models.roles.orchestrator.label)
+      : ("worker " + m.worker + "  ·  orchestrator " + m.orchestrator + "  ·  " + m.base_url);
+    drawModels();
     $("hint").textContent = "Captures are written for every call, successful or not.";
     drawTabs();
     drawForm();
