@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, cast
 
 import pytest
 from fixtures import failures
@@ -61,6 +61,7 @@ from swarm.orchestrator.checks import (
     ChecksReport,
     MergePolicy,
     PullState,
+    UnresolvedJoin,
     apply_checks,
     failing_paths,
     foreign_failure,
@@ -74,6 +75,7 @@ from swarm.orchestrator.checks import (
 from swarm.nodes.judge import mentioned_paths
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
+from swarm.taskref import TaskRef
 
 NOW = dt.datetime(2026, 8, 14, 14, 25, 30, tzinfo=dt.timezone.utc)
 
@@ -359,7 +361,7 @@ def test_a_green_pull_request_is_merged_and_its_issue_marked_done():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -374,7 +376,7 @@ def test_the_merge_deletes_the_branch_because_a_long_run_leaves_one_per_task():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -386,7 +388,7 @@ def test_with_the_override_off_a_green_pull_request_waits_for_a_human():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         policy=MergePolicy(admin_override=False),
         now=NOW,
     )
@@ -404,7 +406,7 @@ def test_a_draft_pull_request_is_not_merged_however_green_it_is():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23, draft=True)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -438,7 +440,7 @@ def test_a_failing_check_retries_and_the_transition_carries_the_failure():
     plan = plan_checks(
         ledger(entry(23, attempt=0)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: failing("tests/test_mod23.py")},
+        checks={task_ref(23): failing("tests/test_mod23.py")},
         now=NOW,
     )
     outcome = plan.outcomes[0]
@@ -456,7 +458,7 @@ def test_the_last_attempt_gives_up_rather_than_retrying_forever():
     plan = plan_checks(
         ledger(entry(23, attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
-        checks={23: failing("tests/test_mod23.py")},
+        checks={task_ref(23): failing("tests/test_mod23.py")},
         max_attempts=3,
         now=NOW,
     )
@@ -471,7 +473,7 @@ def test_a_failure_outside_the_declared_files_goes_to_a_human_not_to_a_retry():
     plan = plan_checks(
         ledger(entry(23, "src/mod23.py")),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: failing("tests/test_somebody_else.py")},
+        checks={task_ref(23): failing("tests/test_somebody_else.py")},
         max_attempts=3,
         now=NOW,
     )
@@ -498,7 +500,7 @@ def test_an_empty_check_set_is_pending_while_the_grace_period_runs():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23, age_s=30)),
-        checks={23: CheckSet()},
+        checks={task_ref(23): CheckSet()},
         policy=MergePolicy(zero_check_grace_s=300),
         now=NOW,
     )
@@ -514,7 +516,7 @@ def test_an_empty_check_set_past_its_grace_goes_to_a_human_and_is_never_merged()
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23, age_s=3600)),
-        checks={23: CheckSet()},
+        checks={task_ref(23): CheckSet()},
         policy=MergePolicy(zero_check_grace_s=300),
         now=NOW,
     )
@@ -530,6 +532,133 @@ def test_an_empty_check_set_past_its_grace_goes_to_a_human_and_is_never_merged()
     # And not retried either: the next attempt touches the same paths and gets
     # the same empty set.
     assert outcome.transition.attempt is None
+
+
+# --------------------------------------------------------------------------
+# The join: `checks` against the ledger, keyed on the ref (#174)
+# --------------------------------------------------------------------------
+#
+# These four pin the one lookup in this module that could not announce its own
+# failure. `plan_checks` used to read `checks.get(entry.number, CheckSet())`,
+# and every part of that line is load-bearing in the wrong direction: a miss
+# returns rather than raises, the default is not neutral, and `CheckSet()`
+# carries the verdict `EMPTY` - which past the grace period is `swarm:failed`,
+# escalated, never merged and never retried. A task whose check runs could not
+# be *looked up* was therefore handed to a human wearing exactly the label of a
+# task whose attempts had genuinely run out, with nothing in the ledger, the
+# plan or the log able to tell the two apart.
+#
+# So the assertions below are on the miss, not on the happy path. The happy
+# path stayed green through the entire life of the defect; that is the whole
+# problem with it.
+
+
+def aged_pull_past_the_grace() -> dict[str, PullState]:
+    """A pull request old enough that an empty check set escalates its issue.
+
+    Named rather than inlined because it is the precondition that makes the
+    fail-open dangerous: inside the grace period a missing check set is merely
+    `PENDING`, and the tests below would pass for the wrong reason.
+    """
+    return pulls(pull(101, issue=23, age_s=3600))
+
+
+def test_a_check_set_that_cannot_be_looked_up_raises_rather_than_escalating():
+    """The headline. An entry the caller was supposed to read checks for and
+    did not must stop the cycle, not quietly become a `swarm:failed`.
+
+    Revert `plan_checks` to a defaulted `.get` and this stops raising: the plan
+    comes back with one escalated outcome and a `swarm:review -> swarm:failed`
+    transition for an issue whose pull request nobody looked at."""
+    with pytest.raises(UnresolvedJoin) as raised:
+        plan_checks(
+            ledger(entry(23)),
+            pulls=aged_pull_past_the_grace(),
+            checks={},
+            policy=MergePolicy(zero_check_grace_s=300),
+            now=NOW,
+        )
+
+    # The message has to name the task, because the operator reading it has to
+    # know which issue the cycle stopped on.
+    assert "#23" in str(raised.value)
+
+
+def test_an_issue_number_is_not_a_ref_and_does_not_resolve_a_check_set():
+    """The regression #142's shape produces, asserted as the property that
+    makes the key type load-bearing rather than decorative.
+
+    An `int` where a `TaskRef` belongs is not a type error at runtime and not a
+    lookup error either: `{23: green} [TaskRef("#23")]` simply misses. Before
+    #174 that miss defaulted, and a caller half-migrated to refs escalated
+    every green pull request it had just read a passing check set for. Now it
+    raises - and should either side of this join go back to the number, this
+    stops raising and fails."""
+    green = summarise_checks([run("test", "success")])
+    wrong_key = cast(Mapping[TaskRef, CheckSet], {23: green})
+
+    with pytest.raises(UnresolvedJoin):
+        plan_checks(
+            ledger(entry(23)),
+            pulls=aged_pull_past_the_grace(),
+            checks=wrong_key,
+            policy=MergePolicy(zero_check_grace_s=300),
+            now=NOW,
+        )
+
+
+def test_a_check_set_read_for_another_task_never_answers_for_this_one():
+    """Present but wrong is the same fault as absent, and the more likely one:
+    a map built over a different selection of entries than the one this loop
+    walks. #24's checks must not decide #23, and a non-empty map must not read
+    as "the lookup worked"."""
+    with pytest.raises(UnresolvedJoin):
+        plan_checks(
+            ledger(entry(23)),
+            pulls=aged_pull_past_the_grace(),
+            checks={task_ref(24): summarise_checks([run("test", "success")])},
+            policy=MergePolicy(zero_check_grace_s=300),
+            now=NOW,
+        )
+
+
+def test_a_genuinely_empty_check_set_still_escalates_after_its_grace():
+    """The other direction, and the reason the fix is a raise rather than a
+    softened verdict: `EMPTY` is a real answer GitHub gives, and a repository
+    whose workflows never run on these paths must still reach a human.
+
+    A fix that made an absent check set harmless by making an *empty* one
+    harmless would delete this module's zero-check rule, so the miss and the
+    empty answer are pinned apart on purpose - same ledger, same clock, same
+    grace, one raising and one escalating."""
+    plan = plan_checks(
+        ledger(entry(23)),
+        pulls=aged_pull_past_the_grace(),
+        checks={task_ref(23): CheckSet()},
+        policy=MergePolicy(zero_check_grace_s=300),
+        now=NOW,
+    )
+
+    assert plan.escalated == (23,)
+    assert plan.outcomes[0].verdict == EMPTY
+    assert plan.merges == ()
+
+
+def test_the_check_sets_a_run_reads_are_keyed_the_way_the_plan_looks_them_up():
+    """End to end, and what makes the raise a wiring assertion rather than a
+    trap for callers: `run_checks` builds the map and `plan_checks` consumes
+    it, so if the two ever disagree about the key this is the test that goes
+    red - in the pass that is supposed to be entirely ordinary."""
+    client = FakeClient(
+        issues={23: issue_payload(23)},
+        open_pulls=((101, branch(23)),),
+        checks={f"{101:0>40x}": [run("test", "success")]},
+    )
+
+    report = run_checks(client, ledger(entry(23)))
+
+    assert [outcome.verdict for outcome in report.plan.outcomes] == [PASSED]
+    assert report.merged == (23,)
 
 
 # --------------------------------------------------------------------------
@@ -559,7 +688,7 @@ def test_check_runs_that_could_not_be_read_are_pending_not_failed():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: CheckSet(unreadable=True)},
+        checks={task_ref(23): CheckSet(unreadable=True)},
         now=NOW,
     )
 
@@ -573,7 +702,7 @@ def test_only_review_issues_with_an_open_pull_request_are_decided():
         # #25 is in review with no open PR - that is #22's row, and two modules
         # writing one transition is how a label moves twice in a cycle.
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -654,7 +783,7 @@ def test_a_green_pull_request_merges_and_only_then_moves_the_label():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -678,7 +807,7 @@ def test_a_refused_merge_leaves_the_issue_in_review_for_the_next_cycle():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -697,7 +826,7 @@ def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -715,7 +844,7 @@ def test_a_retry_persists_the_failure_and_the_counter_before_the_label_moves():
     plan = plan_checks(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: failing("tests/test_mod23.py")},
+        checks={task_ref(23): failing("tests/test_mod23.py")},
         now=NOW,
     )
 
@@ -735,7 +864,7 @@ def test_giving_up_comments_the_failure_where_a_human_will_find_it():
     plan = plan_checks(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py", attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
-        checks={23: failing("tests/test_mod23.py")},
+        checks={task_ref(23): failing("tests/test_mod23.py")},
         max_attempts=3,
         now=NOW,
     )
@@ -755,7 +884,7 @@ def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
     plan = plan_checks(
         ledger(entry(23, attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
-        checks={23: failing("tests/test_mod23.py")},
+        checks={task_ref(23): failing("tests/test_mod23.py")},
         max_attempts=3,
         now=NOW,
     )
@@ -771,7 +900,7 @@ def test_a_dry_run_writes_nothing_at_all():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -788,8 +917,8 @@ def test_one_issue_github_will_not_relabel_does_not_cost_the_others():
         ledger(entry(23), entry(24)),
         pulls=pulls(pull(101, issue=23), pull(102, issue=24)),
         checks={
-            23: failing("tests/test_mod23.py"),
-            24: summarise_checks([run("test", "success")]),
+            task_ref(23): failing("tests/test_mod23.py"),
+            task_ref(24): summarise_checks([run("test", "success")]),
         },
         now=NOW,
     )
@@ -976,7 +1105,7 @@ def test_the_merge_commit_is_kept_because_nothing_else_records_it():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
@@ -1001,7 +1130,7 @@ def test_a_merge_that_answered_with_no_body_is_still_a_merge():
     plan = plan_checks(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
-        checks={23: summarise_checks([run("test", "success")])},
+        checks={task_ref(23): summarise_checks([run("test", "success")])},
         now=NOW,
     )
 
