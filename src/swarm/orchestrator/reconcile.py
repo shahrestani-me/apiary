@@ -489,10 +489,10 @@ def infrastructure_streaks(
 
     (The *files* can tell them apart, and #177 is why: `write_result` never
     replaces an existing record, bumping the filename on collision instead. An
-    older reading of this docstring said the artifacts could not, and six other
-    places repeated it until #217 corrected them - the conclusion above survives
-    either way, because it is the reconciler's one-record-per-task view that
-    loses the count, not the directory.)
+    older reading of this docstring said the artifacts could not, and every
+    other copy of the claim repeated it until #217 corrected them - the
+    conclusion above survives either way, because it is the reconciler's
+    one-record-per-task view that loses the count, not the directory.)
 
     That last clause is what `observed_records` below exists to keep true. It
     was not: exit 2 leaves `entry.attempt` alone, so the dead attempt's record
