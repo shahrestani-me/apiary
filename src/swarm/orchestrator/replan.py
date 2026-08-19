@@ -68,7 +68,9 @@ from ..nodes.planner import (
     IssueAction,
     PlanError,
     PlanReport,
+    human_prompt,
     normalise,
+    repository_files,
     write_plan,
 )
 from ..state import Plan
@@ -194,6 +196,7 @@ def propose(
     verdict: Verdict,
     *,
     proposer: Proposer | None = None,
+    files: Sequence[str] | None = None,
 ) -> Plan:
     """Ask for a different decomposition of the same objective.
 
@@ -201,12 +204,14 @@ def propose(
     rather than rewritten, because the hard rules in it (disjoint `## Files`,
     re-emit under the existing id) are what make the resulting plan writable at
     all, and a second copy of them here would drift from the one the planner
-    self-checks against.
+    self-checks against. The human turn is `planner.human_prompt`'s for the
+    same reason: `files` is the repository listing when the caller could get
+    one, and None sends the turn exactly as it always was.
     """
     failures, tracked = brief(ledger, verdict)
     prompt = SYSTEM + REPLAN_SUFFIX.format(failures=failures, existing=tracked)
     llm = proposer if proposer is not None else structured(orchestrator_llm(), Plan)
-    return llm.invoke([("system", prompt), ("human", f"Objective:\n{objective}")])
+    return llm.invoke([("system", prompt), ("human", human_prompt(objective, files))])
 
 
 # --------------------------------------------------------------------------
@@ -329,7 +334,12 @@ def replan(
         )
 
     try:
-        plan = propose(objective, ledger, verdict, proposer=proposer)
+        # `repository_files` is best-effort by contract: a replan whose tree
+        # read fails plans exactly as it did before listings existed, because
+        # a stalled run must never be made unfixable by a 502.
+        plan = propose(
+            objective, ledger, verdict, proposer=proposer, files=repository_files(client)
+        )
     except Exception as exc:  # noqa: BLE001 - any transport failure reads the same
         # Same reading as an unresolved judgement: the model is unreachable, the
         # run is not wrong, and the stall count stands so the next cycle can try

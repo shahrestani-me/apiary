@@ -542,6 +542,39 @@ def test_unrecognised_output_yields_no_diagnosis():
     assert diagnose("") == ""
 
 
+#: The worker's pinned parse-gate failure, exactly as `worker.edit.
+#: syntax_failure` writes it - the one SyntaxError shape `diagnose` may
+#: recognise, because the worker authored the sentence.
+WORKER_SYNTAX_FAILURE = (
+    "python syntax error in tests/test_wallet.py, line 7: invalid syntax\n"
+    "    amount=3.5 far, typo in my thought process again\n\n"
+    "The verify command was not run: a file that does not parse fails every "
+    "test that imports it."
+)
+
+
+def test_the_workers_pinned_syntax_failure_is_diagnosed_by_file():
+    finding = diagnose(WORKER_SYNTAX_FAILURE)
+
+    assert "syntax error in tests/test_wallet.py" in finding
+    assert "must parse" in finding
+    # No line number in the diagnosis: `signature` uses it as the failure's
+    # identity, and the same broken file at a moved line is the same blocker.
+    assert "line 7" not in finding
+
+
+def test_a_raw_cpython_syntax_traceback_is_still_not_diagnosed():
+    # Attributing a suite's own SyntaxError to a file would mean parsing
+    # pytest's surrounding lines, which is a guess - the honesty rule holds.
+    assert diagnose(SYNTAX_ERROR_OUTPUT) == ""
+
+
+def test_a_moved_syntax_error_in_the_same_file_signs_identically():
+    moved = WORKER_SYNTAX_FAILURE.replace("line 7", "line 12")
+
+    assert signature(WORKER_SYNTAX_FAILURE) == signature(moved)
+
+
 def test_a_retried_issue_carries_the_failure_as_a_comment():
     """The defect this feature exists for: issue #21 of the first live run
     failed 3/3 attempts on the identical ModuleNotFoundError, because a retry
@@ -609,8 +642,9 @@ def test_the_retry_comment_lands_on_the_issue_through_the_apply_path():
 # The retry budget is per blocker, not per task
 # --------------------------------------------------------------------------
 
-# Not diagnosable - `diagnose` knows nothing about SyntaxErrors - so this
-# exercises the normalised-tail tier of `signature`.
+# Not diagnosable - `diagnose` recognises only the worker's own pinned
+# syntax-failure line, never a raw CPython traceback - so this exercises the
+# normalised-tail tier of `signature`.
 SYNTAX_ERROR_OUTPUT = (
     '  File "tests/test_wallet.py", line 7\n'
     "    def test_balance(:\n"

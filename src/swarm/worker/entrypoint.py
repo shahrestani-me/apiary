@@ -76,7 +76,15 @@ from ..github.ledger import (
 from ..run import RUN_ID_ENV
 from ..security import EGRESS_EXTRA_ENV
 from ..worktree import GitError
-from .edit import Applied, EditError, apply_edits, gather_context, propose_edits, read_writable
+from .edit import (
+    Applied,
+    EditError,
+    apply_edits,
+    gather_context,
+    propose_edits,
+    read_writable,
+    syntax_failure,
+)
 
 EXIT_OK = 0
 EXIT_TASK_FAILED = 1
@@ -175,6 +183,26 @@ OUTPUT_TAIL_CHARS = 4_000
 #: a second rule.
 DEPENDENCY_MANIFESTS: tuple[str, ...] = ("requirements.txt",)
 PYTHON_MANIFEST = "requirements.txt"
+
+#: What marks a `## Verify` command as pytest-based, and therefore auditable
+#: by `audit_collection`. A bare substring test, deliberately dumb: the
+#: commands the swarm generates are `python -m pytest -q` and close variants,
+#: and a cleverer parse would only add ways to miss one. A command this
+#: matches by accident (`./run-pytest-like-thing`) costs one fast
+#: `--collect-only` probe; a pytest command it missed would cost the audit
+#: entirely, so the test errs broad.
+PYTEST_MARKER = "pytest"
+
+#: The filename shapes pytest collects by default (`test_*.py` / `*_test.py`).
+#: Used to pick which of an attempt's written files the collection audit must
+#: prove were seen; a helper or fixture file is legitimately never collected.
+TEST_FILE_RE = re.compile(r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.py)$")
+
+#: The collection audit's own clock. A `--collect-only` imports files without
+#: running tests, so it is fast when healthy - and a hang here (an import that
+#: blocks, say) must not spend the container budget the way the verify's own
+#: timeout already guards against.
+AUDIT_TIMEOUT_S = 120
 
 #: The install gets its own clock rather than sharing the verify command's:
 #: a resolver walking a heavy dependency tree is slow in a way a test suite is
@@ -656,6 +684,92 @@ def install_dependencies(root: Path) -> str | None:
     return failure
 
 
+def written_test_files(written: Sequence[str]) -> tuple[str, ...]:
+    """The written paths pytest would treat as test files. See `TEST_FILE_RE`."""
+    return tuple(path for path in written if TEST_FILE_RE.search(path))
+
+
+def audit_collection(root: Path, command: str, written: Sequence[str]) -> str | None:
+    """A passed pytest verify only counts if it *collected* this attempt's tests.
+
+    The failure this closes was observed whole in a generated repository: its
+    `pyproject.toml` pinned `testpaths = ["tests"]`, so `python -m pytest -q`
+    collected 7 tests in `tests/` while ~10 other test files - including two
+    with SyntaxErrors and every DB test - were never executed by any gate.
+    Workers "passed verify" on tests that verified something else, which is
+    the one failure mode the exit-code invariant cannot see from the exit
+    code: 0 is 0 however little ran.
+
+    So, when the verify command looks pytest-based (`PYTEST_MARKER`; kept dumb
+    on purpose) and it PASSED, ask pytest what an argument-less run collects
+    and require every test file this attempt wrote to be in the answer.
+    **Argument-less, not per-file**: `testpaths` only applies when the command
+    line names nothing, so probing `--collect-only <file>` would collect
+    exactly the file the real gate excludes and prove the wrong thing. The
+    probe mirrors the gate's shape instead and checks membership in its
+    output.
+
+    `sys.executable` rather than a bare `python`: this process's interpreter
+    is the container's one Python - the same one the generated verify commands
+    run - and it exists by construction on a developer laptop where `python`
+    may not. Same cwd and the same filtered environment as the verify itself,
+    so the probe answers for the gate that actually ran.
+
+    Scoped to what this attempt wrote (`written_test_files`), never the
+    repository's historical test files: failing a worker for someone else's
+    debt teaches its retry nothing it can fix. A probe that itself errors or
+    times out proves nothing either way, and "cannot be proven to run" fails
+    the audit for the same reason "did not run" does.
+
+    Returns `None` when the audit passes or does not apply, and the failure
+    text otherwise - the same outcome shape as `install_dependencies`, and for
+    the same reason: the text is the retry comment's raw material. `OSError`
+    alone is infrastructure, exactly as it is for the verify command: the
+    shell itself failing to start says nothing about the task.
+    """
+    tests = written_test_files(written)
+    if not tests or PYTEST_MARKER not in command:
+        return None
+    probe = f"{sys.executable} -m pytest --collect-only -q"
+    try:
+        proc = subprocess.run(
+            probe,
+            shell=True,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=AUDIT_TIMEOUT_S,
+            env=verify_env(),
+        )
+    except subprocess.TimeoutExpired:
+        missing = tests
+        evidence = f"the collection probe timed out after {AUDIT_TIMEOUT_S}s"
+    except OSError as exc:
+        raise InfrastructureError(f"could not run the collection audit: {exc}") from exc
+    else:
+        from .result import tail
+
+        # A collected file appears in `-q` output as `<path>::<test id>` lines.
+        # Membership is judged on stdout alone; the return code is not trusted
+        # here because a collection *error* in an unrelated file exits non-zero
+        # while still listing the files it did collect.
+        lines = proc.stdout.splitlines()
+        missing = tuple(
+            path
+            for path in tests
+            if not any(line.startswith(f"{path}::") for line in lines)
+        )
+        if not missing:
+            return None
+        evidence = tail(f"{proc.stdout}\n{proc.stderr}".strip(), OUTPUT_TAIL_CHARS)
+    names = ", ".join(missing)
+    return (
+        f"the verify command passed, but {names} was not collected by the verify "
+        "command - check pytest testpaths/config; a test that never runs proves "
+        f"nothing.\n\ncollection probe: {probe}\n{evidence}"
+    )
+
+
 # --------------------------------------------------------------------------
 # The run
 # --------------------------------------------------------------------------
@@ -794,15 +908,32 @@ def run_worker(
     # infrastructure failure carries both rather than reporting an empty
     # command for a run that had already got as far as a green suite.
     try:
-        # Declared dependencies go in before the gate opens; a failed install
-        # IS the verify verdict, because it is the task's real blocker and the
-        # next retry's feedback. See `install_dependencies` for why it is a
-        # failed task and never infrastructure.
-        blocked = install_dependencies(root)
-        if blocked is not None:
-            passed, verify_output = False, blocked
+        # A written Python file that does not parse fails here, before anything
+        # is installed or run: the gate cannot be trusted to catch it (the
+        # observed case is a suite whose `testpaths` never collected the broken
+        # file), and the SyntaxError text is better retry feedback than
+        # whatever a suite that tripped over it second-hand would say.
+        unparsed = syntax_failure(root, applied.written)
+        if unparsed is not None:
+            passed, verify_output = False, unparsed
         else:
-            passed, verify_output = run_verify(root, contract.verify)
+            # Declared dependencies go in before the gate opens; a failed
+            # install IS the verify verdict, because it is the task's real
+            # blocker and the next retry's feedback. See `install_dependencies`
+            # for why it is a failed task and never infrastructure.
+            blocked = install_dependencies(root)
+            if blocked is not None:
+                passed, verify_output = False, blocked
+            else:
+                passed, verify_output = run_verify(root, contract.verify)
+                if passed:
+                    # A green pytest gate only counts if it actually collected
+                    # the tests this attempt wrote - see `audit_collection`. It
+                    # runs on passes only: a failed gate already carries its
+                    # own, better feedback.
+                    uncollected = audit_collection(root, contract.verify, applied.written)
+                    if uncollected is not None:
+                        passed, verify_output = False, uncollected
 
         commit = None
         if passed:

@@ -51,6 +51,7 @@ is absent.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -411,3 +412,65 @@ def apply_edits(root: Path, edits: Iterable[FileEdit], allowed: Sequence[str]) -
         written.append(path)
 
     return Applied(written=tuple(written), refused=tuple(refused))
+
+
+def syntax_failure(root: Path, written: Sequence[str]) -> str | None:
+    """Do this attempt's written Python files at least *parse*? Text if not.
+
+    The verify command was supposed to make this question redundant, and a
+    real generated repository proved it does not: a merged test file carried a
+    literal model thought-leak (`amount=3.5 far, ... # wait, typo`) and a
+    full-width Unicode full stop - both SyntaxErrors, both green through the
+    gate, because the repo's pytest `testpaths` never collected the file. A
+    test suite only parses the files it runs, so "the gate passed" and "the
+    files parse" are independent claims, and this is the cheap one checked
+    first.
+
+    `ast.parse` rather than `py_compile`: no subprocess, no `.pyc` dropped
+    into a tree whose commit stages exactly the declared paths, and the raised
+    `SyntaxError` carries the filename, line and offending text this function
+    exists to report. The check is *only* a parse - it proves nothing about
+    imports or behaviour, which stay the verify command's job.
+
+    Scoped to what this attempt wrote, `.py` files only: non-Python files and
+    non-Python stacks pass through untouched, and pre-existing debt elsewhere
+    in the repository is not this task's to answer for. Every broken file is
+    reported, not just the first, because the text becomes the retry comment
+    and a retry told about one error per attempt burns the budget one line at
+    a time.
+
+    Returns `None` when everything parses, and the failure text otherwise -
+    an outcome for the caller to fold into the run as a failed gate, in the
+    module's usual shape (`install_dependencies` returns the same way, for the
+    same reason: the text is the next attempt's feedback, not an exception).
+    The first line of each finding is pinned - `python syntax error in <path>,
+    line <n>: <msg>` - because `orchestrator.reconcile.diagnose` matches it.
+    """
+    failures: list[str] = []
+    for relative in written:
+        if not relative.endswith(".py"):
+            continue
+        target = root / relative
+        if not target.is_file():
+            continue
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            ast.parse(text, filename=relative)
+        except SyntaxError as exc:
+            quoted = (exc.text or "").strip()
+            shown = f"\n    {quoted}" if quoted else ""
+            failures.append(
+                f"python syntax error in {relative}, line {exc.lineno}: {exc.msg}{shown}"
+            )
+        except ValueError as exc:
+            # `ast.parse` refuses a NUL byte with ValueError rather than
+            # SyntaxError. Same verdict: the file cannot be parsed.
+            failures.append(f"python syntax error in {relative}: {exc}")
+    if not failures:
+        return None
+    return (
+        "\n".join(failures)
+        + "\n\nThe verify command was not run: a file that does not parse fails "
+        "every test that imports it, and proves nothing in a suite that never "
+        "collects it. Rewrite the file so the quoted line parses."
+    )
