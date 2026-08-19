@@ -86,10 +86,16 @@ services:
       APIARY_TRACKER_TOKEN: ${APIARY_TRACKER_TOKEN:-}
 
       # Where the capability contract is (#150) - which tool on that server
-      # fulfils intake, comment and create. A path *inside this container*: the
-      # only host directory this service mounts is ./.swarm/runs, so a
-      # containerised orchestrator either keeps the block there or gets a mount
-      # added here. Unset means "no tracker configured", which is still a normal
+      # fulfils intake, comment and create. A path *inside this container*, and
+      # #151 is where it got one: this service now mounts ./.swarm/tracker at
+      # /etc/apiary/tracker, so the block goes in ./.swarm/tracker/tracker.yaml
+      # on the host and this variable names it there. Before that mount existed
+      # the variable could be set and could not be satisfied - a containerised
+      # orchestrator had no path to a tracker file at all, which #172 recorded
+      # in a comment and left for the first ticket that ran the tracker path end
+      # to end.
+      #
+      # Unset means "no tracker configured", which is still a normal
       # installation until the label control plane goes (#152), and `swarm
       # doctor` reports it as a skip rather than as a failure.
       APIARY_TRACKER_CONFIG: ${APIARY_TRACKER_CONFIG:-}
@@ -171,6 +177,22 @@ services:
     # forever, however tightly it was scoped.
     volumes:
       - ./.swarm/runs:/var/apiary/runs
+      # The tracker block (#151). A *directory*, not the file: compose creates a
+      # missing bind source, and for a file path it creates a directory with
+      # that name - so mounting ./.swarm/tracker.yaml on a host that has not
+      # written one yet would leave a directory called `tracker.yaml` sitting
+      # where the host's own `swarm run` then looks for a file. Read-only,
+      # because a contract the orchestrator could rewrite is a contract an
+      # LLM-driven run could point at another organization's tracker.
+      #
+      # One gap this does not close: the shipped `github` profile selects the
+      # *local stdio* server, and this image carries no `github-mcp-server`
+      # binary (Dockerfile installs git and the docker client and nothing else).
+      # So a containerised orchestrator on that profile needs the binary added to
+      # the image, or a tracker reached over HTTP. On the host, where every
+      # recorded run of this project has happened, the binary is the operator's
+      # to install and `swarm doctor`'s tracker.reachable check says so.
+      - ./.swarm/tracker:/etc/apiary/tracker:ro
 
   # --- the narrowed Docker API ---------------------------------------------
   # The only container in this file that sees the socket. Dispatching workers

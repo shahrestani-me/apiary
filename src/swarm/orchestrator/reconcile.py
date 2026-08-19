@@ -128,6 +128,7 @@ from ..github.readiness import (
     apply_readiness,
 )
 from ..github.refs import issue_number, task_ref
+from ..mcp.tracker import TrackerError
 from ..run import TERMINAL_LABELS, Run, live_entries
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
@@ -1483,6 +1484,14 @@ def post_comment(client: Any, number: int, text: str) -> bool:
     issue, and `GitHubClient` has no method for it (module docstring). Printing
     is not a substitute for the comment; it is what keeps the reason for a
     `swarm:failed` label from being lost entirely in the meantime.
+
+    **The probe is what routes this to MCP** (#151). `mcp.TrackerView` answers
+    `create_issue_comment` when a tracker is configured and delegates to the
+    code host when one is not, so this function reaches the customer's task
+    system without knowing that either exists. `TrackerError` is caught beside
+    `GitHubError` for the same reason `GitHubError` is: a comment is an
+    explanation, never a prerequisite, and a transport that will not carry one
+    must not end the cycle that was only trying to explain itself.
     """
     poster = getattr(client, COMMENT_METHOD, None)
     if poster is None:
@@ -1490,7 +1499,7 @@ def post_comment(client: Any, number: int, text: str) -> bool:
         return False
     try:
         poster(number, text)
-    except GitHubError as exc:
+    except (GitHubError, TrackerError) as exc:
         print(f"! comment on #{number} failed: {exc}", file=sys.stderr)
         return False
     return True

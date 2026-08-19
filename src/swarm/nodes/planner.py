@@ -152,6 +152,7 @@ from ..github.ledger import (
 )
 from ..github.readiness import BLOCKED, READY, IssueState, resolve_states
 from ..github.refs import task_ref
+from ..mcp.tracker import TrackerError
 from ..taskref import TaskRef
 from ..llm import orchestrator_llm, structured
 from ..state import Plan, PlannedTask, SwarmState, TaskRecord
@@ -1383,7 +1384,7 @@ def _post_comment(client: GitHubClient, number: int, text: str) -> None:
         return
     try:
         poster(number, text)
-    except GitHubError as exc:
+    except (GitHubError, TrackerError) as exc:
         print(f"! comment on #{number} failed: {exc}", file=sys.stderr)
 
 

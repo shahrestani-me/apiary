@@ -73,6 +73,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Collection, Iterable, Mapping, Sequence
 
+from ..mcp.tracker import INTAKE_IS_AUTHORITATIVE
 from ..taskref import TaskRef
 from .client import GitHubClient, GitHubHTTPError
 from .ledger import Ledger, load_ledger
@@ -466,6 +467,22 @@ def resolve_states(
     A 404 becomes `IssueState.missing` rather than an exception, because "that
     issue is not there" is an answer about one reference and not a failure of
     the read.
+
+    **A source may say its listing is the whole answer, and then there is no
+    fallback** (#151). ADR 0004 closes the tracker capability set at intake,
+    comment and create, so a tracker reached over MCP has nothing to fetch one
+    item *with* - and the honest response to that is a different rule rather
+    than a different call: intake's answer is authoritative, and a ref it did
+    not carry is one apiary does not act on. `mcp.TrackerView` sets the
+    property; a plain `GitHubClient` does not have it and fetches as before.
+
+    Probed rather than typed, `Snapshot`'s idiom, and for its reason: this
+    module knows nothing about MCP and must keep knowing nothing. The cost is
+    the case the fallback existed for - a `## Blocked by` line naming a *pull
+    request* was identified by the fetch on the direct path and reads as missing
+    here, so the task waiting on it stays blocked. That is the conservative
+    direction, and a dependency on a pull request rather than on a task is
+    outside `docs/issue-contract.md` §1.2 anyway.
     """
     client = _as_client(source)
     wanted = sorted(set(refs))
@@ -477,10 +494,16 @@ def resolve_states(
     # and block the entire backlog.
     listing = issues if issues is not None else client.list_issues(state="all")
     known = {task_ref(int(payload["number"])): payload for payload in listing}
+    authoritative = bool(getattr(client, INTAKE_IS_AUTHORITATIVE, False))
 
     states: dict[TaskRef, IssueState] = {}
     for ref in wanted:
         payload = known.get(ref)
+        if payload is None and authoritative:
+            # See the docstring: there is no second call to make, and "not in
+            # intake" is the whole answer this source has about the ref.
+            states[ref] = IssueState.missing(ref)
+            continue
         if payload is None:
             try:
                 # `list_issues` drops pull requests, so a ref that names one
