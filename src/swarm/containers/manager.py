@@ -174,6 +174,17 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 MAX_LOG_CHARS = 256_000
 HEAD_SHARE = 0.25
 
+#: What a *watcher* reads from a container that is still running (#133), as
+#: against what disposal writes to disk. Two numbers rather than one because
+#: the two readers want opposite things: the run directory wants everything the
+#: worker ever said, and a page polling every couple of seconds wants the part
+#: that has just changed. `--tail` bounds it at the daemon, so a worker four
+#: minutes into a chatty `npm test` costs the same read as one that has printed
+#: nothing - the character cap alone would still ship a quarter of a megabyte
+#: across the socket before trimming it here.
+LIVE_TAIL_LINES = 400
+LIVE_TAIL_CHARS = 40_000
+
 #: `docker rm` on something already removed. Matching the message is unpleasant
 #: but it is the only signal the CLI gives, and the alternative - inspect first,
 #: then remove - is a race with the reaper rather than a fix for one.
@@ -656,6 +667,50 @@ def capture_logs(handle: Handle, docker: DockerCLI, *, max_chars: int = MAX_LOG_
     # Truncation happens *after* redaction, never before: a secret split across
     # the elision would otherwise survive as two halves that a reader can still
     # recognise, and neither half would match a literal.
+    return _bounded(stream, max_chars)
+
+
+def tail_logs(
+    handle: Handle,
+    docker: DockerCLI,
+    *,
+    lines: int = LIVE_TAIL_LINES,
+    max_chars: int = LIVE_TAIL_CHARS,
+) -> str:
+    """The end of a container's output *while it is still running* (#133).
+
+    `capture_logs` is the disposal reader: it takes everything, and a disposed
+    handle answers from `captured` because there is no container left to ask.
+    This is the watcher's reader, and the differences are the point.
+
+    **It never writes `captured`.** That field is the run directory's evidence
+    (`artifacts.RunArtifacts.container_log`), and a tail written into it would
+    have disposal persist 400 lines where the run printed 40,000 - the log
+    somebody goes looking for precisely when the tail was not enough. Reading
+    ahead of disposal must leave disposal's output byte-identical, so this
+    function only ever reads. A handle that *has* been disposed is answered
+    from `captured` as a bounded tail rather than by asking a daemon about a
+    container that no longer exists.
+
+    **Redaction is the caller's `DockerCLI`, as it is everywhere else.** The
+    stream goes through `DockerCLI.combined`, which redacts before this
+    function - or the console - can see a byte of it. That is what makes "the
+    page never renders a credential" a property of the socket rather than a
+    rule this call site has to remember (`console_board._docker`).
+
+    A container that was removed under the read is empty output, not an error:
+    the reaper sweeping a finished worker mid-poll is the ordinary case.
+    """
+    if handle.captured is not None:
+        return _bounded(handle.captured, max_chars)
+    try:
+        stream = docker.combined("logs", "--tail", str(lines), handle.id)
+    except ContainerError as exc:
+        if is_missing(exc):
+            return ""
+        raise
+    # Bounded after redaction, for `capture_logs`' reason: a secret split
+    # across the elision would survive as two recognisable halves.
     return _bounded(stream, max_chars)
 
 

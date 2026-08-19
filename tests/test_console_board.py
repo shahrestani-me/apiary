@@ -628,3 +628,146 @@ def test_the_board_route_checks_the_host_like_every_other_route():
 
     assert console.render("GET", "/swarm/board?repo=me%2Fthing",
                           {"Host": "attacker.example"}).status == 403
+
+
+# --------------------------------------------------------------------------
+# Watching a worker while it works (#133)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class FakeDocker:
+    """A `DockerCLI` that answers `ps` from a list and records every argv.
+
+    Scripted at the `DockerCLI` level rather than the runner's, because what
+    these tests are about is which *container* gets read - not how the CLI
+    parses a listing, which `test_container_manager.py` already pins.
+    """
+
+    listing: str = ""
+    logs: str = "writing src/cli.py\n"
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    def __call__(self, *args: str, timeout_s: float | None = None) -> str:
+        self.calls.append(args)
+        return self.listing if args and args[0] == "ps" else ""
+
+    def combined(self, *args: str, timeout_s: float | None = None) -> str:
+        self.calls.append(args)
+        return self.logs
+
+    @property
+    def read_ids(self) -> list[str]:
+        return [call[-1] for call in self.calls if call and call[0] == "logs"]
+
+
+def ps_row(container_id: str, *, issue: int = 7, state: str = "running",
+           run_id: str = "apiary-20260819-100000-aaaaaa") -> str:
+    """One `docker ps` line in the format `find_containers` asks for."""
+    return "\t".join([container_id, f"worker-{issue}", "apiary-worker",
+                      run_id, str(issue), state])
+
+
+def watched(monkeypatch: pytest.MonkeyPatch, docker: FakeDocker) -> None:
+    monkeypatch.setattr("swarm.console_board._docker", lambda: docker)
+
+
+def test_a_claimed_card_carries_the_worker_holding_it(monkeypatch):
+    """The page needs no rule of its own about which rows may be expanded: the
+    field is present exactly when a live worker on this machine holds the task,
+    which is the same tuple the resolver read to put the card in Claimed."""
+    client = FakeClient(issues=[issue(3, "swarm:ready"), issue(4, "swarm:ready")])
+
+    board = reader(client, containers=[container(3)]).read("me/thing")
+
+    claimed = board["columns"]["claimed"][0]
+    assert claimed["number"] == 3
+    assert claimed["container"] == ("c3" * 6)[:12]
+    # ...and nothing else advertises a worker it does not have.
+    assert "container" not in board["columns"]["eligible"][0]
+
+
+def test_an_exited_container_is_not_offered_as_something_to_watch(monkeypatch):
+    """`running` is the whole claim of the field. A container that exited this
+    cycle has already opened its pull request, and a row offering to tail it
+    would be offering a log that has stopped moving."""
+    client = FakeClient(issues=[issue(3, "swarm:claimed")])
+
+    board = reader(client, containers=[container(3, running=False)]).read("me/thing")
+
+    assert all("container" not in c for cards_ in board["columns"].values() for c in cards_)
+
+
+def test_the_worker_log_reads_the_container_the_daemon_named(monkeypatch):
+    from swarm.console_board import worker_log
+
+    full = "c0ffee" + "0" * 58
+    docker = FakeDocker(listing=ps_row(full), logs="writing src/cli.py\nPASS\n")
+    watched(monkeypatch, docker)
+
+    log = worker_log(full[:12])
+
+    assert log == {"container": full[:12], "issue": 7, "image": "apiary-worker",
+                   "running": True, "text": "writing src/cli.py\nPASS\n"}
+    # Read by the id the *daemon* listed, not by the string the caller sent.
+    assert docker.read_ids == [full]
+
+
+def test_a_container_apiary_did_not_label_cannot_be_read_through_the_console(monkeypatch):
+    """The console is loopback, but "read any container's logs on this machine"
+    is still a capability a GET must not hand out. The caller's string is only
+    ever compared against the apiary-labelled listing - so somebody's database
+    matches nothing, and no `docker logs` is issued for it at all."""
+    from swarm.console_board import worker_log
+
+    docker = FakeDocker(listing=ps_row("c0ffee" + "0" * 58))
+    watched(monkeypatch, docker)
+
+    assert worker_log("deadbeefcafe") is None
+    assert docker.read_ids == []
+
+
+@pytest.mark.parametrize("named", ["", "  ", "c0ffee"])
+def test_an_id_too_short_to_be_unambiguous_is_refused(monkeypatch, named):
+    """A prefix is a prefix and the match takes the first hit, so `container=c`
+    would answer with whichever worker the daemon listed first - a different
+    worker's log under the right heading. The short id is what the card
+    carries, so requiring it costs the page nothing."""
+    from swarm.console_board import worker_log
+
+    docker = FakeDocker(listing=ps_row("c0ffee" + "0" * 58))
+    watched(monkeypatch, docker)
+
+    with pytest.raises(BoardError) as caught:
+        worker_log(named)
+    assert caught.value.fix
+    assert docker.read_ids == []
+
+
+def test_the_route_serves_a_tail_and_404s_once_the_worker_is_gone(monkeypatch):
+    full = "c0ffee" + "0" * 58
+    docker = FakeDocker(listing=ps_row(full), logs="PASS\n")
+    watched(monkeypatch, docker)
+    console = Console()
+
+    body = json.loads(console.render(
+        "GET", f"/swarm/worker?container={full[:12]}", HOST).body)
+    assert body["text"] == "PASS\n"
+
+    docker.listing = ""              # the reaper swept it between two polls
+    gone = console.render("GET", f"/swarm/worker?container={full[:12]}", HOST)
+    assert gone.status == 404
+    assert "run directory" in json.loads(gone.body)["fix"]
+
+
+def test_an_unreachable_daemon_is_a_502_that_names_the_fix(monkeypatch):
+    def explode() -> Any:
+        raise RuntimeError("Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr("swarm.console_board._docker", explode)
+    console = Console()
+
+    answer = console.render("GET", "/swarm/worker?container=c0ffee000000", HOST)
+
+    assert answer.status == 502
+    assert "daemon" in json.loads(answer.body)["fix"]
