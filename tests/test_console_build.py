@@ -45,6 +45,9 @@ ENV = {"GITHUB_TOKEN": "ghp-work", "APIARY_PROVISION_TOKEN": "github_pat_boot"}
 FORM = {"owner": "shahrestani-me", "name": "expense-tracker", "stack": "python",
         "public": "1", "objective": "a CLI that tracks expenses"}
 
+#: The scaffold unticked - the operator's decomposition and nothing else.
+PLAN_ONLY = dict(FORM, bootstrap="")
+
 #: Two tasks, the second blocked on the first, both writable. The shape a
 #: planner call actually returns, down to the `stack` key `_plan_run` carries
 #: precisely so that this rebuild is lossless.
@@ -185,25 +188,31 @@ def test_the_issues_written_are_the_tasks_that_were_displayed():
 
     assert job["state"] == "done", job.get("error")
     assert len(provisioner.calls) == 1
-    assert [c["number"] for c in issues.created] == [100, 101]
+    assert [c["number"] for c in issues.created] == [100, 101, 102]
+
+    # The scaffold leads, and it is the only issue that is not on the screen.
+    scaffold, *theirs = issues.created
+    assert "id=bootstrap-the-project" in scaffold["body"]
 
     # Titles are the goal made legible; the id is the marker in the body, which
     # is what §2 of the contract makes identity. Both are checked, per task.
-    for created, task in zip(issues.created, PLAN["tasks"]):
+    for created, task in zip(theirs, PLAN["tasks"]):
         assert task["id"] in created["body"]
         assert task["goal"] in created["body"]
         assert created["title"] in task["goal"]
         for path in task["files"]:
             assert path in created["body"]
     # The second task blocks on the first, and by number rather than by name.
-    assert "#100" in issues.created[1]["body"]
+    assert "#101" in theirs[1]["body"]
 
     # And the page says the same thing, with somewhere to click.
-    assert [i["task_id"] for i in job["result"]["issues"]] == ["add-store", "add-cli"]
+    assert [i["task_id"] for i in job["result"]["issues"]] == [
+        "bootstrap-the-project", "add-store", "add-cli"]
     assert job["result"]["html_url"] == "https://github.com/shahrestani-me/expense-tracker"
     assert [i["url"] for i in job["result"]["issues"]] == [
         "https://github.com/shahrestani-me/expense-tracker/issues/100",
         "https://github.com/shahrestani-me/expense-tracker/issues/101",
+        "https://github.com/shahrestani-me/expense-tracker/issues/102",
     ]
 
 
@@ -224,7 +233,10 @@ def test_not_one_model_is_asked_anything(monkeypatch):
     _, job = build(console, planned(console))
 
     assert job["state"] == "done", job.get("error")
-    assert len(issues.created) == 2
+    # Three, because the scaffold is on by default - so this also pins the
+    # other call this action could have made and does not: `Bootstrap.for_prompt`
+    # consults `choose_stack` only when the stack is blank, and it never is here.
+    assert len(issues.created) == 3
 
 
 def test_the_plan_travels_as_a_call_id_not_as_tasks_from_the_browser():
@@ -242,7 +254,7 @@ def test_the_plan_travels_as_a_call_id_not_as_tasks_from_the_browser():
     _, job = build(console, plan_id, values)
 
     assert job["state"] == "done", job.get("error")
-    assert [c["number"] for c in issues.created] == [100, 101]
+    assert [c["number"] for c in issues.created] == [100, 101, 102]
     assert not any("sneak" in c["title"] for c in issues.created)
 
 
@@ -265,7 +277,7 @@ def test_a_task_normalise_rejects_is_reported_on_the_page():
     ]}
     console, _, issues = console_with()
 
-    _, job = build(console, planned(console, plan))
+    _, job = build(console, planned(console, plan), PLAN_ONLY)
 
     assert job["state"] == "done", job.get("error")
     assert [c["number"] for c in issues.created] == [100]
@@ -284,7 +296,7 @@ def test_a_duplicate_id_is_reported_with_normalises_own_reason():
     ]}
     console, _, issues = console_with()
 
-    _, job = build(console, planned(console, plan))
+    _, job = build(console, planned(console, plan), PLAN_ONLY)
 
     assert len(issues.created) == 1
     assert job["result"]["rejected"] == [
@@ -565,7 +577,7 @@ def test_a_blank_verify_field_leaves_the_placeholder_gate_in_place():
 
     assert job["state"] == "done", job.get("error")
     assert provisioner.calls[0].verify_command == "test -f README.md"
-    assert len(issues.created) == 2
+    assert len(issues.created) == 3
     assert job["result"]["rejected"] == []
 
 
@@ -773,3 +785,95 @@ def test_a_repository_that_was_created_is_named_even_when_its_issues_are_not():
     # Not a traceback dump: the fix is the point, and it says what to do with
     # the repository that now exists rather than "try again".
     assert "delete it" in job["error"]["fix"]
+
+
+# --------------------------------------------------------------------------
+# The scaffold
+# --------------------------------------------------------------------------
+
+
+def test_the_scaffold_leads_and_every_task_blocks_on_it():
+    """#101's project-scaffold issue, and the reason it is not optional in
+    spirit: every task the model planned edits files that do not exist yet, so
+    without it the first cycle dispatches all of them against an empty
+    repository, each worker inventing its own idea of the project."""
+    console, _, issues = console_with()
+
+    _, job = build(console, planned(console))
+
+    scaffold, *theirs = issues.created
+    assert "id=bootstrap-the-project" in scaffold["body"]
+    assert "swarm:ready" in scaffold["labels"]          # nothing blocks it
+    # The section is always rendered; what matters is that it names no issue.
+    assert "_none._" in scaffold["body"]
+    for created in theirs:
+        assert "swarm:blocked" in created["labels"]
+        assert f"#{scaffold['number']}" in created["body"]
+
+
+def test_unticking_the_scaffold_writes_the_decomposition_and_nothing_else():
+    """The escape hatch, for a plan that already contains its own setup task."""
+    console, _, issues = console_with()
+
+    _, job = build(console, planned(console), PLAN_ONLY)
+
+    assert [c["number"] for c in issues.created] == [100, 101]
+    assert not any("bootstrap-the-project" in c["body"] for c in issues.created)
+    assert [i["task_id"] for i in job["result"]["issues"]] == ["add-store", "add-cli"]
+
+
+def test_a_caller_that_never_heard_of_the_field_still_gets_a_scaffold():
+    """Absence means on here, and off two fields up on `public` - deliberately.
+
+    An unticked `public` is the conservative direction: a private repository.
+    An unticked scaffold is the broken one. So the field is the operator opting
+    *out*, and anything that does not mention it gets what every other
+    greenfield repository in this system gets.
+    """
+    console, _, issues = console_with()
+    values = {k: v for k, v in FORM.items()}
+    assert "bootstrap" not in values
+
+    build(console, planned(console), values)
+
+    assert "id=bootstrap-the-project" in issues.created[0]["body"]
+
+
+def test_the_scaffold_cannot_stand_in_for_a_plan_that_is_entirely_unwritable():
+    """A scaffold is always writable, so counting it toward "is there any work
+    here" would let a plan whose every real task was rejected provision a
+    repository containing nothing but its own setup issue - the empty backlog
+    this guard refuses, wearing a disguise."""
+    plan = {"reasoning": "", "tasks": [
+        {"id": "", "goal": "", "files": [], "depends_on": [], "stack": None},
+    ]}
+    console, provisioner, issues = console_with()
+
+    _, job = build(console, planned(console, plan))
+
+    assert job["state"] == "error"
+    assert provisioner.calls == []
+    assert issues.created == []
+
+
+def test_the_scaffold_is_the_only_issue_written_that_was_not_on_the_screen():
+    """Criterion 3's boundary, stated as a test: the operator's tasks arrive
+    unaltered except for the one dependency the label warned them about, and
+    nothing else is added."""
+    console, _, issues = console_with()
+
+    _, job = build(console, planned(console))
+
+    ids = [i["task_id"] for i in job["result"]["issues"]]
+    assert set(ids) - {t["id"] for t in PLAN["tasks"]} == {"bootstrap-the-project"}
+
+
+def test_the_checkbox_says_what_it_writes_and_what_it_changes():
+    """The label is the disclosure - it is what makes the addition something
+    the operator read rather than something done to them."""
+    field = next(f for f in BUILD_SITE["fields"] if f["name"] == "bootstrap")
+
+    assert field["value"] == "1"                       # on by default
+    assert "blocked on it" in field["label"]           # what it changes
+    assert "empty repository" in field["label"]        # why it is on
+    assert "project scaffold" in BUILD_SITE["blurb"]   # and the blurb agrees

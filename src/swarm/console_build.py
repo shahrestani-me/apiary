@@ -46,18 +46,35 @@ planned. `BuildReport.rejected` is therefore a first-class part of the answer,
 rendered on the page beside the issues that were written, carrying `normalise`'s
 own reason for each. Silence is the failing direction here, not noise.
 
-## What this module deliberately does not do
+## The bootstrap task, and why it is a checkbox rather than an omission
 
-**It does not add the bootstrap task.** `cli._target` hands `plan_node` a
-`Bootstrap` so that #101's project-scaffold issue leads a greenfield plan, and
-`with_bootstrap` then blocks every other task on it. Doing that here would put
-an issue on GitHub that the operator never saw and rewrite the `## Blocked by`
-of every one they did, which is the precise property this module exists to
-defend. A repository built from this button therefore carries the plan and
-nothing else; giving the operator a scaffold task is a decision for the tab
-that shows them one.
+Every greenfield repository this system has ever made leads with #101's
+project-scaffold issue: `cli._target` hands `plan_node` a `Bootstrap`, and
+`with_bootstrap` then blocks every other task on it. That is not decoration.
+Every task the model planned edits files that do not exist yet, so without the
+scaffold "the dispatcher would run three workers against an empty repository in
+the first cycle, each generating its own idea of the project" - `with_bootstrap`'s
+own words. A button that provisioned a repository and wrote a backlog whose
+first cycle behaves that way would be a worse outcome than the retyping it
+replaces.
 
-**It does not run anything.** Epic #128 step 1 is a plan becoming work. Turning
+The tension is real, though, and it is this module's central one: adding the
+scaffold means writing an issue the operator did not read, and rewriting the
+`## Blocked by` of every issue they did. The resolution is to *show* it rather
+than to drop it. It is a checkbox, on by default, whose label states exactly
+what it writes and what it changes about the rest - so the plan shown is still
+the plan written, with the one addition sitting under the operator's cursor
+when they press the button. Unchecked, they get the decomposition and nothing
+else, which is the right answer when the plan already contains its own setup
+task.
+
+No model is asked either way: `Bootstrap.for_prompt` consults `choose_stack`
+only when the stack is blank, and the stack is a required field here precisely
+because there is nothing to ask.
+
+## What this module does not do
+
+It does not run anything. Epic #128 step 1 is a plan becoming work. Turning
 work into workers is the next button, and `SwarmRuns` already knows how.
 """
 
@@ -204,7 +221,9 @@ BUILD_SITE: dict[str, Any] = {
         "Creates a new GitHub repository and writes the plan above into it as issues — "
         "the tasks on this screen, with these ids, these goals and these files. The model "
         "is not asked again. Nothing is created until the token and image checks pass, and "
-        "any task that cannot become an issue is listed here rather than dropped."
+        "any task that cannot become an issue is listed here rather than dropped. The only "
+        "issue written that is not on this screen is the project scaffold, and only while "
+        "the box below is ticked."
     ),
     "fields": [
         {"name": "owner", "label": "Owner — the GitHub account or organisation to create it under",
@@ -214,6 +233,8 @@ BUILD_SITE: dict[str, Any] = {
         {"name": "stack", "label": f"Stack — one of: {', '.join(sorted(KNOWN_STACKS))}",
          "kind": "text", "placeholder": DEFAULT_STACK, "value": DEFAULT_STACK},
         {"name": "public", "label": "Create it public — a free GitHub plan cannot put branch protection on a private repository",
+         "kind": "check", "value": "1"},
+        {"name": "bootstrap", "label": "Write the project-scaffold issue first — one extra issue that creates the initial project, with every task above blocked on it. Without it the first cycle dispatches every task against an empty repository, each worker inventing its own project.",
          "kind": "check", "value": "1"},
         {"name": "verify", "label": "Verify command (optional; default: the placeholder gate, which the first pull request replaces)",
          "kind": "text", "placeholder": "python -m pytest -q", "value": ""},
@@ -296,12 +317,29 @@ class Builder:
 
     def run(self, result: Any, values: Mapping[str, str]) -> BuildReport:
         """The whole action, in the order that makes each refusal free."""
+        from .greenfield.bootstrap import Bootstrap
         from .greenfield.provision import PLACEHOLDER_VERIFY, ProvisionPlan
-        from .nodes.planner import normalise, order_drafts, write_plan
+        from .nodes.planner import normalise, order_drafts, with_bootstrap, write_plan
 
         plan = plan_from_result(result)
         owner, name, stack, verify = _form(values)
         prompt = _prompt_of(values, plan)
+
+        # No model: `Bootstrap.for_prompt` consults `choose_stack` only when the
+        # stack is blank, and `_form` guarantees one. That is why the stack is a
+        # required field on this form and an optional one on the swarm tab.
+        # Absent means **on**, which is the opposite of what `public` does two
+        # fields up, and the difference is deliberate. An unticked `public` is
+        # the conservative direction: a private repository. An unticked
+        # `bootstrap` is the broken one - a backlog whose first cycle dispatches
+        # every task against an empty repository. The page always sends this key
+        # (`buildValues` emits every field), so absence means a caller that has
+        # not heard of the field, and such a caller should get what every other
+        # greenfield repository in this system gets.
+        scaffold = (
+            None if values.get("bootstrap") == ""
+            else Bootstrap.for_prompt(prompt, stack=stack).task
+        )
 
         # Pure, and therefore first. A ring or an unwritable task refuses here
         # with nothing created anywhere. `write_plan` reaches the same verdicts
@@ -311,10 +349,21 @@ class Builder:
         # carries it exists — and `normalise` rejects every task when it is
         # given an empty command, which would make a blank optional field look
         # like eight broken tasks.
+        # `with_bootstrap` first, exactly as `write_plan` will do it: the ring
+        # check and the rejection list have to be computed over the task set
+        # that is actually written, or this pass would bless a plan the real one
+        # refuses - which is the failure it exists to prevent.
+        tasks = plan.tasks if scaffold is None else list(with_bootstrap(plan.tasks, scaffold))
         drafts, rejected = normalise(
-            plan.tasks, verify=verify or PLACEHOLDER_VERIFY, stack=stack
+            tasks, verify=verify or PLACEHOLDER_VERIFY, stack=stack
         )
-        if not drafts:
+        # The operator's own drafts, with the scaffold discounted. A scaffold is
+        # always writable, so counting it here would let a plan whose every real
+        # task was rejected provision a repository containing nothing but its
+        # own setup issue - which is the empty backlog this guard exists to
+        # refuse, wearing a disguise.
+        theirs = [d for d in drafts if scaffold is None or d.task_id != scaffold.id]
+        if not theirs:
             raise BuildError(
                 "not one task in that plan can be written as an issue: "
                 + "; ".join(f"{action.task_id} - {action.reason}" for action in rejected),
@@ -366,6 +415,11 @@ class Builder:
                 plan,
                 verify=report.verify_command,
                 stack=stack,
+                # `write_plan` applies `with_bootstrap` itself. The plan handed
+                # over is still the operator's, unmodified - which keeps the
+                # scaffold a documented addition rather than an edit to what
+                # they read.
+                bootstrap=scaffold,
             )
         except Exception as exc:  # noqa: BLE001 - the repository outlives this
             # The one failure that must not arrive as a traceback. By this line
