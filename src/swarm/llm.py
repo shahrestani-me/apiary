@@ -540,32 +540,21 @@ def provider_for(llm: Any) -> Provider:
 # --------------------------------------------------------------------------
 
 
-def _spec_from_settings(role: str) -> ModelSpec:
-    """Today's answer: the bare `SWARM_*_MODEL` names, meaning Ollama.
-
-    The whole of resolution lives here for now, and #265 replaces this body
-    with the four-rung ladder without any caller learning that it did. Keeping
-    it a function rather than inlining it at the two factories is the seam that
-    makes that a one-file change.
-    """
-    if role == "orchestrator":
-        return ModelSpec(
-            provider=OLLAMA,
-            model=SETTINGS.orchestrator_model,
-            temperature=SETTINGS.orchestrator_temperature,
-            num_ctx=SETTINGS.orchestrator_num_ctx,
-        )
-    return ModelSpec(
-        provider=OLLAMA,
-        model=SETTINGS.worker_model,
-        temperature=SETTINGS.worker_temperature,
-        num_ctx=SETTINGS.worker_num_ctx,
-    )
-
-
 def _build(role: str, spec: ModelSpec | None) -> Any:
-    resolved = _spec_from_settings(role) if spec is None else spec
-    return PROVIDERS[resolved.provider].build(resolved, _callbacks(role, resolved.model))
+    """Resolve, announce once, build.
+
+    `models` is imported here rather than at module scope because it imports
+    *this* module for `ModelSpec` - and because the direction of the dependency
+    is the point: resolution knows how a spec is chosen, this module knows how
+    one is built, and only the second of those is allowed to import a provider
+    SDK.
+    """
+    from .models import announce, resolve  # noqa: PLC0415 - see above
+
+    resolution = resolve(role, spec)
+    announce(role, resolution)
+    chosen = resolution.spec
+    return PROVIDERS[chosen.provider].build(chosen, _callbacks(role, chosen.model))
 
 
 def orchestrator_llm(spec: ModelSpec | None = None):

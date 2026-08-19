@@ -405,6 +405,19 @@ def _overlay_root(mountinfo: str) -> bool:
     return False
 
 
+#: The zero-config answer, named rather than inlined.
+#:
+#: `models.py` resolves a role's model from four sources and the lowest rung is
+#: "the built-in default" - which has to be *the same* number as the one this
+#: dataclass falls back to, or a clone with nothing configured would resolve one
+#: model and build another. Two string literals in two files is how that drifts,
+#: so there is one of each and both places read it.
+DEFAULT_ORCHESTRATOR_MODEL = "gemma4:31b"
+DEFAULT_WORKER_MODEL = "gemma4:26b"
+DEFAULT_ORCHESTRATOR_NUM_CTX = 16384
+DEFAULT_WORKER_NUM_CTX = 16384
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- Ollama ---------------------------------------------------------
@@ -433,8 +446,10 @@ class Settings:
     # OLLAMA_MAX_LOADED_MODELS=1 and let Ollama swap. A swap measured 6.7 s here,
     # roughly 2 swaps per round, against minutes saved on every worker call.
     # Set both to gemma4:26b to eliminate swapping entirely if you prefer.
-    orchestrator_model: str = field(default_factory=lambda: _env("SWARM_ORCHESTRATOR_MODEL", "gemma4:31b"))
-    worker_model: str = field(default_factory=lambda: _env("SWARM_WORKER_MODEL", "gemma4:26b"))
+    orchestrator_model: str = field(
+        default_factory=lambda: _env("SWARM_ORCHESTRATOR_MODEL", DEFAULT_ORCHESTRATOR_MODEL)
+    )
+    worker_model: str = field(default_factory=lambda: _env("SWARM_WORKER_MODEL", DEFAULT_WORKER_MODEL))
 
     # Low temperature: we want obedient structure, not creativity.
     orchestrator_temperature: float = 0.0
@@ -449,8 +464,8 @@ class Settings:
     # Ollama allocates a runner per (model, options) combination, so if you set
     # both roles to the SAME model, keep these two values equal - differing
     # num_ctx would spawn a second runner and double your memory use.
-    orchestrator_num_ctx: int = int(_env("SWARM_ORCH_CTX", "16384"))
-    worker_num_ctx: int = int(_env("SWARM_WORKER_CTX", "16384"))
+    orchestrator_num_ctx: int = int(_env("SWARM_ORCH_CTX", str(DEFAULT_ORCHESTRATOR_NUM_CTX)))
+    worker_num_ctx: int = int(_env("SWARM_WORKER_CTX", str(DEFAULT_WORKER_NUM_CTX)))
 
     # --- Repo / execution ----------------------------------------------
     repo_path: str = field(default_factory=lambda: _env("SWARM_REPO", os.getcwd()))
