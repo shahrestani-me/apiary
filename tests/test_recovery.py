@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import pytest
 
@@ -52,6 +52,7 @@ from swarm.github.ledger import Ledger, LedgerEntry, render_marker
 from swarm.github.readiness import BLOCKED, READY, IssueState
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, claim
+from swarm.orchestrator.lifecycle import internal_state
 from swarm.orchestrator.reconcile import DONE, FAILED
 from swarm.orchestrator.recovery import (
     Held,
@@ -64,7 +65,8 @@ from swarm.orchestrator.recovery import (
     unrecognised,
 )
 from swarm.run import RUN_LABEL, Run
-from swarm.orchestrator.derived import ELIGIBLE, NEEDS_HUMAN
+from swarm.orchestrator.authority import Belief
+from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import CLAIMED as CLAIMED_STATE
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
@@ -807,3 +809,65 @@ def test_recovering_a_claim_leaves_the_orphaned_container_for_the_reaper(two_run
     # from under the sweep that was capturing its logs.
     assert [found.issue for found in dead.find()] == [DEAD_ISSUE]
     assert client.labels_on(DEAD_ISSUE) == {READY}
+
+
+#: Every rule in `plan_recovery` that builds a `Transition`, each in a world
+#: where the carried label and the believed state disagree - which is the
+#: ordinary case for this sweep rather than a contrived one: the authority
+#: selects a task because a *container* says `claimed`, so the label on the
+#: issue is whatever a human last typed onto it.
+#: Two labels per rule, never one: a world whose carried label happens to
+#: equal the state a mutation substitutes cannot see that mutation.
+CARRIED = (DONE, "swarm:blocked")
+
+CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
+    (
+        "the claim is released with budget left",
+        lambda label: plan_recovery(
+            ledger(entry(4, label=label, attempt=0)),
+            believed=Belief(states={"task-4": CLAIMED_STATE}),
+            max_attempts=3,
+        ),
+        ELIGIBLE,
+    ),
+    (
+        "the claim is released at the cap",
+        lambda label: plan_recovery(
+            ledger(entry(4, label=label, attempt=1)),
+            believed=Belief(states={"task-4": CLAIMED_STATE}),
+            max_attempts=2,
+        ),
+        NEEDS_HUMAN,
+    ),
+    (
+        "a pull request was pushed and no cycle saw it",
+        lambda label: plan_recovery(
+            ledger(entry(4, label=label, attempt=1)),
+            believed=Belief(states={"task-4": CLAIMED_STATE}),
+            open_branches=(branch(4, attempt=1),),
+        ),
+        REVIEW_STATE,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "rule, world, decides", CARRIED_LABEL_RULES, ids=[case[0] for case in CARRIED_LABEL_RULES]
+)
+def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides):
+    """#243. All three rows build their `Transition` from the label the issue
+    carries, and only two of them were pinned - the cap row could have named
+    any state at all with the whole suite still green.
+
+    Here a human has typed `swarm:done` onto a task a container is holding. The
+    write has to take *that* off; taking `swarm:claimed` off would leave the
+    issue wearing two state labels, and §3 would then read the furthest-along
+    of them and stop a task that is only out of budget.
+    """
+    for label in CARRIED:
+        transition = world(label).transitions[0]
+
+        assert transition.to_state == decides, f"{rule}: the rule stopped firing"
+        assert transition.from_state == internal_state(label), (
+            f"{rule} carrying {label}: removed the believed label"
+        )

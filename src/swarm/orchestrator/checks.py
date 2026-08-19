@@ -93,6 +93,16 @@ outside this ticket's file set; both gaps degrade and neither is silent.
 Manual dry run against a real repo - reads only, merges nothing, writes nothing:
 
     GITHUB_TOKEN=... python -m swarm.orchestrator.checks shahrestani-me/apiary
+
+**`from_state` is the label the issue carries, not `review` (#243).** Every
+transition built here used to name `review` as a constant, on the reasoning
+that this gate only ever fires on a task in review - which is true of what the
+gate *believes* and not of what the issue is *wearing*. A human who relabels a
+task mid-review leaves the constant naming a label that is not there:
+`write_labels` then adds the new one and removes nothing, the issue ends up
+with two state labels, and §3's precedence reads the furthest-along of them.
+The rule is `reconcile.Transition`'s and this module now follows it, which also
+makes the property one rule rather than two.
 """
 
 from __future__ import annotations
@@ -111,9 +121,8 @@ from ..github.refs import issue_number, pull_number, pull_ref, task_ref
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
-from .authority import Belief, in_review
+from .authority import Belief, in_review, label_state
 from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN
-from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import normalise
 from .reconcile import (
     COMMENT_METHOD,
@@ -924,7 +933,7 @@ def _decide(
             detail=f"CI failed in {names}, outside this issue's ## Files",
             transition=Transition(
                 ref=entry.ref,
-                from_state=REVIEW_STATE,
+                from_state=label_state(entry.state_label),
                 to_state=NEEDS_HUMAN,
                 reason=(
                     f"CI failed in {names}, which is outside this issue's ## Files - "
@@ -971,7 +980,7 @@ def _decide_empty(
         detail=reason,
         transition=Transition(
             ref=entry.ref,
-            from_state=REVIEW_STATE,
+            from_state=label_state(entry.state_label),
             to_state=NEEDS_HUMAN,
             reason=reason,
             task_id=entry.task_id,
@@ -1010,7 +1019,7 @@ def _decide_passed(
         detail=f"{checks.summary()}; merging PR {pull.number}",
         transition=Transition(
             ref=entry.ref,
-            from_state=REVIEW_STATE,
+            from_state=label_state(entry.state_label),
             to_state=LANDED,
             reason=f"PR {pull.number} merged: {checks.summary()}",
             task_id=entry.task_id,
@@ -1061,7 +1070,7 @@ def _retry_or_give_up(
             detail=f"{named} failed; {attempt} attempt(s) against a cap of {cap}",
             transition=Transition(
                 ref=entry.ref,
-                from_state=REVIEW_STATE,
+                from_state=label_state(entry.state_label),
                 to_state=NEEDS_HUMAN,
                 reason=f"{named} failed; {attempt} attempt(s) made against a cap of {cap}",
                 task_id=entry.task_id,
@@ -1080,7 +1089,7 @@ def _retry_or_give_up(
         detail=f"{named} failed; retrying as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_state=REVIEW_STATE,
+            from_state=label_state(entry.state_label),
             to_state=ELIGIBLE,
             reason=reason,
             task_id=entry.task_id,

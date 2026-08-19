@@ -112,6 +112,16 @@ Manual dry run against a real repo - reads only, updates nothing, merges
 nothing, writes nothing:
 
     GITHUB_TOKEN=... python -m swarm.orchestrator.mergeability shahrestani-me/apiary
+
+**`from_state` is the label the issue carries, not `review` (#243).** Every
+transition built here used to name `review` as a constant, on the reasoning
+that this gate only ever fires on a task in review - which is true of what the
+gate *believes* and not of what the issue is *wearing*. A human who relabels a
+task mid-review leaves the constant naming a label that is not there:
+`write_labels` then adds the new one and removes nothing, the issue ends up
+with two state labels, and §3's precedence reads the furthest-along of them.
+The rule is `reconcile.Transition`'s and this module now follows it, which also
+makes the property one rule rather than two.
 """
 
 from __future__ import annotations
@@ -138,9 +148,8 @@ from .checks import (
     render_keys,
 )
 from ..store import StoreError, TaskStore, record_judgement
-from .authority import Belief, in_review
+from .authority import Belief, in_review, label_state
 from .derived import ELIGIBLE, NEEDS_HUMAN
-from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
@@ -773,7 +782,7 @@ def _decide_conflicted(
             ),
             transition=Transition(
                 ref=entry.ref,
-                from_state=REVIEW_STATE,
+                from_state=label_state(entry.state_label),
                 to_state=NEEDS_HUMAN,
                 reason=(
                     f"the branch conflicts with {facts.base_name} and {attempt} attempt(s) "
@@ -802,7 +811,7 @@ def _decide_conflicted(
         detail=f"conflicts with {facts.base_name}; re-dispatching as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_state=REVIEW_STATE,
+            from_state=label_state(entry.state_label),
             to_state=ELIGIBLE,
             reason=reason,
             task_id=entry.task_id,
@@ -848,7 +857,7 @@ def _decide_behind(
             detail=reason,
             transition=Transition(
                 ref=entry.ref,
-                from_state=REVIEW_STATE,
+                from_state=label_state(entry.state_label),
                 to_state=NEEDS_HUMAN,
                 reason=reason,
                 task_id=entry.task_id,
