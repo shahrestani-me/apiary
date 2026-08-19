@@ -1168,6 +1168,131 @@
     });
   }
 
+  // ---- what a worker is doing, while it does it (#133) ---------------------
+  //
+  //: Step 2 of the epic. A worker runs for two to three minutes and its output
+  //: reaches `logs/` only when the container is *disposed* - `log_sink` is
+  //: wired to the reaper - so for the whole window an operator wants to watch,
+  //: nothing was reading it. `/swarm/worker` reads the running container
+  //: instead.
+  //:
+  //: **The output is a strip under the board, not text inside the card.** A
+  //: board column is ~130px wide (`.board` is six columns inside the right-
+  //: hand pane), and a verify command's output rendered in there is a ribbon
+  //: three words across. So the *row* carries the control - Watch, on exactly
+  //: the tickets a live worker holds - and the strip carries the log at the
+  //: width of the page. One at a time, which is also what bounds this: the
+  //: page holds one worker's tail, never a cache of every worker it has seen.
+  var workerWatching = "", workerCard = null, workerText = "", workerScroll = -1;
+  //: `workerPolling` is "a chain is alive", which `workerTimer` cannot answer:
+  //: it is null while a request is in flight as well as when nothing is
+  //: scheduled. `renderBoard` restarts the poll from it, and without the
+  //: distinction a redraw landing mid-request would start a second chain
+  //: polling the same container twice a second - the bug #130 fixed one layer
+  //: up, arriving through a different door.
+  var workerTimer = null, workerPolling = false;
+
+  //: Faster than the board's five seconds - this is the thing that is supposed
+  //: to look live - and only while a strip is open.
+  var WORKER_POLL_MS = 2000;
+
+  //: Within this many pixels of the end counts as following the tail, and a
+  //: follower is scrolled to the bottom after every update. Anyone who has
+  //: scrolled up to read is left exactly where they were.
+  var TAIL_SLACK_PX = 24;
+
+  function watchWorker(card) {
+    if (workerWatching === card.container) { stopWatching(); return; }
+    workerWatching = card.container;
+    workerCard = card;
+    workerText = "";
+    workerScroll = -1;
+    workerTick();
+    boardDraw();                                   // the strip appears at once
+  }
+
+  function stopWatching() {
+    clearTimeout(workerTimer);
+    workerTimer = null;
+    workerWatching = "";
+    workerCard = null;
+    workerText = "";                               // the one thing held; released here
+    workerScroll = -1;
+    boardDraw();
+  }
+
+  //: The strip itself, rebuilt with the board on every poll - so it is filled
+  //: from `workerText` rather than from the response that happened to arrive
+  //: last, and put back to the scroll offset the operator left it at.
+  function workerStrip() {
+    var c = workerCard;
+    var body = el("div");
+    var head = el("div", "pills");
+    head.appendChild(el("span", "pill", "#" + c.number));
+    head.appendChild(el("span", "pill", "container " + c.container));
+    body.appendChild(head);
+    body.appendChild(el("p", "blurb",
+      "Read from the running container. The full log lands in the run directory "
+      + "when the worker is disposed."));
+    var log = pre(workerText || "reading the container…");
+    log.className = "log worker";
+    log.addEventListener("scroll", function () {
+      workerScroll = (log.scrollHeight - log.scrollTop - log.clientHeight <= TAIL_SLACK_PX)
+        ? -1 : log.scrollTop;
+    });
+    body.appendChild(log);
+    var stop = el("button", "ghost", "Stop watching");
+    stop.onclick = function (e) { e.preventDefault(); stopWatching(); };
+    body.appendChild(stop);
+    var box = card("worker · " + c.title, body, "workerstrip");
+    //: Scrolling only works once the node is in the document, so the caller
+    //: places it and then asks for this.
+    box.restore = function () {
+      log.scrollTop = workerScroll < 0 ? log.scrollHeight : workerScroll;
+    };
+    return box;
+  }
+
+  function workerWrite(text) {
+    workerText = text;
+    var log = panel().boardBody.querySelector("pre.worker");
+    if (!log) return;
+    var following = log.scrollHeight - log.scrollTop - log.clientHeight <= TAIL_SLACK_PX;
+    log.textContent = text;
+    if (following) log.scrollTop = log.scrollHeight;
+  }
+
+  function workerTick() {
+    clearTimeout(workerTimer);
+    workerTimer = null;
+    var id = workerWatching;
+    //: The tab was switched away from; the chain stops rather than polling a
+    //: page nobody is looking at, and `renderBoard` starts it again when the
+    //: board comes back.
+    if (!id || !current || current.kind !== "swarm") { workerPolling = false; return; }
+    workerPolling = true;
+    api("/swarm/worker?container=" + encodeURIComponent(id)).catch(function () {
+      workerPolling = false;                        // a dead chain, restartable
+      return { ok: false, status: 0, body: null };
+    }).then(function (res) {
+      if (workerWatching !== id) { workerPolling = false; return; }
+      if (!res.status && !res.ok) { workerPolling = false; return; }
+      if (!res.ok) {
+        //: 404 is the ordinary ending, not an error: the reaper disposed the
+        //: worker, and from here on the full log is the run directory's.
+        workerWrite(res.status === 404
+          ? "this worker has been disposed — its full log is in the run directory"
+          : (res.body && res.body.error) || "the container could not be read");
+      } else {
+        var text = res.body.text || "";
+        workerWrite(text
+          ? (res.body.running ? text : text + "\n[apiary] the worker has exited")
+          : "the worker has not printed anything yet");
+      }
+      workerTimer = setTimeout(workerTick, WORKER_POLL_MS);
+    });
+  }
+
   function ticket(c) {
     var t = el("div", "tcard");
     //: The resolver's own sentence for why this card sits where it does -
@@ -1190,10 +1315,32 @@
     if (c.renewals) head.appendChild(el("span", "pill", "budget renewed " + c.renewals + "x"));
     t.appendChild(head);
     t.appendChild(el("div", "ttitle", c.title));
+    //: `container` is present exactly when a live worker on this machine holds
+    //: the task, so the page needs no rule of its own about which rows offer
+    //: this - and the control is on the row, where the operator is looking,
+    //: while the output goes to the strip that has room for it.
+    if (c.container) {
+      var watch = el("button", "ghost watch",
+                     workerWatching === c.container ? "Watching" : "Watch");
+      watch.type = "button";
+      watch.setAttribute("aria-pressed", String(workerWatching === c.container));
+      watch.onclick = function (e) { e.preventDefault(); watchWorker(c); };
+      t.appendChild(watch);
+    }
     return t;
   }
 
+  //: The last board payload, so the strip can appear the moment Watch is
+  //: pressed rather than on the next poll - and so a redraw triggered by the
+  //: page itself costs no request.
+  var lastBoard = null;
+
+  function boardDraw() {
+    if (lastBoard) renderBoard(lastBoard);
+  }
+
   function renderBoard(b) {
+    lastBoard = b;
     var body = panel().boardBody;
     body.textContent = "";
     var meta = el("p", "links");
@@ -1219,6 +1366,17 @@
     if ((b.errors || []).length) {
       body.appendChild(el("p", "empty",
         b.errors.length + " issue(s) the ledger could not parse; they are never dispatched"));
+    }
+    //: Under the columns and above the notes: the board answers "where is
+    //: every ticket", and this answers "what is the one I am watching doing".
+    if (workerWatching && workerCard) {
+      var strip = workerStrip();
+      body.appendChild(strip);
+      strip.restore();
+      //: Restarted only when nothing is polling: the chain stops when the
+      //: operator leaves the swarm tab, and the board coming back is where it
+      //: has to be picked up again.
+      if (!workerPolling) workerTick();
     }
     (b.notes || []).forEach(function (note) {
       body.appendChild(el("p", "empty", "⚠ " + note));

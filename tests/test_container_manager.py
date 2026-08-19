@@ -39,6 +39,7 @@ from swarm.containers.manager import (
     ATTEMPT_ENV,
     IMAGE_ENV,
     ISSUE_LABEL,
+    LIVE_TAIL_LINES,
     MAX_LOG_CHARS,
     PLACEHOLDER,
     ContainerError,
@@ -56,6 +57,7 @@ from swarm.containers.manager import (
     dispose_container,
     find_containers,
     missing_image,
+    tail_logs,
 )
 from swarm.containers import manager as manager_module
 from swarm.github.refs import task_ref
@@ -1145,3 +1147,86 @@ def test_the_container_layer_never_imports_the_tracker_adapter():
         for source in sorted(package.glob("*.py"))
     }
     assert {name: lines for name, lines in offenders.items() if lines} == {}
+
+
+# --------------------------------------------------------------------------
+# Watching a worker that is still running (#133)
+# --------------------------------------------------------------------------
+
+
+def a_handle(**overrides: Any) -> Handle:
+    fields: dict[str, Any] = {"id": CONTAINER_ID, "run_id": "apiary-20260819-100000-aaaaaa",
+                              "issue": 7, "state": "running"}
+    return Handle(**{**fields, **overrides})
+
+
+def test_a_running_worker_can_be_read_before_it_is_disposed():
+    """The gap the ticket names: `log_sink` is wired to the reaper, so until
+    now the only copy of what a worker printed was inside a container nothing
+    was reading - for the two to three minutes somebody wants to watch."""
+    runner = ScriptedRunner(replies={"logs": Reply(stdout="writing src/cli.py\nPASS\n")})
+    docker = DockerCLI(runner=runner)
+
+    assert tail_logs(a_handle(), docker) == "writing src/cli.py\nPASS\n"
+    argv = runner.argv_for("logs")
+    assert argv[2:] == ["--tail", str(LIVE_TAIL_LINES), CONTAINER_ID]
+
+
+def test_the_tail_is_redacted_by_the_same_boundary_as_every_other_read():
+    """`container_log` redacts on write and this path must not become the
+    exception. It is the `DockerCLI` that redacts, so the property holds for
+    anything read through it rather than for the call sites that remembered."""
+    runner = ScriptedRunner(replies={"logs": Reply(stdout=f"pushing with {TOKEN}\n")})
+    docker = DockerCLI(redact=Redactor([TOKEN]), runner=runner)
+
+    output = tail_logs(a_handle(), docker)
+
+    assert TOKEN not in output
+    assert PLACEHOLDER in output
+
+
+def test_watching_a_worker_leaves_disposal_s_log_byte_identical():
+    """The criterion that makes this safe to add. `captured` is the run
+    directory's evidence, so a 400-line tail written into it would have
+    disposal persist the tail in place of the log - and the full log is
+    precisely what somebody wants when the tail was not enough."""
+    whole = "".join(f"line {i}\n" for i in range(2_000))
+    runner = ScriptedRunner(replies={"logs": Reply(stdout=whole)})
+    docker = DockerCLI(runner=runner)
+    handle = a_handle()
+
+    tail_logs(handle, docker, lines=10, max_chars=200)
+
+    assert handle.captured is None            # the watcher recorded nothing
+    assert dispose_container(handle, docker) == whole
+
+
+def test_the_tail_is_bounded_for_a_worker_that_will_not_stop_printing():
+    """A chatty verify command must not grow the console's heap. `--tail`
+    bounds it at the daemon and the character cap bounds what a page is sent;
+    both are needed, because 400 lines of minified output is still a megabyte."""
+    runner = ScriptedRunner(replies={"logs": Reply(stdout="x" * 50_000)})
+
+    output = tail_logs(a_handle(), DockerCLI(runner=runner), max_chars=1_000)
+
+    assert len(output) < 1_200
+    assert "characters elided" in output
+
+
+def test_a_worker_disposed_under_the_read_is_empty_rather_than_an_error():
+    """The reaper sweeping a finished worker between the poll that drew the
+    card and the poll that reads it is the ordinary case, not a fault."""
+    runner = ScriptedRunner(
+        replies={"logs": Reply(stderr="Error: No such container: c0ffee", returncode=1)})
+
+    assert tail_logs(a_handle(), DockerCLI(runner=runner)) == ""
+
+
+def test_a_handle_that_was_already_disposed_answers_without_a_daemon():
+    """There is no container left to ask, and `captured` is the whole point of
+    the type. Bounded like any other tail - the caller is a page either way."""
+    runner = ScriptedRunner()
+    handle = a_handle(captured="everything it ever said\n", removed=True)
+
+    assert tail_logs(handle, DockerCLI(runner=runner)) == "everything it ever said\n"
+    assert "logs" not in runner.commands
