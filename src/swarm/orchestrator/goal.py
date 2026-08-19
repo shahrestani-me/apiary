@@ -544,10 +544,11 @@ def close_the_loop(
     passed rather than re-derived for exactly the same reason: it is the belief
     the loop decided to stop on, already folded by everything this cycle wrote.
     One value threads the whole gate - the assessment, the revival join, the
-    settled re-assessment and the supersession - because they are four readings
-    of one partition and a second source anywhere in that chain would revive a
-    task the assessment never named. `None` reads the label, which is the
-    `__main__` dry run and `APIARY_STATE_SOURCE=labels`.
+    settled re-assessment, the supersession and, since #212, the follow-up write
+    itself - because they are five readings of one partition and a second source
+    anywhere in that chain would revive a task the assessment never named. `None`
+    reads the label, which is the `__main__` dry run and
+    `APIARY_STATE_SOURCE=labels`.
 
     `writer` and the two model seams exist so the whole path is exercised
     without an Ollama and without a tracker; `write_plan` is the default and is
@@ -665,7 +666,14 @@ def close_the_loop(
         return GoalReport(assessment, reason=NO_TASKS, rounds=rounds)
 
     try:
-        written = writer(client, plan, ledger=ledger, verify=verify, retire_dropped=False)
+        written = writer(
+            client,
+            plan,
+            ledger=ledger,
+            verify=verify,
+            retire_dropped=False,
+            believed=believed,
+        )
     except PlanError as exc:
         return GoalReport(
             assessment, reason=f"the follow-up plan is not writable: {exc}", rounds=rounds

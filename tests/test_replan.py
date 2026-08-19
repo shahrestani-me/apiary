@@ -835,7 +835,11 @@ def test_a_dropped_task_with_a_worker_on_it_is_left_alone_and_reported(tracker):
     assert report.replanned
     assert store.issues[running]["state"] == "open"
     assert [action.task_id for action in report.retained] == ["in-flight"]
-    assert CLAIMED in report.retained[0].reason
+    # The reason names the state the authority answered in rather than the label
+    # storing it (#212), which is also epic #140's other half: a `swarm:*` string
+    # in a report is a storage detail leaking into what a human reads.
+    assert "claimed" in report.retained[0].reason
+    assert "swarm:" not in report.retained[0].reason
 
 
 def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):

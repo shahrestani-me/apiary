@@ -86,6 +86,26 @@ gate included. In practice the gate never exercises it: `goal.assess` refuses
 to act while any task is `swarm:failed` (an abandoned task is a question for a
 human, not for more planning), so the stall-replan is the path that revives.
 
+**Which state a task is in is the authority's answer, not the label's** (#212).
+Every decision above - revive, retain, retire - read `entry.state_label`, and
+#147's criterion is that a label a human edits mid-run must not change what the
+orchestrator does. The case that bit: a `swarm:done` issue somebody relabels
+`swarm:failed` mid-run is still believed `landed` - #147 ignores the relabel and
+#201's ratchet holds it - and its issue is *open*, so the closed-issue guard in
+`_update` does not catch it either. The revival branch then fired on the label
+alone and put a worker back onto merged code, and before #210 the revival overlay
+cleared the ratchet on its way past. `write_plan` therefore takes the cycle's
+`believed` and both decision paths ask `authority.state_of`, exactly as
+`recovery.py`, `goal.py` and `replan.py` have since #198. `believed=None` reads
+the label, which is `plan_node` and `APIARY_STATE_SOURCE=labels`.
+
+The states those paths compare against are ADR 0001's own rather than the six
+`swarm:*` strings, and that is also what makes this a prerequisite for #152
+rather than a tidy-up. That ticket removes the label writes, and a module still
+*reading* them would not error: it would read absence as a state,
+`entry.state_label == "swarm:failed"` would simply never be true again, and
+revivals would stop happening in silence.
+
 **State labels are written once, at creation.** After that `ready` <-> `blocked`
 belongs to readiness (#11), which resolves each `## Blocked by` ref's real state
 instead of guessing from a ledger read. The label this module picks at creation
@@ -115,7 +135,7 @@ import time
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
@@ -135,6 +155,16 @@ from ..github.refs import task_ref
 from ..taskref import TaskRef
 from ..llm import orchestrator_llm, structured
 from ..state import Plan, PlannedTask, SwarmState, TaskRecord
+
+if TYPE_CHECKING:  # pragma: no cover - the annotation, never the module
+    # `orchestrator/authority.py` holds the cutover (#147) and this module is
+    # the fifth reader of it (#212), but the dependency must not point back up:
+    # `orchestrator/goal.py` and `orchestrator/replan.py` import *this* module,
+    # and `FAILED` below is spelled by hand for the same reason. So the type is
+    # imported for the checker and `state_of` is reached through a local import
+    # in `_state_of`, which is exactly the dance `authority._internal` does in
+    # the other direction to keep `lifecycle` out of its own ring.
+    from ..orchestrator.authority import Belief
 
 #: The planning prompt, minus the two facts that vary per run.
 #:
@@ -429,18 +459,39 @@ def repository_files(source: GitHubClient | str | None) -> tuple[str, ...] | Non
 # out rather than left blank so a human reading the issue sees an answer.
 NO_DEPENDENCIES = "_none._"
 
-# The only two state labels whose issues this module may rewrite. Everything
-# else is another component's row of §4, and an issue in one of them is either
-# being worked on right now or finished.
-WRITABLE = frozenset({READY, BLOCKED})
+# ADR 0001's internal states this module *decides* on, in the vocabulary
+# `authority.state_of` answers in (#212). Spelled here rather than imported from
+# `orchestrator/derived.py` for `FAILED`'s reason below - `orchestrator` modules
+# import this one - and held to that module's spelling by a test, because a
+# constant duplicated for a layering rule is a constant that can drift.
+ELIGIBLE = "eligible"
+BLOCKED_STATE = "blocked"
+CLAIMED_STATE = "claimed"
+REVIEW_STATE = "review"
+NEEDS_HUMAN = "needs-human"
+
+# What `_state_of` answers for a task the belief has no opinion about. A phrase
+# rather than the bare `""` `Belief.state` returns, because it is in neither set
+# below either way and the only thing the empty string changes is a report line
+# that reads "dropped, " and looks like a defect.
+NO_BELIEF = "no state this cycle believed"
+
+# The only two states whose issues this module may rewrite, and the same set
+# `authority.WAITING` names from the other side. Everything else is another
+# component's row of §4, and an issue in one of them is either being worked on
+# right now or finished.
+WRITABLE = frozenset({ELIGIBLE, BLOCKED_STATE})
 
 # In-flight: a container holds it, or a PR is open against it. Dropping one of
 # these is a decision the planner refuses to make - see the module docstring.
-IN_FLIGHT = frozenset({"swarm:claimed", "swarm:review"})
+IN_FLIGHT = frozenset({CLAIMED_STATE, REVIEW_STATE})
 
-# The label a revival takes an issue out of. The same spelling as
-# `reconcile.FAILED`; spelled here rather than imported because `orchestrator`
-# modules import this one, and the dependency must not point back up.
+# The label a revival takes an issue out of - a *write*, which is why this one
+# stays label-shaped where the sets above no longer are: the state that selects
+# a revival is `NEEDS_HUMAN`, and this is the string §3 stores it in until #152
+# stops storing it at all. The same spelling as `reconcile.FAILED`; spelled here
+# rather than imported because `orchestrator` modules import this one, and the
+# dependency must not point back up.
 FAILED = "swarm:failed"
 
 # Path segments that are packaging, not subject matter. `src/swarm/github/…` is
@@ -1013,6 +1064,29 @@ def _closed(states: Mapping[TaskRef, IssueState], ref: TaskRef) -> bool:
     return bool((state := states.get(ref)) and state.closed)
 
 
+def _state_of(entry: LedgerEntry, believed: Belief | None) -> str:
+    """What state is this task in, as the cycle's authority has it (#212)?
+
+    `authority.state_of` and nothing else - "there is exactly one function in
+    that package that answers this, and every decision path calls it" - reached
+    through a local import for the reason the `TYPE_CHECKING` block at the top
+    of this module gives. `believed=None` reads the label, which is `plan_node`'s
+    path and `APIARY_STATE_SOURCE=labels` by way of a belief whose states are the
+    labels anyway.
+
+    A task the belief has no opinion about answers `NO_BELIEF`, which is in
+    neither `WRITABLE` nor `IN_FLIGHT` and is therefore retained rather than
+    rewritten. That is the safe direction and it costs nothing in the loop: every
+    caller that passes a belief passes the one built from the very ledger
+    `write_plan` was handed, so an entry missing from it is a caller holding two
+    different reads of the tracker - and writing to an issue on the strength of
+    the disagreement is the one thing worth refusing there.
+    """
+    from ..orchestrator.authority import state_of
+
+    return state_of(entry, believed) or NO_BELIEF
+
+
 def write_plan(
     source: GitHubClient | str,
     plan: Plan,
@@ -1022,6 +1096,7 @@ def write_plan(
     retire_dropped: bool = True,
     stack: str | None = None,
     bootstrap: PlannedTask | None = None,
+    believed: Belief | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
 ) -> PlanReport:
@@ -1030,6 +1105,14 @@ def write_plan(
     `ledger` is the read the caller already made - `start_run` holds one, and
     re-listing the issues to hand this function one would double the
     rate-limit cost of a cycle's first act.
+
+    `believed` is the cycle's authority on what state each of those entries is
+    in (#212), and it belongs to the caller for the same reason `ledger` does:
+    it was built from that very read, and a belief rebuilt here would be a
+    second opinion about the run this function is writing for. `None` reads the
+    labels, which is `plan_node` and `APIARY_STATE_SOURCE=labels`. The two
+    decisions it reaches are `_update`'s revival and `_drop`'s retirement; see
+    the module docstring for the mid-run relabel that made it matter.
 
     `verify` is the repo-wide command every issue's `## Verify` carries, and it
     belongs to the caller because the caller is what knows the repository:
@@ -1099,6 +1182,7 @@ def write_plan(
                 entry,
                 refs,
                 states,
+                believed=believed,
                 max_attempts=max_attempts,
                 max_total_attempts=max_total_attempts,
             )
@@ -1108,7 +1192,7 @@ def write_plan(
     for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref):
         if task_id not in planned:
             actions.append(  # type: ignore[attr-defined]
-                _drop(client, entry, states, retire=retire_dropped)
+                _drop(client, entry, states, retire=retire_dropped, believed=believed)
             )
 
     return PlanReport(client.repo, tuple(actions), tuple(warnings))
@@ -1144,6 +1228,7 @@ def _update(
     refs: Sequence[TaskRef],
     states: Mapping[TaskRef, IssueState],
     *,
+    believed: Belief | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
 ) -> IssueAction:
@@ -1158,6 +1243,13 @@ def _update(
     The title is never patched. §2 chose a marker over a title prefix precisely
     so a human can retitle mid-run, and re-asserting a generated title every
     replan takes that back.
+
+    **The state is the authority's, not the label's** (#212). `believed=None`
+    reads the label, which is every caller outside a cycle; `_state_of` says
+    what a belief with no opinion about this entry means. The `_closed` guard
+    above is not made redundant by it and runs first: it is GitHub's own answer
+    about the issue rather than a state, and it is the one input this module
+    never argues with.
     """
     if _closed(states, entry.ref):
         return IssueAction(
@@ -1166,21 +1258,27 @@ def _update(
             entry.number,
             reason="issue is closed; reopening it is a human's call",
         )
-    if entry.state_label == FAILED:
+    state = _state_of(entry, believed)
+    if state == NEEDS_HUMAN:
         # The plan still contains this task - updated or unchanged, it is the
         # same decision - so the failure is not abandonment: the replan wants
         # this work done, and a failed task it cannot revive re-stalls the run
         # until a human relabels it by hand. See the module docstring for why
         # the signature budget makes this safe and what is deliberately kept.
+        #
+        # On the state and not on `swarm:failed`, which is #212's whole point: a
+        # `swarm:done` issue somebody relabels mid-run is still believed
+        # `landed`, its issue is open so the guard above does not catch it, and
+        # this branch used to revive it - a worker back onto merged code.
         return revive(
             client, entry, max_attempts=max_attempts, max_total_attempts=max_total_attempts
         )
-    if entry.state_label not in WRITABLE:
+    if state not in WRITABLE:
         return IssueAction(
             "retained",
             draft.task_id,
             entry.number,
-            reason=f"{entry.state_label}; the planner does not rewrite work in flight",
+            reason=f"{state}; the planner rewrites neither work in flight nor work that has landed",
         )
     if draft.matches(entry, refs):
         # Nothing to say that the issue does not already say. Worth the check:
@@ -1326,21 +1424,31 @@ def _drop(
     states: Mapping[TaskRef, IssueState],
     *,
     retire: bool,
+    believed: Belief | None = None,
 ) -> IssueAction:
     """Deal with a ledger entry the new plan no longer contains.
 
     The three cases are the module docstring's, and the one that matters is the
     middle one: an issue with a live container or an open PR is left alone.
+
+    Every one of them is decided by `believed` since #212 rather than by the
+    label, and the drop path has its own version of the mid-run relabel: a
+    `swarm:done` issue somebody typed `swarm:failed` onto, dropped by the same
+    replan, was closed `not_planned` with a comment calling merged work
+    superseded - and `not_planned` is precisely the state reason readiness (#11)
+    refuses to read as a dependency met, so every task waiting on that landed
+    one would have stayed blocked for the rest of the run.
     """
-    if entry.state_label in IN_FLIGHT:
+    state = _state_of(entry, believed)
+    if state in IN_FLIGHT:
         return IssueAction(
             "retained",
             entry.task_id,
             entry.number,
-            reason=f"dropped by the replan but {entry.state_label}; "
+            reason=f"dropped by the replan but {state}; "
             "in-flight work is the reconciler's call, not the planner's",
         )
-    if entry.state_label == FAILED:
+    if state == NEEDS_HUMAN:
         # Dropped and failed is retired like dropped and never-started, not
         # retained like it used to be - see the module docstring for the
         # rewritten rationale. Human-closed stays untouched (GitHub wins), and
@@ -1357,11 +1465,11 @@ def _drop(
             client,
             entry,
             because="the plan no longer contains this task",
-            reason=f"{FAILED} and not in the new plan; closed as superseded",
+            reason=f"{NEEDS_HUMAN} and not in the new plan; closed as superseded",
         )
-    if entry.state_label not in WRITABLE:
+    if state not in WRITABLE:
         return IssueAction(
-            "retained", entry.task_id, entry.number, reason=f"dropped, {entry.state_label}"
+            "retained", entry.task_id, entry.number, reason=f"dropped, {state}"
         )
     if _closed(states, entry.ref):
         return IssueAction(

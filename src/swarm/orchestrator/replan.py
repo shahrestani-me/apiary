@@ -330,6 +330,13 @@ def replan(
     stall silently re-pointed every task in a generated repository at
     `SETTINGS.verify_command`, which that repository has no way to run.
 
+    `believed` is that same cycle's authority on the ledger's states, and it goes
+    to both halves of this function: the brief names each task with it (#198) and
+    the write selects its revivals and retirements on it (#212). One value for
+    both, because a prompt that called a task abandoned while the write path read
+    it as landed would be two control planes inside one replan. `None` reads the
+    labels, which is `__main__` and `APIARY_STATE_SOURCE=labels`.
+
     `proposer` and `writer` are the two seams, and they exist for one reason:
     **a replan rewrites a real issue tracker.** A test that exercised this
     function against GitHub would close issues in the repository the swarm is
@@ -390,7 +397,12 @@ def replan(
         )
 
     try:
-        report = writer(client, plan, ledger=ledger, verify=verify)
+        # `believed` goes to the write as well as to the brief (#212): the
+        # planner's revival and retirement decisions are the two this ticket's
+        # criterion is sharpest about, and a replan that annotated the prompt
+        # with the authority's answer while the write still selected on the
+        # label would be reading two control planes in one function.
+        report = writer(client, plan, ledger=ledger, verify=verify, believed=believed)
     except PlanError as exc:
         # A ring in the proposed graph. `write_plan` orders the drafts before
         # its first write and raises having written nothing, so the tracker is
