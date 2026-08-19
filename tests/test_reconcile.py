@@ -1649,6 +1649,88 @@ def test_the_merge_policy_reaches_the_check_gate(monkeypatch):
     assert seen["policy"] is policy
 
 
+def test_a_merge_gate_join_that_cannot_resolve_is_recorded_not_escaped(monkeypatch):
+    """`UnresolvedJoin` reaches `cycle_error`, and the cycle still reports.
+
+    The gate raising is asserted in `test_checks.py` and `test_mergeability.py`.
+    What those cannot see is what the *cycle* does with it, and the answer is
+    the one `DependencyCycleError` already had: record it, do not escape.
+
+    The reason is specific to where this gate sits. It runs after `apply_plan`
+    has written this cycle's labels and after the recovery sweep, so an
+    exception leaving `cycle` is thrown before `CycleReport` is built -
+    `on_cycle` never fires and the run directory never learns that those writes
+    happened. #174 exists because a silent wrong answer is worse than a loud
+    failure; a loud failure that erases its own evidence is not the trade it
+    was asking for."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise UnresolvedJoin("no check set for #4")
+
+    monkeypatch.setattr("swarm.orchestrator.checks.plan_checks", refuse)
+
+    seen: list[Any] = []
+    client = PullAwareClient(issues={4: issue_payload(4, label=REVIEW)})
+    reports = reconciler(client, FakeFleet(), on_cycle=seen.append).loop(cycles=1)
+
+    # The fault is on the report a human and the run directory both read.
+    report = reports[0]
+    assert "no check set for #4" in report.cycle_error
+    assert "no check set for #4" in report.summary()
+    # And the gate decided nothing: no merge was issued, no admitted plan.
+    assert report.checks is None
+    assert report.mergeability is None
+    # The half that an escaping exception destroyed: `loop` builds the report
+    # and hands it to `on_cycle`, which is what writes `cycle.reconciled` into
+    # the run directory (`cli._report_cycle`). Raising past `cycle` skipped
+    # this entirely, so the cycle's already-written labels went unrecorded.
+    assert seen == [report]
+
+
+def test_a_failed_merge_gate_dispatches_nothing_that_cycle(monkeypatch):
+    """A recorded fault must not read as a quiet cycle.
+
+    Both faults that reach `cycle_error` say the same thing - the machinery
+    deciding what may land is not answering - and a run that keeps spawning
+    workers onto a review queue that cannot drain is precisely the "looks
+    healthy while stuck" failure `mergeability.py`'s docstring is about. So the
+    cycle reports and dispatches nothing, which is what `DependencyCycleError`
+    already did for the readiness half."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise UnresolvedJoin("no check set for #4")
+
+    monkeypatch.setattr("swarm.orchestrator.checks.plan_checks", refuse)
+
+    fleet = FakeFleet()
+    client = PullAwareClient(
+        issues={4: issue_payload(4, label=REVIEW), 5: issue_payload(5, label=READY)}
+    )
+    report = reconciler(client, fleet).cycle()
+
+    assert report.cycle_error
+    assert report.readiness is None
+    assert report.dispatched is None
+    assert fleet.spawned == []
+
+
+def test_the_unresolved_join_is_not_a_lookup_error(monkeypatch):
+    """And it must not be catchable as one.
+
+    `UnresolvedJoin` reports a failed lookup, so `LookupError` is the base a
+    reader reaches for - which is the trap: `KeyError` is a `LookupError`, so
+    one `except LookupError` around a dict access anywhere upstream would
+    swallow this and silently restore the default it exists to remove. The base
+    class is therefore part of the fix, not an implementation detail, and this
+    is what says so."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    assert not issubclass(UnresolvedJoin, LookupError)
+    assert issubclass(UnresolvedJoin, RuntimeError)
+
+
 # --------------------------------------------------------------------------
 # A task that only ever fails as infrastructure (#91)
 # --------------------------------------------------------------------------

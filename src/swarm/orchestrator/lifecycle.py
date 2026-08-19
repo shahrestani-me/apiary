@@ -171,7 +171,7 @@ def lifecycle_events(
     *,
     results: Mapping[TaskRef, ResultRecord] | None = None,
     pulls: Mapping[str, PullState] | None = None,
-    checks: Mapping[int, CheckSet] | None = None,
+    checks: Mapping[TaskRef, CheckSet] | None = None,
 ) -> tuple[TaskEvent, ...]:
     """Project one finished cycle onto the per-task lifecycle. Pure.
 
@@ -200,10 +200,12 @@ def lifecycle_events(
     entries = {entry.ref: entry for entry in report.ledger.entries.values()}
     slugs = {ref: entry.task_id for ref, entry in entries.items() if entry.task_id}
     # And by issue number, because two things this reads are still spelled that
-    # way: the merge gate (`checks.py` addresses pull requests and issues, both
-    # of which GitHub numbers) and a branch name quoted in prose. #142 retyped
-    # the internal model; the code-host half is GitHub-shaped and ADR 0001 says
-    # it stays that way.
+    # way: the merge gate's `Merge` rows (`checks.py` addresses pull requests
+    # and issues, both of which GitHub numbers) and a branch name quoted in
+    # prose. #142 retyped the internal model; the code-host half is
+    # GitHub-shaped and ADR 0001 says it stays that way. The check sets are no
+    # longer among them - #174 moved that map onto the ref, because the same
+    # join in `plan_checks` was escalating healthy issues when it missed.
     by_issue = {entry.number: entry for entry in entries.values()}
     by_number = {number: entry.task_id for number, entry in by_issue.items() if entry.task_id}
     # Pull requests, keyed by the task ref inside each head branch rather than
@@ -272,10 +274,9 @@ def lifecycle_events(
             head_sha=pull.sha,
         )
 
-    for number, check_set in sorted(checks.items()):
-        entry = by_issue.get(number)  # type: ignore[assignment]
-        task = by_number.get(number, "")
-        pull = by_pull_ref.get(entry.ref) if entry is not None else None
+    for ref, check_set in sorted(checks.items()):
+        task = slugs.get(ref, "")
+        pull = by_pull_ref.get(ref) if ref in entries else None
         if not task or pull is None:
             continue
         state = check_set.verdict
