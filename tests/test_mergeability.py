@@ -59,8 +59,6 @@ from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.mergeability import (
     BEHIND,
     COMPUTING,
-    CONFLICT_CLOSE,
-    CONFLICT_OPEN,
     CONFLICTED,
     FRESH,
     ROUNDS_ENV,

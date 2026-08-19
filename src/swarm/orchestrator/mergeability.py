@@ -192,17 +192,14 @@ DEFAULT_MERGES_PER_CYCLE = 1
 ROUNDS_ENV = "APIARY_MAX_UPDATE_ROUNDS"
 MERGES_PER_CYCLE_ENV = "APIARY_MERGES_PER_CYCLE"
 
-#: The delimiters of the conflict block in an issue body, and the sibling of
-#: `checks.FEEDBACK_OPEN`. A separate block rather than the same one because the
-#: two say different things to the next attempt - "your code failed a test" and
-#: "your branch no longer applies" need different responses - and a reader that
-#: found one sentence where the other belonged would act on the wrong one.
-CONFLICT_OPEN = "<!-- apiary:conflict -->"
-CONFLICT_CLOSE = "<!-- /apiary:conflict -->"
-
 #: How much conflict detail to carry, matching `checks.FEEDBACK_CHARS`: this text
-#: lands in an issue body a human reads and a model is meant to be given, and a
-#: pull request touching four hundred files is neither.
+#: lands in a **comment** a human reads and a model is meant to be given, and a
+#: pull request touching four hundred files is neither. It used to land in the
+#: issue body; #249 stopped writing there and #250 gave it the channel the worker
+#: actually reads. The two blocks that used to delimit it in the body are gone
+#: with the write - the distinction they carried, "your code failed a test"
+#: against "your branch no longer applies", is now carried by the two comments
+#: saying different sentences, which is where it always belonged.
 CONTEXT_CHARS = 4000
 
 

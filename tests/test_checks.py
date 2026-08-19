@@ -51,8 +51,6 @@ from swarm.orchestrator.checks import (
     BRANCH_METHODS,
     EMPTY,
     FAILING,
-    FEEDBACK_CLOSE,
-    FEEDBACK_OPEN,
     PASSED,
     PENDING,
     PULLS_METHOD,
