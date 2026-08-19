@@ -179,14 +179,22 @@ def a_run(
 
     `alongside` runs the same two cycles over `a_lifecycle_run`'s two-task
     world, and the edit moves **every** issue in the run onto `label` - one
-    human relabelling a run rather than one issue. That loop is where the pair
-    below gets its *sensitivity*, and it is the whole of it: when the second
-    cycle's `plan_reconcile` runs, the second task is the only one carrying a
-    container - this run's own task is dispatched later in the same cycle - so
-    it is the only issue whose hand-edited label a disposal rule has to read.
-    Relabel `TASK_ISSUE` alone and a `plan_reconcile` back on
-    `entry.state_label` answers identically in both arms again, which is the
-    state #202 found this in. Under the resolver the edit must still change
+    human relabelling a run rather than one issue. When the second cycle's
+    `plan_reconcile` runs, the second task is the only one carrying a container
+    - this run's own task is dispatched later in the same cycle - so it is the
+    only issue whose hand-edited label a disposal rule has to read.
+
+    **What the loop buys, measured rather than argued.** With `plan_reconcile`
+    reverted to `entry.state_label`, the `outcome()` equality below catches the
+    regression on `swarm:done` and `swarm:failed` only. Relabel `TASK_ISSUE`
+    alone and that equality is blind on all five, which is the state #202 found
+    this in - so this loop is the whole of the *equality's* sensitivity, and
+    that is a narrower claim than the whole of the pair's. The other three arms
+    go red on the liveness assertions instead, and those do not depend on this
+    loop at all: under the regression the baseline disposes nothing, so
+    `fleet.disposed == [OTHER_ISSUE]` fails whatever was relabelled. See #228 -
+    an equality that is still blind on three of five arms is not yet the
+    argument #202 wanted it to be. Under the resolver the edit must still change
     nothing.
     """
     monkeypatch.setenv(STATE_SOURCE_ENV, source)
@@ -300,6 +308,11 @@ def test_no_wrong_label_changes_a_decision_under_the_resolver(label, monkeypatch
     `swarm:done` and `swarm:failed`, which read as terminal and dispose the
     container the baseline keeps, and the liveness assertion on the other three,
     because that baseline no longer disposes anything at all.
+
+    Those two are not equally good evidence, and #228 is open about it: on three
+    of five arms the *equality* - the sentence that actually states #147's
+    criterion - still cannot fail, and a fixture guard is what turns them red.
+    Five red arms here are not yet five covered paths.
     """
     baseline = a_run(READY, DERIVED, monkeypatch, alongside=True)
     edited = a_run(label, DERIVED, monkeypatch, alongside=True)
