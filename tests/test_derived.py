@@ -51,7 +51,7 @@ from fixtures.corpus import (
     load_corpus,
 )
 from swarm.github.branches import task_branch
-from swarm.github.refs import task_ref as ref
+from swarm.github.refs import pull_ref, task_ref as ref
 from swarm.orchestrator.derived import (
     BLOCKED,
     CLAIMED,
@@ -92,7 +92,17 @@ def running(number: int = 1, *, run_id: str = "run-1", alive: bool = True) -> Co
 
 
 def open_pull(pull: int, number: int = 1, attempt: int = 0, **kwargs: object) -> PullFact:
-    return PullFact(number=pull, ref=ref(number), attempt=attempt, **kwargs)  # type: ignore[arg-type]
+    """A pull request fact. `pull` is minted here, as a real listing mints it.
+
+    The builder takes an `int` and `PullFact.number` is a `PullRef` since #208,
+    so the mint happens at this edge rather than in every caller - which is the
+    same shape `console_board._pull_facts` and the corpus loader have, and it
+    keeps the test bodies reading `open_pull(71)` instead of carrying the
+    adapter's spelling into thirty call sites.
+    """
+    return PullFact(  # type: ignore[arg-type]
+        number=pull_ref(pull), ref=ref(number), attempt=attempt, **kwargs
+    )
 
 
 def state(observation: Observation, task: str = "solo") -> str:
@@ -260,7 +270,54 @@ def test_the_newest_attempts_pull_request_is_the_one_reported() -> None:
     observation = world(pulls=(open_pull(70, attempt=0), open_pull(71, attempt=1)))
     verdict = resolve(observation).by_task["solo"]
     assert verdict.state == REVIEW
-    assert verdict.pull == 71
+    assert verdict.pull == pull_ref(71)
+
+
+def test_two_open_pull_requests_on_one_attempt_are_broken_by_number() -> None:
+    """`_open_pull` compares `(attempt, number)`, so this is the branch that
+    reaches the number - and before `PullRef` sorted (#208) reaching it raised.
+    The higher number is the newer publication of the same dispatch."""
+    observation = world(pulls=(open_pull(70, attempt=1), open_pull(71, attempt=1)))
+
+    assert resolve(observation).by_task["solo"].pull == pull_ref(71)
+
+
+@pytest.mark.parametrize("order", [(101, 104), (104, 101)])
+def test_the_named_merge_does_not_depend_on_the_listing_order(order) -> None:
+    """Both `sorted()` sites in this module, held to one answer.
+
+    A task can carry two merged pull requests - `recovery.py`'s orphan, merged by
+    a human rather than closed - so `_landed`'s sentence and `_merged_pull`'s
+    number are each a choice among several. Both sort, so the choice is the same
+    one twice and the same one every cycle: a reader told "pull request #101
+    merged" and linked to #104 is being sent to a diff that explains nothing.
+    Parametrised over both listing orders because the order GitHub returns is
+    exactly what an unordered key would leave the answer to.
+    """
+    pulls = tuple(
+        open_pull(n, merged=True, closed=True, attempt=i) for i, n in enumerate(order)
+    )
+
+    verdict = resolve(world(pulls=pulls)).by_task["solo"]
+
+    assert verdict.state == LANDED
+    assert verdict.pull == pull_ref(101)
+    assert verdict.because == "pull request #101 merged"
+
+
+def test_a_verdict_names_a_pull_request_with_exactly_one_hash() -> None:
+    """The retype changed no message, and this is what says so.
+
+    `PullRef` renders `#101` on its own - the ref carries the `#` - so the two
+    format strings that used to write one themselves had to drop it. A `##101`
+    in an operator's shadow report is the kind of regression a type change is
+    allowed to introduce silently and nothing else would catch.
+    """
+    review = resolve(world(pulls=(open_pull(101),))).by_task["solo"]
+    landed = resolve(world(pulls=(open_pull(101, merged=True, closed=True),))).by_task["solo"]
+
+    assert review.because == "pull request #101 is open for this task"
+    assert landed.because == "pull request #101 merged"
 
 
 def test_a_spent_attempt_budget_is_needs_human() -> None:

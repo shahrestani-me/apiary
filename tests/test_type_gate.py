@@ -160,17 +160,24 @@ def test_the_same_read_with_a_ref_is_clean(reproduction_findings: str) -> None:
 #: Both directions are covered, and the comment has to say so because they are
 #: not symmetrical to a reader. Most `WRONG` lines are sourced the way the bug
 #: was - the pull request's number read into the field that holds the issue's -
-#: but the `Mergeability` pair is the reverse, an issue's `int` into a `PullRef`
-#: field. A newtype that rejected only one direction would let the other swap
-#: through unremarked. Every `RIGHT` line is the same call sourced correctly: a
-#: checker that flags both is worth nothing, which is why the pairs are here
-#: rather than the errors alone.
+#: but the `Mergeability` and `PullFact` pairs are the reverse, an issue's `int`
+#: into a `PullRef` field. A newtype that rejected only one direction would let
+#: the other swap through unremarked. Every `RIGHT` line is the same call sourced
+#: correctly: a checker that flags both is worth nothing, which is why the pairs
+#: are here rather than the errors alone.
+#:
+#: `PullFact` joined the list with #208. It is the resolver's view of a pull
+#: request and the resolver is authoritative (#147), so it was the last record on
+#: the decision path where a task's number and a pull request's were one type -
+#: which is the shape #184 had to add a runtime guard for.
 MIS_SOURCING = """\
 from swarm.orchestrator.checks import Merge, PullState
+from swarm.orchestrator.derived import PullFact
 from swarm.orchestrator.mergeability import Decision, Mergeability
+from swarm.taskref import TaskRef
 
 
-def build(issue: int, pull: PullState, facts: Mergeability) -> None:
+def build(issue: int, task: TaskRef, pull: PullState, facts: Mergeability) -> None:
     Merge(number=pull.number, pull=pull.number, branch=pull.branch)  # WRONG
     Merge(number=issue, pull=pull.number, branch=pull.branch)  # RIGHT
 
@@ -179,6 +186,9 @@ def build(issue: int, pull: PullState, facts: Mergeability) -> None:
 
     Mergeability(number=issue)  # WRONG
     Mergeability(number=pull.number)  # RIGHT
+
+    PullFact(number=issue, ref=task)  # WRONG
+    PullFact(number=pull.number, ref=task)  # RIGHT
 """
 
 
@@ -243,7 +253,7 @@ def _lines_with_errors(findings: str, *, naming: str | None = None) -> set[int]:
 def test_a_pull_requests_number_in_the_issues_place_is_an_error(
     mis_sourcing_findings: str,
 ) -> None:
-    """The shape that shipped green before #185, on all three records.
+    """The shape that shipped green before #185, on all four records.
 
     Not "a guard raises later": the construction itself is rejected, which is
     the difference between a bug that is *caught* and one that cannot be

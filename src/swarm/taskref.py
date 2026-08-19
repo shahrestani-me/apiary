@@ -84,13 +84,13 @@ be handed back to `PUT /pulls/{n}/merge` in the end. What the type buys is that
 the hand-back is a written-out call at the API boundary rather than an int
 drifting through four records on its way there.
 
-**Ordering is deliberately absent, and it is the next thing this needs.**
-`TaskRef` sorts (see the note above on determinism in `find_cycle`); `PullRef`
-does not, because nothing in the orchestrator ordered pull requests by number at
-the time it was introduced. `derived.py` does - twice, `sorted(..., key=lambda
-one: one.number)` - which is exactly why `PullFact.number` is still an `int`.
-Retyping it is blocked on this, and the fix is to reuse `_natural_key` rather
-than to invent a second ordering.
+**`PullRef` sorts too, over the same `_natural_key` (#208).** It shipped in #185
+without an ordering because nothing in the orchestrator ordered pull requests by
+number at the time; `derived.py` does, so `PullFact.number` was stuck as an `int`
+until the type could be sorted. One key rather than two is the whole of the
+choice: two orderings over values that look this much alike is how they diverge,
+and a divergence between them would be a sort that reads correctly at both call
+sites and disagrees between them.
 
 **What this does not yet buy.** `LedgerEntry` carries a `number` beside its
 `ref`, and the modules above still read that number wherever they address the
@@ -132,8 +132,9 @@ def _natural_key(value: str) -> tuple[tuple[int, int | str], ...]:
     the key is not injective - `#042` and `#42` share one - so two unequal refs
     would compare neither equal nor less-than in either direction, and
     `sorted()` would fall back to insertion order. That is precisely the
-    non-determinism the ordering exists to remove: `find_cycle` promises the
-    same graph names the same ring every run.
+    non-determinism both orderings exist to remove: `find_cycle` promises the
+    same graph names the same ring every run, and `derived.py` promises the same
+    world names the same pull request.
     """
     chunks: tuple[tuple[int, int | str], ...] = tuple(
         # `isdecimal`, not `isdigit`: the latter is true of superscripts and
@@ -211,6 +212,7 @@ class TaskRef:
         return token
 
 
+@total_ordering
 @dataclass(frozen=True)
 class PullRef:
     """One pull request's address on the code host, in that host's spelling.
@@ -226,6 +228,23 @@ class PullRef:
     it. Unlike `TaskRef`, un-minting is the expected end of the value's life,
     not a leak - a pull request number is an API address and never an identity
     the internal model keys anything on.
+
+    **Ordered, and for `TaskRef`'s reason rather than its caller (#208).**
+    `TaskRef` sorts so `find_cycle` names the same ring every run; this sorts so
+    `derived.py` names the same *pull request* every run. A task can have more
+    than one - `orchestrator/recovery.py` documents the retry that opens a
+    second rather than updating the first - and three sites there pick one of
+    them to report: `_landed` and `_merged_pull` take the lowest-numbered merge,
+    `_open_pull` breaks a tie between two open pull requests on one attempt.
+    Each was an `int` comparison, so each was already deterministic, and the
+    ordering is what let `PullFact.number` become this type without any of them
+    silently falling back to insertion order. The order is the same *natural*
+    one, over the same `_natural_key`: `#9` before `#10`.
+
+    It is deliberately **not** an ordering against `TaskRef`. Comparing the two
+    raises, exactly as assigning one to the other is rejected - a total order
+    spanning both would be the shared vocabulary the no-base-class choice exists
+    to refuse, and `sorted()` over a mixed list is never a thing a caller wants.
     """
 
     value: str
@@ -239,3 +258,8 @@ class PullRef:
 
     def __str__(self) -> str:
         return self.value
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, PullRef):
+            return NotImplemented
+        return _natural_key(self.value) < _natural_key(other.value)

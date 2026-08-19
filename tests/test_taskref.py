@@ -5,6 +5,13 @@ is what keeps `find_cycle` naming the same ring twice, `str` is what keeps
 every message a human reads unchanged by the retype, and the round trip is the
 only route back to an issue number - which is what makes "opaque above the
 adapter" enforceable rather than a convention.
+
+`PullRef` is tested here too, beside its twin rather than in a file of its own,
+because every one of its cases is "the same rule for the other numbering" and
+splitting them is how the two drift. Its guards arrived with #196 and its
+ordering with #208 - the property `derived.py` was blocked on, whose reason is
+`TaskRef`'s reason applied to a different caller: not the same ring twice, the
+same pull request twice.
 """
 
 from __future__ import annotations
@@ -96,6 +103,70 @@ def test_two_refs_that_look_alike_numerically_are_still_ordered():
 def test_a_ref_is_not_ordered_against_anything_else():
     with pytest.raises(TypeError):
         _ = task_ref(1) < 1
+
+
+# --------------------------------------------------------------------------
+# `PullRef`'s ordering - the property `derived.py` was blocked on (#208)
+# --------------------------------------------------------------------------
+
+
+def test_pull_refs_sort_numerically_over_a_mixed_set():
+    """A stable sort over several, not two refs that happen to compare.
+
+    `derived._landed` and `derived._merged_pull` both run `sorted()` over one
+    cycle's pull requests and have to agree about which merge a task landed
+    through, so the property under test is the whole sequence: `#9` before `#10`
+    for every element, not just for the pair somebody thought to check.
+    """
+    numbers = [101, 9, 1004, 10, 2]
+    assert sorted(pull_ref(n) for n in numbers) == [pull_ref(n) for n in sorted(numbers)]
+
+
+def test_two_pull_refs_that_look_alike_numerically_are_still_ordered():
+    """The zero-padding case, for the twin of `TaskRef`'s reason.
+
+    `_natural_key` exists partly because `#007` and `#7` share every numeric
+    chunk, so without the value as a tiebreaker they compare neither equal nor
+    less-than in either direction and `sorted()` falls back to insertion order.
+
+    Unreachable through `pull_ref`, which `int()`-normalises, and GitHub is the
+    only code host ADR 0001 admits - so unlike `TaskRef`'s version of this case
+    there is no second spelling waiting to arrive. It is asserted anyway because
+    the tiebreaker is *shared*: somebody tidying `_natural_key` for the type
+    whose minter cannot produce a padded value breaks the type whose can.
+    """
+    padded, bare = PullRef("#007"), PullRef("#7")
+
+    assert padded != bare
+    assert (padded < bare) != (bare < padded), "neither is ordered before the other"
+    assert sorted([padded, bare]) == sorted([bare, padded])
+
+
+def test_a_pull_ref_orders_inside_the_tuple_open_pull_compares():
+    """`derived._open_pull` compares `(attempt, number)`, so the second element
+    is only reached when the attempts are equal - and before #208 reaching it
+    was a `TypeError` rather than a wrong answer. Two open pull requests on one
+    attempt means a worker published twice for one dispatch; the newer one wins.
+    """
+    assert (1, pull_ref(70)) < (1, pull_ref(71))
+    assert (2, pull_ref(70)) > (1, pull_ref(71))
+
+
+def test_a_pull_ref_is_not_ordered_against_a_task_ref():
+    """The no-base-class choice, held at the comparison too.
+
+    Assignment across the two is rejected by mypy; a comparison would be the
+    hole that reopens the shared vocabulary at runtime, and `sorted()` over a
+    list holding both is never something a caller means. Both directions,
+    because `total_ordering` fills in the reflected operators and a one-sided
+    guard would let one of them through.
+    """
+    with pytest.raises(TypeError):
+        _ = pull_ref(1) < task_ref(1)
+    with pytest.raises(TypeError):
+        _ = task_ref(1) < pull_ref(1)
+    with pytest.raises(TypeError):
+        _ = pull_ref(1) < 1
 
 
 # --------------------------------------------------------------------------

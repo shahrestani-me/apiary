@@ -96,7 +96,7 @@ lowers the bound rather than corrupting it.
 | `tasks` | identity and declared dependencies | **no state and no label** — see below |
 | `branches` | the raw names a remote listing returned | parsed by `parse_task_branch`; anything apiary did not mint is dropped |
 | `containers` | one `docker ps --all` row, reduced | `running` is the field `Handle` does not carry today |
-| `pulls` | open and merged pull requests, by **head branch** | joined to a task through the branch name (#144), never through `Closes #n` |
+| `pulls` | open and merged pull requests, by **head branch** | joined to a task through the branch name (#144), never through `Closes #n`; `number` is a JSON number on disk and a `PullRef` once loaded (#208) |
 | `results` | which result files this cycle could see | names must exist under `results/`, or the load fails |
 | `budget` | the caps the run was configured with | operator setting, not a fact about the world |
 | `live_run_ids` | which runs' containers hold claims | defaults to this run's id; `recovery.py`'s rule |

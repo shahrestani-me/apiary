@@ -469,15 +469,14 @@ def build_observation(
             continue
         facts.append(
             PullFact(
-                # `PullState.number` is a `PullRef` since #185 and `PullFact`'s
-                # is an `int`, which is not an oversight in either: a pull
-                # request number is an API address, and un-minting it through
-                # the adapter is the expected end of the value's life rather
-                # than a leak (`github/refs.pull_number`). Reaching for
-                # `int(...)` here instead is what a bare `PullRef` in scope
-                # beside an issue number produced before #185, and is exactly
-                # the mistake that type exists to make unexpressible.
-                number=pull_number(pull.number),
+                # Both sides are `PullRef` since #208, so the un-mint that used
+                # to stand here (`pull_number(pull.number)`) is gone rather than
+                # merely justified: this is orchestrator-to-orchestrator, not an
+                # API boundary, and the only reason it un-minted was that
+                # `PullFact.number` could not hold the type. Nothing left in
+                # this hop can put a pull request's number where an issue's
+                # belongs, which is what #185 was for.
+                number=pull.number,
                 ref=parsed.ref,
                 attempt=parsed.attempt,
                 draft=bool(pull.draft),
@@ -896,7 +895,12 @@ def observed_line(
         ],
         "pulls": [
             {
-                "number": pull.number,
+                # Un-minted, because this one *is* a boundary: the corpus format
+                # `tests/fixtures/runs/README.md` documents holds a JSON number,
+                # every existing fixture carries one, and a `PullRef` would not
+                # serialise. The loader mints it back (`fixtures/corpus.py`), so
+                # the type lives inside the process and the file stays the file.
+                "number": pull_number(pull.number),
                 "head": task_branch(pull.ref, pull.attempt),
                 "merged": pull.merged,
                 "closed": pull.closed,
