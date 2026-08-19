@@ -1193,10 +1193,16 @@ def _observe(
 ) -> tuple[Transition | None, Disposal]:
     """Turn one finished worker's exit code into a label move (§4).
 
-    Exit 0 moves no label. `claimed -> review` belongs to the worker, which
-    writes it at the instant the PR exists; an exit 0 whose label did not stick
-    leaves a claimed issue with an open PR, and that is #35's row, not this
-    one's. Taking it here would race the worker for the same write.
+    Exit 0 is `claimed -> review`, and it is this function's row since #148.
+    The worker used to write that label itself, from inside the container, at
+    the instant the pull request existed - which was worth a tracker write while
+    the label *was* the state. It is not any more: `derived.py` reads `review`
+    off the open pull request, so the write only kept the label plane honest,
+    and a write that exists to keep a label honest belongs to the process that
+    owns the labels rather than to one running model-generated code
+    (`worker/pr.py`, "No tracker call, of any kind"). #35's row survives for the
+    case it was always for: a claim whose orchestrator died, where no cycle is
+    left to observe the record.
 
     Every transition this returns names the record it was made from, so a cycle
     that lands one can retire that record (`observed_records`). Stamped at this
@@ -1226,9 +1232,21 @@ def _verdict(
     infrastructure_streak: int = 0,
     policy: InfrastructurePolicy = InfrastructurePolicy(),
 ) -> tuple[Transition | None, Disposal]:
-    """§4's three rows, and nothing about which record said so. `_observe`'s body."""
+    """§4's four rows, and nothing about which record said so. `_observe`'s body."""
     if record.exit_code == EXIT_OK:
-        return None, Disposal(entry.ref, "the worker published its pull request")
+        # The counter is deliberately left alone: the attempt succeeded, and
+        # `review -> ready` is where a consumed attempt is accounted for if the
+        # pull request is later rejected.
+        return (
+            Transition(
+                ref=entry.ref,
+                from_label=entry.state_label,
+                to_label=REVIEW,
+                reason="the worker published its pull request",
+                task_id=entry.task_id,
+            ),
+            Disposal(entry.ref, "the worker published its pull request"),
+        )
 
     detail = record.reason or record.outcome
     if record.consumes_attempt:

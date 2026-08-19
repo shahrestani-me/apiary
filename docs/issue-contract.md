@@ -375,12 +375,12 @@ table as a specification:
 | `blocked` | `ready` | every `## Blocked by` ref closed as completed | readiness (#11) |
 | `ready` | `blocked` | a dep reopened, or a replan added one | readiness (#11) |
 | `ready` | `claimed` | picked for dispatch, **before** the container is spawned | dispatcher (#21) |
-| `claimed` | `review` | branch pushed and PR opened (worker exit 0) | worker (#17) |
+| `claimed` | `review` | the worker's exit 0 observed, so its PR is open | reconciler (#148) |
 | `claimed` | `ready` | worker exit 1, attempts remain | reconciler (#22) |
 | `claimed` | `failed` | worker exit 1, attempts exhausted | reconciler (#22) |
 | `claimed` | `ready` | worker exit 2 (infrastructure) — attempt **not** consumed | reconciler (#22) |
 | `claimed` | `ready` | stale claim, no live container at startup — attempt consumed | recovery (#35) |
-| `claimed` | `review` | stale claim but an open PR exists (worker died after pushing) | recovery (#35) |
+| `claimed` | `review` | stale claim but an open PR exists (no cycle survived to observe the result) | recovery (#35) |
 | `review` | `done` | PR merged | reconciler (#23) |
 | `review` | `ready` | checks failed with attempts remaining, or PR closed unmerged | reconciler (#23) |
 | `review` | `failed` | checks failed, attempts exhausted | reconciler (#23) |
@@ -390,16 +390,20 @@ table as a specification:
 
 Rules the table does not show:
 
-- **The worker writes exactly one label, `swarm:review`, and never touches any
-  other.** It never writes the attempt counter and never marks itself done. The
-  container runs LLM-generated code with a push token
-  ([architecture-v2 §3](architecture-v2.md)); every label it does not need is
-  scope it does not get.
-- The worker writing that label at all is a deliberate trade: it knows the PR
-  exists at the instant it exists, and having the orchestrator discover it by
-  polling widens the window where a finished task looks claimed. The cost is that
-  a worker crashing between `git push` and the label leaves a claimed issue with
-  an open PR, which is why the recovery row above exists.
+- **The worker writes no label at all, and touches nothing else in the tracker
+  either** (#148). It never writes the attempt counter and never marks itself
+  done. The container runs LLM-generated code with a push token
+  ([architecture-v2 §3](architecture-v2.md)); every permission it does not need
+  is scope it does not get, and `issues:write` was the last one a label write was
+  keeping alive ([security §1](security.md)).
+- It used to write `swarm:review`, on the argument that it knows the PR exists at
+  the instant it exists while an orchestrator has to poll for it. That trade
+  stopped paying once the orchestrator stopped reading the label: it derives
+  `review` from the open pull request itself, so the label is a record of the
+  state rather than the state, and the reconciler writes it on the same exit 0 it
+  already observes. The recovery row above survives for the case it was always
+  for — an orchestrator that died with the claim outstanding, where no cycle is
+  left to observe anything.
 - `ready → claimed` happens **before** the spawn. A crash in that window leaves a
   claim with no container, recoverable by #35. The reverse order loses issues
   outright.

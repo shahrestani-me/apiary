@@ -453,8 +453,10 @@ def in_review(entry: Any, believed: Belief | None = None) -> bool:
     `APIARY_STATE_SOURCE=labels`.
 
     Both sides say the same thing in the ordinary case, and it is worth naming
-    which fact each is: the label is a record of `worker/pr.py` having opened a
-    pull request, and the derived state is that pull request being open now.
+    which fact each is: the label is a record of a cycle having *observed* a
+    worker open a pull request (`reconcile._verdict`, since #148 - before that
+    the worker wrote it itself), and the derived state is that pull request
+    being open now.
     """
     return state_of(entry, believed) == REVIEW
 

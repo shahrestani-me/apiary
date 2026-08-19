@@ -113,7 +113,7 @@ survives unchanged.
 | `swarm:ready` | dependencies met, may be dispatched | orchestrator |
 | `swarm:blocked` | waiting on another issue | orchestrator |
 | `swarm:claimed` | a worker container holds it now | orchestrator |
-| `swarm:review` | PR open, awaiting checks/review | worker |
+| `swarm:review` | PR open, awaiting checks/review | orchestrator (the worker's, until #148) |
 | `swarm:done` | PR merged | orchestrator |
 | `swarm:failed` | attempts exhausted, needs a human | orchestrator |
 | `swarm:attempt/1..3` | retry counter | orchestrator |
@@ -144,7 +144,7 @@ create (labeled apiary.run=<id>, apiary.issue=<n>)
   → read issue contract
   → edit loop against host Ollama
   → run Verify command
-  → commit, push, open PR, label swarm:review
+  → commit, push, open PR            (and nothing in the tracker: #148)
   → exit(0 = PR open, 1 = failed, 2 = infrastructure error)
 orchestrator observes exit code → disposes container → updates labels
 ```

@@ -8,7 +8,9 @@ Four claims from #17, each with a test that fails loudly if it stops holding:
   on both the client that can find it and the client that cannot;
 - the token reaches git through the environment and a credential helper, and
   appears in no argv, no `.git/config` and no error message;
-- the worker writes `swarm:review` and no other label.
+- **no tracker endpoint is reachable from this path at all** (#148), asserted as
+  an absence: a test that only checked that `swarm:review` still appears would
+  pass with the write still in place.
 
 Hermetic throughout. The GitHub side is `fixtures/github.py`'s scripted
 transport, the git side is `fixtures/repo.py`'s bare repository standing in for
@@ -19,6 +21,7 @@ between #16 and #17 - `swarm.worker.pr.publish(result, *, client)`, found by
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -36,7 +39,6 @@ from swarm.worker import pr as pr_module
 from swarm.worker.entrypoint import EXIT_INFRASTRUCTURE, EXIT_OK, WorkerResult, main
 from swarm.worker.pr import (
     CREDENTIAL_HELPER,
-    REVIEW_LABEL,
     TOKEN_ENV,
     PublishError,
     publish,
@@ -221,7 +223,7 @@ def result_at(root: Path, **overrides: Any) -> WorkerResult:
 
 @pytest.mark.usefixtures("worker_env")
 def test_publish_pushes_the_branch_and_opens_one_pr(fake_github, scratch_repo, finished):
-    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, [{"name": REVIEW_LABEL}]))
+    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()))
 
     published = publish(finished, client=gh)
 
@@ -232,7 +234,6 @@ def test_publish_pushes_the_branch_and_opens_one_pr(fake_github, scratch_repo, f
     assert transport.calls == [
         ("GET", f"/repos/{REPO}/pulls"),
         ("POST", f"/repos/{REPO}/pulls"),
-        ("POST", f"/repos/{REPO}/issues/{ISSUE}/labels"),
     ]
 
 
@@ -298,15 +299,12 @@ def test_a_second_run_updates_the_pr_it_can_find(fake_github, scratch_repo, tmp_
     publish(finished, client=first)
 
     second = attempt(scratch_repo, tmp_path / "attempt-2", GOOD_CALC, "swarm[add-sub]: retry")
-    gh, transport, _ = fake_github(response(200, pull()), response(200, []))
+    gh, transport, _ = fake_github(response(200, pull()))
 
     published = publish(second, client=can_list_pulls(gh, pull()))
 
     assert not published.created and published.number == 42
-    assert transport.calls == [
-        ("PATCH", f"/repos/{REPO}/pulls/42"),
-        ("POST", f"/repos/{REPO}/issues/{ISSUE}/labels"),
-    ]
+    assert transport.calls == [("PATCH", f"/repos/{REPO}/pulls/42")]
     # The body now describes this attempt, and the remote branch carries this
     # attempt's commit even though the two histories diverged.
     assert transport.sent[0].json()["title"] == "swarm[add-sub]: retry"
@@ -327,7 +325,7 @@ def test_a_second_run_opens_no_second_pr_without_the_listing_method(
     publish(finished, client=first)
 
     second = attempt(scratch_repo, tmp_path / "attempt-2", GOOD_CALC, "swarm[add-sub]: retry")
-    gh, transport, _ = fake_github(already_exists(), response(200, []))
+    gh, transport, _ = fake_github(already_exists())
     # `GitHubClient` now has the listing method, so the "cannot look" path has
     # to be asked for. It is still a real path - a client stubbed by a caller,
     # or a listing that 403s - and the 422 is what keeps the invariant then.
@@ -336,10 +334,7 @@ def test_a_second_run_opens_no_second_pr_without_the_listing_method(
     published = publish(second, client=gh)
 
     assert not published.created and published.number is None
-    assert transport.calls == [
-        ("POST", f"/repos/{REPO}/pulls"),
-        ("POST", f"/repos/{REPO}/issues/{ISSUE}/labels"),
-    ]
+    assert transport.calls == [("POST", f"/repos/{REPO}/pulls")]
     assert scratch_repo.remote_head(BRANCH) == second.commit
     # Loud, not silent: the PR body is one attempt behind until the listing
     # method lands.
@@ -488,38 +483,90 @@ def test_the_credential_helper_actually_answers(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# The one label
+# The tracker, and the absence of it
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("worker_env")
-def test_the_worker_writes_only_the_review_label(fake_github, finished):
-    """`docs/issue-contract.md` §4: one label, and `swarm:claimed` is not touched."""
-    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()), response(200, []))
+def test_the_worker_reaches_no_tracker_endpoint(fake_github, finished):
+    """#148: `publish` addresses the code host and nothing else.
 
-    published = publish(finished, client=gh)
+    Asserted as an absence, and on the *transport* rather than on the client,
+    because that is the claim - `docs/security.md` §1, "The worker's half". A
+    test that checked `swarm:review` still appears would pass with the write
+    still in place, since the label is now derived from this very pull request.
+    Every issue endpoint is one call: labels, comments, the body `PATCH`, close.
+    """
+    gh, transport, _ = fake_github(no_open_pulls(), response(201, pull()))
 
-    assert published.labelled
-    label_call = transport.sent[-1]
-    assert label_call.method == "POST"
-    assert label_call.json() == {"labels": [REVIEW_LABEL]}
-    assert "DELETE" not in {request.method for request in transport.sent}
+    publish(finished, client=gh)
+
+    assert transport.calls, "the publish made no request at all, so this proves nothing"
+    assert not [path for _, path in transport.calls if "/issues" in path]
+    # Nothing is removed either: `swarm:claimed` is the orchestrator's to move.
+    assert {"GET", "POST"} >= {request.method for request in transport.sent}
 
 
 @pytest.mark.usefixtures("worker_env")
-def test_a_label_that_does_not_stick_does_not_undo_the_pr(fake_github, finished, capsys):
-    """Exit 2 here would dispatch a second container over an open PR.
+def test_a_worker_whose_client_refuses_issue_calls_still_publishes(
+    fake_github, scratch_repo, finished
+):
+    """The absence again, from the other side: an issue call is now a failure.
 
-    Recovery (#35) can put `swarm:review` back by looking at the PR; nothing
-    can put back a PR that was never reported as opened.
+    `transport.calls` proves nothing was sent *this* run. This proves nothing
+    *would* be: the write path is gone rather than merely unexercised by these
+    fixtures, so a re-added `add_labels` call fails here even if some future
+    fixture happens to script a 200 for it.
     """
-    gh, _, _ = fake_github(no_open_pulls(), response(201, pull()), response(403, {"message": "Forbidden"}))
+    gh, _, _ = fake_github(no_open_pulls(), response(201, pull()))
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("the worker reached the tracker")
+
+    for method in ("add_labels", "remove_label", "update_issue", "create_issue_comment"):
+        setattr(gh, method, refuse)
 
     published = publish(finished, client=gh)
 
     assert published.created and published.number == 42
-    assert not published.labelled
-    assert REVIEW_LABEL in capsys.readouterr().err
+    assert scratch_repo.remote_head(BRANCH) == finished.commit
+
+
+def test_no_module_in_the_worker_package_names_a_tracker_write() -> None:
+    """The absence over the whole package, not just the path these tests run.
+
+    Static, and over attribute names, for the reason
+    `test_framework_boundary.py` gives for its own scan: the call that fires on
+    one code path is the one a runtime probe misses. Every write below is a
+    `GitHubClient` method, and a worker that grew one - to comment on its own
+    failure, say, which is a plausible and well-meant idea - fails here with the
+    ticket's argument attached rather than in review, or not at all.
+
+    Reads are deliberately absent from the set. `entrypoint` still calls
+    `get_issue` and `list_issue_comments` for the contract and the retry
+    feedback; #151 moves those behind the tracker MCP server, and `issues:read`
+    is why `security.WORKER_PERMISSIONS` is not empty of tracker scope yet.
+    """
+    writes = {
+        "add_labels",
+        "remove_label",
+        "create_issue",
+        "update_issue",
+        "create_issue_comment",
+    }
+    package = Path(pr_module.__file__).parent
+
+    found: dict[str, set[str]] = {}
+    for module in sorted(package.glob("*.py")):
+        names = {
+            node.attr
+            for node in ast.walk(ast.parse(module.read_text(encoding="utf-8")))
+            if isinstance(node, ast.Attribute)
+        }
+        if names & writes:
+            found[module.name] = names & writes
+
+    assert found == {}
 
 
 # --------------------------------------------------------------------------
@@ -559,7 +606,6 @@ def test_the_entrypoint_finds_and_calls_publish(fake_github, scratch_repo, tmp_p
         issue_response(),
         no_open_pulls(),
         response(201, pull()),
-        response(200, [{"name": REVIEW_LABEL}]),
     )
     editor = FakeEditor(WorkerOutput(edits=[FileEdit(path="calc.py", content=GOOD_CALC)]))
 
@@ -571,11 +617,12 @@ def test_the_entrypoint_finds_and_calls_publish(fake_github, scratch_repo, tmp_p
     )
 
     assert code == EXIT_OK
+    # The contract read is the one tracker call left on the whole worker path,
+    # and it is a `GET` (#151 moves it behind the tracker MCP server).
     assert transport.calls == [
         ("GET", f"/repos/{REPO}/issues/{ISSUE}"),
         ("GET", f"/repos/{REPO}/pulls"),
         ("POST", f"/repos/{REPO}/pulls"),
-        ("POST", f"/repos/{REPO}/issues/{ISSUE}/labels"),
     ]
     assert BRANCH in scratch_repo.remote_branches()
     assert f"Closes #{ISSUE}" in transport.sent[2].json()["body"]

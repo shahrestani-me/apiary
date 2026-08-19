@@ -3,9 +3,10 @@
 `entrypoint.py` stops at a verified commit inside a container that is about to
 be destroyed. This module gets that commit onto the remote and turns it into
 the one artefact the rest of the system reads: **exactly one open pull request
-per issue**, carrying `Closes #<n>` so the merge closes the issue, and the
-`swarm:review` label so the orchestrator knows a PR exists at the instant it
-does.
+per issue**, carrying `Closes #<n>` so the merge closes the issue. That pull
+request is the whole handover - the orchestrator derives `review` from it
+(`orchestrator/derived.py`), so there is nothing left for this module to
+announce.
 
 `publish(result, *, client=...)` is the whole surface, and its signature is
 fixed by `entrypoint._publish`, which probes for this module with `find_spec`
@@ -82,22 +83,29 @@ keeps the previous publish's verify output until the listing method lands.
 Nothing about that failure mode is silent: it is printed, and
 `Published.created` is False.
 
-## The one label
+## No tracker call, of any kind
 
-`docs/issue-contract.md` §4: the worker writes exactly one label,
-`swarm:review`, and never touches another. It does not remove `swarm:claimed` -
-the reconciler repairs a double state label by furthest-along-wins, and every
-label this container does not need is scope a bad generation cannot spend.
+This module used to write one label, `swarm:review`, immediately after opening
+the pull request - a tracker write issued from inside a container that is
+running model-generated code, which is the one thing `docs/security.md` is most
+careful about. #148 deleted it, and the argument is that it had stopped buying
+anything: `orchestrator/derived.py` reads `review` off *an open pull request
+whose head branch carries this task's ref*, so the pull request this function
+just opened **is** the state the label was announcing. Writing it as well only
+narrowed a window that no longer exists.
 
-The label is written *after* the PR exists, because it is the claim that a PR
-exists. A worker that dies in between leaves a claimed issue with an open PR,
-which is exactly the case #35's recovery repairs; a worker that labelled first
-would leave the opposite, which nothing can distinguish from a lie.
+What that removes is a permission, not a call. The credential a worker holds no
+longer needs `issues:write` (`security.WORKER_PERMISSIONS`), so a bad
+generation that got hold of it cannot relabel, comment on or close a work item
+in the tracker at all. The label itself has not gone anywhere - the orchestrator
+writes `claimed -> review` when it observes the exit 0 this publish produces
+(`reconcile._verdict`), from outside the container, on the credential that was
+always going to keep `issues:write` until #152 removes the label plane.
 
-A failure to label is reported, not raised. Raising would exit 2, hand the
-issue back as retryable, and dispatch a second container that force-pushes over
-a PR someone may already be reviewing - a worse outcome than a label the
-recovery pass can repair from the PR itself.
+So the only endpoints reachable from here are the code host's: `git push`, and
+`/pulls`. `tests/test_worker_pr.py` asserts that absence rather than the
+presence of the state, because a test that only checked that `review` still
+appears would pass with the write still in place.
 """
 
 from __future__ import annotations
@@ -112,9 +120,6 @@ from typing import Any, Mapping
 
 from ..github.client import GitHubClient, GitHubError, GitHubHTTPError
 from .entrypoint import OUTPUT_TAIL_CHARS, WorkerResult
-
-#: The only label this module writes (`docs/issue-contract.md` §4).
-REVIEW_LABEL = "swarm:review"
 
 #: The environment variable the credential helper reads the token out of. Its
 #: *name* is what lands in `argv`; its value never leaves the child process.
@@ -166,7 +171,6 @@ class Published:
     number: int | None = None
     url: str | None = None
     created: bool = False
-    labelled: bool = False
 
     def summary(self) -> str:
         what = "opened" if self.created else "updated"
@@ -379,17 +383,6 @@ def _already_open(exc: GitHubHTTPError) -> bool:
     return exc.status == 422 and "already exist" in str(exc).lower()
 
 
-def _apply_review_label(client: GitHubClient, issue: int) -> bool:
-    """Add `swarm:review`, and only that. False means it did not stick."""
-    try:
-        client.add_labels(issue, [REVIEW_LABEL])
-    except GitHubError as exc:
-        print(f"! the PR is open but {REVIEW_LABEL} did not stick on #{issue}: {exc}",
-              file=sys.stderr)
-        return False
-    return True
-
-
 # --------------------------------------------------------------------------
 # The handover
 # --------------------------------------------------------------------------
@@ -439,7 +432,6 @@ def publish(
         number=_int_or_none((payload or {}).get("number")),
         url=(payload or {}).get("html_url"),
         created=created,
-        labelled=_apply_review_label(client, result.issue),
     )
     print(f"» {published.summary()}")
     return published

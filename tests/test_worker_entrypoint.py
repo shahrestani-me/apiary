@@ -135,11 +135,14 @@ def issue(number: int = ISSUE, **kwargs: Any):
 
 
 def publishes(number: int = 42):
-    """The three further responses a *verified* run needs, now that #17 landed.
+    """The two further responses a *verified* run needs, now that #17 landed.
 
     A run that passes its gate no longer stops at the commit: `_publish` opens
-    the PR and applies `swarm:review`. Scripting them is what keeps these tests
-    about the entrypoint rather than about how far the seam had got.
+    the PR. Scripting that is what keeps these tests about the entrypoint rather
+    than about how far the seam had got.
+
+    Two rather than three since #148: the label write that used to follow the
+    create is gone, and with it the last tracker write on the worker path.
     """
     return (
         # The lookup for an existing PR comes first: `GitHubClient` grew
@@ -147,7 +150,6 @@ def publishes(number: int = 42):
         # than degrading to None.
         response(200, []),
         response(201, {"number": number, "html_url": f"https://example.invalid/pull/{number}"}),
-        response(200, [{"name": "swarm:review"}]),
     )
 
 
@@ -243,14 +245,13 @@ def test_verified_task_produces_a_commit(fake_github, scratch_repo, workspace):
     assert work.head() != base
     assert work.subjects()[0].startswith("swarm[add-sub]:")
     assert work.read("calc.py") == GOOD_CALC
-    # Read the contract, open the PR, apply the review label - in that order,
-    # and nothing else. The label goes on last because a `swarm:review` issue
-    # with no PR behind it is a state the reconciler cannot act on.
+    # Read the contract, open the PR - in that order, and nothing else. No
+    # label: since #148 the worker makes no tracker write at all, and the
+    # orchestrator writes `claimed -> review` when it observes this exit 0.
     assert transport.calls == [
         ("GET", f"/repos/{gh.repo}/issues/{ISSUE}"),
         ("GET", f"/repos/{gh.repo}/pulls"),
         ("POST", f"/repos/{gh.repo}/pulls"),
-        ("POST", f"/repos/{gh.repo}/issues/{ISSUE}/labels"),
     ]
 
 
