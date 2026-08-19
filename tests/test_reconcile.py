@@ -2175,8 +2175,17 @@ TASK_REF = f"task-{TASK_ISSUE}"
 TASK_BRANCH = task_branch(ref(TASK_ISSUE), 0)
 TASK_PULL = 900
 
+#: The second task `alongside` adds, its branch and its pull request. Four
+#: digits, for `TASK_ISSUE`'s stated reason, and far enough from it that a
+#: reader of a payload can tell the two tasks apart at a glance.
+OTHER_ISSUE = 4343
+OTHER_BRANCH = task_branch(ref(OTHER_ISSUE), 0)
+OTHER_PULL = 901
 
-def a_lifecycle_run(label: str = READY) -> tuple[LifecycleClient, FakeFleet, Reconciler, list]:
+
+def a_lifecycle_run(
+    label: str = READY, *, alongside: bool = False
+) -> tuple[LifecycleClient, FakeFleet, Reconciler, list]:
     """One task, labelled the way the planner actually creates a dep-free one.
 
     `swarm:ready`, not `swarm:blocked` - `nodes/planner.py` writes the state
@@ -2185,9 +2194,41 @@ def a_lifecycle_run(label: str = READY) -> tuple[LifecycleClient, FakeFleet, Rec
     verbatim from #141, never produces a readiness *transition* at all. A
     fixture that seeded `swarm:blocked` would test a shape the planner only
     emits for a task that has dependencies.
+
+    `alongside` adds a **second** task, one stage further on: its worker
+    published a green pull request and exited, so `OTHER_PULL` is open and its
+    container is still there. Off by default, because the callers of this
+    fixture - here and the fourteen in `tests/test_shadow.py` - assert on the
+    announcements of a one-task run, and a second task would put its own
+    lifecycle into every one of them.
+
+    It is here for the cutover pair in `tests/test_authority.py`, which #202
+    found could not fail on a `plan_reconcile` regression. Over a one-task run
+    two of the four things `test_authority.outcome` compares are `[]` in every
+    arm whatever the orchestrator decided: nothing is open to merge, and the
+    cycle that could dispose a container runs before the one task is ever
+    dispatched, so `apply_plan`'s disposal loop never has a handle to remove.
+    This second task makes both live. The merge gate lands its pull request on
+    the first cycle it sees it, and `Belief.landed` is a ratchet - so from the
+    next cycle on the task is terminal with a container still against it, which
+    is a disposal.
     """
     client = LifecycleClient(issues={TASK_ISSUE: issue_payload(TASK_ISSUE, label=label)})
     fleet = FakeFleet()
+    if alongside:
+        client.issues[OTHER_ISSUE] = issue_payload(OTHER_ISSUE, label=REVIEW)
+        client.open_pulls = ((OTHER_PULL, OTHER_BRANCH),)
+        client.check_runs = {client.head_of(OTHER_PULL): green()}
+        # The state is left empty, which `Handle.running` reads as false: this
+        # is the exited container of a worker that has already published. A
+        # `running` one would resolve the task `claimed` and the merge gate
+        # would leave its pull request alone, which is not what an open pull
+        # request means. The disposal loop still has a handle either way:
+        # `Reconciler.cycle` passes `running=` the containers that *exist*,
+        # which is the distinction `plan_dispatch` is written about.
+        fleet.handles[OTHER_ISSUE] = Handle(
+            id=f"{OTHER_ISSUE:0>64x}", run_id=RUN_ID, issue=OTHER_ISSUE
+        )
     seen, emit = recorder()
     return client, fleet, reconciler(client, fleet, events=emit), seen
 

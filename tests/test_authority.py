@@ -91,6 +91,8 @@ from swarm.worker.result import write_result
 
 from test_goal import Says, met  # the goal gate's scripted oracle
 from test_reconcile import (  # the doubles that drive a real cycle
+    OTHER_ISSUE,
+    OTHER_PULL,
     TASK_ISSUE,
     TASK_PULL,
     a_lifecycle_run,
@@ -143,6 +145,15 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
     the label it is wearing - which is the point of `Transition.from_label`
     staying the real label. What has to match is the containers, the merges and
     the state the issue ends the cycle in.
+
+    Two of the four are only live when the run has something to dispose and
+    something to merge, which is what `a_run(alongside=True)` is for: over a
+    one-task run `fleet.disposed` and `client.merges` are `[]` in every arm,
+    and a comparison of two dead slots is a comparison of dispatch and
+    readiness alone (#202). The first slot stays one issue's rather than the
+    run's - the other three already speak for every task, and the label a
+    second task ends on is asserted where it is edited rather than folded in
+    here, where it would read as `TASK_ISSUE`'s.
     """
     return (
         sorted(client.labels_on(TASK_ISSUE)),
@@ -152,22 +163,49 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
     )
 
 
-def a_run(label: str, source: str, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any]:
+def a_run(
+    label: str,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    alongside: bool = False,
+) -> tuple[Any, Any, Any]:
     """One cycle the orchestrator has already seen, then a human edits a label.
 
     Two cycles, and the first one matters: `authority.believe`'s `remembered` falls back to
     the label for a task this process has never seen, so an edit made before the
     first cycle would be seeding rather than overriding. #147's criterion is
     about a label edited **mid-run**, and this is what mid-run means.
+
+    `alongside` runs the same two cycles over `a_lifecycle_run`'s two-task
+    world, and the edit moves **every** issue in the run onto `label` - one
+    human relabelling a run rather than one issue. When the second cycle's
+    `plan_reconcile` runs, the second task is the only one carrying a container
+    - this run's own task is dispatched later in the same cycle - so it is the
+    only issue whose hand-edited label a disposal rule has to read.
+
+    **What the loop buys, measured rather than argued.** With `plan_reconcile`
+    reverted to `entry.state_label`, the `outcome()` equality below catches the
+    regression on `swarm:done` and `swarm:failed` only. Relabel `TASK_ISSUE`
+    alone and that equality is blind on all five, which is the state #202 found
+    this in - so this loop is the whole of the *equality's* sensitivity, and
+    that is a narrower claim than the whole of the pair's. The other three arms
+    go red on the liveness assertions instead, and those do not depend on this
+    loop at all: under the regression the baseline disposes nothing, so
+    `fleet.disposed == [OTHER_ISSUE]` fails whatever was relabelled. See #228 -
+    an equality that is still blind on three of five arms is not yet the
+    argument #202 wanted it to be. Under the resolver the edit must still change
+    nothing.
     """
     monkeypatch.setenv(STATE_SOURCE_ENV, source)
-    client, fleet, loop, seen = a_lifecycle_run(label=READY)
+    client, fleet, loop, seen = a_lifecycle_run(label=READY, alongside=alongside)
     # No fleet for the first cycle, so it settles the task without dispatching
     # it and the comparison below is between two second cycles.
     loop.fleet = None
     loop.cycle()
 
-    client.issues[TASK_ISSUE]["labels"] = [{"name": label}]
+    for number in client.issues:
+        client.issues[number]["labels"] = [{"name": label}]
     loop.fleet = fleet
     loop.cycle()
     return client, fleet, seen
@@ -253,17 +291,44 @@ def test_a_hand_edited_label_is_reported_even_when_the_cycle_repairs_it(monkeypa
 def test_no_wrong_label_changes_a_decision_under_the_resolver(label, monkeypatch):
     """The completeness test, and the one that fails if a path forgets.
 
-    Five of the six labels, each edited onto a task whose world plainly says
-    `eligible`, each asserted to produce the decisions of a run whose label was
-    never touched. Readiness, dispatch and reconcile all run in every arm, so a
-    decision path that still read `entry.state_label` would have to agree with
-    the resolver on all five to hide here - and `swarm:done` and `swarm:review`
-    disagree with `eligible` in different modules.
+    Five of the six labels, each written over a run whose world plainly
+    disagrees with it, each asserted to produce the decisions of a run whose
+    labels were never touched. Readiness, dispatch and reconcile all run in
+    every arm, so a decision path that still read `entry.state_label` would
+    have to agree with the resolver on all five to hide here - and `swarm:done`
+    and `swarm:review` disagree with the world in different modules.
+
+    The run has two tasks for #202's reason. `outcome()` compares four things,
+    and over a one-task run two of them - the containers disposed and the pull
+    requests merged - are `[]` in every arm whatever was decided, so the
+    equality was evidence about dispatch and readiness and nothing else. The
+    second task carries a container and an open pull request,
+    which puts both back in play. With `plan_reconcile` reverted to
+    `entry.state_label` the whole parametrization goes red: the equality on
+    `swarm:done` and `swarm:failed`, which read as terminal and dispose the
+    container the baseline keeps, and the liveness assertion on the other three,
+    because that baseline no longer disposes anything at all.
+
+    Those two are not equally good evidence, and #228 is open about it: on three
+    of five arms the *equality* - the sentence that actually states #147's
+    criterion - still cannot fail, and a fixture guard is what turns them red.
+    Five red arms here are not yet five covered paths.
     """
-    baseline = a_run(READY, DERIVED, monkeypatch)
-    edited = a_run(label, DERIVED, monkeypatch)
+    baseline = a_run(READY, DERIVED, monkeypatch, alongside=True)
+    edited = a_run(label, DERIVED, monkeypatch, alongside=True)
 
     assert outcome(*edited[:2]) == outcome(*baseline[:2])
+    # And the three things that equality needed to mean anything, because each
+    # of them is a line somebody could take out without a test going red and
+    # leave #202 exactly where it started. Two live slots: a container was
+    # disposed and a pull request was merged, so the comparison ran over four
+    # components rather than two. And the edit reached the task carrying that
+    # container - relabelling `TASK_ISSUE` alone leaves the disposal rule
+    # reading the same label in both arms, which is what made this blind.
+    client, fleet, _ = baseline
+    assert fleet.disposed == [OTHER_ISSUE]
+    assert client.merges == [OTHER_PULL]
+    assert edited[0].labels_on(OTHER_ISSUE) == {label}
 
 
 # --------------------------------------------------------------------------
@@ -286,15 +351,25 @@ def test_the_flag_puts_every_one_of_those_decisions_back(label, monkeypatch):
     behaviour rather than a hole in the new one: readiness owns both waiting
     states and recomputed them from the dependency graph every cycle, so the
     label machine already repaired that one by itself.
+
+    Two tasks, for the reason its inverse above is run over two - the two
+    baselines have to be the same world or the inequality is a statement about
+    the fixtures. It buys a second thing here: the old behaviour reaches the
+    container as well as the dispatcher, and the last assertion below says
+    which arms that is true of.
     """
-    baseline = a_run(READY, LABELS, monkeypatch)
-    edited = a_run(label, LABELS, monkeypatch)
+    baseline = a_run(READY, LABELS, monkeypatch, alongside=True)
+    edited = a_run(label, LABELS, monkeypatch, alongside=True)
 
     assert outcome(*edited[:2]) != outcome(*baseline[:2])
     # And the specific old behaviour, not merely "something differs": the label
     # says this task is in flight or finished, so nothing spawns.
     assert edited[1].spawned == []
     assert edited[0].labels_on(TASK_ISSUE) == {label}
+    # And the label decides the container too: `swarm:done` and `swarm:failed`
+    # are terminal to a label reader, so the second task's container goes with
+    # them, while `swarm:claimed` reads as a worker still holding it.
+    assert edited[1].disposed == ([] if label == CLAIMED else [OTHER_ISSUE])
 
 
 def test_under_labels_a_review_label_with_no_pull_request_is_charged(monkeypatch):
