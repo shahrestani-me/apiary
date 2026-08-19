@@ -975,3 +975,121 @@ def test_a_named_block_that_is_not_there_is_a_refusal_and_not_a_silent_fallback(
     """The misconfiguration that would otherwise present as a tracker being ignored."""
     with pytest.raises(ContractError, match="no such file"):
         view_for(Refuser(), path=str(tmp_path / "absent.yaml"), env={})
+
+
+# --------------------------------------------------------------------------
+# Who mints a task ref out of a raw payload (#260)
+# --------------------------------------------------------------------------
+#
+# `mcp/tracker.py` hands intake's payloads on untouched, and they are read by the
+# GitHub adapter above. On a GitHub tracker that is invisible. On any other one it
+# is two ref vocabularies in one cycle: the contract says the ref is
+# `intake.ref` - `identifier` on Linear, which `contract.task_ref` checks is
+# branch-safe - while the sites below independently mint `#42` from a `number`
+# field the payload may not even carry. Branches are `apiary/<ref>-attempt-N`, so
+# a disagreement there is a branch that parses back as a different task.
+#
+# **This is a ratchet, not the fix.** #260 draws the normalisation boundary, and
+# it cannot be drawn until #152 has removed the label reads that would otherwise
+# be inside it. What this does is stop a fifth site appearing in the meantime, and
+# hand #260 an exact inventory instead of a grep - which is what the four entries
+# below are for. Each says what a non-GitHub payload does to it.
+#
+# The distinction the scan has to encode: eleven call sites match
+# `task_ref(int(...))`, and seven of them mint from `handle.issue` or
+# `failure.number` - apiary's own container and dispatch records, not a tracker
+# payload. A check that fired on all eleven would be a check somebody switches
+# off. Only a subscript with a *literal string key* counts, because that is what
+# "reads a payload field by name" means.
+
+#: The payload fields a mint may read, keyed to the site, with what a non-GitHub
+#: tracker does to it. Written out rather than counted: #260's own evidence listed
+#: three of these four, and the missing one is the earliest of them in a cycle.
+PAYLOAD_MINTS: dict[tuple[str, str], str] = {
+    ("github/ledger.py", "number"): (
+        "a `## Blocked by` reference. The contract has no capability for "
+        "resolving one, so a non-GitHub ref here is unresolvable rather than "
+        "merely mis-minted"
+    ),
+    ("github/readiness.py", "number"): (
+        "`IssueState.from_payload` and `resolve_states`' listing. The first of "
+        "the four a payload reaches in a cycle, and the one #260's evidence "
+        "omits"
+    ),
+    ("orchestrator/reconcile.py", "number"): (
+        "`Snapshot.labels`, which is **core** rather than adapter - the one site "
+        "that breaks ADR 0001's rule that nothing above the adapter takes a ref "
+        "apart, and so the first one #260 should move"
+    ),
+}
+
+
+def _payload_mints() -> set[tuple[str, str]]:
+    """Every `task_ref(...)` whose argument reads a field by name, as (file, field).
+
+    A `Subscript` with a string-constant slice anywhere inside the call's
+    arguments. `handle.issue` and `failure.number` are attribute reads and do not
+    match, which is the whole point - see the note above.
+    """
+    found: set[tuple[str, str]] = set()
+    for path in sorted(SOURCE.rglob("*.py")):
+        rel = str(path.relative_to(SOURCE))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            if node.func.id != "task_ref":
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Subscript)
+                    and isinstance(inner.slice, ast.Constant)
+                    and isinstance(inner.slice.value, str)
+                ):
+                    found.add((rel, inner.slice.value))
+    return found
+
+
+def test_only_the_known_sites_mint_a_ref_out_of_a_payload():
+    """A fifth site is a fifth place a non-GitHub tracker mints the wrong ref.
+
+    Failing here means either a new mint was added - move it behind whatever #260
+    settles on instead - or one was removed, in which case delete its entry and
+    enjoy the shorter list.
+    """
+    assert _payload_mints() == set(PAYLOAD_MINTS), (
+        "the set of payload-sourced ref mints changed; see PAYLOAD_MINTS above"
+    )
+
+
+def test_every_known_mint_says_what_a_non_github_payload_does_to_it():
+    """An inventory with a blank entry is a list, and #260 needs the reasons."""
+    for site, why in PAYLOAD_MINTS.items():
+        assert why.strip(), f"{site} is inventoried with no consequence written down"
+
+
+def test_the_scan_ignores_a_ref_minted_from_apiary_s_own_records():
+    """The negative control, and the reason this check is narrow enough to keep.
+
+    Seven live call sites mint from `handle.issue` or `failure.number`. Those are
+    apiary's own bookkeeping - a `Handle` carries the number `spawn` was given -
+    so they are a different question from reading a tracker's payload, and a scan
+    that flagged them would be a scan somebody turns off rather than narrows.
+    """
+    module = ast.parse(
+        "def f(handle, failure, payload):\n"
+        "    a = task_ref(int(handle.issue))\n"
+        "    b = task_ref(int(failure.number))\n"
+        "    c = task_ref(int(payload['number']))\n"
+    )
+    found = {
+        inner.slice.value
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "task_ref"
+        for inner in ast.walk(node)
+        if isinstance(inner, ast.Subscript) and isinstance(inner.slice, ast.Constant)
+    }
+
+    # The attribute reads are invisible to it; only the subscript is seen.
+    assert found == {"number"}
