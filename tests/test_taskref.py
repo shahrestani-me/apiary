@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from swarm.github.refs import issue_number, task_ref
-from swarm.taskref import TaskRef
+from swarm.github.refs import issue_number, pull_number, pull_ref, task_ref
+from swarm.taskref import PullRef, TaskRef
 
 
 # --------------------------------------------------------------------------
@@ -37,6 +37,18 @@ def test_an_empty_or_padded_ref_is_refused_at_construction(value):
     """The alternative is a graph node nothing resolves, found much later."""
     with pytest.raises(ValueError):
         TaskRef(value)
+
+
+@pytest.mark.parametrize("value", ["", " ", "#42 ", " #42"])
+def test_an_empty_or_padded_pull_ref_is_refused_at_construction(value):
+    """`PullRef` shipped in #185 with this branch never executed by a test.
+
+    The same guard as its twin above, and it matters for the same reason: a
+    padded value reaches `PUT /pulls/{n}/merge` as a URL nobody can read back,
+    and the failure surfaces at the API rather than at the construction.
+    """
+    with pytest.raises(ValueError):
+        PullRef(value)
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +111,23 @@ def test_a_ref_another_adapter_minted_is_refused_rather_than_guessed():
     """Addressing some unrelated issue in this repository is the worse failure."""
     with pytest.raises(ValueError, match="not minted by the GitHub adapter"):
         issue_number(TaskRef("ENG-123"))
+
+
+def test_a_pull_ref_another_adapter_minted_is_refused_rather_than_guessed():
+    """The twin of the case above, and dead in the suite until now.
+
+    Un-minting a pull ref is ordinary rather than a smell - ADR 0001 keeps the
+    code host GitHub-shaped - but "ordinary" is not "unchecked": a value some
+    other adapter spelled would address an unrelated pull request in this
+    repository, which is the same worse-failure this guard exists for.
+    """
+    with pytest.raises(ValueError, match="not minted by the GitHub adapter"):
+        pull_number(PullRef("ENG-123"))
+
+
+def test_a_pull_ref_round_trips_through_its_minter():
+    """The property the type exists for: it can be handed back to the API."""
+    assert pull_number(pull_ref(7)) == 7
 
 
 # --------------------------------------------------------------------------
