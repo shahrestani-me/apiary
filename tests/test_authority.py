@@ -39,6 +39,7 @@ keep in step with the loop.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ from typing import Any
 import pytest
 
 from swarm.artifacts import STATE_OVERRIDE, DivergenceTally
+from swarm.github.ledger import load_ledger
 from swarm.github.readiness import BLOCKED, READY, compute_readiness
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.authority import (
@@ -60,6 +62,7 @@ from swarm.orchestrator.authority import (
     UNRESOLVED,
     Belief,
     Grant,
+    Remembered,
     believe,
     state_source,
 )
@@ -773,7 +776,20 @@ def test_a_task_this_run_has_seen_land_is_never_dispatched_again():
     # first is this run remembering its own merge; the second is a fresh process
     # with nothing but the label, which is the restart case and the reason the
     # seed exists at all.
-    held = believe(ledger(merged), world_after_the_merge, remembered={"task-4": LANDED})
+    #
+    # The remembered value is a `Remembered` rather than a bare `"landed"`, and
+    # that is not ceremony: since #201 only a state this process actually
+    # *believed*, about this very work item, seeds the ratchet, and a real cycle
+    # carries exactly this - `believe` mints them and `Belief.fold`/`hold` carry
+    # them through `Reconciler._carry_forward`. The bare string is what the
+    # `UNRESOLVED` label fallback leaves behind, and it deliberately no longer
+    # counts; `test_a_label_the_resolver_had_no_verdict_for_does_not_pin_a_task`
+    # is that half.
+    held = believe(
+        ledger(merged),
+        world_after_the_merge,
+        remembered={"task-4": Remembered(LANDED, ref(4))},
+    )
     resumed = believe(ledger(merged), world_after_the_merge)
 
     assert held.state("task-4") == LANDED
@@ -1117,3 +1133,311 @@ def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
     # is a string in a prompt, so "unchanged" has to mean the same characters.
     _, unchanged = brief(book, verdict)
     assert "task-4 (swarm:failed):" in unchanged
+
+
+# --------------------------------------------------------------------------
+# 8. The ratchet has no lapse, so its entry points are its whole safety (#201)
+# --------------------------------------------------------------------------
+#
+# `landed-stands` is the only overlay above that re-tests nothing: its input is
+# its own previous output, carried through `Reconciler._carry_forward` and read
+# back as `remembered`. That is defensible on "a merge cannot be taken back",
+# and it makes every *entry* into `landed` a permanent, silent decision - so
+# every test here drives the **silent** direction. A task wrongly pinned
+# `landed` produces no transition, no comment and no event; it is simply never
+# dispatched and never escalated, and a run ends reporting work as shipped that
+# nothing ever ran. Asserting that an ordinary merge still ratchets proves none
+# of that, which is why each test below ends on a dispatch plan.
+
+
+def dispatchable(book: Any, held: Belief, *refs: Any) -> tuple[int, ...]:
+    """Which of these tasks the dispatcher would actually put on the fleet.
+
+    The assertion every test in this section ends on. `Belief.state` is what the
+    bug is *about*, but a state nobody acts on is not a defect - the failure
+    being pinned down here is a worker spawned over merged code, or a task that
+    silently never runs again, and only the plan says which happened.
+    """
+    return plan_dispatch(
+        book,
+        capacity=Capacity(slots=3, configured=3),
+        ready=refs,
+        believed=held,
+    ).numbers
+
+
+def test_a_label_the_resolver_had_no_verdict_for_never_pins_a_task():
+    """The `UNRESOLVED` arm may decide a cycle; it may not decide the run.
+
+    That arm writes `entry.state_label` into the belief because there is nothing
+    else to write - "the resolver said nothing" is not an opinion, and the label
+    is the only record left. Harmless for one cycle. The defect was that the
+    value was then carried forward like any other and could not be told from a
+    verdict, so a `swarm:done` on a task the resolver has no opinion about
+    entered the ratchet and pinned it for the life of the process: **a label
+    reaching a decision nothing can undo**, which is the exact seam #147 closed
+    everywhere else.
+
+    Driven the way it actually happens rather than by handing `believe` a map,
+    and **mid-run**, which is what makes it a different fact from the first-sight
+    seed below: three cycles, a human typing `swarm:done` onto a live task in the
+    second, and a resolver that has no verdict for it on the cycle that matters.
+    """
+    task = entry(4, label=READY)
+    book = ledger(task)
+
+    # Cycle one: an ordinary task this process has now seen.
+    seen = believe(book, world(task))
+    assert seen.state("task-4") == ELIGIBLE
+
+    # Cycle two: a human types `swarm:done` onto it, and this is one of the
+    # cycles the observation has nothing to say about the task - a stack with no
+    # image, a listing that came back without it. The label stands in, which is
+    # the documented fallback and is harmless for one cycle.
+    typed = ledger(entry(4, label=DONE))
+    silent = believe(typed, world(), remembered=dict(seen.states))
+    assert silent.state("task-4") == LANDED
+    assert [one.kind for one in silent.overrides] == [UNRESOLVED]
+
+    # Cycle three: the resolver has an opinion again, and it is `eligible`. The
+    # label never became a belief, so there is nothing for the ratchet to stand
+    # on and the task runs.
+    after = believe(typed, world(task), remembered=dict(silent.states))
+
+    assert after.state("task-4") == ELIGIBLE
+    # One override, and it is the plain kind: the label is stale, which is
+    # ordinary and is reported. What must not be here is `landed-stands`.
+    assert [one.kind for one in after.overrides] == [""]
+    assert dispatchable(typed, after, ref(4)) == (4,)
+
+
+def test_a_cycle_with_no_verdict_does_not_drop_a_ratchet_it_did_not_test():
+    """The other direction of the same arm, and the one that would be a
+    regression rather than a fix.
+
+    "The resolver returned nothing this cycle" is not evidence that a merge was
+    undone. If a silent cycle overwrote the belief with the label, the ratchet
+    would be at the mercy of whatever `swarm:*` string the issue happens to be
+    wearing on the next cycle the resolver *does* answer - which is the label
+    deciding again, one step further along.
+    """
+    merged = entry(4, label=DONE)
+    book = ledger(merged)
+
+    landed = believe(book, world(merged), remembered={"task-4": Remembered(LANDED, ref(4))})
+    assert landed.state("task-4") == LANDED
+
+    silent = believe(book, world(), remembered=dict(landed.states))
+    resumed = believe(book, world(merged), remembered=dict(silent.states))
+
+    assert silent.state("task-4") == LANDED
+    assert resumed.state("task-4") == LANDED
+    assert dispatchable(book, resumed, ref(4)) == ()
+
+
+def adopted_issue(number: int, *, title: str, label: str = READY) -> dict[str, Any]:
+    """A hand-written issue: a legal contract body with **no identity marker**.
+
+    The marker is what makes an id stable, so an issue without one is the only
+    kind whose id `ledger._adopted_id` has to invent - and inventing it is where
+    the reuse below comes from.
+    """
+    return {
+        "number": number,
+        "title": title,
+        "state": "open",
+        "labels": [{"name": label}],
+        "body": (
+            "## Goal\nDo the thing.\n\n"
+            f"## Files\n- src/mod{number}.py\n\n"
+            "## Verify\npython -m pytest -q\n\n"
+            "## Blocked by\n_none._\n"
+        ),
+    }
+
+
+class Tracker:
+    """The one call `load_ledger` makes when it is not allowed to write."""
+
+    def __init__(self, *issues: dict[str, Any]) -> None:
+        self.issues = list(issues)
+
+    def list_issues(self, *, state: str = "open", **_: Any) -> list[dict[str, Any]]:
+        return [dict(issue) for issue in self.issues]
+
+
+def test_an_adopted_id_minted_for_another_issue_does_not_inherit_landed():
+    """`remembered` is keyed by task id, and a task id is not a durable name.
+
+    `ledger._adopted_id` derives a hand-written issue's id from its title and
+    disambiguates collisions by *order*: the first taker gets the bare slug and
+    later ones get `<slug>-<number>`. So the bare slug is not owned - it is
+    leased, and it moves to the next issue in line the moment the holder leaves
+    `Ledger.entries`. This drives that for real rather than asserting on a
+    hand-built map: one cycle where `a-task` is #7, then a human breaks #7's
+    contract, and the very same string now names #9.
+
+    Without the ref carried alongside, #9 inherits #7's `landed` and is **never
+    dispatched and never escalated** - the quietest failure in this module,
+    because `landed` emits no transition and, once the ratchet is standing, no
+    event either.
+    """
+    first = adopted_issue(7, title="Add a retry", label=DONE)
+    second = adopted_issue(9, title="Add a retry")
+
+    before = load_ledger(Tracker(first, second), adopt=False)
+    assert sorted(before.entries) == ["add-a-retry", "add-a-retry-9"]
+    assert before.entries["add-a-retry"].ref == ref(7)
+
+    # A human edits #7 and drops a required section. §1.4's policy is that the
+    # issue lands in `Ledger.errors` and never in `entries` - so the lease on
+    # the bare slug is up, and #9 takes it.
+    broken = dict(first, body="## Goal\nDo the thing.\n")
+    after = load_ledger(Tracker(broken, second), adopt=False)
+    assert after.entries["add-a-retry"].ref == ref(9)
+
+    # What the previous cycle carried: #7, believed landed, under the id it held
+    # at the time.
+    carried = {"add-a-retry": Remembered(LANDED, ref(7))}
+    now = believe(after, world(*after.entries.values()), remembered=carried)
+
+    assert now.state("add-a-retry") == ELIGIBLE
+    assert [one.kind for one in now.overrides] == []
+    assert dispatchable(after, now, ref(9)) == (9,)
+
+    # And the same memory still pins the task it is actually about, which is
+    # what makes the assertion above about identity rather than about the
+    # ratchet having been weakened.
+    still = believe(before, world(*before.entries.values()), remembered=carried)
+    assert still.state("add-a-retry") == LANDED
+    assert dispatchable(before, still, ref(7), ref(9)) == (9,)
+
+
+def test_a_revival_cannot_clear_a_merge():
+    """`Reconciler._carry_forward` applies its revival overlay unconditionally.
+
+    `{task: ELIGIBLE for task in revived_tasks(report)}` goes through
+    `Belief.hold` after the fold, and before #201 it could silently clear the one
+    fact the ratchet exists to make unundoable - after which the next cycle's
+    resolver, which cannot see a merged pull request, reads `eligible` and a
+    worker goes onto code that is already on the default branch.
+
+    **Reachability, which #201 left open.** The goal gate is not a route: since
+    #205 `goal._revive_abandoned` selects `abandoned(ledger, believed)`, which is
+    `needs-human`, and `landed` never reads as that. The replan is: `_update`
+    still selects its revival on `entry.state_label == FAILED` and takes no
+    belief at all, so a `swarm:done` issue a human relabels `swarm:failed`
+    mid-run - which the ratchet keeps believing landed, correctly - is revived by
+    any replan that keeps the task. That selector is pinned below, because the
+    guard here is only worth what the argument for needing it is worth.
+    """
+    from swarm.nodes.planner import _update
+
+    assert "believed" not in inspect.signature(_update).parameters
+
+    merged = entry(4, label=DONE)
+    book = ledger(merged)
+    held = believe(book, world(merged), remembered={"task-4": Remembered(LANDED, ref(4))})
+    assert held.state("task-4") == LANDED
+
+    revived = held.hold({"task-4": ELIGIBLE})
+
+    assert revived.state("task-4") == LANDED
+    # The label really did move - `planner.revive` writes `swarm:ready` - and the
+    # belief saying otherwise is the disagreement, not a lost write.
+    assert revived.stored["task-4"] == ELIGIBLE
+    assert dispatchable(book, revived, ref(4)) == ()
+
+    # And it survives the carry, which is the half that matters: a guard that
+    # held for one cycle and was forgotten by the next would only move the
+    # dispatch one cycle later.
+    later = believe(book, world(merged), remembered=dict(revived.states))
+    assert later.state("task-4") == LANDED
+    assert dispatchable(book, later, ref(4)) == ()
+
+
+def test_a_ratchet_that_keeps_standing_stops_announcing_itself():
+    """One `state.override` for the fact, not one per cycle for the run's length.
+
+    Every other kind here re-tests its input each cycle, so a repeat of one of
+    them is news: the store was read again, the streak was counted again, a
+    dispatch spent a grant. `landed-stands` re-tests nothing, so left alone it
+    contributes one event per landed task per remaining cycle and
+    `DivergenceTally.overrides` becomes a measure of how long the run lasted.
+    That number is exactly what an operator reads as "the cutover is
+    misbehaving", so the one signal that says the cutover is *working* would be
+    indistinguishable from the alarm.
+    """
+    merged = entry(4, label=DONE)
+    book = ledger(merged)
+
+    cycles: list[Belief] = []
+    carried: dict[str, str] = {"task-4": Remembered(LANDED, ref(4))}
+    for _ in range(4):
+        held = believe(book, world(merged), remembered=carried)
+        cycles.append(held)
+        carried = dict(held.states)
+
+    assert [one.state("task-4") for one in cycles] == [LANDED] * 4
+    # Announced once, on the cycle it started standing.
+    assert [[one.kind for one in held.overrides] for held in cycles] == [
+        [LANDED_STANDS],
+        [],
+        [],
+        [],
+    ]
+
+    tally = DivergenceTally.from_events(
+        [
+            {"event": STATE_OVERRIDE, "task": one.task_id, "kind": one.kind}
+            for held in cycles
+            for one in held.overrides
+        ]
+    )
+    assert tally.overrides == 1
+    assert tally.override_kinds == ((LANDED_STANDS, 1),)
+
+
+def test_the_first_sight_seed_is_the_label_and_the_contract_says_so():
+    """The one entry point #201 deliberately **kept**, and its price, written down.
+
+    A task this process has never carried is decided by the label, because on a
+    fresh process the label is the only record of the last belief this system
+    held. `swarm:done` on an open issue is produced by three different things and
+    a restarted orchestrator cannot tell them apart - the window in which
+    `checks._decide_passed` has written the label before GitHub honoured
+    `Closes #<n>`, a pull request merged without the keyword at all, and a human
+    reopening finished work. Two of the three must not be dispatched, so a seed
+    that honoured the third would put a worker back on merged code in the other
+    two.
+
+    The cost falls on a human: an issue reopened *mid-run* to have the work
+    redone stays pinned until the process restarts. That is the same fact as the
+    relabel #147 already ignores, in a different field - but it is a fact
+    somebody has to be told, so it is in `docs/issue-contract.md` §4 beside the
+    human rows rather than only in a docstring. Asserted rather than promised,
+    for `test_doctor`'s reason.
+    """
+    reopened = entry(4, label=DONE)
+    book = ledger(reopened)
+
+    fresh = believe(book, world(reopened))
+    assert fresh.state("task-4") == LANDED
+    assert [one.kind for one in fresh.overrides] == [LANDED_STANDS]
+    assert dispatchable(book, fresh, ref(4)) == ()
+
+    # The documented route back, and the reason the pin is not a dead end: the
+    # first cycle is the one place the label still seeds, so a restart with the
+    # issue already moved off `swarm:done` is honoured.
+    moved = ledger(entry(4, label=READY))
+    restarted = believe(moved, world(*moved.entries.values()))
+    assert restarted.state("task-4") == ELIGIBLE
+    assert dispatchable(moved, restarted, ref(4)) == (4,)
+
+    contract = (Path(__file__).resolve().parents[1] / "docs" / "issue-contract.md").read_text()
+    section = contract.split("## 4. The label state machine")[1].split("\n## 5.")[0]
+    # Unwrapped, because a sentence's line breaks are a formatter's business and
+    # a test that pinned them would fail on a reflow that changed nothing.
+    prose = " ".join(section.split())
+    assert "reopening the issue does not take it back" in prose
+    assert "stays pinned until the process restarts" in prose

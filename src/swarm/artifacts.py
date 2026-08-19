@@ -1236,6 +1236,17 @@ class DivergenceTally:
     #: question - not "do the two agree afterwards" but "which one decided".
     #: Zero over a run with coverage is the interesting reading: it says the
     #: labels never lied, not that nothing was believed.
+    #:
+    #: **It counts events, so an overlay that repeats itself is a defect in the
+    #: overlay rather than in this number** (#201). Every kind
+    #: `orchestrator/authority.py` applies re-tests its own input each cycle and
+    #: is therefore news each time it fires - except `landed-stands`, which has
+    #: no lapse by design and would otherwise contribute one event per landed
+    #: task per remaining cycle. That would make this a measure of how long the
+    #: run lasted, and a reader would be right to read a climbing count as the
+    #: cutover misbehaving. `authority.believe` announces that one on the cycle
+    #: it starts standing and is quiet afterwards, which is what keeps the
+    #: number a count of decisions.
     overrides: int = 0
     #: Kind -> count for the overrides that carried an account, and the task ids
     #: of the ones that did not. An unaccounted override is the label being
