@@ -445,7 +445,8 @@ class RunJob:
         self.returncode = returncode
         p = self.progress
         if self.stop_requested:
-            self.state, p["outcome"] = "stopped", "stopped"
+            self.state = "stopped"
+            p["outcome"] = "stopped"
         elif returncode == 0:
             self.state = "done"
             if p["met"]:
@@ -455,7 +456,8 @@ class RunJob:
             else:
                 p["outcome"] = "done"
         else:
-            self.state, p["outcome"] = "failed", "failed"
+            self.state = "failed"
+            p["outcome"] = "failed"
 
     def _no_verdict(self) -> str:
         """Which of the two endings `cli.py` prints one line for.

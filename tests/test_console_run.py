@@ -747,10 +747,12 @@ def test_the_page_can_name_every_ending_the_server_can_write():
     from swarm import console_runs
 
     body = pathlib.Path(console_runs.__file__).read_text()
-    written = set(re.findall(r'"outcome"\]\s*=\s*"([a-z]+)"', body))
-    written |= set(re.findall(r'p\["outcome"\]\s*=\s*"([a-z]+)"', body))
-    written |= set(re.findall(r'return "([a-z]+)" if ', body))
-    written |= set(re.findall(r'else "([a-z]+)"', body))
+    # Only the region that decides an ending - `conclude`, `_no_verdict` and
+    # `fail`. Sweeping the whole module would collect any unrelated string
+    # somebody adds later and fail with a diff that explains nothing.
+    deciders = body[body.index("def conclude"):body.index("def to_dict")]
+    written = set(re.findall(r'"outcome"\]\s*=\s*"([a-z]+)"', deciders))
+    written |= set(re.findall(r'return "([a-z]+)" if .* else "([a-z]+)"', deciders)[0])
     assert written == set(OUTCOMES), written ^ set(OUTCOMES)
 
 
@@ -764,8 +766,12 @@ def test_the_view_that_draws_last_owns_the_run():
 
     script = asset("app.js")
 
-    assert "clearTimeout(runTimer)" in script
-    assert "var generation = ++runGeneration" in script
+    # Anchored to its context, not matched loose: `clearTimeout(runTimer)`
+    # also appears in `swarmFire`, so a bare substring test stayed green with
+    # the one that closes this bug deleted.
+    assert ("clearTimeout(runTimer);\n"
+            "    runTimer = null;\n"
+            "    var generation = ++runGeneration") in script
     assert "if (view.generation !== runGeneration) return" in script
 
 
@@ -834,8 +840,8 @@ def test_a_stop_racing_the_spawn_interrupts_exactly_once(tokens):
 
     assert locked_during_registration == [True]
 
-    # ...and the race itself, from a thread that starts stopping the moment the
-    # job is visible. Pre-fix this reported [SIGINT, SIGINT].
+    # ...and the ordinary path end to end, which the invariant above is what
+    # makes safe: one stop after the run is up, one signal.
     runs.stop(job.id)
     settle(job, state="stopped")
 
