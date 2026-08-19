@@ -102,6 +102,32 @@ STACK_IMAGES_ENV = "APIARY_WORKER_IMAGES"
 #: the two spellings together.
 IMAGE_ENV = "APIARY_WORKER_IMAGE"
 
+#: How a worker learns which attempt it is, so it can name its own branch.
+#:
+#: **Why this exists at all.** The worker reads the counter out of the issue
+#: body's identity marker today (`docs/issue-contract.md` §2), which makes the
+#: customer's issue body the transport for one of apiary's own numbers - and
+#: #152 deletes that write. The counter is already in apiary's store
+#: (`store.TaskJudgement.attempt`, #159), and the reconciler is holding it at
+#: the moment it dispatches, so the shortest honest channel is the one that
+#: already carries `IMAGE_ENV`: tell the container.
+#:
+#: **Why an environment variable and not an argument.** `--issue` and
+#: `--base-commit` are the same category of fact and travel on the command line,
+#: so an `--attempt` flag would read as the more consistent choice. It is the
+#: more dangerous one. The worker image is versioned independently of the
+#: orchestrator - `SETUP.md` step 4 builds it, and a stale one is the normal
+#: state of this repository between changes - and a stale image meeting an
+#: unknown *flag* fails `argparse` and exits 2, which turns every task in the
+#: run into an infrastructure failure. A stale image meeting an unknown
+#: environment variable ignores it and reads the marker, which is exactly the
+#: old behaviour. The failure modes are not symmetric, so the channel is not a
+#: matter of taste.
+#:
+#: Spelled in both modules and pinned by `test_the_attempt_variable_matches_the_
+#: workers_own`, for `IMAGE_ENV`'s reason.
+ATTEMPT_ENV = "APIARY_ATTEMPT"
+
 #: The label a stack image carries so it can be recognised without being run.
 #: `docker image inspect` is denied to a containerised orchestrator
 #: (`SOCKET_PROXY_ENV` sets `IMAGES=0`), so this is for a human and for #100's
@@ -792,6 +818,7 @@ class ContainerManager:
         *,
         issue: int | None = None,
         image: str | None = None,
+        attempt: int | None = None,
         entrypoint: str | None = None,
         command: Sequence[str] | None = None,
     ) -> Handle:
@@ -818,6 +845,12 @@ class ContainerManager:
         manager's own `image` stays the default, because a run whose tasks
         never declare anything must keep working unchanged.
 
+        `attempt` is the counter the worker names its branch from, and it is
+        `None` for the same callers `issue` is: a probe has no attempt. Passing
+        it is what stops the customer's issue body from being the transport for
+        one of apiary's own numbers - see `ATTEMPT_ENV`. Omitting it leaves the
+        worker reading the marker, which is what every worker did before #152.
+
         `entrypoint` and `command` override what the image runs. The dispatcher
         never passes either - they exist so a caller can put a probe container
         under this run's labels, limits and redaction, which is what the
@@ -839,6 +872,11 @@ class ContainerManager:
             "--init",
             "--label", f"{RUN_LABEL}={self.run.id}",
             "--label", f"{ISSUE_LABEL}={token}",
+            # Per *spawn*, so it goes here rather than through `self.env`: that
+            # mapping is the run's, shared by every container, and an attempt
+            # number shared by every container is the one bug this variable
+            # exists to make impossible.
+            *(["--env", f"{ATTEMPT_ENV}={int(attempt)}"] if attempt is not None else []),
             *self.limits.flags(),
             # Docker Desktop resolves this itself; a Linux host does not, and
             # the host's Ollama is the one piece of infrastructure every worker

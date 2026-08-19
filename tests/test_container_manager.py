@@ -36,6 +36,7 @@ import pytest
 
 from swarm.containers.manager import (
     DEFAULT_STACK_IMAGES,
+    ATTEMPT_ENV,
     IMAGE_ENV,
     ISSUE_LABEL,
     MAX_LOG_CHARS,
@@ -1001,6 +1002,69 @@ def test_a_spawn_with_no_image_still_uses_the_managers():
 
     assert handle.image == WORKER_IMAGE
     assert WORKER_IMAGE in runner.argv_for("create")
+
+
+def test_the_attempt_variable_matches_the_workers_own():
+    """Same pinning as the image variable, and for the same reason.
+
+    The spawner writes it, the worker reads it, and neither imports the other:
+    `worker/entrypoint.py` is what runs *inside* the container and depends on
+    nothing in `containers/`. Two spellings of one name."""
+    from swarm.worker.entrypoint import ATTEMPT_ENV as worker_side
+
+    assert ATTEMPT_ENV == worker_side
+
+
+def test_the_worker_is_told_which_attempt_it_is():
+    """So it can name its own branch without reading the customer's issue body.
+
+    The counter is apiary's own number, it is in apiary's store, and the
+    reconciler is holding it at the moment it dispatches. Before this it reached
+    the worker only through the issue-body marker, which is the write #152
+    removes."""
+    manager, runner = make_manager()
+
+    manager.spawn(task_ref(7), BASE_COMMIT, issue=7, attempt=2)
+
+    assert f"{ATTEMPT_ENV}=2" in runner.argv_for("create")
+
+
+def test_attempt_zero_is_told_rather_than_left_to_a_default():
+    """`0` and "not told" are different, and the difference decides a branch.
+
+    A worker that falls back reads the marker; a worker that was told `0` knows
+    it. Passing `attempt=0` must therefore produce the variable, which
+    a truthiness test on the argument would silently drop."""
+    manager, runner = make_manager()
+
+    manager.spawn(task_ref(7), BASE_COMMIT, issue=7, attempt=0)
+
+    assert f"{ATTEMPT_ENV}=0" in runner.argv_for("create")
+
+
+def test_a_spawn_that_names_no_attempt_sets_no_variable():
+    """A probe has no attempt, and the worker's fallback is what serves it."""
+    manager, runner = make_manager()
+
+    spawned(manager)
+
+    assert not [flag for flag in runner.argv_for("create") if flag.startswith(ATTEMPT_ENV)]
+
+
+def test_the_attempt_is_per_container_and_not_in_the_runs_shared_env():
+    """The one bug this variable could introduce, made impossible.
+
+    `self.env` is the run's - every container gets it - so an attempt number
+    living there would be one number for the whole fleet. Two spawns at
+    different attempts must disagree."""
+    manager, runner = make_manager()
+
+    manager.spawn(task_ref(7), BASE_COMMIT, issue=7, attempt=1)
+    manager.spawn(task_ref(8), BASE_COMMIT, issue=8, attempt=3)
+
+    creates = runner.argvs_for("create")
+    assert f"{ATTEMPT_ENV}=1" in creates[0]
+    assert f"{ATTEMPT_ENV}=3" in creates[1]
 
 
 def test_the_worker_is_told_which_image_it_is_running_in():

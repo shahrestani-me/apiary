@@ -232,6 +232,22 @@ FEEDBACK_MAX_CHARS = 3_000
 #: worker's own testimony can answer the same question.
 IMAGE_ENV = "APIARY_WORKER_IMAGE"
 
+#: Which attempt this container is, as the orchestrator counted it.
+#:
+#: The counter used to reach here one way only: out of the issue body's identity
+#: marker (`docs/issue-contract.md` §2). That made a customer's issue body the
+#: transport for one of apiary's own numbers, which is what ADR 0001 says a
+#: tracker is not for, and #152 removes the write that maintained it. The
+#: reconciler holds the counter at the moment it dispatches - it is in apiary's
+#: store since #159 - so it now tells the container, the same way it tells it
+#: which image it is (`IMAGE_ENV`).
+#:
+#: `containers/manager.ATTEMPT_ENV` is the other half, and
+#: `test_the_attempt_variable_matches_the_workers_own` pins the two spellings
+#: together. Nothing is imported across that boundary: this module runs *inside*
+#: the container and imports nothing from the orchestrator's packages.
+ATTEMPT_ENV = "APIARY_ATTEMPT"
+
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
 _REMOTE_RE = re.compile(r"[:/](?P<owner>[A-Za-z0-9_.\-]+)/(?P<name>[A-Za-z0-9_.\-]+?)(?:\.git)?/?$")
 
@@ -854,6 +870,49 @@ def fetch_feedback(client: GitHubClient, issue: int) -> str:
     return ""
 
 
+def dispatched_attempt(marked: int, env: Mapping[str, str] | None = None) -> int:
+    """Which attempt this container is: what it was told, or what the marker says.
+
+    **The variable wins when it is set**, because the orchestrator is the process
+    that owns the counter - it is in apiary's store, it was read at dispatch, and
+    the marker is a copy of it that #152 stops maintaining. A container told `2`
+    by the process that decided to run it must not be talked out of that by a
+    body somebody edited.
+
+    **The marker is the fallback, and the fallback is what makes this landable on
+    its own.** Until #152 the marker is still written and still correct, so a
+    worker that was not told anything behaves exactly as every worker did before:
+    an older image under a newer orchestrator, a container started by hand, an
+    integration probe. When #152 removes the write, this fallback becomes a lie -
+    the marker will read `attempt=0` forever - so it is removed *there*, and the
+    variable becomes required. That is one line, and this docstring is where the
+    next person looking for it will be.
+
+    **A value that is not a counter is refused rather than rounded.** Guessing
+    would name a branch that either collides with a previous attempt's or claims
+    budget nobody granted, and both of those are silent: the push succeeds and
+    the reconciler goes looking for a branch that means something else. An
+    `InfrastructureError` is exit 2, which costs no attempt - the right price for
+    a wiring fault the task had nothing to do with.
+    """
+    raw = (env if env is not None else os.environ).get(ATTEMPT_ENV)
+    if raw is None or not raw.strip():
+        return marked
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise InfrastructureError(
+            f"{ATTEMPT_ENV}={raw!r} is not a whole number, and it is how this "
+            f"container was told which attempt it is. The branch it would push "
+            f"cannot be named without it."
+        ) from None
+    if value < 0:
+        raise InfrastructureError(
+            f"{ATTEMPT_ENV}={raw!r} is negative; an attempt counter starts at 0."
+        )
+    return value
+
+
 def _with_feedback(goal: str, feedback: str) -> str:
     """One brief: what went wrong last time, then the task, clearly delimited.
 
@@ -896,12 +955,17 @@ def run_worker(
     does so carries the `ollama` marker.
     """
     contract, title = _fetch_contract(client, issue)
+    # The counter, from the process that owns it. `dispatched_attempt` prefers
+    # what the orchestrator told this container and falls back to the marker;
+    # everything below reads this local rather than `contract.attempt`, so there
+    # is one answer per run and no path that mixes the two.
+    attempt = dispatched_attempt(contract.attempt)
     # The name carries the ref and the attempt, so an orchestrator that lost
     # its memory can tell from the remote alone what was in flight and how much
-    # budget it had spent (`github/branches.py`). Read from the marker, which is
-    # the same counter the ledger will build `LedgerEntry.branch` from, so the
-    # branch this pushes is the one the reconciler goes looking for.
-    branch = task_branch(task_ref(issue), contract.attempt)
+    # budget it had spent (`github/branches.py`). It is the same counter the
+    # ledger builds `LedgerEntry.branch` from, so the branch this pushes is the
+    # one the reconciler goes looking for.
+    branch = task_branch(task_ref(issue), attempt)
     task_id = contract.task_id or f"issue-{issue}"
 
     try:
@@ -910,10 +974,10 @@ def run_worker(
         # testimony that at least one was consumed, and it is checked before
         # the fetch so a first attempt costs no comment listing at all.
         goal = contract.goal
-        if contract.attempt > 0:
+        if attempt > 0:
             feedback = fetch_feedback(client, issue)
             if feedback:
-                print(f"  · attempt {contract.attempt + 1}; folding in the failure report")
+                print(f"  · attempt {attempt + 1}; folding in the failure report")
                 goal = _with_feedback(goal, feedback)
 
         root = prepare_checkout(clone_url, workspace / f"issue-{issue}", base_commit, branch)
@@ -939,7 +1003,7 @@ def run_worker(
                 verify_command=contract.verify,
                 verify_output=oversized,
                 passed=False,
-                attempt=contract.attempt,
+                attempt=attempt,
             )
 
         output = propose_edits(goal, writable, readable, llm=editor)
@@ -970,7 +1034,7 @@ def run_worker(
                 verify_output="the model produced no edit inside the declared file set",
                 passed=False,
                 refused=applied.refused,
-                attempt=contract.attempt,
+                attempt=attempt,
             )
 
         if applied.written:
@@ -1065,7 +1129,7 @@ def run_worker(
             written=applied.written,
             refused=applied.refused,
             deleted=applied.deleted,
-            attempt=contract.attempt,
+            attempt=attempt,
         )
     except (InfrastructureError, EditError, GitError, GitHubError, OSError) as exc:
         # The contract is in hand from here on, so any failure that escapes can
@@ -1079,7 +1143,7 @@ def run_worker(
         # (a git subprocess, the model transport) rightly know nothing about
         # attempt counters.
         if getattr(exc, "attempt", None) is None:
-            exc.attempt = contract.attempt  # type: ignore[union-attr,attr-defined]
+            exc.attempt = attempt  # type: ignore[union-attr,attr-defined]
         raise
 
 
