@@ -351,20 +351,23 @@
   //: whether the card in the run area belongs to the project on the selector.
   var ownRepo = "";
 
-  //: Lifecycle order, mirroring `console_board.COLUMNS`. swarm:failed is a
-  //: strip below rather than a column: a ticket needing a human must not hide.
+  //: Lifecycle order, mirroring `console_board.COLUMNS` - the internal
+  //: vocabulary, derived from the world rather than read off labels.
+  //: needs-human is a strip below rather than a column: a ticket needing a
+  //: human must not hide.
   var BOARD_COLUMNS = [
-    ["backlog", "Backlog"], ["ready", "Ready"], ["in_progress", "In progress"],
-    ["review", "Review"], ["merged", "Merged"], ["verified", "Verified"]
+    ["blocked", "Blocked"], ["eligible", "Eligible"], ["claimed", "Claimed"],
+    ["review", "Review"], ["landed", "Landed"], ["verified", "Verified"]
   ];
 
   function panel() {
     if (!panel.built) {
       var boardBody = el("div");
       boardBody.appendChild(el("p", "empty",
-        "Name a repository (or start a run) and the board follows its swarm:* labels, live."));
+        "Name a repository (or start a run) and the board derives every ticket's state "
+        + "from GitHub, live."));
       panel.built = {
-        board: card("board — read from GitHub, the labels are the truth", boardBody),
+        board: card("board — derived from the world, read-only", boardBody),
         boardBody: boardBody,
         runBox: el("div", "stack")
       };
@@ -745,7 +748,7 @@
     if (!current || current.kind !== "swarm") return;
     var kept = typed["swarm"] || {};
     if (kept.local === "1" && !runRepo) {
-      boardHint("local run — the board follows GitHub's swarm:* labels, and a local run "
+      boardHint("local run — the board derives its columns from GitHub, and a local run "
                 + "never touches GitHub. The log below is the whole story.");
       boardTimer = setTimeout(boardTick, 3000);
       return;
@@ -766,6 +769,9 @@
 
   function ticket(c) {
     var t = el("div", "tcard");
+    //: The resolver's own sentence for why this card sits where it does -
+    //: textContent-safe prose, surfaced as a hover rather than more pixels.
+    if (c.because) t.title = c.because;
     var head = el("div", "thead");
     var a = el("a", null, "#" + c.number);
     a.href = c.url; a.target = "_blank"; a.rel = "noopener";
@@ -800,10 +806,10 @@
       grid.appendChild(box);
     });
     body.appendChild(grid);
-    if ((b.failed || []).length) {
+    if ((b.needs_human || []).length) {
       var strip = el("div", "failedstrip");
-      strip.appendChild(el("h3", null, "Failed — needs a human · " + b.failed.length));
-      b.failed.forEach(function (c) { strip.appendChild(ticket(c)); });
+      strip.appendChild(el("h3", null, "Needs a human · " + b.needs_human.length));
+      b.needs_human.forEach(function (c) { strip.appendChild(ticket(c)); });
       body.appendChild(strip);
     }
     if ((b.errors || []).length) {

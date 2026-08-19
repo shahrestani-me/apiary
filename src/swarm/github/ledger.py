@@ -319,10 +319,18 @@ class LedgerEntry:
     #: Whether the issue is closed on GitHub. The ledger reads `state="all"`
     #: because closed `swarm:done` issues anchor the dependency graph - which
     #: means a closed issue can still wear any state label, and a projection
-    #: (the console board's failed strip is the live example) needs to tell a
-    #: failed task that still wants a human from one that was already closed
-    #: as superseded.
+    #: (the console board's needs-human strip is the live example) needs to
+    #: tell a failed task that still wants a human from one that was already
+    #: closed as superseded.
     closed: bool = False
+    #: GitHub's `state_reason` for a closed issue - `completed`, `not_planned`,
+    #: `duplicate`, or `None` for issues closed before the field existed. The
+    #: half of `closed` that says *how*: "closed as completed" discharges a
+    #: dependency and reads as landed, "closed as not planned" discharges
+    #: nothing and is a human's verdict (`orchestrator/derived.TaskFact` runs on
+    #: exactly this split). Carried on the entry so a projection reading the
+    #: ledger does not need a second issue listing to tell the two apart.
+    state_reason: str | None = None
 
     @property
     def ref(self) -> TaskRef:
@@ -975,6 +983,7 @@ def load_ledger(
             labels=labels,
             adopted=adopted,
             closed=(issue.get("state") or "open") != "open",
+            state_reason=issue.get("state_reason"),
         )
         entry = _judged(entry, judged.get(entry.ref))
         entries[task_id] = entry
