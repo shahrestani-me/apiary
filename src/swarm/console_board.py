@@ -50,10 +50,10 @@ from the renewal above is the whole point of naming them separately:
   direction a projection should fail in - it over-reports a task wanting a
   human rather than hiding one.
 - **The infrastructure streak** is not derivable at all, by
-  `reconcile.infrastructure_streaks`' own argument: exit 2 does not bump the
-  attempt, so N mechanical failures write one result filename and no artifact
-  can count them. A task escalated on that ceiling reads here as whatever it
-  would otherwise be.
+  `reconcile.infrastructure_streaks`' own argument: the artifacts are read as
+  one record per task (`summarise_dir(...).latest`), so N mechanical failures
+  displace one another there and no artifact can count them. A task escalated on
+  that ceiling reads here as whatever it would otherwise be.
 
 **What this board cannot see, said out loud.** The resolver reads containers
 from the local daemon, so a repository being run by an orchestrator on another

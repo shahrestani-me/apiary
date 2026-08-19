@@ -66,10 +66,12 @@ as though one was.
 
 Each of ADR 0001's three, and what the orchestrator now does about it:
 
-**1. The infrastructure ceiling.** Not derivable at all: exit 2 does not bump
-the attempt, so N mechanical failures write one result filename and the
-artifacts cannot tell one from three (`reconcile.infrastructure_streaks`
-counts *transitions*, which are writes). The orchestrator therefore keeps
+**1. The infrastructure ceiling.** Not derivable at all: the artifacts reach a
+cycle as `summarise_dir(...).latest`, one record per task, so N mechanical
+failures displace one another there and no count of them survives to be read.
+(The *files* have told them apart since #177 - it is the one-record-per-task
+view that loses them, which is why `reconcile.infrastructure_streaks` counts
+*transitions*, which are writes.) The orchestrator therefore keeps
 believing its own counter: a task whose streak has reached
 `APIARY_MAX_INFRASTRUCTURE` is `needs-human` whatever the resolver says, and
 the override is reported. The counter is run-scoped, exactly as it was before
@@ -1056,8 +1058,9 @@ def believe(
             believed, kind = NEEDS_HUMAN, INFRASTRUCTURE_CEILING
             why = (
                 f"{streak} consecutive infrastructure verdict(s) against a cap of "
-                f"{cap}. Exit 2 does not bump the attempt, so N mechanical failures "
-                "write one result filename and no artifact can count them - ADR 0001's "
+                f"{cap}. The artifacts reach the resolver as one record per task "
+                "(`summarise_dir(...).latest`), so consecutive mechanical failures "
+                "displace one another there and no artifact can count them - ADR 0001's "
                 f"first non-derivable state. The resolver reads {verdict.state}."
             )
         elif believed in WAITING and spent:
