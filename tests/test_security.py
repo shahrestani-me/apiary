@@ -41,12 +41,21 @@ from typing import Sequence
 
 import pytest
 
-from swarm.containers.manager import STACK_IMAGES_ENV, ContainerManager, Handle, Redactor, dispose_container
+from swarm.containers.manager import (
+    INHERITED_ENV,
+    STACK_IMAGES_ENV,
+    ContainerManager,
+    Handle,
+    Redactor,
+    dispose_container,
+)
+from swarm.mcp.client import TRACKER_ENDPOINT_ENV, TRACKER_TOKEN_ENV
 from swarm.run import Run
 from swarm.security import (
     DOCKER_HOST_URL,
     EGRESS_ALLOWLIST,
     FORBIDDEN_PERMISSIONS,
+    MCP_HOSTS,
     REQUIRED_PERMISSIONS,
     PROVISION_PERMISSIONS,
     PROVISION_TOKEN_ENV,
@@ -218,6 +227,8 @@ ALLOWED_HOSTS = [
     "host.docker.internal",
     "https://api.github.com/repos/x/y",
     "HOST.DOCKER.INTERNAL:11434",
+    "mcp.linear.app",
+    "https://mcp.linear.app/mcp",
 ]
 REFUSED_HOSTS = [
     "gitlab.com",
@@ -227,6 +238,14 @@ REFUSED_HOSTS = [
     "attacker.net",
     "169.254.169.254",
     "",
+    # The remote GitHub MCP server, absent on purpose: it advertises the
+    # classic OAuth scopes `assert_scoped_token` refuses, so the GitHub tracker
+    # runs as a local stdio server against api.github.com instead (#143).
+    "api.githubcopilot.com",
+    # Jira is deferred, and a hole for a tracker nobody configured is exactly
+    # the quiet widening this file exists to catch.
+    "api.atlassian.com",
+    "linear.app",
 ]
 
 
@@ -268,7 +287,27 @@ def test_the_default_allowlist_is_the_goal_sentence_and_nothing_more() -> None:
         "api.github.com",
         "codeload.github.com",
         "host.docker.internal",
+        # The one destination ADR 0001 adds. `MCP_HOSTS` says at length why it
+        # is one and not three.
+        "mcp.linear.app",
     }
+    assert MCP_HOSTS == ("mcp.linear.app",)
+
+
+def test_the_tracker_credential_never_reaches_a_worker() -> None:
+    """What actually makes the MCP endpoint the orchestrator's alone.
+
+    tinyproxy filters on hostname, so `mcp.linear.app` on the allowlist is
+    reachable by every container on `apiary-egress` - a worker included. The
+    confinement is the credential, exactly as `assert_scoped_token` argues for
+    `github.com`: one host serves every customer and only the token knows
+    which. `INHERITED_ENV` is the list that decides, so it is the list this
+    asserts on, and a worker that reached the endpoint without the credential
+    is answered 401.
+    """
+    assert TRACKER_TOKEN_ENV not in INHERITED_ENV
+    assert TRACKER_ENDPOINT_ENV not in INHERITED_ENV
+    assert set(INHERITED_ENV) == {"GITHUB_TOKEN", "OLLAMA_HOST"}
 
 
 def test_a_package_index_is_off_until_an_operator_asks_for_it() -> None:

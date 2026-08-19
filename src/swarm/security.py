@@ -62,6 +62,7 @@ __all__ = [
     "assert_scoped_token",
     "EgressPolicy",
     "EGRESS_ALLOWLIST",
+    "MCP_HOSTS",
     "WORKER_NETWORK",
     "SOCKET_PROXY_ENV",
     "SOCKET_PROXY_HOST",
@@ -306,7 +307,33 @@ def assert_scoped_token(token: str | None, *, allow_unrecognised: bool = False) 
 #: infrastructure every container needs (`docs/architecture-v2.md`).
 GITHUB_HOSTS: tuple[str, ...] = ("github.com", "api.github.com", "codeload.github.com")
 OLLAMA_HOST_NAME = "host.docker.internal"
-EGRESS_ALLOWLIST: tuple[str, ...] = (*GITHUB_HOSTS, OLLAMA_HOST_NAME)
+
+#: Remote MCP servers apiary reaches a customer's task system through (ADR
+#: 0001, #149). Exactly one host, and the shortness of this tuple is the
+#: finding rather than an omission:
+#:
+#: - **Linear** has no local server, so `mcp.linear.app` is a genuine new hole.
+#: - **GitHub** needs none. The remote server at `api.githubcopilot.com`
+#:   advertises the classic OAuth scopes - the `ghp_`/`gho_` family
+#:   `assert_scoped_token` refuses above, because their scope is a verb rather
+#:   than a repository - so it is incompatible with the token policy in section
+#:   1 and is deliberately absent here. The local stdio `github-mcp-server`
+#:   takes apiary's existing fine-grained PAT from its environment and talks to
+#:   `api.github.com`, which is already three lines up (#143).
+#: - **Jira** is deferred, so `api.atlassian.com` is not here either. Adding a
+#:   destination for a tracker nobody has configured is the quiet widening the
+#:   suite exists to catch.
+#:
+#: Note what this list cannot do: tinyproxy filters on hostname, so an entry
+#: here is reachable by every container on `apiary-egress`, workers included.
+#: The tracker credential is what actually confines this - it lives only in the
+#: orchestrator's environment and `containers.manager.INHERITED_ENV` does not
+#: carry it, so a worker that reached `mcp.linear.app` is answered 401. That is
+#: the same reasoning `assert_scoped_token` sets out for `github.com`: one host
+#: serves every customer, and only the credential knows which.
+MCP_HOSTS: tuple[str, ...] = ("mcp.linear.app",)
+
+EGRESS_ALLOWLIST: tuple[str, ...] = (*GITHUB_HOSTS, OLLAMA_HOST_NAME, *MCP_HOSTS)
 
 #: Where an operator widens it. Comma-separated hostnames, and the reason it is
 #: an environment variable rather than a constant is that the honest default
@@ -440,11 +467,21 @@ DEFAULT_EGRESS = EgressPolicy()
 
 
 def _hostname(value: str) -> str:
-    """`https://api.github.com:443/x` -> `api.github.com`. Lowercased."""
+    """`https://api.github.com:443/x` -> `api.github.com`. Lowercased.
+
+    The query and the fragment are cut before the userinfo `@` is, and the
+    order is the whole point. A URL may carry an `@` after `?` or `#` without
+    it delimiting userinfo at all, so splitting on `@` first reads
+    `https://attacker.example?x=@api.github.com` as `api.github.com` - a
+    hostname the predicate then admits while the request goes somewhere else.
+    Nothing enforces on this string but the proxy sees the real authority, so
+    the effect is a check that passes for a host tinyproxy blocks. Which is
+    worse than not checking, and is why the order is spelled out here.
+    """
     value = value.strip().lower()
     if "://" in value:
         value = value.split("://", 1)[1]
-    value = value.split("/", 1)[0].split("@")[-1]
+    value = value.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].split("@")[-1]
     if value.startswith("["):  # bracketed IPv6 literal
         return value.partition("]")[0] + "]"
     return value.split(":", 1)[0]
