@@ -43,7 +43,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from langchain_core.callbacks import BaseCallbackHandler
 
@@ -59,6 +59,10 @@ __all__ = [
     "Capture",
     "Recorder",
     "Text",
+    "Timings",
+    "UNRECOGNISED",
+    "READERS",
+    "read_metadata",
     "enabled",
     "handler_for",
     "max_chars",
@@ -164,6 +168,10 @@ class Capture:
     id: str
     role: str = ""
     model: str = ""
+    #: Which provider built the model, stamped by the factory. Its own field
+    #: rather than a prefix on `model`, because a reader comparing two captures
+    #: groups by it and `total_s` means a different measurement per provider.
+    provider: str = ""
     schema_name: str = ""
     messages: list[dict[str, str]] = field(default_factory=list)
     prompt: Text | None = None
@@ -172,8 +180,14 @@ class Capture:
     error: dict[str, str] | None = None
     total_s: float | None = None
     load_s: float | None = None
+    #: Which reader produced the two fields above - a provider name, or
+    #: `UNRECOGNISED`. The difference between "this provider reports no
+    #: duration" and "nobody here knows how to read this provider" is invisible
+    #: in a null, and only one of the two is a bug worth chasing.
+    timings_from: str = ""
     prompt_tokens: int | None = None
     output_tokens: int | None = None
+    total_tokens: int | None = None
 
     @property
     def failed(self) -> bool:
@@ -185,14 +199,17 @@ class Capture:
             "id": self.id,
             "role": self.role,
             "model": self.model,
+            "provider": self.provider,
             "schema_name": self.schema_name,
             "messages": self.messages,
             "parsed_ok": self.parsed_ok,
             "error": self.error,
             "total_s": self.total_s,
             "load_s": self.load_s,
+            "timings_from": self.timings_from,
             "prompt_tokens": self.prompt_tokens,
             "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
         }
         if self.prompt is not None:
             payload["prompt"] = self.prompt.to_dict()
@@ -312,12 +329,114 @@ def _messages(serialised: Any, prompts: Any) -> list[dict[str, str]]:
     return rows
 
 
-def _seconds(metadata: Mapping[str, Any], key: str) -> float | None:
-    """Ollama reports durations in nanoseconds; nobody reads nanoseconds."""
-    value = metadata.get(key)
-    if not isinstance(value, (int, float)):
-        return None
-    return round(value / 1e9, 3)
+# --------------------------------------------------------------------------
+# Reading one provider's metadata
+# --------------------------------------------------------------------------
+#
+# `response_metadata` is a different document per provider, and until ADR 0006
+# there was only one provider so this file simply knew its spelling. Against
+# any other one those two fields record blank, and the capture is silently less
+# useful than it looks - which matters more than it sounds, because capture is
+# the *instrument* for #259 and for the console's compare-two-models view. An
+# instrument that reads zero for one of the two things being compared makes the
+# comparison worthless while still producing a chart.
+#
+# So: one reader per provider, chosen by the provider that *built* the model
+# rather than sniffed out of the payload. The factory knows which one it used
+# and stamps it, exactly as it already stamps `role` and `model`; sniffing
+# would be guessing at the one moment there is no need to guess.
+
+
+#: What a reader could not find. Distinct from `Timings(None, None)` produced by
+#: a reader that *did* run: see `Capture.timings_from`.
+UNRECOGNISED = "unrecognised"
+
+
+@dataclass(frozen=True)
+class Timings:
+    """How long a call took, in seconds, plus whatever the provider called the
+    model it actually served."""
+
+    total_s: float | None = None
+    load_s: float | None = None
+    model: str = ""
+
+
+def _number(value: Any) -> float | None:
+    """A scalar, or the first element of the list one provider wraps it in.
+
+    `langchain-aws` stores `metrics.latencyMs` as a one-element list, because
+    `response_metadata` values are documented as string, list or dict. Reading
+    it as a scalar records nothing at all, which is the failure this whole
+    section exists to prevent.
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _read_ollama(metadata: Mapping[str, Any]) -> Timings:
+    """Nanoseconds, because that is what Ollama reports and nobody reads them.
+
+    Moved rather than changed: this is the path that has always worked, and the
+    only thing ADR 0006 did to it was give it company.
+    """
+    total, load = _number(metadata.get("total_duration")), _number(metadata.get("load_duration"))
+    return Timings(
+        total_s=None if total is None else round(total / 1e9, 3),
+        load_s=None if load is None else round(load / 1e9, 3),
+        model=str(metadata.get("model") or ""),
+    )
+
+
+def _read_openai(metadata: Mapping[str, Any]) -> Timings:
+    """No server-side duration exists to read, and that is not a gap.
+
+    OpenAI reports token counts and a finish reason, and no timing at all - the
+    wall clock is the client's to measure. `total_s` is therefore `None`
+    because the provider reports none, which `timings_from` distinguishes from
+    `None` because nobody looked.
+    """
+    return Timings(model=str(metadata.get("model_name") or ""))
+
+
+def _read_bedrock(metadata: Mapping[str, Any]) -> Timings:
+    """`metrics.latencyMs`, in milliseconds, wrapped in a list.
+
+    No load time: Bedrock serves a hosted model and has no equivalent of
+    Ollama's weights-into-memory step, so that field stays honestly empty
+    rather than being filled with the total.
+    """
+    metrics = metadata.get("metrics")
+    latency = _number(metrics.get("latencyMs")) if isinstance(metrics, Mapping) else None
+    return Timings(
+        total_s=None if latency is None else round(latency / 1e3, 3),
+        model=str(metadata.get("model_name") or ""),
+    )
+
+
+#: Keyed by `llm.PROVIDERS`' names, and deliberately not importing them: this
+#: module is reached from the model factory and importing back into it would
+#: close a cycle that only exists to check three strings.
+READERS: dict[str, Callable[[Mapping[str, Any]], Timings]] = {
+    "ollama": _read_ollama,
+    "openai": _read_openai,
+    "bedrock": _read_bedrock,
+}
+
+
+def read_metadata(provider: str, metadata: Mapping[str, Any]) -> tuple[Timings, str]:
+    """One provider's timings, and the name of the reader that produced them.
+
+    The second half is the point of the ticket. A provider nobody wrote a
+    reader for records `UNRECOGNISED` and blank timings - an *explicit* absence
+    rather than a zero, because a zero that means "not reported" is a number
+    somebody will average.
+    """
+    reader = READERS.get(provider)
+    if reader is None:
+        return Timings(), UNRECOGNISED
+    return reader(metadata), provider
 
 
 class _CaptureHandler(BaseCallbackHandler):
@@ -338,9 +457,12 @@ class _CaptureHandler(BaseCallbackHandler):
     be unable to say which model failed.
     """
 
-    def __init__(self, *, role: str, model: str, sink: Recorder | None = None) -> None:
+    def __init__(
+        self, *, role: str, model: str, provider: str = "", sink: Recorder | None = None
+    ) -> None:
         self.role = role
         self.model = model
+        self.provider = provider
         self._sink = sink
         self._open: dict[str, Capture] = {}
 
@@ -353,7 +475,12 @@ class _CaptureHandler(BaseCallbackHandler):
     def _capture(self, run_id: Any) -> Capture:
         key = str(run_id)
         if key not in self._open:
-            self._open[key] = Capture(id=key or uuid.uuid4().hex, role=self.role, model=self.model)
+            self._open[key] = Capture(
+                id=key or uuid.uuid4().hex,
+                role=self.role,
+                model=self.model,
+                provider=self.provider,
+            )
         return self._open[key]
 
     def _finish(self, run_id: Any) -> None:
@@ -404,12 +531,20 @@ class _CaptureHandler(BaseCallbackHandler):
             capture.response = Text.of(text, cap=cap)
             capture.parsed_ok = True
             if isinstance(metadata, Mapping):
-                capture.model = str(metadata.get("model") or capture.model)
-                capture.total_s = _seconds(metadata, "total_duration")
-                capture.load_s = _seconds(metadata, "load_duration")
+                timings, source = read_metadata(self.provider, metadata)
+                capture.model = timings.model or capture.model
+                capture.total_s = timings.total_s
+                capture.load_s = timings.load_s
+                capture.timings_from = source
             if isinstance(usage, Mapping):
+                # `usage_metadata` is langchain's own normalised shape and is
+                # already the same three keys on every provider - the one part
+                # of this that needed no reader. Recorded for all of them
+                # because it is what #270's spend ceiling is computed from, and
+                # a remote provider is the only kind that bills for it.
                 capture.prompt_tokens = usage.get("input_tokens")
                 capture.output_tokens = usage.get("output_tokens")
+                capture.total_tokens = usage.get("total_tokens")
         except Exception as exc:  # noqa: BLE001
             print(f"! capture: {type(exc).__name__}: {exc}", file=sys.stderr)
         finally:
@@ -426,16 +561,23 @@ class _CaptureHandler(BaseCallbackHandler):
             self._finish(kwargs.get("run_id"))
 
 
-def handler_for(*, role: str, model: str, sink: Recorder | None = None) -> Any:
-    """The callback to hand `ChatOllama(callbacks=[...])`, or `None` when off.
+def handler_for(
+    *, role: str, model: str, provider: str = "", sink: Recorder | None = None
+) -> Any:
+    """The callback to hand a client's `callbacks=[...]`, or `None` when off.
 
     Returning `None` rather than a do-nothing handler is what makes "capture is
     off" mean *nothing is attached*, which is the only version of off that
     cannot cost an inference call anything.
+
+    `provider` is defaulted so that a caller which does not know one still gets
+    a working handler - it records `UNRECOGNISED` timings rather than nothing,
+    which is the honest answer to "how long did this take" when the reader was
+    never chosen.
     """
     if not enabled():
         return None
-    return _CaptureHandler(role=role, model=model, sink=sink)
+    return _CaptureHandler(role=role, model=model, provider=provider, sink=sink)
 
 
 def as_dict(capture: Capture) -> dict[str, Any]:

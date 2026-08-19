@@ -137,7 +137,7 @@ def test_a_process_with_capture_off_never_writes(on, sink, monkeypatch, tmp_path
 
 
 def test_a_successful_call_records_prompt_response_and_ollamas_own_timings(on, sink):
-    handler = handler_for(role="orchestrator", model="gemma4:31b", sink=sink)
+    handler = handler_for(role="orchestrator", model="gemma4:31b", provider="ollama", sink=sink)
     a_start(handler)
     an_end(handler)
 
@@ -157,6 +157,10 @@ def test_a_successful_call_records_prompt_response_and_ollamas_own_timings(on, s
     assert record["prompt_tokens"] == 231
     assert record["output_tokens"] == 11
     assert record["schema"] == 1
+    # Which reader produced the two timings. Ollama's spelling is no longer the
+    # only one this file knows, so the record says which one it read.
+    assert record["provider"] == "ollama"
+    assert record["timings_from"] == "ollama"
 
 
 def test_the_record_says_the_host_was_swapping_not_thinking(on, sink):
@@ -165,7 +169,7 @@ def test_the_record_says_the_host_was_swapping_not_thinking(on, sink):
     A measured call spent 10.4s of 13.4s loading the model. Recording only a
     wall clock would have reported a slow model rather than a cold one.
     """
-    handler = handler_for(role="orchestrator", model="gemma4:31b", sink=sink)
+    handler = handler_for(role="orchestrator", model="gemma4:31b", provider="ollama", sink=sink)
     a_start(handler)
     an_end(handler)
 
@@ -489,3 +493,145 @@ def test_a_real_call_is_captured_end_to_end(on, tmp_path, monkeypatch):
     assert record["response"]["chars"] > 0
     assert record["total_s"] > 0
     assert record["schema_name"] == "Ping"
+
+
+# --------------------------------------------------------------------------
+# Reading a provider's metadata - one reader each, and an honest absence
+# --------------------------------------------------------------------------
+#
+# Capture is the *instrument* for #259 and for the console's compare-two-models
+# view. An instrument that reads zero for one of the two things being compared
+# makes the comparison worthless while still producing a chart, which is the
+# whole reason this section exists.
+
+
+#: The shapes the two remote providers really carry. Bedrock's `latencyMs` is a
+#: one-element list because `response_metadata` values are documented as string,
+#: list or dict - and reading it as a scalar records nothing at all.
+OPENAI_META = {
+    "model_name": "gpt-5.6-terra",
+    "finish_reason": "stop",
+    "system_fingerprint": "fp_abc",
+    "token_usage": {"prompt_tokens": 231, "completion_tokens": 11},
+}
+BEDROCK_META = {
+    "model_name": "gpt-5.6-luna",
+    "model_provider": "bedrock_converse",
+    "stopReason": "end_turn",
+    "metrics": {"latencyMs": [1290]},
+}
+#: langchain's own normalised shape, identical on every provider - the one part
+#: of this that needed no reader.
+USAGE = {"input_tokens": 231, "output_tokens": 11, "total_tokens": 242}
+
+
+def test_the_ollama_nanosecond_path_moved_rather_than_changed():
+    from swarm.capture import read_metadata
+
+    timings, source = read_metadata("ollama", OLLAMA_META)
+
+    assert (timings.total_s, timings.load_s) == (13.401, 10.417)
+    assert timings.model == "gemma4:31b"
+    assert source == "ollama"
+
+
+def test_bedrock_milliseconds_are_read_out_of_the_list_they_arrive_in():
+    from swarm.capture import read_metadata
+
+    timings, source = read_metadata("bedrock", BEDROCK_META)
+
+    assert timings.total_s == 1.29
+    assert timings.model == "gpt-5.6-luna"
+    assert source == "bedrock"
+
+
+def test_bedrock_reports_no_load_time_and_does_not_invent_one():
+    """It serves a hosted model and has no equivalent of Ollama's
+    weights-into-memory step. Filling `load_s` with the total would make
+    `RunMetrics.swap_share` report a cold host that does not exist."""
+    from swarm.capture import read_metadata
+
+    timings, _ = read_metadata("bedrock", BEDROCK_META)
+
+    assert timings.load_s is None
+
+
+def test_openai_reports_no_duration_and_that_is_not_a_gap():
+    """The wall clock is the client's to measure. What matters is that the
+    record says a *reader ran* - see the next test for why."""
+    from swarm.capture import read_metadata
+
+    timings, source = read_metadata("openai", OPENAI_META)
+
+    assert (timings.total_s, timings.load_s) == (None, None)
+    assert timings.model == "gpt-5.6-terra"
+    assert source == "openai"
+
+
+def test_an_unrecognised_provider_records_an_explicit_absence_not_a_zero():
+    """The bug this ticket exists to avoid, stated exactly.
+
+    A zero that means "not reported" is a number somebody will average. And a
+    `None` alone cannot tell "this provider reports no duration" apart from
+    "nobody here knows how to read this provider" - only one of which is worth
+    chasing, so the record says which.
+    """
+    from swarm.capture import UNRECOGNISED, read_metadata
+
+    timings, source = read_metadata("vertex", {"latency": 1234})
+
+    assert timings.total_s is None and timings.load_s is None
+    assert source == UNRECOGNISED
+    assert source != "openai", "an unread provider must not look like one that reports nothing"
+
+
+def test_a_remote_call_records_token_counts_the_spend_ceiling_will_need(on, sink):
+    """#270's raw input. Remote providers carry something Ollama does not and
+    this system had nowhere to put: billed token counts."""
+    handler = handler_for(role="worker", model="gpt-5.6-luna", provider="bedrock", sink=sink)
+    a_start(handler)
+    handler.on_llm_end(
+        Result(Message("ai", '{"edits": []}', metadata=BEDROCK_META, usage=USAGE)),
+        run_id="run-1",
+    )
+
+    record = json.loads(sink.written[0].read_text())
+
+    assert record["provider"] == "bedrock"
+    assert record["timings_from"] == "bedrock"
+    assert record["total_s"] == 1.29
+    assert (record["prompt_tokens"], record["output_tokens"]) == (231, 11)
+    assert record["total_tokens"] == 242
+    # The model the provider says it served, not the one the spec asked for.
+    assert record["model"] == "gpt-5.6-luna"
+
+
+def test_a_capture_with_no_provider_stamped_says_so_rather_than_reading_ollamas(on, sink):
+    """A caller that does not know its provider still gets a working handler.
+    What it must not get is Ollama's spelling applied hopefully to somebody
+    else's payload."""
+    handler = handler_for(role="worker", model="m", sink=sink)
+    a_start(handler)
+    handler.on_llm_end(
+        Result(Message("ai", "{}", metadata=BEDROCK_META, usage=USAGE)), run_id="run-1"
+    )
+
+    record = json.loads(sink.written[0].read_text())
+
+    assert record["timings_from"] == capture_mod.UNRECOGNISED
+    assert record["total_s"] is None
+    # The tokens still land: `usage_metadata` needs no reader.
+    assert record["total_tokens"] == 242
+
+
+def test_every_registered_provider_has_a_metadata_reader():
+    """The tenth-call-site problem again, in this file's terms. A provider
+    added to the registry with no reader here records `UNRECOGNISED` for every
+    call - which is honest, and still means the console's compare view has a
+    blank column nobody was warned about."""
+    from swarm.capture import READERS
+    from swarm.llm import PROVIDERS
+
+    assert set(PROVIDERS) <= set(READERS), (
+        f"no metadata reader for {sorted(set(PROVIDERS) - set(READERS))}"
+    )
