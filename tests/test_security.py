@@ -308,7 +308,16 @@ def test_the_tracker_credential_never_reaches_a_worker() -> None:
     """
     assert TRACKER_TOKEN_ENV not in INHERITED_ENV
     assert TRACKER_ENDPOINT_ENV not in INHERITED_ENV
-    assert set(INHERITED_ENV) == {"GITHUB_TOKEN", "OLLAMA_HOST"}
+    # The full list, pinned so growing it is a decision made here. The two
+    # `SWARM_WORKER_*` knobs are tuning values, not credentials - they exist
+    # in the list so an operator's export reaches the `Settings` the worker
+    # reads inside the container - and neither names a host or a secret.
+    assert set(INHERITED_ENV) == {
+        "GITHUB_TOKEN",
+        "OLLAMA_HOST",
+        "SWARM_WORKER_CTX",
+        "SWARM_WORKER_MODEL",
+    }
 
 
 def test_a_package_index_is_off_until_an_operator_asks_for_it() -> None:
