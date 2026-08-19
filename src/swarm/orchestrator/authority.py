@@ -112,6 +112,57 @@ revival and the task waits for a human. That is the safe direction - a
 forgotten revival escalates, it never grants a budget - and it is the opposite
 of what the label did, where a restart preserved the granted retry.
 
+*What "spent" is allowed to mean, and why it is not a result (#200).* The
+grant used to lapse on one thing only: the code host accounting for an attempt
+past the one it was granted at, which needs a result record or an
+attempt-numbered branch on an **open** pull request. A granted attempt that
+dies without writing either - killed at `SWARM_WORKER_TIMEOUT`, a spawn that
+failed, a container reaped mid-cycle - produces neither, so the grant
+suppressed the give-up for the rest of the run and the task was re-dispatched
+every cycle, indefinitely.
+
+**Nothing else bounds it, and each of the three reasons is worth naming**,
+because a reader who assumes one of them will read this as a slow leak rather
+than a loop with no end.
+
+- `_retry_or_give_up` is the only thing that moves `entry.attempt` here, and it
+  runs off a result record.
+- `infrastructure_streaks(..., result.applied)` counts *transitions*, and this
+  input produces none.
+- `recovery.plan_recovery` does consume an attempt for a claim with nothing
+  behind it - but since #205 it selects on `state_of(entry, believed)` rather
+  than on the `swarm:claimed` label, and a revived task holding a grant with no
+  live container is believed **eligible**. It is not the sweep's to speak about,
+  so it does not speak. Before #205 the sweep released it and bounded the loop
+  at `max_total_attempts`; the cutover removed that accident, and this is the
+  rule that replaces it deliberately.
+
+So the grant lapses on the **dispatch**, not on what the dispatch produced.
+That is the intent stated exactly - the grant buys one attempt, and putting the
+task on the fleet is what spends it - and it is the only signal in reach no
+worker behaviour can starve, because the orchestrator is the thing that emits
+it. A third piece of code-host evidence would have failed on the same input as
+the first two. `Grant.dispatched` is that fact, `Reconciler` records it off
+`DispatchReport`, and a lapsed grant simply stops suppressing: the streak
+`planner.revive` never reset caps the task through the ordinary arithmetic
+below, which is exactly where a revival that *did* produce a result has always
+ended up.
+
+*The option that looks cheaper and is not.* ADR 0002's other half -
+`TaskJudgement.matches`, "a moved counter means it is no longer that attempt" -
+would lapse the grant on `grant.attempt != entry.attempt`, with no new field at
+all. It is rejected on the same fact the three bullets establish: on this input
+`entry.attempt` does not move, so the stamp never goes stale and the comparison
+never fires. It would have worked against the pre-#205 sweep, which is exactly
+the kind of dependence on a belief-sensitive component this rule must not have.
+
+The lapse cannot escalate a task mid-attempt: the overlay that reads it is
+bounded to the *waiting* states, so a live container reads `claimed` and an open
+pull request reads `review`, both of which outrank a budget row. It *does*
+charge for an attempt the fleet refused to start, and
+`reconcile._dispatch_attempted` argues why: a rule that has to classify why an
+attempt did not run is a rule with an arm somebody forgot.
+
 None of the three is made derivable by making the resolver authoritative, and
 pretending otherwise is how a cutover ships a run that cannot stop retrying.
 
@@ -211,6 +262,7 @@ __all__ = [
     "UNRESOLVED",
     "WAITING",
     "Belief",
+    "Grant",
     "Override",
     "believe",
     "in_review",
@@ -367,6 +419,40 @@ def source_summary(source: str | None = None) -> str:
 
 
 @dataclass(frozen=True)
+class Grant:
+    """One revival, and whether the attempt it bought has been spent (#200).
+
+    `attempt` is the counter the task was on when `planner.revive` returned it
+    to the run - a *stamp* of when the grant was made, never a second copy of
+    the counter, which is ADR 0002's "As built" rule and the reason this is not
+    a number the store keeps. It is compared against the code host's own count,
+    so a grant that produced a result lapses on the arithmetic it always did.
+
+    `dispatched` is the half a result cannot suppress, and the whole of #200: a
+    granted attempt that dies without writing a result record moves no counter
+    at all, so `attempt` alone suppressed the give-up forever. The reconciler
+    sets it from `DispatchReport` - the orchestrator's own record of having put
+    a worker on the task - which is why it is here rather than derived from
+    anything the worker leaves behind.
+
+    Frozen because every value in this module is, and for the same reason: a
+    belief, an override and a grant are all things one cycle *decided*, and a
+    decision a later stage can edit in place is one two stages can disagree
+    about. The map holding them is not frozen - `Reconciler` replaces entries in
+    it as the run goes on - so the guarantee is per grant, not per map.
+    """
+
+    #: The attempt counter at the moment of the grant.
+    attempt: int
+    #: Has a dispatch since the grant spent the attempt it bought?
+    dispatched: bool = False
+
+    def spend(self) -> Grant:
+        """The same grant, spent. Returns `self` unchanged when it already was."""
+        return self if self.dispatched else replace(self, dispatched=True)
+
+
+@dataclass(frozen=True)
 class Override:
     """One task the orchestrator believes something other than its label.
 
@@ -518,7 +604,7 @@ def believe(
     source: str = DERIVED,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_cap: int = 3,
-    revived: Mapping[TaskRef, int] | None = None,
+    revived: Mapping[TaskRef, Grant] | None = None,
     remembered: Mapping[str, str] | None = None,
     max_attempts: int = 3,
     max_total_attempts: int = 9,
@@ -541,9 +627,15 @@ def believe(
     place a label still reaches a decision, argued in the module docstring - and
     it is read here for one rule: `landed` is terminal within a run, so a task
     already believed landed stays landed.
+
+    `revived` is the run's grants (#200): the attempt each revival was made at,
+    and whether the one attempt it bought has been spent. A bare attempt number
+    was the shape before #200 and is deliberately **not** still accepted - it
+    means "granted, and no dispatch can ever spend it", which is the defect, and
+    leaving it legal would let a later caller reopen it with no type complaining.
     """
     infrastructure = infrastructure or {}
-    revived = revived or {}
+    grants = dict(revived or {})
     entries = sorted(ledger.entries.values(), key=lambda entry: entry.ref)
 
     by_label = {entry.task_id: _internal(entry.state_label) for entry in entries}
@@ -613,10 +705,11 @@ def believe(
             continue
 
         believed, kind, why = verdict.state, "", ""
+        grant = grants.get(entry.ref)
         spent = _budget_spent(
             entry,
             verdict.attempts_spent,
-            revived.get(entry.ref),
+            grant,
             max_attempts=max_attempts,
             max_total_attempts=max_total_attempts,
         )
@@ -660,15 +753,31 @@ def believe(
                 "a failed task whose run directory is gone and whose pull requests "
                 f"are closed leaves none. The resolver reads {verdict.state}."
             )
+            if grant is not None and grant.dispatched:
+                # The one line that tells a reader which of the two ways a
+                # revival ends they are looking at, and the only visible trace
+                # of #200's lapse: the code-host count is *still* sitting where
+                # the grant was made, and the task is escalating anyway.
+                why += (
+                    f" The revival granted at attempt {grant.attempt} has lapsed: a "
+                    "worker was dispatched on it, and a dispatch spends the one "
+                    "attempt a revival buys whether or not it leaves a result."
+                )
         elif believed == NEEDS_HUMAN and not spent:
             lenient_verdict = lenient.get(entry.task_id)
             believed = lenient_verdict.state if lenient_verdict is not None else ELIGIBLE
-            kind = REVIVED if entry.ref in revived else BUDGET_RENEWED
+            # `not grant.dispatched`, because a spent grant is a tombstone
+            # rather than a live one: a task whose budget is renewed later by a
+            # new blocker signature is a `budget-renewed`, and explaining it with
+            # a revival that lapsed cycles ago would name the wrong mechanism on
+            # the one log that exists to tell the two apart.
+            outstanding = grant if grant is not None and not grant.dispatched else None
+            kind = REVIVED if outstanding is not None else BUDGET_RENEWED
             why = (
                 f"the code host accounts for {verdict.attempts_spent} attempt(s) "
                 f"against a cap of {max_attempts}, but apiary's own record says the "
                 f"budget is not spent (streak={entry.streak}, attempt={entry.attempt}"
-                + (f", revived at attempt {revived[entry.ref]}" if entry.ref in revived else "")
+                + (f", revived at attempt {outstanding.attempt}" if outstanding else "")
                 + f"). `_retry_or_give_up` gives up on the streak, so {believed} stands."
             )
 
@@ -705,7 +814,7 @@ def believe(
 def _budget_spent(
     entry: LedgerEntry,
     attempts_spent: int,
-    revived_at: int | None,
+    grant: Grant | None,
     *,
     max_attempts: int,
     max_total_attempts: int,
@@ -726,6 +835,16 @@ def _budget_spent(
     the whole of what `planner.revive` does: it "resets nothing", so the moment
     the granted attempt produces a result the streak it never reset caps the
     task again.
+
+    **Spent has two readings and only one of them is the code host's** (#200).
+    A result carries the granted attempt and `attempts_spent` moves past it,
+    which is the reading above. `Grant.dispatched` is the other, for the attempt
+    that writes no result at all; the module docstring argues why it is a
+    dispatch rather than a third reading of the code host, and why no other
+    counter bounds that input. A dispatched grant stops suppressing and falls
+    through to the streak test, which is the same place the first reading lands -
+    so a revival that produced a result is decided by exactly the arithmetic it
+    always was.
 
     The fallback for a task the store has never judged is ADR 0002's own -
     `previous_streak = entry.attempt if entry.streak is None else entry.streak`,
@@ -754,7 +873,7 @@ def _budget_spent(
     # fresh budget over work apiary had already abandoned.
     if attempts_spent >= total_cap or int(entry.attempt) >= total_cap:
         return True
-    if revived_at is not None and attempts_spent <= revived_at:
+    if grant is not None and not grant.dispatched and attempts_spent <= grant.attempt:
         return False
     streak = entry.attempt if entry.streak is None else entry.streak
     return int(streak) >= cap
