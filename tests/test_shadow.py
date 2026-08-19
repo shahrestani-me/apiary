@@ -51,12 +51,11 @@ from swarm.github.readiness import IssueState
 from swarm.github.refs import pull_ref
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.checks import PullState
+from swarm.github.readiness import READY
+from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.reconcile import (
-    CLAIMED,
     DONE,
     FAILED,
-    READY,
-    REVIEW,
     CycleReport,
     ReconcilePlan,
     ReconcileReport,
@@ -95,6 +94,8 @@ from test_reconcile import (  # the doubles that drive a real cycle
 )
 from swarm.store import STORE_DIR_ENV
 from swarm.worker.result import write_result
+from swarm.orchestrator.derived import LANDED, NEEDS_HUMAN
+from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
 BLOCKED = "swarm:blocked"
 
@@ -404,8 +405,8 @@ def test_a_task_mergeability_escalated_is_in_the_control_map():
                 Transition(
                     ref=ref(4),
                     task_id="task-4",
-                    from_label=REVIEW,
-                    to_label=FAILED,
+                    from_state=REVIEW_STATE,
+                    to_state=NEEDS_HUMAN,
                     reason="its branch could not be updated within the round cap",
                 ),
             ),
@@ -422,20 +423,20 @@ def test_the_check_gate_wins_over_mergeability_for_the_same_task():
     from swarm.orchestrator.mergeability import MergeabilityPlan, MergeabilityReport
     from swarm.orchestrator.reconcile import Transition
 
-    def moved(to_label: str) -> Any:
+    def moved(to_state: str) -> Any:
         return Transition(
             ref=ref(4),
             task_id="task-4",
-            from_label=REVIEW,
-            to_label=to_label,
+            from_state=REVIEW_STATE,
+            to_state=to_state,
             reason="moved",
         )
 
     both = replace(
         report(entry(4, label=DONE), checks=ChecksReport(
-            plan=ChecksPlan(), applied=(moved(DONE),)
+            plan=ChecksPlan(), applied=(moved(LANDED),)
         )),
-        mergeability=MergeabilityReport(plan=MergeabilityPlan(), applied=(moved(FAILED),)),
+        mergeability=MergeabilityReport(plan=MergeabilityPlan(), applied=(moved(NEEDS_HUMAN),)),
     )
 
     assert control_labels(both) == {"task-4": DONE}

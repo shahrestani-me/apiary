@@ -147,15 +147,17 @@ from ..containers.manager import DockerCLI, Handle, Redactor, find_containers
 from ..github.branches import TaskBranch, parse_task_branch
 from ..github.client import GitHubClient
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
-from ..github.readiness import READY, IssueState
+from ..github.readiness import IssueState
 from ..github.refs import task_ref
 from ..run import Run, RunError, validate_run_id
 from ..taskref import TaskRef
-from .authority import Belief, state_of
+from .authority import Belief, label_state, state_of
 from .derived import CLAIMED as CLAIMED_STATE
+from .derived import ELIGIBLE, NEEDS_HUMAN
+from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import CLAIMED, REVIEW
 from ..store import TaskStore
-from .reconcile import FAILED, ReconcilePlan, ReconcileReport, Snapshot, Transition, apply_plan
+from .reconcile import ReconcilePlan, ReconcileReport, Snapshot, Transition, apply_plan
 
 
 # --------------------------------------------------------------------------
@@ -297,12 +299,12 @@ class RecoveryPlan:
     @property
     def released(self) -> tuple[Transition, ...]:
         """Claims returned to the pool, or handed to a human at the cap."""
-        return tuple(item for item in self.transitions if item.to_label != REVIEW)
+        return tuple(item for item in self.transitions if item.to_state != REVIEW_STATE)
 
     @property
     def published(self) -> tuple[Transition, ...]:
         """Claims whose worker finished and died before it could relabel."""
-        return tuple(item for item in self.transitions if item.to_label == REVIEW)
+        return tuple(item for item in self.transitions if item.to_state == REVIEW_STATE)
 
     @property
     def changed(self) -> bool:
@@ -340,8 +342,8 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
     if attempt >= cap:
         return Transition(
             ref=entry.ref,
-            from_label=entry.state_label,
-            to_label=FAILED,
+            from_state=label_state(entry.state_label),
+            to_state=NEEDS_HUMAN,
             reason=f"{reason}; {attempt} attempt(s) made against a cap of {cap}",
             task_id=entry.task_id,
             attempt=attempt,
@@ -353,8 +355,8 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
         )
     return Transition(
         ref=entry.ref,
-        from_label=entry.state_label,
-        to_label=READY,
+        from_state=label_state(entry.state_label),
+        to_state=ELIGIBLE,
         reason=reason,
         task_id=entry.task_id,
         attempt=attempt,
@@ -467,8 +469,8 @@ def plan_recovery(
             transitions.append(
                 Transition(
                     ref=entry.ref,
-                    from_label=entry.state_label,
-                    to_label=REVIEW,
+                    from_state=label_state(entry.state_label),
+                    to_state=REVIEW_STATE,
                     reason=(
                         f"{branch} has an open pull request; "
                         f"no cycle survived to observe the result"

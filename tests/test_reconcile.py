@@ -84,6 +84,7 @@ from swarm.orchestrator.reconcile import (
     retry_comment,
     rewrite_marker,
     signature,
+    write_labels,
 )
 from swarm.orchestrator.lifecycle import lifecycle_events
 from swarm.run import Run
@@ -91,6 +92,9 @@ from swarm.store import STORE_DIR_ENV, SqliteTaskStore, TaskJudgement
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
+from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
+from swarm.orchestrator.derived import CLAIMED as CLAIMED_STATE
+from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
 from fixtures.markers import legacy_marker
 
@@ -424,7 +428,7 @@ def test_an_issue_closed_by_hand_is_taken_out_of_the_run_and_its_worker_disposed
     # The headline of #22: a human closing an issue mid-run is a feature of
     # putting the ledger on GitHub, and the container has to go with it.
     assert [str(t) for t in plan.transitions] == [
-        "#4: swarm:claimed -> swarm:done (closed as completed on GitHub)"
+        "#4: claimed -> landed (closed as completed on GitHub)"
     ]
     assert [d.ref for d in plan.disposals] == [ref(4)]
 
@@ -436,7 +440,7 @@ def test_a_merged_pull_request_is_read_from_the_issue_it_closed():
 
     # `Closes #<n>` means the merge closes the issue, so the cheap read already
     # carries the signal and nothing has to page through every PR ever opened.
-    assert plan.transitions[0].to_label == DONE
+    assert plan.transitions[0].to_state == LANDED
     assert plan.disposals[0].ref == ref(4)
 
 
@@ -449,7 +453,7 @@ def test_an_issue_closed_as_not_planned_is_failed_rather_than_done():
 
     # The same judgement readiness makes about a dependency: work somebody
     # explicitly decided not to do did not happen.
-    assert plan.transitions[0].to_label == FAILED
+    assert plan.transitions[0].to_state == NEEDS_HUMAN
     assert "not planned" in plan.transitions[0].reason
 
 
@@ -495,7 +499,7 @@ def test_a_failed_worker_consumes_an_attempt_and_goes_back_to_ready():
     )
 
     transition = plan.transitions[0]
-    assert (transition.to_label, transition.attempt) == (READY, 1)
+    assert (transition.to_state, transition.attempt) == (ELIGIBLE, 1)
     assert [d.ref for d in plan.disposals] == [ref(4)]
 
 
@@ -507,7 +511,7 @@ def test_a_failed_worker_at_the_cap_is_handed_to_a_human():
     )
 
     transition = plan.transitions[0]
-    assert (transition.to_label, transition.attempt) == (FAILED, 3)
+    assert (transition.to_state, transition.attempt) == (NEEDS_HUMAN, 3)
     # §5: the counter is an upper bound on attempts made. Giving up early puts
     # a human in front of the problem; looping forever looks healthy.
     assert "cap of 3" in transition.reason
@@ -524,7 +528,7 @@ def test_an_infrastructure_failure_does_not_consume_an_attempt():
     transition = plan.transitions[0]
     # A broken Ollama would otherwise burn every task's budget before anyone
     # noticed. `attempt=None` means the counter is not written at all.
-    assert (transition.to_label, transition.attempt) == (READY, None)
+    assert (transition.to_state, transition.attempt) == (ELIGIBLE, None)
 
 
 def test_an_unknown_exit_code_is_charged_like_a_failure():
@@ -552,7 +556,7 @@ def test_a_worker_that_published_is_moved_to_review_here():
     # model-generated code to announce a fact `derived.py` now reads off the
     # pull request itself, so the label is written from out here instead.
     transition = plan.transitions[0]
-    assert (transition.from_label, transition.to_label) == (CLAIMED, REVIEW)
+    assert (transition.from_state, transition.to_state) == (CLAIMED_STATE, REVIEW_STATE)
     # The attempt succeeded: nothing is charged for it, and `review -> ready` is
     # where a rejected pull request is accounted for.
     assert transition.attempt is None
@@ -607,7 +611,7 @@ def test_the_corrected_record_is_observed_and_costs_no_attempt():
     )
 
     transition = plan.transitions[0]
-    assert (transition.to_label, transition.attempt) == (READY, None)
+    assert (transition.to_state, transition.attempt) == (ELIGIBLE, None)
     # Counted toward the infrastructure ceiling, not the task's budget.
     assert transition.infrastructure
     assert "OutputParserException" in transition.reason
@@ -740,7 +744,7 @@ def test_a_retried_issue_carries_the_failure_as_a_comment():
     )
 
     transition = plan.transitions[0]
-    assert transition.to_label == READY
+    assert transition.to_state == ELIGIBLE
     assert transition.comment.startswith("apiary: attempt 1 failed")
     assert "worker exit 1" in transition.comment
     assert "missing dependency 'sqlalchemy'" in transition.comment
@@ -847,7 +851,7 @@ def test_a_different_failure_renews_the_retry_budget():
 
     transition = plan.transitions[0]
     # Attempt 3 of a 3-cap would have failed under the old arithmetic.
-    assert transition.to_label == READY
+    assert transition.to_state == ELIGIBLE
     # The total keeps counting for honesty; the streak restarts.
     assert (transition.attempt, transition.streak) == (3, 1)
     assert transition.blocker == signature(SYNTAX_ERROR_OUTPUT)
@@ -868,7 +872,7 @@ def test_the_same_failure_repeating_gives_up_exactly_as_before():
     )
 
     transition = plan.transitions[0]
-    assert transition.to_label == FAILED
+    assert transition.to_state == NEEDS_HUMAN
     assert "cap of 3" in transition.reason
     assert transition.comment.startswith("apiary: giving up after 3 attempt(s)")
     assert "failed the same way" in transition.comment
@@ -885,7 +889,7 @@ def test_an_old_marker_without_a_signature_behaves_exactly_as_before():
     )
 
     transition = plan.transitions[0]
-    assert (transition.to_label, transition.attempt) == (FAILED, 3)
+    assert (transition.to_state, transition.attempt) == (NEEDS_HUMAN, 3)
     assert "cap of 3" in transition.reason
 
 
@@ -898,7 +902,7 @@ def test_a_renewed_blocker_that_then_repeats_burns_its_own_budget():
     )
 
     transition = plan.transitions[0]
-    assert transition.to_label == READY
+    assert transition.to_state == ELIGIBLE
     assert (transition.attempt, transition.streak) == (4, 2)
     # A repeat is not a renewal, so the comment must not claim progress.
     assert "renewed" not in transition.comment
@@ -915,7 +919,7 @@ def test_the_hard_cap_gives_up_whatever_the_signature_says():
     )
 
     transition = plan.transitions[0]
-    assert (transition.to_label, transition.attempt) == (FAILED, 9)
+    assert (transition.to_state, transition.attempt) == (NEEDS_HUMAN, 9)
     assert "total cap of 9" in transition.reason
     assert "total retry budget is spent" in transition.comment
 
@@ -930,7 +934,7 @@ def test_a_cap_of_one_gives_up_even_on_a_renewed_failure():
         max_total_attempts=9,
     )
 
-    assert plan.transitions[0].to_label == FAILED
+    assert plan.transitions[0].to_state == NEEDS_HUMAN
 
 
 def test_a_retry_with_no_output_signs_as_the_sentinel_and_burns_down():
@@ -944,7 +948,7 @@ def test_a_retry_with_no_output_signs_as_the_sentinel_and_burns_down():
     )
 
     transition = plan.transitions[0]
-    assert transition.to_label == READY
+    assert transition.to_state == ELIGIBLE
     assert (transition.blocker, transition.streak) == (EMPTY_SIGNATURE, 2)
 
 
@@ -983,8 +987,8 @@ def test_the_signature_is_persisted_in_the_store_before_the_relabel():
 def test_folding_a_signature_transition_updates_the_in_memory_ledger():
     transition = Transition(
         ref=ref(4),
-        from_label=CLAIMED,
-        to_label=READY,
+        from_state=CLAIMED_STATE,
+        to_state=ELIGIBLE,
         reason="worker exit 1",
         task_id="task-4",
         attempt=1,
@@ -1010,8 +1014,8 @@ def test_a_counter_bump_without_a_signature_clears_the_stale_record():
         transitions=(
             Transition(
                 ref=ref(4),
-                from_label=CLAIMED,
-                to_label=READY,
+                from_state=CLAIMED_STATE,
+                to_state=ELIGIBLE,
                 reason="a stale claim, with nothing to sign",
                 task_id="task-4",
                 attempt=2,
@@ -1054,7 +1058,7 @@ def test_a_pull_request_closed_without_merging_returns_the_issue_to_the_pool():
     transition = plan.transitions[0]
     # The attempt is consumed: the work was done and rejected, and a retry that
     # costs nothing can be rejected forever.
-    assert (transition.to_label, transition.attempt) == (READY, 1)
+    assert (transition.to_state, transition.attempt) == (ELIGIBLE, 1)
     assert [d.ref for d in plan.disposals] == [ref(4)]
     assert plan.blind is False
 
@@ -1099,16 +1103,16 @@ def test_pull_requests_that_could_not_be_listed_are_not_read_as_closed():
 
 
 def _decisions(plan: ReconcilePlan) -> tuple[Any, ...]:
-    """A plan as the decisions it carries, with `from_label` struck out.
+    """A plan as the decisions it carries, with `from_state` struck out.
 
-    `Transition.from_label` is the label the write has to *remove*, so it says
+    `Transition.from_state` is the label the write has to *remove*, so it says
     what the issue was wearing rather than what was decided about it - two runs
     that decided identically over differently-labelled issues differ there and
     nowhere else. `test_authority.outcome` drops the label-write log for the
     same reason and says so at more length.
     """
     return (
-        tuple(replace(t, from_label="") for t in plan.transitions),
+        tuple(replace(t, from_state="") for t in plan.transitions),
         tuple(plan.disposals),
     )
 
@@ -1185,7 +1189,7 @@ def test_a_malformed_issue_is_failed_and_carries_the_reason_as_a_comment():
     plan = plan_reconcile(ledger(errors=(error,)), labels={ref(7): frozenset({READY})})
 
     transition = plan.transitions[0]
-    assert (transition.ref, transition.from_label, transition.to_label) == (ref(7), READY, FAILED)
+    assert (transition.ref, transition.from_state, transition.to_state) == (ref(7), ELIGIBLE, NEEDS_HUMAN)
     # §1.4: the parse failure is posted back on the issue that failed it.
     assert "section is missing" in transition.comment
 
@@ -1254,7 +1258,7 @@ def test_a_landed_transition_is_folded_into_the_ledger_rather_than_re_read():
     entries = ledger(entry(4, label=CLAIMED, attempt=0))
 
     folded = fold(
-        entries, [Transition(ref(4), CLAIMED, READY, "exit 1", task_id="task-4", attempt=1)]
+        entries, [Transition(ref(4), CLAIMED_STATE, ELIGIBLE, "exit 1", task_id="task-4", attempt=1)]
     )
 
     # A second listing to observe our own writes is the one request that buys
@@ -1268,7 +1272,7 @@ def test_a_landed_transition_is_folded_into_the_ledger_rather_than_re_read():
 def test_folding_a_transition_for_an_issue_outside_the_ledger_changes_nothing():
     entries = ledger(entry(4))
 
-    unrelated = [Transition(ref(9), READY, FAILED, "malformed")]
+    unrelated = [Transition(ref(9), ELIGIBLE, NEEDS_HUMAN, "malformed")]
     assert fold(entries, unrelated).entries == entries.entries
 
 
@@ -1340,7 +1344,7 @@ def test_a_container_that_will_not_die_does_not_stop_the_labels_from_moving():
 
     report = apply_plan(client, plan, fleet=fleet, handles=running(4))
 
-    assert [t.to_label for t in report.applied] == [DONE]
+    assert [t.to_state for t in report.applied] == [LANDED]
     assert report.disposed == ()
     assert "daemon is not responding" in str(report.failures[0])
 
@@ -1905,7 +1909,7 @@ def test_an_infrastructure_failure_below_the_cap_still_re_readies():
     )
 
     transition = plan.transitions[0]
-    assert (transition.to_label, transition.attempt) == (READY, None)
+    assert (transition.to_state, transition.attempt) == (ELIGIBLE, None)
     assert transition.infrastructure
 
 
@@ -1919,7 +1923,7 @@ def test_the_nth_consecutive_infrastructure_failure_reaches_a_human():
     )
 
     transition = plan.transitions[0]
-    assert transition.to_label == FAILED
+    assert transition.to_state == NEEDS_HUMAN
     # The reason names the repeated verdict, not just a count: "3 failures" on
     # its own sends a human to the wrong place.
     assert "3 consecutive infrastructure failures" in transition.reason
@@ -1950,7 +1954,7 @@ def test_a_real_task_failure_resets_the_streak():
 
     after = infrastructure_streaks(
         before,
-        [Transition(ref=ref(4), from_label=CLAIMED, to_label=READY, reason="worker exit 1")],
+        [Transition(ref=ref(4), from_state=CLAIMED_STATE, to_state=ELIGIBLE, reason="worker exit 1")],
     )
 
     assert ref(4) not in after
@@ -1964,8 +1968,8 @@ def test_consecutive_infrastructure_transitions_accumulate():
             [
                 Transition(
                     ref=ref(4),
-                    from_label=CLAIMED,
-                    to_label=READY,
+                    from_state=CLAIMED_STATE,
+                    to_state=ELIGIBLE,
                     reason="infrastructure failure",
                     infrastructure=True,
                 )
@@ -1981,8 +1985,8 @@ def test_one_issues_streak_is_not_another_issues():
         [
             Transition(
                 ref=ref(5),
-                from_label=CLAIMED,
-                to_label=READY,
+                from_state=CLAIMED_STATE,
+                to_state=ELIGIBLE,
                 reason="infrastructure failure",
                 infrastructure=True,
             )
@@ -2008,7 +2012,7 @@ def test_a_record_that_moved_nothing_is_not_retired():
     `fold`'s rule and `infrastructure_streaks`' rule, for the same reason. A
     label write GitHub refused leaves the task where it was, and retiring its
     record would lose the only evidence the retry never happened."""
-    moved_nothing = Transition(ref(4), CLAIMED, READY, "no record caused this")
+    moved_nothing = Transition(ref(4), CLAIMED_STATE, ELIGIBLE, "no record caused this")
 
     assert observed_records({}, []) == {}
     assert observed_records({ref(4): "kept"}, [moved_nothing]) == {ref(4): "kept"}
@@ -2065,7 +2069,7 @@ def test_a_cap_of_zero_or_less_is_honoured_as_written():
         infrastructure_policy=policy,
     )
 
-    assert plan.transitions[0].to_label == FAILED  # cap 0 means the first one escalates
+    assert plan.transitions[0].to_state == NEEDS_HUMAN  # cap 0 means the first one escalates
     assert "no ceiling" in InfrastructurePolicy(cap=-1).summary()
 
 
@@ -2625,8 +2629,8 @@ def a_report(
 def escalation(reason: str = "attempts exhausted", attempt: int | None = 3) -> Transition:
     return Transition(
         ref=ref(4),
-        from_label=CLAIMED,
-        to_label=FAILED,
+        from_state=CLAIMED_STATE,
+        to_state=NEEDS_HUMAN,
         reason=reason,
         task_id="task-4",
         attempt=attempt,
@@ -2689,7 +2693,7 @@ def test_a_malformed_issue_reaching_a_human_is_deliberately_not_announced():
     nothing is not a timeline entry, and inventing a key from the issue number
     is the thing this whole module refuses to do."""
     malformed = Transition(
-        ref=ref(4), from_label=READY, to_label=FAILED, reason="malformed contract: no ## Goal"
+        ref=ref(4), from_state=ELIGIBLE, to_state=NEEDS_HUMAN, reason="malformed contract: no ## Goal"
     )
 
     assert lifecycle_events(a_report(applied=[malformed])) == ()
@@ -2701,8 +2705,8 @@ def test_a_reason_that_quoted_a_branch_is_rewritten_into_the_task_ref():
     adapter a branch carries an issue number (#144 encodes `#4` as `%234`)."""
     failed = Transition(
         ref=ref(4),
-        from_label=REVIEW,
-        to_label=FAILED,
+        from_state=REVIEW_STATE,
+        to_state=NEEDS_HUMAN,
         reason=(
             f"no check run was ever created for {task_branch(ref(4), 0)}; "
             f"move it back to {READY}"
@@ -2721,7 +2725,7 @@ def test_a_transition_github_refused_is_never_announced():
     """`fold`'s rule, and for the same reason: a label write GitHub refused left
     the task where it was, so announcing it would put a state in an append-only
     log that the control plane never reached."""
-    planned = Transition(ref=ref(4), from_label=CLAIMED, to_label=DONE, reason="x", task_id="task-4")
+    planned = Transition(ref=ref(4), from_state=CLAIMED_STATE, to_state=LANDED, reason="x", task_id="task-4")
 
     # Planned, not applied.
     assert lifecycle_events(a_report(applied=[], entries=[entry(4, label=CLAIMED)])) == ()
@@ -3245,3 +3249,108 @@ def test_a_revived_attempt_that_does_leave_a_result_is_unchanged(tmp_path, monke
 
     assert fleet.spawned == [TASK_ISSUE], "still exactly one attempt"
     assert loop._believed[ref(TASK_ISSUE)] == NEEDS_HUMAN
+
+
+# --------------------------------------------------------------------------
+# Storing a state as labels
+# --------------------------------------------------------------------------
+#
+# `Transition` speaks ADR 0001's internal states since #152, so the `swarm:*`
+# names appear at exactly one point in the transition path: `write_labels`.
+# These are the properties that made it safe to move the vocabulary.
+
+
+def test_a_transition_is_stored_as_the_label_that_holds_its_state():
+    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
+
+    write_labels(client, Transition(ref(4), CLAIMED_STATE, LANDED, "merged"))
+
+    assert client.labels_on(4) == {DONE}
+
+
+def test_the_label_is_added_before_the_stale_one_is_removed():
+    """`readiness._relabel`'s rule, held at the one place that now writes.
+
+    GitHub has no transaction across two label calls. A crash between them leaves
+    two state labels or none: two is repairable by §3's precedence, none puts the
+    issue outside the ledger entirely, where nothing looks at it again.
+    """
+    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
+
+    write_labels(client, Transition(ref(4), CLAIMED_STATE, LANDED, "merged"))
+
+    assert client.log == [f"+{DONE} #4", f"-{CLAIMED} #4"]
+
+
+def test_a_transition_that_does_not_move_writes_no_removal():
+    """Adding and removing the same name is a call that undoes itself."""
+    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
+
+    write_labels(client, Transition(ref(4), CLAIMED_STATE, CLAIMED_STATE, "unchanged"))
+
+    assert client.log == [f"+{CLAIMED} #4"]
+    assert client.labels_on(4) == {CLAIMED}
+
+
+def test_the_label_removed_is_the_one_the_issue_carries_not_the_one_believed():
+    """Why `from_state` is built from the label and not from the belief (#152).
+
+    A human relabels a claimed task `swarm:done` mid-run. The resolver still
+    believes `claimed` - there is a container - and the cycle decides to move the
+    task to `needs-human`. The write has to take **`swarm:done`** off, because
+    that is what the issue is wearing; taking `swarm:claimed` off would leave the
+    issue carrying two state labels, and §3 would then read the furthest-along of
+    them and stop the task.
+
+    `plan_reconcile` therefore passes `label_state(entry.state_label)` rather than
+    the belief, and this asserts the consequence rather than the plumbing.
+    """
+    client = CommentingClient(issues={4: issue_payload(4, label=DONE)})
+
+    # `label_state(swarm:done)` is `landed` - what the issue says, not what a
+    # cycle watching the container would say.
+    write_labels(client, Transition(ref(4), LANDED, NEEDS_HUMAN, "budget spent"))
+
+    assert client.log == [f"+{FAILED} #4", f"-{DONE} #4"]
+    assert client.labels_on(4) == {FAILED}
+
+
+def test_a_transition_with_no_previous_state_removes_nothing():
+    """The malformed-issue path: `from_state` is empty when nothing carried a state."""
+    client = CommentingClient(issues={4: issue_payload(4, label=READY)})
+
+    write_labels(client, Transition(ref(4), "", NEEDS_HUMAN, "malformed contract"))
+
+    assert client.log == [f"+{FAILED} #4"]
+
+
+def test_the_transition_path_writes_labels_in_exactly_one_place():
+    """The property that makes the deletion in #152 a deletion rather than a hunt.
+
+    Three modules used to carry their own copy of add-before-remove - here,
+    `checks._apply` and `mergeability._apply` - so the label vocabulary had three
+    exits from the transition path. Now it has one, and this is the test that
+    fails if a fourth appears.
+
+    Static, over the source, because a runtime probe only sees the path the test
+    happened to take: the merge gate's copy fired on a green pull request and
+    nothing else.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "swarm" / "orchestrator"
+    writers = {}
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        if "add_labels" in calls:
+            writers[path.name] = sorted(calls & {"add_labels", "remove_label"})
+
+    # `dispatcher.py` writes the claim, which is not a `Transition` and is #152's
+    # to delete separately; `reconcile.py` is `write_labels`. Nothing else.
+    assert set(writers) == {"reconcile.py", "dispatcher.py"}, writers

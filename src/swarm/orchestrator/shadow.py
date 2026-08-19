@@ -253,7 +253,7 @@ from .derived import (
     resolve,
 )
 from .dispatcher import CLAIMED as CLAIMED_LABEL
-from .lifecycle import INTERNAL_STATE, internal_state
+from .lifecycle import INTERNAL_STATE, internal_state, state_label
 from .reconcile import CycleReport
 
 __all__ = [
@@ -386,7 +386,13 @@ def control_labels(report: CycleReport) -> dict[str, str]:
         }
         for transition in report.mergeability.applied:
             if transition.task_id and transition.task_id not in gated:
-                labels[transition.task_id] = transition.to_label
+                # Translated *back* to a label on purpose. A `Transition` carries
+                # a state since #152, and this function's whole subject is what
+                # the label control plane was left holding - the map is compared
+                # against the resolver's states by the caller, so keeping the
+                # state here would compare the derived answer with itself and
+                # report agreement that was never tested.
+                labels[transition.task_id] = state_label(transition.to_state)
     for task in revived_tasks(report):
         labels[task] = READY_LABEL
     if report.readiness is not None:

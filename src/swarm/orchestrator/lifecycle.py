@@ -64,15 +64,19 @@ from ..github.refs import issue_number, pull_number
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord
 from .checks import CheckSet, PullState
+from .derived import LANDED as LANDED_STATE
+from .derived import NEEDS_HUMAN as NEEDS_HUMAN_STATE
 from .dispatcher import CLAIMED, REVIEW
 from .reconcile import DONE, FAILED, CycleReport, Transition
 
 __all__ = [
     "INTERNAL_STATE",
+    "STATE_LABEL",
     "LifecycleLog",
     "TaskEvent",
     "internal_state",
     "lifecycle_events",
+    "state_label",
     "scrub",
 ]
 
@@ -96,6 +100,21 @@ INTERNAL_STATE = {
     FAILED: "needs-human",
 }
 
+#: The same table read the other way: which label *stores* a given state.
+#:
+#: Inverted rather than written out, because two hand-maintained tables of six
+#: rows each are two tables that disagree the day somebody edits one. The
+#: inversion is total - the six states are distinct, so `INTERNAL_STATE` is a
+#: bijection - and `test_the_label_and_state_vocabularies_round_trip` is what
+#: keeps that true if a seventh state ever arrives.
+#:
+#: **This is the direction epic #140 needs and #152 deletes.** Since #147 every
+#: decision is made on the internal state, so a `Transition` carries states and
+#: the label is looked up here at the single moment one is written
+#: (`reconcile.write_labels`). When that write goes, so does this - and with it
+#: the last module in the tree that knows what a `swarm:*` label is called.
+STATE_LABEL = {state: label for label, state in INTERNAL_STATE.items()}
+
 #: A branch name carries the task ref (`github/branches.py`), and for the
 #: GitHub adapter a ref *is* an issue number - `apiary/%2312-attempt-1` spells
 #: 12 as plainly as `swarm/issue-12` did. So prose quoting a branch still
@@ -110,6 +129,25 @@ _LABEL_RE = re.compile(r"\bswarm:([a-z_-]+)\b")
 def internal_state(label: str) -> str:
     """The internal state a `swarm:*` label is storing. See `INTERNAL_STATE`."""
     return INTERNAL_STATE.get(label, label.split(":", 1)[-1])
+
+
+def state_label(state: str) -> str:
+    """The `swarm:*` label that stores one internal state. See `STATE_LABEL`.
+
+    Raises on a state with no label rather than inventing `swarm:<state>`, which
+    is the direction `internal_state` guesses in and the wrong one here: that
+    function is reading a repository somebody else may have written labels into,
+    and this one is about to *write* one. A made-up label name is a label GitHub
+    creates with a random colour and no description, which is the exact failure
+    `github/labels.py` exists to prevent.
+    """
+    try:
+        return STATE_LABEL[state]
+    except KeyError:
+        raise KeyError(
+            f"no swarm:* label stores the state {state!r}; the six are "
+            f"{', '.join(sorted(STATE_LABEL))}"
+        ) from None
 
 
 def scrub(text: str, refs: Mapping[int, str]) -> str:
@@ -408,11 +446,11 @@ def _landed_or_human(
         task = transition.task_id or slugs.get(transition.ref, "")
         if not task:
             continue
-        if transition.to_label == DONE:
+        if transition.to_state == LANDED_STATE:
             events.append(
                 TaskEvent(TASK_LANDED, {"cycle": cycle, "task": task}, once=(task,))
             )
-        elif transition.to_label == FAILED:
+        elif transition.to_state == NEEDS_HUMAN_STATE:
             events.append(
                 TaskEvent(
                     TASK_NEEDS_HUMAN,

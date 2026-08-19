@@ -76,6 +76,7 @@ from swarm.nodes.judge import mentioned_paths
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
 from swarm.taskref import TaskRef
+from swarm.orchestrator.derived import ELIGIBLE, NEEDS_HUMAN
 
 NOW = dt.datetime(2026, 8, 14, 14, 25, 30, tzinfo=dt.timezone.utc)
 
@@ -383,7 +384,7 @@ def test_a_green_pull_request_is_merged_and_its_issue_marked_done():
     )
 
     assert [str(t) for t in plan.transitions] == [
-        "#23: swarm:review -> swarm:done (PR #101 merged: 1 passed)"
+        "#23: review -> landed (PR #101 merged: 1 passed)"
     ]
     assert plan.merges[0].pull == pull_ref(101)
     assert plan.merges[0].admin_override is True
@@ -463,7 +464,7 @@ def test_a_failing_check_retries_and_the_transition_carries_the_failure():
     outcome = plan.outcomes[0]
 
     assert outcome.transition is not None
-    assert outcome.transition.to_label == READY
+    assert outcome.transition.to_state == ELIGIBLE
     # §5: the counter rides on the transition, so it is persisted before the
     # issue can be dispatched again.
     assert outcome.transition.attempt == 1
@@ -482,7 +483,7 @@ def test_the_last_attempt_gives_up_rather_than_retrying_forever():
     transition = plan.outcomes[0].transition
 
     assert transition is not None
-    assert transition.to_label == FAILED
+    assert transition.to_state == NEEDS_HUMAN
     assert "against a cap of 3" in transition.reason
 
 
@@ -501,7 +502,7 @@ def test_a_failure_outside_the_declared_files_goes_to_a_human_not_to_a_retry():
     # and spending them hides the diagnosis behind an exhausted budget.
     assert outcome.escalated
     assert outcome.transition is not None
-    assert outcome.transition.to_label == FAILED
+    assert outcome.transition.to_state == NEEDS_HUMAN
     assert "tests/test_somebody_else.py" in outcome.transition.reason
     # The attempt budget is untouched: this was never the attempt's fault.
     assert outcome.transition.attempt is None
@@ -544,7 +545,7 @@ def test_an_empty_check_set_past_its_grace_goes_to_a_human_and_is_never_merged()
     assert plan.merges == ()
     assert outcome.verdict == EMPTY
     assert outcome.transition is not None
-    assert outcome.transition.to_label == FAILED
+    assert outcome.transition.to_state == NEEDS_HUMAN
     assert outcome.escalated
     # And not retried either: the next attempt touches the same paths and gets
     # the same empty set.
