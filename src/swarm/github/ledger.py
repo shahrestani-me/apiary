@@ -39,6 +39,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ..state import TaskRecord, TaskStatus
 from ..taskref import TaskRef
+from .branches import task_branch
 from .client import GitHubClient
 from .refs import task_ref
 
@@ -333,8 +334,23 @@ class LedgerEntry:
 
     @property
     def branch(self) -> str:
-        """The worker's branch for this task - addressing, so it uses the number."""
-        return f"swarm/issue-{self.number}"
+        """The branch this task's *current* attempt pushes (`github/branches.py`).
+
+        Attempt-scoped, so it moves when the counter does. That is safe rather
+        than fragile because of one rule in `reconcile._observe`: an exit 0
+        moves no label and writes no counter, so a task sitting in
+        `swarm:review` still carries the attempt whose pull request is open.
+        The counter only moves on a path that has already decided the previous
+        attempt is over - a consumed failure, or a pull request closed unmerged
+        - and the next attempt is then supposed to get a name of its own rather
+        than force-push over work somebody may still be reading.
+
+        Consumers that have to survive a restart read the pair back out of the
+        name instead of rebuilding it from an entry (`console_board.py`,
+        `orchestrator/recovery.py`): after a crash there is a remote and no
+        ledger, which is the whole point of putting it in the name.
+        """
+        return task_branch(self.ref, self.attempt)
 
     def to_task_record(self) -> TaskRecord:
         """Project onto v1's `TaskRecord`, which is all the graph ever sees."""

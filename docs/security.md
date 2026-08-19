@@ -43,7 +43,7 @@ exactly one**:
 
 | Permission | Level | Why |
 |---|---|---|
-| Contents | Read and write | push `swarm/issue-<n>` |
+| Contents | Read and write | push `apiary/<ref>-attempt-<n>` |
 | Pull requests | Read and write | open and update the one PR per issue |
 | Issues | Read and write | read the contract, write `swarm:*` labels and comments |
 | Metadata | Read-only | mandatory; GitHub adds it for you |

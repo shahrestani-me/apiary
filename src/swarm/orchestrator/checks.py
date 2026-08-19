@@ -71,7 +71,7 @@ exactly as `reconcile.py` probes for `create_issue_comment` and `worker/pr.py`
 for `list_pull_requests`: `GitHubClient` has no way to list pull requests (so
 the issue -> PR mapping is unavailable and, without it, this module decides
 nothing at all rather than guessing) and no way to delete a ref (so the
-`swarm/issue-<n>` branch survives its merge and is reported). `client.py` is
+`apiary/<ref>-attempt-<n>` branch survives its merge and is reported). `client.py` is
 outside this ticket's file set; both gaps degrade and neither is silent.
 
 Manual dry run against a real repo - reads only, merges nothing, writes nothing:

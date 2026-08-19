@@ -24,6 +24,7 @@ from unittest import mock
 import pytest
 
 from swarm.github import ledger as ledger_module
+from swarm.github.branches import task_branch
 from swarm.github.ledger import (
     DEFAULT_STACK,
     GENERATED_FILES,
@@ -704,8 +705,9 @@ def test_task_records_have_the_v1_shape():
         "depends_on": ["add-the-client"],
         "status": "pending",
         "attempts": 2,
-        # Addressing, so the branch name uses the number.
-        "branch": "swarm/issue-60",
+        # The branch carries the ref and the attempt (#144), so the same
+        # counter that says "attempts: 2" is in the name the worker pushes.
+        "branch": task_branch(ref(60), 2),
     }
     assert tasks["add-the-client"]["status"] == "verified"
 

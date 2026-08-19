@@ -142,6 +142,12 @@ class TaskRef:
         that needed the distinction would need a reversible encoding here, and
         an unreadable one: this stays readable because a human greps
         `docker ps` with it.
+
+        Which is why this is not the token a branch name uses.
+        `github/branches.py` needs the reversible one - recovery reads a name
+        off a remote with no ledger in hand to disambiguate it - and pays the
+        readability for it. Two safe tokens is the right number here: the trade
+        genuinely lands the other way in the two places.
         """
         token = "".join(char for char in self.value if char in _SAFE or char.isalnum())
         token = token.lstrip("_.-")

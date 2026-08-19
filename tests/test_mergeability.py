@@ -42,6 +42,7 @@ from typing import Any, Iterable
 
 import pytest
 
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
 from swarm.github.refs import task_ref
@@ -116,8 +117,22 @@ def ledger(*entries: LedgerEntry) -> Ledger:
 PULL_NUMBERS = (101, 102, 103, 104)
 
 
-def pull(number: int, *, issue: int) -> PullState:
-    return PullState(number=number, branch=f"swarm/issue-{issue}", sha=f"{issue:0>40x}")
+def branch(number: int, attempt: int = 0) -> str:
+    """The head ref a worker for `(number, attempt)` pushed - built, not spelled.
+
+    Spelling the name out would make these tests assert #144's encoding rather
+    than the merge gate's behaviour; the encoding is `test_branches.py`'s.
+    """
+    return task_branch(task_ref(number), attempt)
+
+
+def pull(number: int, *, issue: int, attempt: int = 0) -> PullState:
+    # The attempt has to match the ledger entry's: a branch name carries it
+    # (#144) and the gate finds a pull request by `LedgerEntry.branch`. That is
+    # the invariant, not a test detail - a task in `swarm:review` still carries
+    # the attempt its open pull request was pushed from, because an exit 0
+    # moves no counter (`reconcile._observe`).
+    return PullState(number=number, branch=branch(issue, attempt), sha=f"{issue:0>40x}")
 
 
 def pulls(*states: PullState) -> dict[str, PullState]:
@@ -133,7 +148,7 @@ def state(
 ) -> Mergeability:
     return Mergeability(
         number=pull_number,
-        branch=f"swarm/issue-{issue}",
+        branch=branch(issue),
         mergeable=mergeable,
         state=mergeable_state,
         base="main",
@@ -158,9 +173,15 @@ def green(*numbers: int, ledger_: Ledger | None = None, states: dict[int, Mergea
     say", so building the two plans together is the shape most tests want.
     """
     tasks = ledger_ or ledger(*(entry(number) for number in numbers))
+    # Read back off the ledger rather than assumed to be 0, so a test that
+    # hands in an entry mid-budget gets a pull request on that attempt's branch.
+    attempts = {item.number: item.attempt for item in tasks.entries.values()}
     checks = plan_checks(
         tasks,
-        pulls=pulls(*(pull(pr, issue=number) for pr, number in zip(PULL_NUMBERS, numbers))),
+        pulls=pulls(*(
+            pull(pr, issue=number, attempt=attempts.get(number, 0))
+            for pr, number in zip(PULL_NUMBERS, numbers)
+        )),
         checks={number: summarise_checks([{"name": "test", "status": "completed",
                                            "conclusion": "success"}]) for number in numbers},
     )
@@ -294,7 +315,7 @@ def pr_payload(
 ) -> dict[str, Any]:
     return {
         "number": number,
-        "head": {"ref": f"swarm/issue-{issue}", "sha": f"{issue:0>40x}"},
+        "head": {"ref": branch(issue), "sha": f"{issue:0>40x}"},
         "base": {"ref": "main", "sha": "abcdef1234567890"},
         "mergeable": mergeable,
         "mergeable_state": mergeable_state,
@@ -371,7 +392,7 @@ def test_a_green_pull_request_behind_its_base_is_updated_and_not_merged():
     assert plan.merges == ()
     assert plan.held == (23,)
     assert [str(u) for u in plan.updates] == [
-        "#23: update PR #101 (swarm/issue-23) from main, round 1 of 3"
+        f"#23: update PR #101 ({branch(23)}) from main, round 1 of 3"
     ]
     # And the `swarm:done` #23 planned goes with the merge: a label written for a
     # merge that did not happen is a lie nothing later can detect.
@@ -697,7 +718,7 @@ def test_a_branch_this_client_cannot_update_still_spends_its_round():
     # what turns "never updatable" into a named `swarm:failed` three cycles later
     # instead of a review queue that quietly never drains.
     assert report.updated == ()
-    assert report.unupdatable == ("swarm/issue-23",)
+    assert report.unupdatable == (branch(23),)
     assert UPDATE_METHODS[0] in report.summary()
     assert budget.spent(23) == 1
 
@@ -795,7 +816,7 @@ def test_a_dry_run_writes_nothing_at_all():
 def test_one_pass_updates_the_stale_one_and_lets_the_fresh_one_through():
     client = UpdatingClient(
         issues={23: issue_payload(23), 24: issue_payload(24)},
-        open_pulls=((101, "swarm/issue-23"), (102, "swarm/issue-24")),
+        open_pulls=((101, branch(23)), (102, branch(24))),
         payloads={
             101: pr_payload(101, issue=23),
             102: pr_payload(102, issue=24, mergeable_state="behind"),
@@ -817,7 +838,7 @@ def test_one_pass_updates_the_stale_one_and_lets_the_fresh_one_through():
 def test_one_pass_costs_one_pull_request_read_per_review_issue_and_nothing_else():
     client = UpdatingClient(
         issues={23: issue_payload(23), 24: issue_payload(24, label=CLAIMED)},
-        open_pulls=((101, "swarm/issue-23"), (102, "swarm/issue-24")),
+        open_pulls=((101, branch(23)), (102, branch(24))),
         payloads={101: pr_payload(101, issue=23, mergeable_state="behind")},
     )
     tasks = ledger(entry(23), entry(24, label=CLAIMED))
@@ -851,7 +872,7 @@ def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothin
 def test_a_conflicting_pass_re_dispatches_with_the_touched_files_named():
     client = UpdatingClient(
         issues={23: issue_payload(23)},
-        open_pulls=((101, "swarm/issue-23"),),
+        open_pulls=((101, branch(23)),),
         payloads={101: pr_payload(101, issue=23, mergeable=False, mergeable_state="dirty")},
         files={101: ["src/mod23.py", "src/shared.py"]},
     )
@@ -878,7 +899,7 @@ def test_behind_and_dirty_are_what_git_actually_does_to_two_swarm_branches(scrat
     against a real bare-repo origin, so the distinction the rest of this file
     mocks is one git demonstrably makes.
     """
-    scratch_repo.branch("swarm/issue-23")
+    scratch_repo.branch(branch(23))
     scratch_repo.write("mod23.py", "VALUE = 23\n")
     scratch_repo.commit("issue 23")
 
@@ -888,7 +909,7 @@ def test_behind_and_dirty_are_what_git_actually_does_to_two_swarm_branches(scrat
     scratch_repo.commit("issue 24")
 
     # Disjoint files: the branch is merely *behind*, and updating it is enough.
-    scratch_repo.checkout("swarm/issue-23")
+    scratch_repo.checkout(branch(23))
     behind_merge = scratch_repo.git("merge", "--no-edit", "main", check=False)
     assert behind_merge.returncode == 0
     assert scratch_repo.read("calc.py").endswith("VALUE = 24\n")
@@ -898,7 +919,7 @@ def test_behind_and_dirty_are_what_git_actually_does_to_two_swarm_branches(scrat
     scratch_repo.checkout("main")
     scratch_repo.write("calc.py", "def add(a, b):\n    return a + b\n\n\nVALUE = 25\n")
     scratch_repo.commit("issue 25")
-    scratch_repo.checkout("swarm/issue-23")
+    scratch_repo.checkout(branch(23))
     scratch_repo.write("calc.py", "def add(a, b):\n    return a + b\n\n\nVALUE = 99\n")
     scratch_repo.commit("issue 23 again")
 

@@ -36,8 +36,10 @@ from typing import Any
 
 import pytest
 
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubClient, Response
 from swarm.github.labels import SWARM_LABELS
+from swarm.github.refs import task_ref
 from swarm.greenfield.stacks import REACT_TOOLCHAIN
 from swarm.greenfield.provision import (
     CHECK_NAME,
@@ -339,7 +341,7 @@ def test_the_workflow_is_valid_yaml_that_runs_on_push():
     # Filtered to the default branch, where it used to be unfiltered. The
     # initial commit lands straight on that branch and still produces a check
     # run there; what the filter removes is the second run every PR push paid
-    # for, once for `push` on `swarm/issue-<n>` and once for `pull_request`.
+    # for, once for `push` on the worker's branch and once for `pull_request`.
     assert triggers["push"] == {"branches": ["main"]}
 
 
@@ -351,7 +353,7 @@ def test_a_pull_request_push_produces_one_run_and_not_two():
     triggers = triggers.get("on", triggers.get(True))
 
     assert triggers["push"]["branches"] == ["main"]
-    assert "swarm/issue-7" not in triggers["push"]["branches"]
+    assert task_branch(task_ref(7), 0) not in triggers["push"]["branches"]
 
 
 def test_the_push_filter_names_the_branch_github_actually_made():

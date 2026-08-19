@@ -29,6 +29,8 @@ import pytest
 from fixtures.github import REPO, response
 from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 
+from swarm.github.branches import task_branch
+from swarm.github.refs import task_ref
 from swarm.state import FileEdit, WorkerOutput
 from swarm.worker import pr as pr_module
 from swarm.worker.entrypoint import EXIT_INFRASTRUCTURE, EXIT_OK, WorkerResult, main
@@ -44,7 +46,9 @@ from swarm.worker.pr import (
 )
 
 ISSUE = 7
-BRANCH = f"swarm/issue-{ISSUE}"
+#: Attempt 0's branch: the fixtures below are a first attempt, and #144 puts
+#: the attempt in the name rather than leaving one name to serve every one.
+BRANCH = task_branch(task_ref(ISSUE), 0)
 OWNER = REPO.split("/")[0]
 TOKEN = "ghp-not-a-real-token-0123456789"
 
@@ -164,7 +168,7 @@ def worker_env(scratch_repo: ScratchRepo, monkeypatch: pytest.MonkeyPatch) -> No
 
 @pytest.fixture()
 def finished(scratch_repo: ScratchRepo, tmp_path: Path) -> WorkerResult:
-    """A clone with a verified commit on `swarm/issue-7` - a worker's end state."""
+    """A clone with a verified commit on the attempt-0 branch - a worker's end state."""
     return attempt(scratch_repo, tmp_path / "attempt-1", GOOD_CALC, "swarm[add-sub]: add sub")
 
 

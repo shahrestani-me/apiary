@@ -58,7 +58,9 @@ from ..artifacts import (
     TASK_NEEDS_HUMAN,
     TASK_RESULT,
 )
+from ..github.branches import parse_task_branch
 from ..github.readiness import BLOCKED, READY
+from ..github.refs import issue_number
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord
 from .checks import CheckSet, PullState
@@ -94,11 +96,14 @@ INTERNAL_STATE = {
     FAILED: "needs-human",
 }
 
-#: A branch name carries the issue number because addressing needs one
-#: (`LedgerEntry.branch`), so prose quoting a branch smuggles the number into a
-#: payload that is meant to be joinable on the task ref alone. Both it and any
-#: label name are translated on the way out.
-_BRANCH_RE = re.compile(r"\bswarm/issue-(\d+)\b")
+#: A branch name carries the task ref (`github/branches.py`), and for the
+#: GitHub adapter a ref *is* an issue number - `apiary/%2312-attempt-1` spells
+#: 12 as plainly as `swarm/issue-12` did. So prose quoting a branch still
+#: smuggles the number into a payload that is meant to be joinable on the task
+#: ref alone, and it is still translated on the way out, alongside any label
+#: name. Matched loosely and parsed strictly: the regex finds the shape, and
+#: `parse_task_branch` decides whether it really is one of ours.
+_BRANCH_RE = re.compile(r"\bapiary/[A-Za-z0-9_%-]+-attempt-\d+\b")
 _LABEL_RE = re.compile(r"\bswarm:([a-z_-]+)\b")
 
 
@@ -112,7 +117,7 @@ def scrub(text: str, refs: Mapping[int, str]) -> str:
 
     Two things the reconciler and the merge gate legitimately put in a reason
     are the two this ticket keeps out of the log: the branch
-    (`swarm/issue-12`, which *is* an issue number) and the label
+    (`apiary/%2312-attempt-1`, which carries one) and the label
     (`swarm:ready`, which epic #140 deletes). A task ref the ledger cannot
     resolve becomes a neutral phrase rather than the number, because a number
     that survives *because* the ledger lost the task is the worst case, not the
@@ -125,7 +130,18 @@ def scrub(text: str, refs: Mapping[int, str]) -> str:
     """
 
     def branch(match: re.Match[str]) -> str:
-        return refs.get(int(match.group(1)), "another task in this run")
+        parsed = parse_task_branch(match.group(0))
+        if parsed is not None:
+            try:
+                number = issue_number(parsed.ref)
+            except ValueError:
+                # A ref this adapter did not mint. Nothing here can turn it
+                # into a number, which is the correct outcome rather than a
+                # failure: `refs` is keyed by issue number because the code
+                # host is, and a foreign ref simply has no entry to find.
+                return "another task in this run"
+            return refs.get(number, "another task in this run")
+        return "another task in this run"
 
     return _LABEL_RE.sub(
         lambda match: internal_state(match.group(0)), _BRANCH_RE.sub(branch, text)
@@ -190,6 +206,17 @@ def lifecycle_events(
     # it stays that way.
     by_issue = {entry.number: entry for entry in entries.values()}
     by_number = {number: entry.task_id for number, entry in by_issue.items() if entry.task_id}
+    # Pull requests, keyed by the task ref inside each head branch rather than
+    # by the name itself (#144). `LedgerEntry.branch` names a ticket's *current*
+    # attempt, and this projection runs after the cycle folded its transitions -
+    # so a failing check set moves the counter, and a name comparison would then
+    # find no pull request for the very task whose checks just failed. The
+    # `pr.checks failing` announcement is the one nobody can afford to lose.
+    by_pull_ref = {
+        parsed.ref: state
+        for name, state in pulls.items()
+        if (parsed := parse_task_branch(name)) is not None
+    }
     events: list[TaskEvent] = []
 
     def emit(name: str, once: tuple[Any, ...] | None = None, **fields: Any) -> None:
@@ -233,7 +260,7 @@ def lifecycle_events(
     # 2. The merge gate, in the order it ran: mergeability decides what may
     #    merge against the base as it is now, then checks merges it.
     for ref, entry in sorted(entries.items()):
-        pull = pulls.get(entry.branch)
+        pull = by_pull_ref.get(entry.ref)
         task = slugs.get(ref, "")
         if pull is None or not task:
             continue
@@ -248,7 +275,7 @@ def lifecycle_events(
     for number, check_set in sorted(checks.items()):
         entry = by_issue.get(number)  # type: ignore[assignment]
         task = by_number.get(number, "")
-        pull = pulls.get(entry.branch) if entry is not None else None
+        pull = by_pull_ref.get(entry.ref) if entry is not None else None
         if not task or pull is None:
             continue
         state = check_set.verdict

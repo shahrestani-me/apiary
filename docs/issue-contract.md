@@ -215,9 +215,14 @@ editor.
 - The **marker id is authoritative for identity** — it is the ledger key, the
   thing replanning matches on, the thing that survives.
 - The **issue number is authoritative for addressing** — API calls, `## Blocked
-  by` refs, container labels (`apiary.issue=<n>`), branch names
-  (`swarm/issue-<n>`). Refs never use the slug: a slug is not resolvable by
-  GitHub and would not close an issue or cross-link.
+  by` refs, container labels (`apiary.issue=<n>`). Refs never use the slug: a
+  slug is not resolvable by GitHub and would not close an issue or cross-link.
+- **Branch names carry the task ref and the attempt**, not the number:
+  `apiary/<ref>-attempt-<n>` (`src/swarm/github/branches.py`, #144). The ref is
+  percent-encoded into something git accepts and reads back out losslessly, so
+  an orchestrator that lost its memory can reconstruct what was in flight from
+  the code host alone. GitHub's `#42` encodes as `%2342`; a tracker whose ids
+  are already git-safe keeps them verbatim.
 - They cannot "disagree" about the same fact because they answer different
   questions. What can go wrong is **two issues carrying the same id**, and that
   is control-plane corruption: the cycle aborts with an error naming both issue

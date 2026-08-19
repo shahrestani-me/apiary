@@ -2,7 +2,7 @@
 
     apiary-worker --repo shahrestani-me/apiary --issue 16 --base-commit 64afc6c
 
-Clone at the base commit, branch `swarm/issue-<n>`, read the issue's contract,
+Clone at the base commit, branch `apiary/<ref>-attempt-<n>`, read the contract,
 edit the files it declares, run **its** `## Verify` command, and commit only if
 that command exits zero. `Dockerfile.worker`'s shim delegates here as soon as
 this module exists, argv untouched, so `main(argv)` is the argument contract
@@ -63,6 +63,7 @@ from typing import Mapping, Sequence
 
 from ..config import SETTINGS
 from ..containers.manager import SECRET_NAME_RE
+from ..github.branches import task_branch
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import (
     ContractError,
@@ -70,6 +71,7 @@ from ..github.ledger import (
     generated_for,
     parse_contract,
 )
+from ..github.refs import task_ref
 # GitError says "a git command failed" and means it in both v1's worktrees and
 # v2's clones; a second error class for the same fact would only make callers
 # catch both.
@@ -355,10 +357,13 @@ def prepare_checkout(clone_url: str, dest: Path, base_commit: str, branch: str) 
     whatever main happened to be would verify against a tree nobody planned
     for.
 
-    `--force-create` because this is also the retry path. A previous attempt
-    pushed `swarm/issue-<n>`, the clone fetched it, and a fresh attempt starts
-    from the base commit again rather than compounding the last failure - #17
-    updates the existing PR instead of opening a second one.
+    `--force-create` because this is also the retry path. Since #144 a retry
+    is a *different* branch - the attempt is in the name - so the force is no
+    longer what stops a fresh attempt compounding the last one; branching from
+    the base commit is. It stays because the clone fetched every previous
+    attempt's branch and this is still the call that decides where HEAD lands,
+    and because a worker re-run by hand at the same attempt must start over
+    rather than resume.
     """
     dest = dest.resolve()
     if dest.exists() and any(dest.iterdir()):
@@ -869,7 +874,12 @@ def run_worker(
     does so carries the `ollama` marker.
     """
     contract, title = _fetch_contract(client, issue)
-    branch = f"swarm/issue-{issue}"
+    # The name carries the ref and the attempt, so an orchestrator that lost
+    # its memory can tell from the remote alone what was in flight and how much
+    # budget it had spent (`github/branches.py`). Read from the marker, which is
+    # the same counter the ledger will build `LedgerEntry.branch` from, so the
+    # branch this pushes is the one the reconciler goes looking for.
+    branch = task_branch(task_ref(issue), contract.attempt)
     task_id = contract.task_id or f"issue-{issue}"
 
     # A retry gets told why the last attempt failed, or it is not a retry - it
@@ -1120,6 +1130,7 @@ def _unrun(
     verify_command: str = "",
     written: tuple[str, ...] = (),
     task_id: str = "",
+    attempt: int = 0,
 ) -> WorkerResult:
     """A result for an attempt that never got as far as a verify command.
 
@@ -1134,7 +1145,12 @@ def _unrun(
         issue=issue,
         repo=repo,
         task_id=task_id,
-        branch=f"swarm/issue-{issue}",
+        # `attempt` defaults to 0 because both callers get here without having
+        # read the marker - one because the body would not parse, the other
+        # because the host broke first. The branch is a field of the record and
+        # nothing dispatches from it; naming the attempt-0 branch is the honest
+        # answer when no attempt number was ever learned.
+        branch=task_branch(task_ref(issue), attempt),
         root=Path("."),
         verify_command=verify_command,
         verify_output=reason,

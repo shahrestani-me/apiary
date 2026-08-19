@@ -42,8 +42,10 @@ from typing import Any, Iterable
 import pytest
 from fixtures import failures
 
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
+from swarm.github.refs import task_ref
 from swarm.orchestrator.checks import (
     ADMIN_OVERRIDE_ENV,
     BRANCH_METHODS,
@@ -101,14 +103,29 @@ def entry(
     )
 
 
+def branch(number: int, attempt: int = 0) -> str:
+    """The head ref a worker for `(number, attempt)` pushed - built, not spelled.
+
+    Spelling the name out would make these tests assert #144's encoding rather
+    than the gate's behaviour, and the encoding is `test_branches.py`'s subject.
+    """
+    return task_branch(task_ref(number), attempt)
+
+
 def ledger(*entries: LedgerEntry) -> Ledger:
     return Ledger(entries={item.task_id: item for item in entries})
 
 
-def pull(number: int, *, issue: int, age_s: float = 0.0, draft: bool = False) -> PullState:
+def pull(number: int, *, issue: int, age_s: float = 0.0, draft: bool = False,
+         attempt: int = 0) -> PullState:
+    # `attempt` has to match the entry's, because a branch name carries it
+    # (#144) and the gate looks a pull request up by `LedgerEntry.branch`. That
+    # is the real invariant, not a test detail: a task in `swarm:review` still
+    # carries the attempt its open pull request was pushed from, because an
+    # exit 0 moves no counter (`reconcile._observe`).
     return PullState(
         number=number,
-        branch=f"swarm/issue-{issue}",
+        branch=branch(issue, attempt),
         sha=f"{issue:0>40x}",
         updated_at=NOW - dt.timedelta(seconds=age_s),
         draft=draft,
@@ -362,7 +379,7 @@ def test_the_merge_deletes_the_branch_because_a_long_run_leaves_one_per_task():
     )
 
     assert plan.merges[0].delete_branch is True
-    assert plan.merges[0].branch == "swarm/issue-23"
+    assert plan.merges[0].branch == branch(23)
 
 
 def test_with_the_override_off_a_green_pull_request_waits_for_a_human():
@@ -438,7 +455,7 @@ def test_a_failing_check_retries_and_the_transition_carries_the_failure():
 def test_the_last_attempt_gives_up_rather_than_retrying_forever():
     plan = plan_checks(
         ledger(entry(23, attempt=2)),
-        pulls=pulls(pull(101, issue=23)),
+        pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={23: failing("tests/test_mod23.py")},
         max_attempts=3,
         now=NOW,
@@ -534,8 +551,8 @@ def test_the_pull_request_listing_is_probed_for_rather_than_assumed():
     # ticket's file set, so the probe is what keeps two tickets whose file sets
     # cannot reach each other from deadlocking.
     assert read_pulls(BlindClient()) is None
-    found = read_pulls(FakeClient(open_pulls=((101, "swarm/issue-23"),)))
-    assert found is not None and found["swarm/issue-23"].number == 101
+    found = read_pulls(FakeClient(open_pulls=((101, branch(23)),)))
+    assert found is not None and found[branch(23)].number == 101
 
 
 def test_check_runs_that_could_not_be_read_are_pending_not_failed():
@@ -645,7 +662,7 @@ def test_a_green_pull_request_merges_and_only_then_moves_the_label():
 
     assert report.merged == (23,)
     assert client.labels_on(23) == {DONE}
-    assert client.deleted == ["swarm/issue-23"]
+    assert client.deleted == [branch(23)]
     # Merge first: a `swarm:done` written over a merge GitHub refused is a lie
     # nothing later in the system can detect, because `done` is terminal.
     assert client.log.index("merge PR #101 squash sha=" + f"{23:0>40x}") < client.log.index(
@@ -689,7 +706,7 @@ def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
     # `GitHubClient` has no ref deletion and `client.py` is outside this
     # ticket's file set, so the gap degrades and says so.
     assert report.merged == (23,)
-    assert report.undeleted == ("swarm/issue-23",)
+    assert report.undeleted == (branch(23),)
     assert BRANCH_METHODS[0] in report.summary()
 
 
@@ -717,7 +734,7 @@ def test_giving_up_comments_the_failure_where_a_human_will_find_it():
     client = CommentingClient(issues={23: issue_payload(23, attempt=2)})
     plan = plan_checks(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py", attempt=2)),
-        pulls=pulls(pull(101, issue=23)),
+        pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={23: failing("tests/test_mod23.py")},
         max_attempts=3,
         now=NOW,
@@ -737,7 +754,7 @@ def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
     client = client_with(issues={23: issue_payload(23, attempt=2)})
     plan = plan_checks(
         ledger(entry(23, attempt=2)),
-        pulls=pulls(pull(101, issue=23)),
+        pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={23: failing("tests/test_mod23.py")},
         max_attempts=3,
         now=NOW,
@@ -793,7 +810,7 @@ def test_one_issue_github_will_not_relabel_does_not_cost_the_others():
 def test_one_pass_reads_checks_only_for_review_issues_with_an_open_pull_request():
     client = DeletingClient(
         issues={23: issue_payload(23), 24: issue_payload(24, label=CLAIMED)},
-        open_pulls=((101, "swarm/issue-23"), (102, "swarm/issue-24")),
+        open_pulls=((101, branch(23)), (102, branch(24))),
         checks={f"{101:0>40x}": [run("test", "success")]},
     )
 
@@ -806,7 +823,7 @@ def test_one_pass_reads_checks_only_for_review_issues_with_an_open_pull_request(
     ]
     assert report.merged == (23,)
     assert client.labels_on(23) == {DONE}
-    assert client.deleted == ["swarm/issue-23"]
+    assert client.deleted == [branch(23)]
 
 
 def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothing():
@@ -822,7 +839,7 @@ def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothin
 def test_a_failing_pass_leaves_the_issue_ready_with_the_failure_on_it():
     client = FakeClient(
         issues={23: issue_payload(23)},
-        open_pulls=((101, "swarm/issue-23"),),
+        open_pulls=((101, branch(23)),),
         checks={
             f"{101:0>40x}": [
                 run("test", "failure", text="FAILED tests/test_mod23.py::test_x - boom")

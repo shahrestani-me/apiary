@@ -41,6 +41,7 @@ from fixtures.github import response
 from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 
 from swarm.containers.manager import ContainerManager, ContainerTimeout, Handle
+from swarm.github.branches import task_branch
 from swarm.github.refs import task_ref
 from swarm.run import Run
 from swarm.state import FileEdit, WorkerOutput
@@ -203,7 +204,7 @@ def a_record(**overrides: Any) -> ResultRecord:
         "reason": "verified and committed",
         "task_id": "add-sub",
         "repo": REPO,
-        "branch": f"swarm/issue-{ISSUE}",
+        "branch": task_branch(task_ref(ISSUE), 0),
         "commit": "abc1234",
         "written": ("calc.py",),
     }
@@ -498,7 +499,7 @@ def test_from_worker_carries_the_deletions(tmp_path):
         issue=ISSUE,
         repo=REPO,
         task_id="drop-legacy",
-        branch=f"swarm/issue-{ISSUE}",
+        branch=task_branch(task_ref(ISSUE), 0),
         root=tmp_path,
         verify_command="pytest -q",
         verify_output="1 passed",
@@ -568,7 +569,7 @@ def test_from_worker_reports_the_gate_and_the_verdict(tmp_path):
         issue=ISSUE,
         repo=REPO,
         task_id="add-sub",
-        branch=f"swarm/issue-{ISSUE}",
+        branch=task_branch(task_ref(ISSUE), 0),
         root=tmp_path,
         verify_command="pytest -q",
         verify_output="1 passed",
@@ -580,7 +581,7 @@ def test_from_worker_reports_the_gate_and_the_verdict(tmp_path):
     record = from_worker(result, run_id=RUN_ID, attempt=2)
 
     assert record.exit_code == EXIT_OK and record.reason == "verified and committed"
-    assert record.task_id == "add-sub" and record.branch == f"swarm/issue-{ISSUE}"
+    assert record.task_id == "add-sub" and record.branch == task_branch(task_ref(ISSUE), 0)
     assert not record.synthesised
 
     # Verified but with nothing to commit is a failure, and says why.

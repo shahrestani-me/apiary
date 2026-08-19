@@ -36,18 +36,35 @@ cheap and the alternative is discovering a gap in it by reading a log.
 
 ## Pushing is a force, with a lease
 
-The retry path recreates `swarm/issue-<n>` from the base commit
-(`entrypoint.prepare_checkout`), so a second attempt's history diverges from
-the first attempt's and a plain push is rejected as a non-fast-forward. The
-push is therefore `--force-with-lease`: it overwrites what *this* worker's
-clone last saw on the remote, and refuses when the branch moved since - a human
-pushing a fix onto the PR branch, or a second container that should never have
-been dispatched. A bare `--force` would silently discard both.
+The branch is `apiary/<ref>-attempt-<n>` (`github/branches.py`), minted by
+`entrypoint.run_worker` from the marker's own counter, so #144 removed the
+common reason this push had to force at all: a retry is a *different* attempt
+and gets a *different* branch, rather than recreating one name from the base
+commit and diverging from what the last attempt left there.
 
-## Opening once, updating thereafter
+The lease stays, and not out of caution about a case that can no longer happen.
+`--force-with-lease` overwrites what *this* worker's clone last saw on the
+remote and refuses when the branch moved since, which is the check that catches
+the two things attempt-scoped names do not rule out: a human pushing a fix onto
+the PR branch, and a second container dispatched for an attempt that already
+has one. A bare `--force` would silently discard both, and a plain push would
+fail without saying which of them happened.
 
-A retry must land on the same PR. Finding it means asking GitHub for the open
-PR whose head is this branch, and `GitHubClient` has no method for that: its
+## Opening once per branch, updating thereafter
+
+**Once per branch, and since #144 that is once per attempt.** It used to be
+once per issue: one name served every attempt, so a retry force-pushed over the
+first attempt's head and updated the pull request already open on it. Attempt-
+scoped names end that, and deliberately - a retry's history diverges from the
+attempt before it, and quietly replacing the head of a pull request somebody may
+be reading is a worse outcome than a second pull request they can see and close.
+The convergence that is lost is narrow and named in `orchestrator/recovery.py`:
+a *re-dispatch of the same attempt*, which only a blind recovery sweep produces.
+
+What has not changed is that the same branch must not collect two pull requests,
+which is what the rest of this section is about. Finding the one already open
+means asking GitHub for the open PR whose head is this branch, and `GitHubClient`
+has no method for that: its
 pull-request surface is `get`, `create`, `update` and `merge` by number, and
 #17's file contract does not include `client.py`. So this module **probes** for
 `client.list_pull_requests` - the public method the client grows when the
@@ -59,10 +76,11 @@ cannot reach each other must not deadlock.
 Until that method exists the fallback is still correct, because GitHub itself
 enforces the invariant: `POST /pulls` for a head branch that already has an
 open PR is a 422, never a second PR. The push has already moved that PR's head
-to the new commit, so the retry updates the PR that exists rather than opening
-another. What is lost is only the PR *body* - it keeps the previous attempt's
-verify output until the listing method lands. Nothing about that failure mode
-is silent: it is printed, and `Published.created` is False.
+to the new commit, so a re-publish onto the same branch updates the PR that
+exists rather than opening another. What is lost is only the PR *body* - it
+keeps the previous publish's verify output until the listing method lands.
+Nothing about that failure mode is silent: it is printed, and
+`Published.created` is False.
 
 ## The one label
 

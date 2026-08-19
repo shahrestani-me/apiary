@@ -28,7 +28,9 @@ import pytest
 from fixtures.github import not_found, response
 from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 
+from swarm.github.branches import task_branch
 from swarm.github.ledger import ContractError
+from swarm.github.refs import task_ref
 from swarm.state import FileEdit, WorkerOutput
 from swarm.worker import edit as edit_module
 from swarm.worker import entrypoint
@@ -192,6 +194,36 @@ def checkout(workspace: Path, scratch_repo: ScratchRepo) -> ScratchRepo:
 
 
 @pytest.mark.usefixtures("worker_env")
+def test_a_retry_branches_under_its_own_attempt_number(
+    fake_github, scratch_repo, workspace
+):
+    """#144: the branch carries the ref *and* the attempt, read from the marker.
+
+    Which means a second attempt does not recreate the first attempt's branch
+    from the base commit - it gets one of its own. That is what lets an
+    orchestrator with no memory left list the remote and see how much budget a
+    task has already spent, and it is why `recovery.py` can derive `review`
+    from a name instead of a label."""
+    gh, _, _ = fake_github(
+        issue(attempt=2, verify=ALWAYS_FAILS), response(200, feedback_comments())
+    )
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert result.branch == task_branch(task_ref(ISSUE), 2)
+    assert checkout(workspace, scratch_repo).current_branch() == result.branch
+
+
+@pytest.mark.usefixtures("worker_env")
 def test_verified_task_produces_a_commit(fake_github, scratch_repo, workspace):
     gh, transport, _ = fake_github(issue(), *publishes())
     base = scratch_repo.head()
@@ -200,7 +232,7 @@ def test_verified_task_produces_a_commit(fake_github, scratch_repo, workspace):
     assert main(argv(scratch_repo, workspace), client=gh, editor=editor) == EXIT_OK
 
     work = checkout(workspace, scratch_repo)
-    assert work.current_branch() == f"swarm/issue-{ISSUE}"
+    assert work.current_branch() == task_branch(task_ref(ISSUE), 0)
     assert work.head() != base
     assert work.subjects()[0].startswith("swarm[add-sub]:")
     assert work.read("calc.py") == GOOD_CALC
@@ -1382,7 +1414,7 @@ def test_result_reports_the_gate_it_used(tmp_path):
         issue=ISSUE,
         repo="shahrestani-me/apiary",
         task_id="add-sub",
-        branch=f"swarm/issue-{ISSUE}",
+        branch=task_branch(task_ref(ISSUE), 0),
         root=tmp_path,
         verify_command="pytest -q",
         verify_output="1 passed",
