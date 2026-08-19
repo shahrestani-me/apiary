@@ -56,7 +56,7 @@ from ..github.ledger import STATUS_BY_LABEL, Ledger
 from ..llm import orchestrator_llm, structured
 from ..state import ProgressJudgement, SwarmState, TaskRecord, TaskStatus
 from ..taskref import TaskRef
-from ..worker.entrypoint import EXIT_OK
+from ..worker.entrypoint import DEFAULT_WORKSPACE, EXIT_OK
 from ..worker.result import ResultRecord
 
 SYSTEM = """You judge whether a multi-agent coding run is progressing.
@@ -99,14 +99,28 @@ SIGNATURE_CHARS = 400
 # question. That naming convention (`*.test.js`, `*.spec.tsx`) is the dominant
 # one in exactly the stacks #87 is adding. Found by #93's agreement test, which
 # exists to keep this expression honest.
-#: The lookbehind refuses a match that continues a URL or an absolute path:
-#: `https://docs.pytest.org/...` starts matching at `docs...` (the `:` stops
-#: the character class), looks repo-relative, and passed every filter below.
-#: pytest prints exactly that URL in its own footer, so a task that failed on
-#: "no tests collected" was reported as failing on a *file* its `## Files`
-#: does not list - the one diagnosis that suppresses the replan which exists
-#: for that situation.
-_PATH_RE = re.compile(r"(?<![:/])(?:[\w.@+-]+/)+[\w.@+-]*\.[A-Za-z0-9_]+")
+#: The lookbehind is a token boundary: a match may not begin mid-token, so a
+#: URL never yields a path - every position past the scheme of
+#: `https://docs.pytest.org/...` is preceded by `/`, `:` or a word character,
+#: and the whole token is refused rather than matched from partway in. Its
+#: predecessor, `(?<![:/])`, tried to refuse URL and absolute-path
+#: continuations but only shifted the match start by one character:
+#: `/workspace/...` extracted as `orkspace/...` and `/usr/local/...` as
+#: `sr/local/...` - mangled paths that compared equal to nothing in any
+#: `## Files` set, so the blocker veto fired on every repeated pytest failure
+#: (observed live, twice, on consecutive plans). An absolute path now matches
+#: intact, leading `/` included, so `mentioned_paths` can translate it into
+#: `## Files`' own coordinate space or discard it for what it is.
+_PATH_RE = re.compile(r"(?<![-\w.@+:/])/?(?:[\w.@+-]+/)+[\w.@+-]*\.[A-Za-z0-9_]+")
+
+#: The one absolute prefix under which the repository exists inside a worker:
+#: `worker.entrypoint` clones to `<DEFAULT_WORKSPACE>/issue-<n>` (its
+#: `prepare_checkout` call spells the layout), so a verify command's traceback
+#: names `/workspace/issue-40/pyproject.toml` where the issue's `## Files`
+#: names the same file `pyproject.toml`. Stripping this prefix - and only this
+#: one - is what puts an extracted path into the space `## Files` is written
+#: in; a path still absolute afterwards is by construction not the repo's.
+_WORKSPACE_RE = re.compile(rf"^{re.escape(DEFAULT_WORKSPACE)}/issue-\d+/")
 
 # Digits are dropped from a failure signature: pytest reports `1 failed in
 # 0.42s`, a traceback names line numbers, and a temporary directory carries a
@@ -115,9 +129,12 @@ _PATH_RE = re.compile(r"(?<![:/])(?:[\w.@+-]+/)+[\w.@+-]*\.[A-Za-z0-9_]+")
 _DIGITS_RE = re.compile(r"\d+")
 _SPACE_RE = re.compile(r"\s+")
 
-# Paths that are not the repository's: an absolute path, and the two shapes an
-# interpreter's own tree takes inside a container. A traceback through
-# site-packages says nothing about whether a task can reach its own fix.
+# Relative paths through an interpreter's own tree: a checkout can carry its
+# own virtualenv, and a traceback through its `site-packages` says nothing
+# about whether a task can reach its own fix. Absolute foreign paths need no
+# enumeration - `mentioned_paths` discards anything still absolute once the
+# one workspace prefix is stripped, a rule about the layout rather than a
+# blocklist of interpreters. (`checks._FOREIGN` is this list's sibling.)
 _FOREIGN = ("site-packages", "dist-packages", ".venv/", "/usr/", "/opt/")
 
 
@@ -150,29 +167,50 @@ def failure_signature(text: str) -> str:
 
 
 def mentioned_paths(text: str) -> tuple[str, ...]:
-    """Repo-relative-looking paths named in a failure, in order, deduplicated.
+    """Repo-relative paths named in a failure, in order, deduplicated.
 
-    Deliberately conservative. Everything absolute and everything inside an
-    interpreter's own tree is dropped, because the question this feeds is "could
-    the worker have fixed it", and a path it could never have been given an
-    answer about is not evidence either way.
+    Everything is normalised into `## Files`' own coordinate space - which is
+    repo-relative - before anything is compared, in this order:
+
+    - The container checkout prefix (`/workspace/issue-<n>/`, the layout the
+      worker creates under its `DEFAULT_WORKSPACE`) is stripped: a traceback's
+      `/workspace/issue-40/pyproject.toml` and a `## Files` entry
+      `pyproject.toml` are the same file, and comparing them unstripped made
+      every workspace-absolute mention look undeclared.
+    - A path still absolute after that is not the repository's - the
+      interpreter's tree, the OS's, the tail of a URL - and is discarded. The
+      worker checks the repo out under exactly one absolute prefix, so this is
+      a rule about the workspace layout, not a blocklist of interpreters.
+    - Relative paths through an interpreter's tree (a checked-in `.venv`'s
+      `site-packages`, say) are dropped on `_FOREIGN`.
+
+    Deliberately conservative, because the question this feeds is "could the
+    worker have fixed it": a dropped real path just means the failure counts
+    as "the model keeps writing the wrong code", which replanning may fix; a
+    kept foreign path is what falsely parks a run on "needs a human".
     """
     found: list[str] = []
     for match in _PATH_RE.finditer(text or ""):
-        path = match.group(0)
+        path = _WORKSPACE_RE.sub("", match.group(0), count=1)
         if path.startswith("/") or any(part in path for part in _FOREIGN):
             continue
         # `./internal/calc/calc.go` and `internal/calc/calc.go` are one file,
         # and a `## Files` set never spells the first. `checks.failing_paths`
-        # has always stripped it; this did not, so a Go build error named a
-        # path that compared equal to nothing.
-        path = path.lstrip("./")
-        # A dotted first segment is a hostname, not a directory: a schemeless
-        # `docs.pytest.org/en/how-to.html` survives the lookbehind above.
+        # has always stripped it. Prefix removal, not `lstrip("./")`: lstrip
+        # eats characters, and `.github/workflows/ci.yml` is not
+        # `github/workflows/ci.yml`.
+        while path.startswith("./"):
+            path = path[2:]
+        # A dotted first segment of a still-slashed path is a hostname, not a
+        # directory: a schemeless `docs.pytest.org/en/how-to.html` survives
+        # the token boundary above. Two exemptions, both shapes a hostname
+        # cannot take: a bare filename left behind by the workspace strip
+        # (`pyproject.toml`) was spelled absolute inside the checkout, and a
+        # leading dot (`.github/workflows/ci.yml`) is a dotfile directory.
         # Conservative in the right direction - a dropped real path just means
         # the failure counts as "the model keeps writing the wrong code",
         # which replanning is allowed to fix; a kept fake path suppresses it.
-        if "." in path.split("/", 1)[0]:
+        if "/" in path and "." in path.split("/", 1)[0].lstrip("."):
             continue
         if path not in found:
             found.append(path)

@@ -405,7 +405,12 @@ class GitHubClient:
         """Delete a branch, returning False if it was already gone.
 
         Called after a merge so a long run does not leave one dead
-        `swarm/issue-<n>` branch per task. Already-deleted is the ordinary
+        `apiary/<ref>-attempt-<n>` branch per task - and since #144 that is one
+        per *attempt*, so the branch list grows faster than it used to.
+        `urllib.parse.quote` is load-bearing rather than decorative here: the
+        ref inside that name is percent-encoded, so a `%` in the branch has to
+        survive as `%25` in the path or the delete addresses a ref that does
+        not exist. Already-deleted is the ordinary
         case when GitHub's own "delete branch on merge" setting is enabled, so
         a 404 (and the 422 the refs endpoint returns for an absent ref) is a
         no-op rather than a failure.

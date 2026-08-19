@@ -37,6 +37,7 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
+from fixtures.markers import legacy_marker
 from swarm.github.client import GitHubError
 from swarm.github.ledger import Ledger, LedgerEntry, load_ledger, render_marker
 from swarm.github.refs import task_ref as ref
@@ -472,6 +473,87 @@ def test_a_leading_dot_slash_is_not_a_different_file():
     )
 
 
+def test_a_workspace_absolute_path_is_the_repo_file_it_names():
+    """Pinned: the two mangled extractions observed live, twice, on issue #40.
+
+    The old lookbehind meant to refuse a match *continuing* an absolute path
+    only shifted the match start by one character, so `/workspace/...` was
+    extracted as `orkspace/...` and `/usr/local/...` as `sr/local/...` -
+    paths that compared equal to nothing in any `## Files` set. Tracebacks
+    always name workspace-absolute and stdlib paths, so the blocker veto fired
+    on nearly every repeated pytest failure and suppressed replans that would
+    have worked. A workspace-absolute path is the repo-relative file it names;
+    an interpreter path is noise.
+    """
+    text = (
+        'E   File "/workspace/issue-40/pyproject.toml", line 3\n'
+        'E   File "/usr/local/lib/python3.12/importlib/__init__.py", line 90, in import_module'
+    )
+
+    paths = mentioned_paths(text)
+
+    assert paths == ("pyproject.toml",)
+    assert "orkspace/issue-40/pyproject.toml" not in paths
+    assert "sr/local/lib/python3.12/importlib/__init__.py" not in paths
+
+
+def test_interpreter_paths_alone_are_not_evidence_of_a_wall():
+    # A traceback through the interpreter's own tree says nothing about
+    # whether the task could reach its fix; after the workspace prefix is
+    # stripped, a path still absolute is by construction not the repo's.
+    stuck = ledger(entry(40, attempt=4, files=("pyproject.toml",)))
+    noisy = record(
+        40,
+        attempt=3,
+        output='File "/usr/local/lib/python3.12/importlib/__init__.py", line 90, in import_module',
+    )
+
+    assert Observation.of(stuck, results={ref(40): noisy}).blockers == ()
+
+
+def test_a_declared_file_failing_behind_the_workspace_prefix_does_not_veto():
+    # `## Files` listed `pyproject.toml` and the failure named it as
+    # `/workspace/issue-40/pyproject.toml` - the same file in the container's
+    # coordinates. Observed live as "failed 4 time(s) on <files>, which its
+    # ## Files does not list" on a file the issue did list.
+    declared = ledger(entry(40, attempt=4, files=("pyproject.toml",)))
+    failing = record(
+        40,
+        attempt=3,
+        output=(
+            'E   File "/workspace/issue-40/pyproject.toml", line 3\n'
+            'E   File "/usr/local/lib/python3.12/importlib/__init__.py", line 90'
+        ),
+    )
+
+    assert Observation.of(declared, results={ref(40): failing}).blockers == ()
+
+
+def test_an_undeclared_repo_file_behind_the_workspace_prefix_still_vetoes():
+    # The veto still exists for the case it was written for: a repeated
+    # failure entirely inside repo files the task was never given.
+    stuck = ledger(entry(40, attempt=4, files=("pyproject.toml",)))
+    failing = record(
+        40,
+        attempt=3,
+        output=(
+            "/workspace/issue-40/src/settings.py:7: ImportError\n"
+            'File "/usr/local/lib/python3.12/importlib/__init__.py", line 90'
+        ),
+    )
+
+    observation = Observation.of(stuck, results={ref(40): failing})
+
+    assert len(observation.blockers) == 1
+    assert observation.blockers[0].paths == ("src/settings.py",)
+
+
+def test_a_dotfile_directory_is_not_a_hostname():
+    # The hostname heuristic drops `docs.pytest.org/...`; a leading dot is a
+    # shape a hostname cannot take, and `lstrip("./")` used to rename the file.
+    assert mentioned_paths("error in .github/workflows/ci.yml") == (".github/workflows/ci.yml",)
+
+
 def test_two_runs_of_one_failure_share_a_signature():
     assert failure_signature("FAILED tests/test_a.py::test_x in 0.42s") == failure_signature(
         "FAILED tests/test_a.py::test_x in 11.7s"
@@ -765,7 +847,7 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
     client, store = tracker()
     body = render_body("stuck", goal="Unblock the chain", files=["src/swarm/a.py"], verify=VERIFY, attempt=3)
     body = body.replace(
-        render_marker("stuck", 3), render_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
+        render_marker("stuck", 3), legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
     )
     number = store.add(body=body, labels=[FAILED])
     before = load_ledger(client, adopt=False)
@@ -785,7 +867,7 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
     labels = {label["name"] for label in store.issues[number]["labels"]}
     assert labels == {READY}
     # The marker survives verbatim: nothing is reset, the arithmetic guards.
-    assert render_marker("stuck", 3, blocker="ab12cd34ef", streak=3) in store.issues[number]["body"]
+    assert legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3) in store.issues[number]["body"]
     assert store.comments[0][0] == number
     assert store.comments[0][1].startswith("apiary: the replan retained this task")
     assert "revived" in report.summary()

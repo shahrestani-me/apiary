@@ -71,7 +71,7 @@ exactly as `reconcile.py` probes for `create_issue_comment` and `worker/pr.py`
 for `list_pull_requests`: `GitHubClient` has no way to list pull requests (so
 the issue -> PR mapping is unavailable and, without it, this module decides
 nothing at all rather than guessing) and no way to delete a ref (so the
-`swarm/issue-<n>` branch survives its merge and is reported). `client.py` is
+`apiary/<ref>-attempt-<n>` branch survives its merge and is reported). `client.py` is
 outside this ticket's file set; both gaps degrade and neither is silent.
 
 Manual dry run against a real repo - reads only, merges nothing, writes nothing:
@@ -92,7 +92,9 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
-from ..github.refs import issue_number
+from ..github.refs import issue_number, task_ref
+from ..store import StoreError, TaskStore, record_judgement
+from ..taskref import TaskRef
 from ..worker.result import tail
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
@@ -223,6 +225,72 @@ _LOCATION = re.compile(rf"(?P<path>{_QUALIFIED_PATH}):\d+")
 #: loud rather than leaving it to be discovered.
 _GO_TEST_LINE = re.compile(r"(?m)^\s+(?P<path>[\w.+-]+_test\.go):\d+:")
 
+
+# --------------------------------------------------------------------------
+# The one fault the merge gate may not swallow
+# --------------------------------------------------------------------------
+
+
+class UnresolvedJoin(RuntimeError):
+    """A key this gate had to resolve was not in the map it was handed.
+
+    Every join here and in `mergeability.py` is between two facts *one cycle
+    read about one task* - a check set and the ledger entry it was read for, an
+    outcome and the entry it was decided from, a held merge and the outcome it
+    holds. Both sides are built in the same pass over the same entries, so a
+    miss is never data. It is the two sides having drifted apart, and there is
+    no neutral value to stand in for the answer:
+
+    - **an absent check set is not an empty one.** `CheckSet()` has verdict
+      `EMPTY`, and `EMPTY` past its grace period is `swarm:failed` - so a
+      lookup that missed would escalate a healthy issue to a human, and the
+      ledger cannot tell that from attempts genuinely exhausted;
+    - **an absent ledger entry is not "no such issue".** It drops the issue out
+      of mergeability, and an issue the staleness gate never decided is a merge
+      it never inspected. The module's entire purpose, switched off with no log
+      line saying so.
+
+    So the miss raises, where both fail-open alternatives write a label nobody
+    afterwards can tell from a real one. #174 is the ticket; #142 is why the
+    shape recurs, because a `dict.get` default is how a retype ships green.
+
+    **Raised here, recorded by the caller.** `Reconciler.cycle` catches this
+    one and puts it on `CycleReport.cycle_error`, exactly as it does a
+    `DependencyCycleError`, and skips dispatch for the cycle. That is not the
+    catch these gates exist to prevent - it is the opposite. The merge gate
+    runs *after* a cycle's labels are written, so an exception escaping `cycle`
+    would be thrown before `CycleReport` exists: `on_cycle` would never fire
+    and the run directory would never learn that those writes happened. A loud
+    failure that erases its own evidence is not an improvement on a silent one.
+    So the rule is that this must never be *defaulted*, not that it must never
+    be handled - which is also what #174's acceptance criterion asks for:
+    "raises **or** is explicitly handled".
+
+    **`RuntimeError`, deliberately not `LookupError`.** The failure it reports
+    *is* a failed lookup, so `LookupError` reads as the natural base - and that
+    is the trap: `KeyError` is a `LookupError`, so any caller that ever wraps a
+    dict access in `except LookupError` would swallow this one and silently
+    restore the fail-open behaviour it exists to remove. `store.StoreError`
+    picked `RuntimeError` over the same argument, and for the same reason: an
+    exception that must not be recovered from should not inherit from the one
+    people routinely recover from.
+    """
+
+
+
+def render_keys(values: Iterable[str], limit: int = 20) -> str:
+    """The first `limit` of `values`, sorted, with the remainder counted.
+
+    An `UnresolvedJoin` names the keys it did hold, because that is what tells
+    an operator whether the map was empty, stale or keyed on the wrong thing.
+    A review queue is not bounded, though, and an exception message is not the
+    place to render one - so this caps what the message carries and says how
+    much it left out.
+    """
+    ordered = sorted(values)
+    if len(ordered) <= limit:
+        return repr(ordered)
+    return f"{ordered[:limit]!r} (+{len(ordered) - limit} more)"
 
 # --------------------------------------------------------------------------
 # Policy
@@ -579,7 +647,27 @@ class Merge:
     explicit rather than a default nobody sees.
     """
 
+    #: The issue this merge closes - a GitHub issue number, and the same one
+    #: the `Outcome` carrying this record holds. Documented rather than retyped
+    #: (#174) because moving it is the *reporting* surface's migration rather
+    #: than this gate's: it keys `ChecksReport.merged` and
+    #: `ChecksReport.merge_commits`, and `lifecycle.py` joins it against the
+    #: issue-numbered half of its own index.
+    #:
+    #: **One join in this module does read it, and it is on the decision path.**
+    #: `apply_checks` collects the merges GitHub refused into `refused` by this
+    #: number and tests `outcome.number` against it, to stop a `swarm:done`
+    #: being written for a merge that did not happen. That is int-against-int
+    #: and safe *by construction rather than by type*: both sides are the one
+    #: `entry.number` `_decide_passed` put on the pair, built and consumed
+    #: inside a single `apply_checks` call, with no map surviving it. What keeps
+    #: it that way is the type gate - retyping either half alone produces
+    #: `Non-overlapping container check [comparison-overlap]` on that line under
+    #: `strict_equality`, which is the ratchet #168 installed for exactly this.
+    #: Retyping it is a follow-up; asserting it is not a hazard would be wrong.
     number: int
+    #: The pull request GitHub is asked to merge. A *different* numbering from
+    #: `number`, which is why both are spelled out: `#23: merge PR #101`.
     pull: int
     branch: str
     sha: str = ""
@@ -604,13 +692,16 @@ class Outcome:
     attempt must be told.
     """
 
-    #: The issue this row is about. Still a number, where `Transition.ref` -
-    #: the field right below - is a `TaskRef`: #142 retyped the *task-identity
-    #: model* (the dependency graph, readiness and the reconciler's transition)
-    #: and stopped there deliberately, so these policy rows are one vocabulary
-    #: behind. They are internally consistent - built from the same `entry`,
-    #: compared only against each other - and nothing keys a `TaskRef` map on
-    #: one. Moving them is a follow-up, not an oversight.
+    #: The issue this row is about, as GitHub numbers it. `ChecksPlan.escalated`
+    #: prints it, `apply_checks` addresses the API with it, and `lifecycle.py`
+    #: joins it against the issue-numbered half of its index - all three are the
+    #: code-host vocabulary, which ADR 0001 says stays GitHub-shaped.
+    #:
+    #: **`ref` below is the half that joins.** #142 retyped the task-identity
+    #: model and stopped here, and #174 is what that cost: `plan_mergeability`
+    #: looked its entry up by this number, and a miss returned `None` and
+    #: dropped the issue out of the staleness gate in silence. The lookup is on
+    #: the ref now and raises `UnresolvedJoin` instead.
     number: int
     verdict: str
     detail: str = ""
@@ -625,6 +716,11 @@ class Outcome:
 
     def __str__(self) -> str:
         return f"#{self.number}: {self.verdict} - {self.detail}"
+
+    @property
+    def ref(self) -> TaskRef:
+        """This row's task, in the internal model's vocabulary. See `number`."""
+        return task_ref(self.number)
 
 
 @dataclass(frozen=True)
@@ -676,7 +772,7 @@ def plan_checks(
     ledger: Ledger,
     *,
     pulls: Mapping[str, PullState] | None,
-    checks: Mapping[int, CheckSet],
+    checks: Mapping[TaskRef, CheckSet],
     policy: MergePolicy | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     now: dt.datetime | None = None,
@@ -684,9 +780,28 @@ def plan_checks(
     """Decide every `swarm:review` issue. Pure - no API call, no daemon, no model.
 
     `pulls` is the open pull requests by head ref (`None` when this cycle could
-    not look), `checks` the folded check set per issue number, and `now` the
-    moment the grace period is measured against. All three are facts somebody
-    else read; keeping the I/O out of here is what makes the rules assertable.
+    not look), `checks` the folded check set per task ref, and `now` the moment
+    the grace period is measured against. All three are facts somebody else
+    read; keeping the I/O out of here is what makes the rules assertable.
+
+    **`checks` must carry every issue this loop reaches, and a miss raises.**
+    The caller reads a check set for exactly the entries selected below - in
+    `swarm:review`, with an open pull request - so the two sets are the same set
+    or somebody has broken the wiring.
+
+    The default this replaced was `CheckSet()`, which reads as `EMPTY`, and
+    `EMPTY` past its grace period escalates the issue to `swarm:failed` - #174's
+    headline, a healthy task marked as needing a human because its check runs
+    could not be looked up. A *neutral* stand-in does exist in the type, and it
+    is worth saying why it is not used: `CheckSet(unreadable=True)` reads as
+    `PENDING`, which is what `read_checks` returns when GitHub could not be
+    asked, and it escalates nothing. But it is the right answer to a different
+    question. "GitHub did not answer" is a fact about this cycle that the next
+    cycle re-reads; "the map I was handed has no key for this task" is a fact
+    about the code, and mapping it to `PENDING` parks the task in
+    `swarm:review` every cycle for the rest of the run with nothing anywhere
+    saying why. That is the same disease as the escalation, only quieter - so
+    the miss is raised and `Reconciler.cycle` records it where a human sees it.
 
     Issues with no open PR are skipped rather than decided: that is #22's row -
     it reads a `swarm:review` issue whose branch has no open PR as a PR closed
@@ -703,9 +818,18 @@ def plan_checks(
         pull = pulls.get(entry.branch)
         if pull is None:
             continue
-        outcomes.append(
-            _decide(entry, pull, checks.get(entry.number, CheckSet()), rules, max_attempts, moment)
-        )
+        try:
+            found = checks[entry.ref]
+        except KeyError:
+            raise UnresolvedJoin(
+                f"no check set for {entry.ref} ({entry.task_id}), whose pull request "
+                f"{pull.ref} this cycle listed as open. The caller reads one check set per "
+                f"reviewable entry, so this is the two halves having drifted apart - and "
+                f"the miss cannot be defaulted: an absent check set reads as an empty one, "
+                f"which escalates this issue to swarm:failed. Keys held: "
+                f"{render_keys(str(key) for key in checks)}"
+            ) from None
+        outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment))
 
     return ChecksPlan(outcomes=tuple(outcomes), blind=pulls is None, policy=rules)
 
@@ -1094,6 +1218,7 @@ def apply_checks(
     client: Any,
     plan: ChecksPlan,
     *,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> ChecksReport:
     """Merge, then relabel. Never raises for one issue; see `Failure`.
@@ -1107,10 +1232,15 @@ def apply_checks(
     `swarm:done` on the next cycle.
 
     Within a transition the order is `docs/issue-contract.md` §5 and
-    `reconcile.apply_plan`'s: the counter and the retry feedback are one body
-    `PATCH` written first, then the new label, then the old one. One patch
-    rather than two because both are edits to the same body, and a second read
-    between them is a window for a human's edit to be lost.
+    `reconcile.apply_plan`'s: the judgment is recorded, then the counter and the
+    retry feedback go out as one body `PATCH`, then the new label, then the old
+    one. One patch rather than two because both are edits to the same body, and
+    a second read between them is a window for a human's edit to be lost.
+
+    `store` is where the judgment that goes with the counter is recorded (#159).
+    `None` records none - for a caller exercising the label half alone - and
+    `Reconciler` always passes one, because an attempt consumed without its
+    signature recorded is an attempt that renews somebody's budget for free.
     """
     merged: list[int] = []
     applied: list[Transition] = []
@@ -1158,6 +1288,15 @@ def apply_checks(
         if transition is None or outcome.number in refused:
             continue
         try:
+            if transition.attempt is not None:
+                record_judgement(
+                    store,
+                    transition.ref,
+                    transition.attempt,
+                    blocker=transition.blocker,
+                    streak=transition.streak,
+                    renewals=transition.renewals,
+                )
             if transition.attempt is not None or outcome.feedback:
                 _patch_body(client, transition, outcome.feedback)
             # `Transition` is keyed on the task, and every call here addresses
@@ -1166,7 +1305,7 @@ def apply_checks(
             client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
                 client.remove_label(number, transition.from_label)
-        except GitHubError as exc:
+        except (GitHubError, StoreError) as exc:
             failures.append(Failure(outcome.number, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
@@ -1196,7 +1335,9 @@ def _patch_body(client: Any, transition: Transition, feedback: str) -> None:
 
     `rewrite_marker` is #22's, imported rather than reimplemented: two modules
     with their own idea of where the counter lives is how a counter stops
-    bounding anything.
+    bounding anything. It carries the counter and nothing else - the failure
+    signature that used to ride with it is written to apiary's own store by the
+    caller, immediately before this (#159).
     """
     number = issue_number(transition.ref)
     issue = client.get_issue(number)
@@ -1220,6 +1361,7 @@ def run_checks(
     policy: MergePolicy | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     now: dt.datetime | None = None,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> ChecksReport:
     """Read, decide, write. The whole module in one call.
@@ -1231,12 +1373,15 @@ def run_checks(
     `orchestrator/reconcile.py`, which is outside this ticket's file set.
     """
     pulls = read_pulls(client)
-    checks: dict[int, CheckSet] = {}
+    # Keyed on the ref and built from exactly the entries `plan_checks` selects:
+    # the two loops are the same loop, and `plan_checks` raises rather than
+    # defaulting if they ever stop being.
+    checks: dict[TaskRef, CheckSet] = {}
     if pulls is not None:
         for entry in ledger.entries.values():
             pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
             if pull is not None:
-                checks[entry.number] = read_checks(client, pull.ref)
+                checks[entry.ref] = read_checks(client, pull.ref)
     plan = plan_checks(
         ledger,
         pulls=pulls,
@@ -1245,7 +1390,7 @@ def run_checks(
         max_attempts=max_attempts,
         now=now,
     )
-    return apply_checks(client, plan, dry_run=dry_run)
+    return apply_checks(client, plan, store=store, dry_run=dry_run)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docstring

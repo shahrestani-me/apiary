@@ -23,7 +23,9 @@ from unittest import mock
 
 import pytest
 
+from fixtures.markers import legacy_marker
 from swarm.github import ledger as ledger_module
+from swarm.github.branches import task_branch
 from swarm.github.ledger import (
     DEFAULT_STACK,
     GENERATED_FILES,
@@ -434,19 +436,27 @@ def test_a_marker_without_the_signature_fields_parses_exactly_as_before():
     assert (contract.attempt, contract.blocker, contract.streak) == (2, "", None)
 
 
-def test_the_signature_fields_round_trip_through_render_and_parse():
-    marker = render_marker("add-retry-logic", 3, blocker="ab12cd34ef", streak=2)
+def test_the_signature_fields_of_an_older_build_are_still_parsed():
+    """#159 stopped *writing* `blocker=`/`streak=` - the store holds them now -
+    but every issue in a repository that ran an older build still carries them.
+    A build that stopped reading them would answer "no previous blocker" for
+    all of those tasks at once, which is a fresh retry budget for each of them
+    on the first cycle after the upgrade."""
+    marker = legacy_marker("add-retry-logic", 3, blocker="ab12cd34ef", streak=2)
     contract = parse_contract(20, contract_body(marker=marker))
 
     assert contract.task_id == "add-retry-logic"
     assert (contract.attempt, contract.blocker, contract.streak) == (3, "ab12cd34ef", 2)
 
 
-def test_render_marker_without_signature_fields_is_byte_identical_to_the_old_form():
-    # Every writer that predates the fields - the planner, adoption, checks'
-    # and recovery's counter bumps - must keep producing the marker existing
-    # bodies and tests carry.
+def test_render_marker_writes_the_identity_and_the_counter_and_nothing_else():
+    # The counter stays because the worker reads it - it derives its branch
+    # name and its result filename from that number - and the signature is
+    # gone because it is apiary's own judgment and lives in apiary's own store
+    # (ADR 0002). Byte-identical to what every writer predating the signature
+    # fields produced, which is what existing bodies and tests carry.
     assert render_marker("add-retry-logic", 2) == "<!-- apiary:task id=add-retry-logic attempt=2 -->"
+    assert render_marker("add-retry-logic", 2) == legacy_marker("add-retry-logic", 2)
 
 
 def test_unknown_marker_fields_are_tolerated_and_ignored():
@@ -482,7 +492,7 @@ def test_the_ledger_entry_carries_the_signature_record():
             issue(
                 60,
                 contract_body(
-                    marker=render_marker("add-retry-logic", 2, blocker="ab12cd34ef", streak=2)
+                    marker=legacy_marker("add-retry-logic", 2, blocker="ab12cd34ef", streak=2)
                 ),
             )
         ]
@@ -704,8 +714,9 @@ def test_task_records_have_the_v1_shape():
         "depends_on": ["add-the-client"],
         "status": "pending",
         "attempts": 2,
-        # Addressing, so the branch name uses the number.
-        "branch": "swarm/issue-60",
+        # The branch carries the ref and the attempt (#144), so the same
+        # counter that says "attempts: 2" is in the name the worker pushes.
+        "branch": task_branch(ref(60), 2),
     }
     assert tasks["add-the-client"]["status"] == "verified"
 

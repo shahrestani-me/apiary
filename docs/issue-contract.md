@@ -215,9 +215,14 @@ editor.
 - The **marker id is authoritative for identity** — it is the ledger key, the
   thing replanning matches on, the thing that survives.
 - The **issue number is authoritative for addressing** — API calls, `## Blocked
-  by` refs, container labels (`apiary.issue=<n>`), branch names
-  (`swarm/issue-<n>`). Refs never use the slug: a slug is not resolvable by
-  GitHub and would not close an issue or cross-link.
+  by` refs, container labels (`apiary.issue=<n>`). Refs never use the slug: a
+  slug is not resolvable by GitHub and would not close an issue or cross-link.
+- **Branch names carry the task ref and the attempt**, not the number:
+  `apiary/<ref>-attempt-<n>` (`src/swarm/github/branches.py`, #144). The ref is
+  percent-encoded into something git accepts and reads back out losslessly, so
+  an orchestrator that lost its memory can reconstruct what was in flight from
+  the code host alone. GitHub's `#42` encodes as `%2342`; a tracker whose ids
+  are already git-safe keeps them verbatim.
 - They cannot "disagree" about the same fact because they answer different
   questions. What can go wrong is **two issues carrying the same id**, and that
   is control-plane corruption: the cycle aborts with an error naming both issue
@@ -412,17 +417,27 @@ budget — the body is already in the response the loader fetched.
 
 ### The failure signature: the budget is per blocker
 
-The marker may carry two further, optional fields:
+**The signature is not in the body. It is in apiary's own store**
+([ADR 0002](adr/0002-apiary-owns-a-thin-task-store.md), #159). The marker
+carried it for two days and that was the wrong place: a failure signature is
+apiary's judgment about its own execution, not a fact the customer's tracker
+owns, and [ADR 0001](adr/0001-task-systems-are-integrations.md) exists to stop
+apiary writing its vocabulary into somebody else's issues. `render_marker`
+therefore emits `id=` and `attempt=` and nothing else. A body written by an
+older build still carries `blocker=` and `streak=`; the parser still reads
+them, because a build that stopped would answer "no previous blocker" for every
+task in an upgraded repository at once and hand each of them a fresh budget,
+and they leave the body the first time anything rewrites the marker.
 
-```
-<!-- apiary:task id=add-retry-logic attempt=2 blocker=ab12cd34ef streak=2 -->
-```
-
-`blocker=` is a short deterministic signature of the failure the last consumed
-attempt died on (`reconcile.signature`: the diagnosis when one was recognised,
+What the store holds per task is a task ref, the attempt the judgment was taken
+at, a short deterministic signature of the failure the last consumed attempt
+died on (`reconcile.signature`: the diagnosis when one was recognised,
 otherwise the normalised exception line — paths, line numbers and addresses
-stripped), and `streak=` is how many consecutive attempts have failed with that
-signature. The reconciler's give-up test runs on the **streak**: the same
+stripped), how many consecutive attempts have failed with that signature, and
+how many times the budget has been renewed. It holds nothing the tracker owns,
+which is why there is nothing to reconcile between the two.
+
+The arithmetic is unchanged. The give-up test runs on the **streak**: the same
 failure repeating burns the budget down as it always did, while a *different*
 failure than the last recorded one is proof the previous blocker is gone, so
 the streak restarts at 1 and the retry is granted even when `attempt` has
@@ -431,16 +446,30 @@ reached `max_attempts_per_task`. Renewal is bounded by
 three full per-blocker budgets) on the monotonic `attempt` itself, so a task
 that keeps failing in new ways still ends.
 
-Both fields ride the same body `PATCH` as `attempt=`, so the write rule above
-covers them: the record lands before the label goes back to `swarm:ready`, and
-a crash between the two costs an attempt with its signature recorded rather
-than granting a retry that forgot what it was retrying. A marker without the
-fields — every marker written before they existed — reads as "no previous
-blocker recorded" and behaves exactly as this section always specified; a
-writer that consumes an attempt with nothing to sign (a stale claim, a failed
-check run) rewrites the marker without them, which falls back to the same
-arithmetic. The worker tolerates and ignores both fields, and must: only the
-reconciler consumes them.
+The write rule above extends across the split rather than being weakened by it:
+the judgment is recorded, then the counter is patched, then the label goes back
+to `swarm:ready`. The two were never one transaction — the counter and the
+label were already two calls — and the guarantee comes from the order, so a
+crash anywhere in the sequence costs an attempt with its signature recorded
+rather than granting a retry that forgot what it was retrying. A task the store
+has never judged reads as "no previous blocker recorded" and behaves exactly as
+this section always specified; a writer that consumes an attempt with nothing
+to sign (a stale claim, a failed check run) records the judgment without a
+signature, which falls back to the same arithmetic.
+
+If the store's stamped attempt and the marker's counter disagree, somebody
+edited the counter — a human resetting it after fixing the environment is the
+documented case — and the tracker wins, exactly as it wins everywhere else. The
+counter stands as the body has it and the signature is dropped as a statement
+about an attempt that no longer exists, which is the safe direction: it can
+only give up early.
+
+The **counter itself stays in the marker**, and that is not an oversight. The
+worker reads it: a worker is a container with no socket and no view of the
+host, it derives its branch name and its result filename from that number, and
+it has no path to apiary's store. One authority per fact — the tracker owns the
+counter, the store owns the judgment about it, and neither holds a copy of the
+other's.
 
 ---
 

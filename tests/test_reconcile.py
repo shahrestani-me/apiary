@@ -33,6 +33,7 @@ the request count is the client's own and not a stub's.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ import pytest
 
 from fixtures.github import SentRequest, not_modified, page, response
 from swarm.containers.manager import DockerError, Handle
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import (
     ContractError,
@@ -82,9 +84,12 @@ from swarm.orchestrator.reconcile import (
 )
 from swarm.orchestrator.lifecycle import lifecycle_events
 from swarm.run import Run
+from swarm.store import STORE_DIR_ENV, SqliteTaskStore, TaskJudgement
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
+
+from fixtures.markers import legacy_marker
 
 REPO = "shahrestani-me/apiary"
 RUN_ID = "apiary-20260814-142530-k3f9qz"
@@ -95,6 +100,26 @@ BLOCKED = "swarm:blocked"
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def store_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every store this module opens lands under `tmp_path`.
+
+    Autouse and unconditional, because the failure it prevents is silent: a
+    test that forgot to redirect the root would open the *operator's* store at
+    `.swarm/store`, read a real project's retry budgets and write test
+    judgments into them. Nothing would fail; the next real run would simply
+    believe something untrue about its own history.
+    """
+    root = tmp_path / "store"
+    monkeypatch.setenv(STORE_DIR_ENV, str(root))
+    return root
+
+
+def task_store() -> SqliteTaskStore:
+    """This repository's store, under whatever `store_root` redirected to."""
+    return SqliteTaskStore.open(REPO)
 
 
 def entry(
@@ -361,6 +386,10 @@ def reconciler(client: Any, fleet: Any = None, **kwargs: Any) -> Reconciler:
     # every other test here would otherwise pay `DEFAULT_INTERVAL_S` per cycle
     # to assert something that has nothing to do with the clock.
     kwargs.setdefault("sleep", lambda _seconds: None)
+    # Required rather than defaulted on `Reconciler`, so this is the one place
+    # a test can forget it - and a forgotten store is a `TypeError` here rather
+    # than a run that silently forgets what it decided.
+    kwargs.setdefault("store", task_store())
     return Reconciler(
         run=Run.start(REPO, "reconcile the ledger", run_id=RUN_ID),
         client=client,
@@ -523,6 +552,48 @@ def test_a_records_verdict_is_not_applied_twice():
     )
 
     assert plan.transitions == ()
+
+
+def test_a_record_behind_the_counter_is_discarded_and_the_claim_stands():
+    """The live wedge, pinned as the guard's correct behaviour: a retry's
+    model call blew up and the worker filed the exit-2 record under attempt 0
+    against a ledger already on attempt 2. The staleness guard rightly
+    discards it - a record behind the counter has already been acted on, for
+    all this cycle can tell - so the issue stays claimed against an exited
+    container, forever. The guard is not the bug; the record writer had to
+    learn to tell the truth (`worker/entrypoint.py` stamps the real attempt,
+    and `worker/result.py` files an unknowable one under the next free index,
+    which is never behind the counter)."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2)),
+        results={
+            ref(4): record(4, 2, attempt=0, reason="model call failed: OutputParserException")
+        },
+        running=[ref(4)],
+    )
+
+    assert plan.transitions == () and plan.disposals == ()
+
+
+def test_the_corrected_record_is_observed_and_costs_no_attempt():
+    """The same failure carrying its real attempt: the observation proceeds,
+    the issue is re-readied, the container is disposed - and the budget is
+    untouched, because an infrastructure verdict never consumes an attempt
+    however late in the retry sequence it lands."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2)),
+        results={
+            ref(4): record(4, 2, attempt=2, reason="model call failed: OutputParserException")
+        },
+        running=[ref(4)],
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.to_label, transition.attempt) == (READY, None)
+    # Counted toward the infrastructure ceiling, not the task's budget.
+    assert transition.infrastructure
+    assert "OutputParserException" in transition.reason
+    assert [d.ref for d in plan.disposals] == [ref(4)]
 
 
 # --------------------------------------------------------------------------
@@ -859,27 +930,36 @@ def test_a_retry_with_no_output_signs_as_the_sentinel_and_burns_down():
     assert (transition.blocker, transition.streak) == (EMPTY_SIGNATURE, 2)
 
 
-def test_the_signature_is_persisted_in_the_marker_before_the_relabel():
+def test_the_signature_is_persisted_in_the_store_before_the_relabel():
+    """Where #154-#156 wrote the signature into the issue body, #159 writes it
+    into apiary's own store. The ordering guarantee is the one that matters and
+    it is unchanged: the record lands before the label goes back to ready, so a
+    crash between the two costs an attempt with its signature intact."""
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    store = task_store()
     plan = plan_reconcile(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
         max_attempts=3,
     )
 
-    apply_plan(client, plan)
+    apply_plan(client, plan, store=store)
 
     sig = signature(SQLALCHEMY_TRACEBACK)
-    body_text = client.issues[4]["body"]
-    assert f"blocker={sig}" in body_text
-    assert "streak=1" in body_text
-    # §5's ordering, extended to the record that rides the same PATCH: the
-    # write lands before the label goes back to ready, so a crash between the
-    # two costs an attempt with its signature intact.
+    held = store.read()[ref(4)]
+    assert (held.attempt, held.blocker, held.streak) == (1, sig, 1)
+    # The judgment is durable before the counter is, and the counter before the
+    # label: `update_issue` is the counter's write, so the store's must precede
+    # a body that already carries the bump.
+    assert "attempt=1" in client.issues[4]["body"]
     assert client.log.index("update_issue #4") < client.log.index(f"+{READY} #4")
-    # And it round-trips: the next cycle's loader reads the record back.
+    # And it is nowhere near the customer's issue - that is the whole point of
+    # ADR 0002.
+    body_text = client.issues[4]["body"]
+    assert "blocker=" not in body_text
+    assert "streak=" not in body_text
     contract = parse_contract(4, body_text)
-    assert (contract.attempt, contract.blocker, contract.streak) == (1, sig, 1)
+    assert (contract.attempt, contract.blocker, contract.streak) == (1, "", None)
 
 
 def test_folding_a_signature_transition_updates_the_in_memory_ledger():
@@ -902,15 +982,42 @@ def test_folding_a_signature_transition_updates_the_in_memory_ledger():
 
 def test_a_counter_bump_without_a_signature_clears_the_stale_record():
     # checks, mergeability and recovery consume attempts through channels with
-    # no verify output to sign; rewriting the marker from their transitions
-    # clears the record, and the next failure is judged by the old arithmetic
-    # - the direction that can only give up early, never late (§5).
-    original = render_marker("task-4", 1, blocker="ab12cd34ef", streak=1)
+    # no verify output to sign; their transition carries no signature, so the
+    # store is written with none and the next failure is judged by the old
+    # arithmetic - the direction that can only give up early, never late (§5).
+    client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    store = task_store()
+    store.write(TaskJudgement(ref=ref(4), attempt=1, blocker="ab12cd34ef", streak=1))
+    plan = ReconcilePlan(
+        transitions=(
+            Transition(
+                ref=ref(4),
+                from_label=CLAIMED,
+                to_label=READY,
+                reason="a stale claim, with nothing to sign",
+                task_id="task-4",
+                attempt=2,
+            ),
+        )
+    )
+
+    apply_plan(client, plan, store=store)
+
+    held = store.read()[ref(4)]
+    assert (held.attempt, held.blocker, held.streak) == (2, "", None)
+
+
+def test_a_marker_still_carrying_an_older_builds_signature_sheds_it_on_the_next_bump():
+    # The upgrade path: the parse still reads `blocker=`/`streak=` so a live
+    # repository's budgets survive the change, and the first rewrite takes them
+    # out of the body for good.
+    original = legacy_marker("task-4", 1, blocker="ab12cd34ef", streak=1)
 
     updated = rewrite_marker(original, "task-4", 2)
 
     assert updated.splitlines()[0] == render_marker("task-4", 2)
     assert "blocker=" not in updated
+    assert "streak=" not in updated
 
 
 # --------------------------------------------------------------------------
@@ -937,7 +1044,7 @@ def test_a_pull_request_closed_without_merging_returns_the_issue_to_the_pool():
 def test_an_open_pull_request_is_left_alone():
     plan = plan_reconcile(
         ledger(entry(4, label=REVIEW)),
-        open_branches=frozenset({"swarm/issue-4"}),
+        open_branches=frozenset({task_branch(ref(4), 0)}),
     )
 
     assert plan.transitions == ()
@@ -946,7 +1053,7 @@ def test_an_open_pull_request_is_left_alone():
 def test_a_published_workers_container_is_disposed_without_waiting_for_the_merge():
     plan = plan_reconcile(
         ledger(entry(4, label=REVIEW)),
-        open_branches=frozenset({"swarm/issue-4"}),
+        open_branches=frozenset({task_branch(ref(4), 0)}),
         results={ref(4): record(4, 0)},
         running=[ref(4)],
     )
@@ -1378,20 +1485,20 @@ def test_a_reconciler_holds_nothing_a_restart_would_need(fake_github):
 
 
 def test_the_snapshot_falls_through_to_the_client_for_anything_it_does_not_shape():
-    client = PullAwareClient(issues={4: issue_payload(4)}, open_pulls=("swarm/issue-4",))
+    client = PullAwareClient(issues={4: issue_payload(4)}, open_pulls=(task_branch(ref(4), 0),))
     snapshot = Snapshot(client)
 
     # The probe for a method the client has not grown yet must see the client's
     # own answer. A wrapper that answered for it would turn a method that is
     # merely missing into one that can never be found.
-    assert snapshot.open_branches() == frozenset({"swarm/issue-4"})
+    assert snapshot.open_branches() == frozenset({task_branch(ref(4), 0)})
     with pytest.raises(AttributeError):
         getattr(snapshot, COMMENT_METHOD)
 
     # The listing is wrapped rather than delegated, so a cycle's collaborators
     # share one read - but the wrapper exists only because this client does
     # have the method, and it answers with the client's own data.
-    assert [p["head"]["ref"] for p in getattr(snapshot, PULLS_METHOD)()] == ["swarm/issue-4"]
+    assert [p["head"]["ref"] for p in getattr(snapshot, PULLS_METHOD)()] == [task_branch(ref(4), 0)]
 
 
 def test_a_client_that_cannot_list_pull_requests_still_cannot():
@@ -1583,6 +1690,88 @@ def test_the_merge_policy_reaches_the_check_gate(monkeypatch):
     reconciler(client, FakeFleet(), merge_policy=policy).cycle()
 
     assert seen["policy"] is policy
+
+
+def test_a_merge_gate_join_that_cannot_resolve_is_recorded_not_escaped(monkeypatch):
+    """`UnresolvedJoin` reaches `cycle_error`, and the cycle still reports.
+
+    The gate raising is asserted in `test_checks.py` and `test_mergeability.py`.
+    What those cannot see is what the *cycle* does with it, and the answer is
+    the one `DependencyCycleError` already had: record it, do not escape.
+
+    The reason is specific to where this gate sits. It runs after `apply_plan`
+    has written this cycle's labels and after the recovery sweep, so an
+    exception leaving `cycle` is thrown before `CycleReport` is built -
+    `on_cycle` never fires and the run directory never learns that those writes
+    happened. #174 exists because a silent wrong answer is worse than a loud
+    failure; a loud failure that erases its own evidence is not the trade it
+    was asking for."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise UnresolvedJoin("no check set for #4")
+
+    monkeypatch.setattr("swarm.orchestrator.checks.plan_checks", refuse)
+
+    seen: list[Any] = []
+    client = PullAwareClient(issues={4: issue_payload(4, label=REVIEW)})
+    reports = reconciler(client, FakeFleet(), on_cycle=seen.append).loop(cycles=1)
+
+    # The fault is on the report a human and the run directory both read.
+    report = reports[0]
+    assert "no check set for #4" in report.cycle_error
+    assert "no check set for #4" in report.summary()
+    # And the gate decided nothing: no merge was issued, no admitted plan.
+    assert report.checks is None
+    assert report.mergeability is None
+    # The half that an escaping exception destroyed: `loop` builds the report
+    # and hands it to `on_cycle`, which is what writes `cycle.reconciled` into
+    # the run directory (`cli._report_cycle`). Raising past `cycle` skipped
+    # this entirely, so the cycle's already-written labels went unrecorded.
+    assert seen == [report]
+
+
+def test_a_failed_merge_gate_dispatches_nothing_that_cycle(monkeypatch):
+    """A recorded fault must not read as a quiet cycle.
+
+    Both faults that reach `cycle_error` say the same thing - the machinery
+    deciding what may land is not answering - and a run that keeps spawning
+    workers onto a review queue that cannot drain is precisely the "looks
+    healthy while stuck" failure `mergeability.py`'s docstring is about. So the
+    cycle reports and dispatches nothing, which is what `DependencyCycleError`
+    already did for the readiness half."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise UnresolvedJoin("no check set for #4")
+
+    monkeypatch.setattr("swarm.orchestrator.checks.plan_checks", refuse)
+
+    fleet = FakeFleet()
+    client = PullAwareClient(
+        issues={4: issue_payload(4, label=REVIEW), 5: issue_payload(5, label=READY)}
+    )
+    report = reconciler(client, fleet).cycle()
+
+    assert report.cycle_error
+    assert report.readiness is None
+    assert report.dispatched is None
+    assert fleet.spawned == []
+
+
+def test_the_unresolved_join_is_not_a_lookup_error(monkeypatch):
+    """And it must not be catchable as one.
+
+    `UnresolvedJoin` reports a failed lookup, so `LookupError` is the base a
+    reader reaches for - which is the trap: `KeyError` is a `LookupError`, so
+    one `except LookupError` around a dict access anywhere upstream would
+    swallow this and silently restore the default it exists to remove. The base
+    class is therefore part of the fix, not an implementation detail, and this
+    is what says so."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    assert not issubclass(UnresolvedJoin, LookupError)
+    assert issubclass(UnresolvedJoin, RuntimeError)
 
 
 # --------------------------------------------------------------------------
@@ -1918,7 +2107,7 @@ def names(seen: Iterable[tuple[str, dict[str, Any]]]) -> list[str]:
 #: against a number that cannot also be an attempt, an exit code or a PR.
 TASK_ISSUE = 4242
 TASK_REF = f"task-{TASK_ISSUE}"
-TASK_BRANCH = f"swarm/issue-{TASK_ISSUE}"
+TASK_BRANCH = task_branch(ref(TASK_ISSUE), 0)
 TASK_PULL = 900
 
 
@@ -1938,10 +2127,17 @@ def a_lifecycle_run(label: str = READY) -> tuple[LifecycleClient, FakeFleet, Rec
     return client, fleet, reconciler(client, fleet, events=emit), seen
 
 
-def reaches_review(client: LifecycleClient, fleet: FakeFleet, checks: list) -> None:
-    """The worker finished: it moved its own label (#17) and left an open PR."""
+def reaches_review(
+    client: LifecycleClient, fleet: FakeFleet, checks: list, *, attempt: int = 0
+) -> None:
+    """The worker finished: it moved its own label (#17) and left an open PR.
+
+    `attempt` names the branch the worker pushed, because #144 gives each
+    attempt its own (`apiary/<ref>-attempt-<n>`). A caller driving a second
+    attempt has to say so, exactly as a real second worker would.
+    """
     client.issues[TASK_ISSUE]["labels"] = [{"name": REVIEW}]
-    client.open_pulls = ((TASK_PULL, TASK_BRANCH),)
+    client.open_pulls = ((TASK_PULL, task_branch(ref(TASK_ISSUE), attempt)),)
     client.check_runs = {client.head_of(TASK_PULL): checks}
     fleet.handles.clear()
 
@@ -2275,13 +2471,16 @@ def test_a_malformed_issue_reaching_a_human_is_deliberately_not_announced():
 
 def test_a_reason_that_quoted_a_branch_is_rewritten_into_the_task_ref():
     """The one place the label vocabulary leaks into prose: the merge gate's
-    "no check run was ever created for swarm/issue-12" names a branch, and a
-    branch is an issue number."""
+    "no check run was ever created for <branch>" names a branch, and for this
+    adapter a branch carries an issue number (#144 encodes `#4` as `%234`)."""
     failed = Transition(
         ref=ref(4),
         from_label=REVIEW,
         to_label=FAILED,
-        reason=f"no check run was ever created for swarm/issue-4; move it back to {READY}",
+        reason=(
+            f"no check run was ever created for {task_branch(ref(4), 0)}; "
+            f"move it back to {READY}"
+        ),
         task_id="task-4",
     )
 
@@ -2332,16 +2531,16 @@ def test_a_check_name_is_announced_verbatim(tmp_path):
     A check name is written by whoever wrote the target repository's workflow.
     It cannot carry an apiary issue number, and it is precisely the string a
     reader pastes into the CI UI - so it is not scrubbed, and a repository with
-    a check called `swarm/issue-4242` sees that name and not a task ref.
+    a check named exactly like a worker branch sees that name and not a task ref.
     """
     client, fleet, loop, seen = a_lifecycle_run()
     loop.artifacts = tmp_path
     loop.cycle()
-    reaches_review(client, fleet, pending(f"swarm/issue-{TASK_ISSUE}"))
+    reaches_review(client, fleet, pending(TASK_BRANCH))
     loop.cycle()
 
     checks = [f["check"] for name, f in seen if name == "pr.checks"]
-    assert checks == [f"swarm/issue-{TASK_ISSUE}"]
+    assert checks == [TASK_BRANCH]
 
 
 def test_a_check_set_that_moved_is_announced_again(tmp_path):
@@ -2362,19 +2561,20 @@ def test_a_check_set_that_moved_is_announced_again(tmp_path):
 
 
 def test_a_retry_pushing_a_new_head_gets_its_own_check_announcements(tmp_path):
-    """The worker reuses the pull request it already opened (`worker/pr.py`), so
-    one PR number cycles pending -> failing -> pending across attempts. A key
-    without the head sha would announce the first attempt's gate and silently
-    swallow every later one."""
+    """One task's gate can report twice, and the second report must not be
+    swallowed by the first. #144 changed how the second attempt gets there - it
+    pushes `apiary/<ref>-attempt-1` and opens its own pull request rather than
+    force-pushing the one attempt 0 opened - but the announcement key is what is
+    under test, and a key without the head sha would announce the first
+    attempt's gate and silently swallow every later one."""
     client, fleet, loop, seen = a_lifecycle_run()
     loop.artifacts = tmp_path
     loop.cycle()
     reaches_review(client, fleet, failing())
     loop.cycle()
-    # Attempt two, same pull request, new head.
-    # The gate consumed an attempt and sent it back to `swarm:ready`; the next
-    # worker re-published onto the pull request it already had.
-    client.issues[TASK_ISSUE]["labels"] = [{"name": REVIEW}]
+    # Attempt two: the gate consumed an attempt and sent the issue back to
+    # `swarm:ready`, and the next worker published from the attempt-1 branch.
+    reaches_review(client, fleet, failing(), attempt=1)
     client.heads[TASK_PULL] = "b" * 40
     client.check_runs = {"b" * 40: failing()}
     loop.cycle()

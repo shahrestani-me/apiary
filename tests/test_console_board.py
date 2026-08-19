@@ -19,6 +19,8 @@ import pytest
 
 from swarm.console import Console
 from swarm.console_board import BoardError, BoardReader, COLUMNS
+from swarm.github.branches import task_branch
+from swarm.github.refs import task_ref
 
 HOST = {"Host": "127.0.0.1:8117"}
 MARKER = "<!-- apiary:task id={tid} attempt={attempt} -->"
@@ -40,6 +42,11 @@ def issue(number: int, label: str, *, tid: str = "", attempt: int = 0,
         "body": body,
         "labels": [{"name": label}],
     }
+
+
+def branch(number: int, attempt: int = 0) -> str:
+    """The head ref a worker for `(number, attempt)` pushed - built, not spelled."""
+    return task_branch(task_ref(number), attempt)
 
 
 def pr(number: int, branch: str, *, merged: bool = False,
@@ -138,7 +145,7 @@ def test_failed_is_a_strip_not_a_column():
 def test_a_ticket_is_matched_to_its_pr_by_the_worker_branch():
     client = FakeClient(
         issues=[issue(4, "swarm:review")],
-        prs=[pr(11, "swarm/issue-4"), pr(12, "swarm/issue-99")],
+        prs=[pr(11, branch(4)), pr(12, branch(99))],
     )
 
     card = reader(client).read("me/thing")["columns"]["review"][0]
@@ -146,6 +153,69 @@ def test_a_ticket_is_matched_to_its_pr_by_the_worker_branch():
     assert card["pr"] == 11
     assert card["pr_url"] == "https://github.com/me/thing/pull/11"
     assert card["url"] == "https://github.com/me/thing/issues/4"
+
+
+def test_a_ticket_keeps_its_pr_link_after_the_attempt_counter_moves():
+    """The board matches on the ref inside the head branch, not on
+    `LedgerEntry.branch` (#144). The entry names the ticket's *current* attempt,
+    so a board that compared names would drop the PR link the moment a task was
+    retried - and a card that loses its link looks like a task nobody worked on."""
+    client = FakeClient(
+        issues=[issue(4, "swarm:review", attempt=2)],
+        prs=[pr(11, branch(4, attempt=1))],
+    )
+
+    card = reader(client).read("me/thing")["columns"]["review"][0]
+
+    assert card["pr"] == 11
+
+
+def test_the_newest_pull_request_wins_when_a_ticket_has_had_several_attempts():
+    """One branch per attempt means one pull request per attempt, and the board
+    wants the live one. GitHub lists newest first."""
+    client = FakeClient(
+        issues=[issue(4, "swarm:review", attempt=1)],
+        prs=[pr(12, branch(4, attempt=1)), pr(11, branch(4, attempt=0))],
+    )
+
+    card = reader(client).read("me/thing")["columns"]["review"][0]
+
+    assert card["pr"] == 12
+
+
+def test_a_pull_request_on_a_pre_144_branch_is_named_rather_than_silently_dropped():
+    """A repository mid-run when the naming changed. The ticket shows no PR
+    link, which is honest, but "no link" and "no pull request" look identical on
+    a card - so the reason is put where the operator will see it."""
+    client = FakeClient(
+        issues=[issue(4, "swarm:review")],
+        prs=[pr(11, "swarm/issue-4"), pr(12, "renovate/urllib3-2.x")],
+    )
+
+    board = reader(client).read("me/thing")
+
+    assert "pr" not in board["columns"]["review"][0]
+    # One note, for the apiary branch. A human's branch is somebody's work, not
+    # a degradation, and a permanent note about it would be noise every poll.
+    assert len(board["notes"]) == 1
+    assert "1 pull request(s)" in board["notes"][0]
+
+
+def test_a_legacy_branch_note_does_not_blind_the_verified_column():
+    """`blind` is "the pull request list could not be read", and only that. A
+    note about one ticket's branch says nothing about the merge commits of the
+    tickets that did match, and parking all of them in Merged for it would hide
+    a whole repository's post-merge CI."""
+    client = FakeClient(
+        issues=[issue(4, "swarm:review"), issue(5, "swarm:done")],
+        prs=[pr(11, "swarm/issue-4"), pr(12, branch(5), merged=True, sha="abc123")],
+        checks={"abc123": [check("success")]},
+    )
+
+    board = reader(client).read("me/thing")
+
+    assert board["notes"]
+    assert cards(board, "verified") == [5]
 
 
 def test_the_reader_adopts_nothing():
@@ -169,7 +239,7 @@ def test_the_reader_adopts_nothing():
 def test_green_post_merge_checks_promote_merged_to_verified():
     client = FakeClient(
         issues=[issue(5, "swarm:done")],
-        prs=[pr(11, "swarm/issue-5", merged=True, sha="abc123")],
+        prs=[pr(11, branch(5), merged=True, sha="abc123")],
         checks={"abc123": [check("success"), check("skipped")]},
     )
 
@@ -190,7 +260,7 @@ def test_green_post_merge_checks_promote_merged_to_verified():
 def test_anything_short_of_green_stays_merged_and_says_why(checks, said):
     client = FakeClient(
         issues=[issue(5, "swarm:done")],
-        prs=[pr(11, "swarm/issue-5", merged=True, sha="abc123")],
+        prs=[pr(11, branch(5), merged=True, sha="abc123")],
         checks=checks,
     )
 
@@ -202,7 +272,7 @@ def test_anything_short_of_green_stays_merged_and_says_why(checks, said):
 
 def test_done_without_a_merged_pr_is_not_verified():
     """Merged by hand, or the branch is gone: no evidence is not a pass."""
-    client = FakeClient(issues=[issue(5, "swarm:done")], prs=[pr(11, "swarm/issue-5")])
+    client = FakeClient(issues=[issue(5, "swarm:done")], prs=[pr(11, branch(5))])
 
     board = reader(client).read("me/thing")
 
@@ -213,7 +283,7 @@ def test_done_without_a_merged_pr_is_not_verified():
 def test_a_verified_verdict_is_cached_because_a_merge_commit_is_immutable():
     client = FakeClient(
         issues=[issue(5, "swarm:done")],
-        prs=[pr(11, "swarm/issue-5", merged=True, sha="abc123")],
+        prs=[pr(11, branch(5), merged=True, sha="abc123")],
         checks={"abc123": [check("success")]},
     )
     board_reader = reader(client)
@@ -227,7 +297,7 @@ def test_a_verified_verdict_is_cached_because_a_merge_commit_is_immutable():
 def test_a_pending_verdict_is_polled_again():
     client = FakeClient(
         issues=[issue(5, "swarm:done")],
-        prs=[pr(11, "swarm/issue-5", merged=True, sha="abc123")],
+        prs=[pr(11, branch(5), merged=True, sha="abc123")],
         checks={"abc123": [check(None, status="queued")]},
     )
     board_reader = reader(client)

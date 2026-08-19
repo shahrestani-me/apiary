@@ -28,7 +28,9 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
+from fixtures.markers import legacy_marker
 from swarm.config import SETTINGS
+from swarm.github.branches import task_branch
 from swarm.github.client import GitHubError
 from swarm.github.ledger import (
     DEFAULT_STACK,
@@ -37,6 +39,7 @@ from swarm.github.ledger import (
     parse_contract,
     render_marker,
 )
+from swarm.github.refs import task_ref
 from swarm.nodes import planner
 from swarm.nodes.planner import (
     NO_DEPENDENCIES,
@@ -525,7 +528,7 @@ def failed_body(
     body = render_body(task_id, goal=goal, files=list(files), verify=VERIFY, attempt=attempt)
     return body.replace(
         render_marker(task_id, attempt),
-        render_marker(task_id, attempt, blocker=blocker, streak=streak),
+        legacy_marker(task_id, attempt, blocker=blocker, streak=streak),
     )
 
 
@@ -901,9 +904,10 @@ def test_plan_node_returns_what_the_loader_says_and_not_what_it_sent(github, mon
 
     tasks = result["tasks"]
     assert set(tasks) == {"root", "leaf"}
-    # `branch` is derived from the issue number by the loader, so its presence
-    # is proof the graph is being handed GitHub's answer rather than the plan.
-    assert tasks["root"]["branch"] == f"swarm/issue-{store.issues[1]['number']}"
+    # `branch` is derived from the task ref and the attempt by the loader
+    # (#144), so its presence is proof the graph is being handed GitHub's
+    # answer rather than the plan - the plan has neither.
+    assert tasks["root"]["branch"] == task_branch(task_ref(store.issues[1]["number"]), 0)
     assert tasks["leaf"]["depends_on"] == ["root"]
     assert tasks["leaf"]["status"] == "pending"
     assert any("created" in event for event in result["events"])
