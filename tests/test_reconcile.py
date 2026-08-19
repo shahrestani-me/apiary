@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field, replace
+from itertools import product
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -1083,6 +1084,87 @@ def test_pull_requests_that_could_not_be_listed_are_not_read_as_closed():
     # conflating them relabels the entire review queue.
     assert plan.transitions == ()
     assert plan.blind is True
+
+
+# --------------------------------------------------------------------------
+# What this function does not read
+# --------------------------------------------------------------------------
+
+
+def _decisions(plan: ReconcilePlan) -> tuple[Any, ...]:
+    """A plan as the decisions it carries, with `from_label` struck out.
+
+    `Transition.from_label` is the label the write has to *remove*, so it says
+    what the issue was wearing rather than what was decided about it - two runs
+    that decided identically over differently-labelled issues differ there and
+    nowhere else. `test_authority.outcome` drops the label-write log for the
+    same reason and says so at more length.
+    """
+    return (
+        tuple(replace(t, from_label="") for t in plan.transitions),
+        tuple(plan.disposals),
+    )
+
+
+def test_plan_reconcile_cannot_tell_blocked_from_ready():
+    """`swarm:blocked`'s arm of the cutover pair can never fail, and this is why.
+
+    #228 asked, of the three arms where the pair's `outcome()` equality was
+    blind to a `plan_reconcile` regression, either to make the equality fail or
+    to write down why it cannot. Two of the three - `swarm:claimed` and
+    `swarm:review` - were a missing result record in the fixture, and they now
+    fail. This one is not a fixture gap: it is a property of the function.
+
+    Every rule in the per-entry loop is keyed on a *closed issue*, on
+    `terminal`, on `claimed` or on `review`; the two that follow it read the
+    parse errors and the containers no ledger entry claims, and neither asks
+    what state an entry is in. `blocked` and `eligible` appear nowhere in any of
+    them, so the two labels take the same branch at every combination of the
+    facts the function is given - which is what this asserts, over the whole
+    product of them rather than over one world. No fixture can make an arm
+    sensitive to a distinction the function under test does not draw, so the
+    `swarm:blocked` arm of the cutover pair in `tests/test_authority.py` costs
+    the completeness claim one path: it is evidence about readiness and
+    dispatch, and no evidence at all about reconcile.
+
+    That is not the same as saying nothing checks the label there. Readiness
+    owns both waiting states and recomputes them from the dependency graph every
+    cycle, which is why `swarm:blocked` is the one wrong label the pre-#147
+    machine already repaired by itself (`test_authority.WRONG_LABELS`).
+    """
+    branch = entry(4).branch
+    worlds = product(
+        [{}, {ref(4): IssueState(ref=ref(4))}, {ref(4): closed(4)}],
+        [{}, {ref(4): record(4, 0)}, {ref(4): record(4, 1)}, {ref(4): record(4, 2)}],
+        [None, (), (branch,)],
+        [(), (ref(4),)],
+    )
+    decided = 0
+    disposed = 0
+    for states, results, branches, running in worlds:
+        facts: dict[str, Any] = dict(
+            states=states, results=results, open_branches=branches, running=running
+        )
+        # `believed=None` is the label reading - the authority a regression to
+        # `entry.state_label` would restore, and the only one under which the
+        # question is even askable.
+        blocked = plan_reconcile(ledger(entry(4, label=BLOCKED)), **facts)
+        ready = plan_reconcile(ledger(entry(4, label=READY)), **facts)
+
+        assert _decisions(blocked) == _decisions(ready), facts
+        decided += len(blocked.transitions)
+        disposed += len(blocked.disposals)
+
+    # And not a comparison of nothing with nothing, which is the failure mode a
+    # test shaped like this one has. 24 of the 72 worlds decide something and 12
+    # of those dispose a container - exactly the 24 where the issue is closed and
+    # the 12 of those carrying a container, so every decision reached here came
+    # from rule 1, the one rule that does not consult the state at all. The
+    # other 48 produce nothing under either label, and that emptiness is the
+    # finding rather than a hole in the matrix. A rule added later that *does*
+    # read `blocked` moves these numbers as well as failing the equality above,
+    # which is why they are pinned rather than bounded.
+    assert (decided, disposed) == (24, 12)
 
 
 # --------------------------------------------------------------------------
@@ -2184,7 +2266,7 @@ OTHER_PULL = 901
 
 
 def a_lifecycle_run(
-    label: str = READY, *, alongside: bool = False
+    label: str = READY, *, alongside: bool = False, artifacts: Path | None = None
 ) -> tuple[LifecycleClient, FakeFleet, Reconciler, list]:
     """One task, labelled the way the planner actually creates a dep-free one.
 
@@ -2212,6 +2294,24 @@ def a_lifecycle_run(
     the first cycle it sees it, and `Belief.landed` is a ratchet - so from the
     next cycle on the task is terminal with a container still against it, which
     is a disposal.
+
+    `artifacts` is the directory the run reads result records from, and passing
+    one is what completes the second task's story: a worker publishes its pull
+    request and then writes its record, in that order and as the last thing it
+    does (`worker/pr.py`, `worker/result.py`), so "published and exited" without
+    a record on disk is half a worker. Threaded rather than made unconditional
+    because a record needs somewhere to live and this helper has no `tmp_path`.
+
+    That record is what #228 needed. Under the resolver it changes nothing here
+    - the second task is `landed` by the second cycle and rule 2 disposes it
+    before rule 3 is reached - but a *label* reader has no `landed`, so the
+    record is the difference between `swarm:claimed` meaning "still holding it"
+    and meaning "was claimed, has finished, observe the verdict", and between
+    `swarm:review` meaning nothing and meaning "the container is only holding a
+    clone". Both are §4 rows that a one-record-poorer world could not reach, so
+    with it the cutover pair's `outcome()` equality can fail on those two arms
+    rather than only on the two terminal ones. Measured, not argued: see
+    `test_authority.a_run`.
     """
     client = LifecycleClient(issues={TASK_ISSUE: issue_payload(TASK_ISSUE, label=label)})
     fleet = FakeFleet()
@@ -2229,8 +2329,21 @@ def a_lifecycle_run(
         fleet.handles[OTHER_ISSUE] = Handle(
             id=f"{OTHER_ISSUE:0>64x}", run_id=RUN_ID, issue=OTHER_ISSUE
         )
+        if artifacts is not None:
+            # Exit 0 and attempt 0: the record a worker that published this
+            # pull request would have left. `overwrite=False` so two runs
+            # handed the same directory read one record rather than the second
+            # landing at `attempt-1` and reading as a retry nobody made.
+            write_result(
+                record(OTHER_ISSUE, 0, attempt=0, reason="verified and committed"),
+                artifacts,
+                overwrite=False,
+            )
     seen, emit = recorder()
-    return client, fleet, reconciler(client, fleet, events=emit), seen
+    loop = reconciler(client, fleet, events=emit)
+    if artifacts is not None:
+        loop.artifacts = artifacts
+    return client, fleet, loop, seen
 
 
 def reaches_review(
