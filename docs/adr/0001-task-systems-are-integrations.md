@@ -106,6 +106,40 @@ state, and a merge *is* done. The code host was already holding this.
 Only `needs-human` is reported outbound, because it is the one state the
 customer's own integration cannot infer.
 
+### Three of these are not derivable from the code host alone (#145)
+
+The table above says "derived from" and names the code host and the containers.
+Building the resolver found that incomplete in three specific ways, and they are
+recorded here because #146's shadow window will surface them as divergences and
+somebody has to know in advance which divergences are *expected*.
+
+**The infrastructure ceiling is not derivable at all.** `needs-human` is listed
+above as "attempts exhausted, or the infrastructure cap hit". The second half is
+false. `infrastructure_streaks` counts *transitions*, and exit 2 deliberately
+does not bump the attempt counter — so N consecutive mechanical failures write
+the *same* result filename, and the results directory cannot tell one from
+three. A run at the cap reads as `eligible` from the artifacts while the label
+says `swarm:failed`.
+
+**A renewed per-blocker budget is not derivable from the code host.**
+`_retry_or_give_up` gives up on `streak`, not `attempt`, and the blocker
+signature is an ADR 0002 store judgment. A task at attempt 3 against a cap of 3
+looks spent from the branch *and* the pull request, so a second code-host source
+does not rescue it.
+
+**A goal-gate revival is not derivable while it is in flight.** `planner.revive`
+"deliberately resets nothing", so the counter reads spent while the label reads
+ready. It converges on merge, which is what the `landed > needs-human`
+precedence exists for — but it diverges for the cycles in between.
+
+The honest statement is therefore narrower than the one above: **the five
+lifecycle states are derived from the code host, the containers, the run
+artifacts, and apiary's own store.** ADR 0002's store is not an addition beside
+the derivation; two of the five states need it. That does not weaken the
+decision — the store holds only apiary's own judgments, so nothing here is a
+fact the tracker owns — but a reader who took the original table literally would
+build a resolver that reads three states wrong.
+
 ## Deterministic and model-driven MCP are different call sites
 
 MCP is a protocol, not a model. Plain code can call an MCP tool, and the
