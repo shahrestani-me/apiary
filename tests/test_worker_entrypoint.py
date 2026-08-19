@@ -34,6 +34,13 @@ from swarm.github.refs import task_ref
 from swarm.state import FileEdit, WorkerOutput
 from swarm.worker import edit as edit_module
 from swarm.worker import entrypoint
+from swarm.worker.result import (
+    RESULT_DIR_ENV,
+    ResultRecord,
+    read_result,
+    record_path,
+    write_result,
+)
 from swarm.worker.entrypoint import (
     EXIT_INFRASTRUCTURE,
     EXIT_OK,
@@ -1808,14 +1815,122 @@ def test_context_is_attached_by_the_frame_that_has_it():
     cannot know the gate command, so `learned` fills in from the frame that has
     both rather than threading context through every raise site."""
     error = InfrastructureError("boom")
-    assert (error.verify_command, error.written) == ("", ())
+    assert (error.verify_command, error.written, error.deleted) == ("", (), ())
 
-    error.learned(verify_command="pytest -q", written=("a.py",), task_id="t")
+    error.learned(
+        verify_command="pytest -q", written=("a.py",), deleted=("old.py",), task_id="t"
+    )
     # Idempotent, and never overwrites what the raiser did know.
-    error.learned(verify_command="npm test", written=("b.js",), task_id="u")
+    error.learned(verify_command="npm test", written=("b.js",), deleted=("x.js",), task_id="u")
 
     assert error.verify_command == "pytest -q"
     assert error.written == ("a.py",)
+    assert error.deleted == ("old.py",)
+
+
+# --------------------------------------------------------------------------
+# The record carries the attempt that actually died (#the wedge)
+# --------------------------------------------------------------------------
+#
+# Observed live: a retry's model call blew up (Ollama emitted unparseable
+# JSON), and the exit-2 record was written as attempt 0 - overwriting the real
+# first attempt's file - with a `reason` inferred from its empty file list
+# ("no edit landed inside the declared file set") instead of the exception
+# that happened. The reconciler's staleness guard (`record.attempt >=
+# entry.attempt`) then discarded the record against a ledger on attempt 2, and
+# the run showed "1 in flight" forever against an exited container.
+
+
+class OutputParserException(RuntimeError):
+    """The live failure's name, so the record's reason can be asserted on."""
+
+
+def seed_record(attempt: int) -> ResultRecord:
+    """The real earlier attempt's testimony, which nothing may replace."""
+    return ResultRecord(
+        run_id="run",
+        issue=ISSUE,
+        attempt=attempt,
+        exit_code=EXIT_TASK_FAILED,
+        reason="the verify command failed",
+    )
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_an_infra_failure_on_a_retry_records_the_real_attempt_and_reason(
+    fake_github, scratch_repo, workspace, tmp_path, monkeypatch
+):
+    """The wedge, whole: marker at attempt 2, the model call explodes, and the
+    record must say attempt 2 and what exploded - not attempt 0 and the shape
+    of the previous attempt's failure."""
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv(RESULT_DIR_ENV, str(artifacts))
+    write_result(seed_record(attempt=0), artifacts)
+    # A marker at attempt 2 makes this a retry, so the worker lists the
+    # feedback comments before it edits; none is the ordinary answer.
+    gh, _, _ = fake_github(issue(attempt=2), response(200, []))
+    editor = FakeEditor(OutputParserException("Invalid json output: {"))
+
+    code = main(argv(scratch_repo, workspace), client=gh, editor=editor)
+
+    assert code == EXIT_INFRASTRUCTURE
+    record = read_result(record_path(artifacts, ISSUE, 2))
+    assert record.attempt == 2 and not record.consumes_attempt
+    # The reason is the failure's own words, bounded - not a guess from the
+    # empty file list.
+    assert "OutputParserException" in record.reason
+    assert "Invalid json output" in record.reason
+    # And the real first attempt's record was not touched.
+    assert read_result(record_path(artifacts, ISSUE, 0)).exit_code == EXIT_TASK_FAILED
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_failure_before_the_contract_never_clobbers_an_earlier_record(
+    fake_github, scratch_repo, workspace, tmp_path, monkeypatch
+):
+    """GitHub refuses the issue read, so no attempt number exists to file
+    under. The record takes the next free index on disk: wrong-but-fresh keeps
+    the observation alive, where a hardcoded 0 destroyed history."""
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv(RESULT_DIR_ENV, str(artifacts))
+    write_result(seed_record(attempt=0), artifacts)
+    gh, _, _ = fake_github(not_found())
+
+    code = main(
+        argv(scratch_repo, workspace),
+        client=gh,
+        editor=FakeEditor(edits({"calc.py": GOOD_CALC})),
+    )
+
+    assert code == EXIT_INFRASTRUCTURE
+    # The seed survives, and the fresh record filed one past it.
+    assert read_result(record_path(artifacts, ISSUE, 0)).exit_code == EXIT_TASK_FAILED
+    fresh = read_result(record_path(artifacts, ISSUE, 1))
+    assert fresh.exit_code == EXIT_INFRASTRUCTURE
+    assert "reading issue" in fresh.reason
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_deletions_survive_onto_a_post_apply_infrastructure_record(
+    fake_github, scratch_repo, workspace, tmp_path, monkeypatch
+):
+    """The attempt deleted its declared file and then the gate could not run
+    (exit 127, infrastructure). "What had it done before the host broke" is
+    the question an exit-2 record exists to answer, and the infrastructure
+    path used to carry `written` only - a cleanup task's whole output went
+    missing from its own record."""
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv(RESULT_DIR_ENV, str(artifacts))
+    gh, _, _ = fake_github(issue(verify="definitely-not-a-real-command --quiet"))
+    editor = FakeEditor(edits({"calc.py": ""}))  # empty content deletes
+
+    code = main(argv(scratch_repo, workspace), client=gh, editor=editor)
+
+    assert code == EXIT_INFRASTRUCTURE
+    record = read_result(record_path(artifacts, ISSUE, 0))
+    assert record.attempt == 0
+    assert record.deleted == ("calc.py",) and record.written == ()
+    assert record.verify_command == "definitely-not-a-real-command --quiet"
 
 
 # --------------------------------------------------------------------------

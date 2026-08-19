@@ -67,6 +67,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -457,23 +458,56 @@ def has_result(directory: str | Path, issue: int, attempt: int) -> bool:
     return record_path(directory, issue, attempt).exists()
 
 
+def next_attempt(directory: str | Path, issue: int) -> int:
+    """The first attempt index no record file for `issue` occupies yet.
+
+    "Free" means one past the highest taken, never a gap below it: the
+    reconciler discards any record whose attempt is behind the ledger's counter
+    as stale (`record.attempt >= entry.attempt`), so a late record filed into a
+    low gap would be a record nobody ever acts on - which is exactly the wedge
+    this function exists to avoid. An empty or absent directory answers 0, the
+    honest number for a first attempt.
+    """
+    pattern = re.compile(rf"^issue-{int(issue)}-attempt-(\d+)\.json$")
+    taken = [
+        int(match.group(1))
+        for path in Path(directory).glob(f"issue-{int(issue)}-attempt-*.json")
+        if (match := pattern.match(path.name))
+    ]
+    return max(taken, default=-1) + 1
+
+
 def write_result(
     record: ResultRecord,
     directory: str | Path | None = None,
     *,
     overwrite: bool = True,
 ) -> Path:
-    """Write one record, atomically. Returns the path it now occupies.
+    """Write one record, atomically, and never over another. Returns the path used.
 
     Temporary file plus `os.replace`, because the process most likely to be
     writing this is the one being torn down: a reader that finds a truncated
     object cannot tell it from a corrupt one, and the rename means a result file
     either exists whole or does not exist.
+
+    **No call replaces an existing record file, whatever the arguments say.** A
+    record is the only testimony its attempt leaves behind - the container is
+    deleted seconds later - so overwriting one destroys history that cannot be
+    rebuilt, and it was observed live doing exactly that: an exception-path
+    record that guessed attempt 0 replaced the real first attempt's file. When
+    the target name is taken, `overwrite=False` keeps the existing file and
+    writes nothing, because the caller is saying what is already there is truer
+    (a synthesised record must never displace the worker's own); the default
+    writes anyway, under the next free `issue-N-attempt-*.json` index. Only the
+    filename moves in that case - the record inside still says which attempt it
+    testifies about, because a reader is told to trust the field, not the path.
     """
     where = directory if directory is not None else result_dir()
     target = record_path(where, record.issue, record.attempt)
-    if not overwrite and target.exists():
-        return target
+    if target.exists():
+        if not overwrite:
+            return target
+        target = record_path(where, record.issue, next_attempt(where, record.issue))
     target.parent.mkdir(parents=True, exist_ok=True)
 
     payload = json.dumps(record.to_dict(), indent=2, sort_keys=False) + "\n"
@@ -524,11 +558,12 @@ def report(
     result: WorkerResult,
     *,
     run_id: str,
-    attempt: int,
+    attempt: int | None,
     directory: str | Path | None = None,
     started_at: dt.datetime | None = None,
     finished_at: dt.datetime | None = None,
     exit_code: int | None = None,
+    reason: str | None = None,
     image: str = "",
 ) -> Path:
     """Build the worker's record and write it. One call, because it is one act.
@@ -537,7 +572,20 @@ def report(
     `entrypoint.main` for the reason `_publish` is: `docs/issue-contract.md`
     makes the file set of an issue a contract, and #18 does not own
     `entrypoint.py`.
+
+    `attempt=None` means the worker died before the contract - the only place
+    the attempt number is written down - was readable. The record still has to
+    carry *some* number: the number names the file, and the reconciler discards
+    any record whose attempt is behind the ledger's counter as stale. So the
+    next free index on disk is used. That number may be wrong, and wrong is the
+    lesser evil said out loud: a wrong-but-fresh attempt keeps the observation
+    alive and clobbers no earlier record, where the previous behaviour - a
+    hardcoded 0 - silently destroyed the real first attempt's file and left a
+    live run showing "in flight" forever against a container that had exited.
     """
+    where = Path(directory) if directory is not None else result_dir()
+    if attempt is None:
+        attempt = next_attempt(where, result.issue)
     record = from_worker(
         result,
         run_id=run_id,
@@ -545,9 +593,10 @@ def report(
         started_at=started_at,
         finished_at=finished_at,
         exit_code=exit_code,
+        reason=reason,
         image=image,
     )
-    return write_result(record, directory)
+    return write_result(record, where)
 
 
 # --------------------------------------------------------------------------

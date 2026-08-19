@@ -62,6 +62,7 @@ from swarm.worker.result import (
     from_worker,
     has_result,
     load_results,
+    next_attempt,
     read_result,
     record_path,
     report,
@@ -438,6 +439,77 @@ def test_an_empty_directory_summarises_to_nothing(tmp_path):
 
     assert summary.attempts == 0 and summary.consumed == 0
     assert load_results(tmp_path) == ()
+
+
+# --------------------------------------------------------------------------
+# No record file is ever overwritten
+# --------------------------------------------------------------------------
+
+
+def test_a_colliding_record_bumps_its_filename_rather_than_replacing(artifacts):
+    """Two records claiming one attempt keep two files. Observed live: an
+    exception-path record that guessed attempt 0 replaced the real first
+    attempt's file, and the reason for the retry vanished with it."""
+    first = write_result(a_record(attempt=1, exit_code=EXIT_TASK_FAILED), artifacts)
+    second = write_result(a_record(attempt=1, exit_code=EXIT_INFRASTRUCTURE), artifacts)
+
+    assert first.name == f"issue-{ISSUE}-attempt-1.json"
+    assert second.name == f"issue-{ISSUE}-attempt-2.json"
+    # The earlier testimony survives word for word.
+    assert read_result(first).exit_code == EXIT_TASK_FAILED
+    # Only the filename moved; the record still says which attempt it is about.
+    bumped = read_result(second)
+    assert bumped.exit_code == EXIT_INFRASTRUCTURE and bumped.attempt == 1
+
+
+def test_next_attempt_is_one_past_the_highest_taken(artifacts):
+    """Never a gap below: a late record filed under a low index would sit
+    behind the reconciler's staleness guard forever."""
+    assert next_attempt(artifacts, ISSUE) == 0
+
+    write_result(a_record(attempt=0), artifacts)
+    write_result(a_record(attempt=3), artifacts)
+
+    assert next_attempt(artifacts, ISSUE) == 4
+    # Per issue: somebody else's attempts are not this issue's history.
+    assert next_attempt(artifacts, ISSUE + 1) == 0
+
+
+def test_a_report_with_no_attempt_files_under_the_next_free_index(artifacts):
+    """A worker that died before the contract was readable cannot know its
+    attempt. The record takes the next free index instead: a wrong-but-fresh
+    number keeps the observation alive and clobbers nothing, where the old
+    hardcoded 0 destroyed the real first attempt's record and wedged the run
+    behind the staleness guard."""
+    write_result(a_record(attempt=0, exit_code=EXIT_TASK_FAILED), artifacts)
+    unrun = WorkerResult(
+        issue=ISSUE,
+        repo=REPO,
+        task_id="",
+        branch=f"swarm/issue-{ISSUE}",
+        root=Path("."),
+        verify_command="",
+        verify_output="reading issue #7: the transport refused",
+        passed=False,
+    )
+
+    path = report(
+        unrun,
+        run_id=RUN_ID,
+        attempt=None,
+        directory=artifacts,
+        exit_code=EXIT_INFRASTRUCTURE,
+        reason="reading issue #7: the transport refused",
+    )
+
+    assert path.name == f"issue-{ISSUE}-attempt-1.json"
+    fresh = read_result(path)
+    assert fresh.attempt == 1 and fresh.exit_code == EXIT_INFRASTRUCTURE
+    # The reason is the failure's own words, not a shape inferred from the
+    # empty file list.
+    assert fresh.reason == "reading issue #7: the transport refused"
+    # And the real first attempt still stands.
+    assert read_result(record_path(artifacts, ISSUE, 0)).exit_code == EXIT_TASK_FAILED
 
 
 # --------------------------------------------------------------------------
