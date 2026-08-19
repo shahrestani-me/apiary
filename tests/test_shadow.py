@@ -28,6 +28,7 @@ be a second thing to keep in step with the loop.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -93,7 +94,15 @@ from test_reconcile import (  # the doubles that drive a real cycle
     recorder,
 )
 from swarm.store import STORE_DIR_ENV
-from swarm.worker.result import write_result
+from swarm.worker.result import (
+    EXIT_INFRASTRUCTURE,
+    EXIT_TASK_FAILED,
+    ResultRecord,
+    latest_named,
+    load_named,
+    record_path,
+    write_result,
+)
 from swarm.orchestrator.derived import LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
@@ -112,6 +121,24 @@ def store_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "store"
     monkeypatch.setenv(STORE_DIR_ENV, str(root))
     return root
+
+
+#: A fixed clock. `record_order` breaks a tie inside one attempt on the moment
+#: the record was finished, so two records that share an attempt need distinct
+#: ones for "newest" to mean anything.
+_BASE = dt.datetime(2026, 8, 14, 12, 0, tzinfo=dt.timezone.utc)
+
+
+def a_result(issue: int, *, attempt: int, exit_code: int, minute: int) -> ResultRecord:
+    """One worker's record, stamped the way `from_worker` stamps every record."""
+    return ResultRecord(
+        run_id="run-1",
+        issue=issue,
+        attempt=attempt,
+        exit_code=exit_code,
+        started_at=_BASE + dt.timedelta(minutes=minute),
+        finished_at=_BASE + dt.timedelta(minutes=minute),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1013,6 +1040,91 @@ def test_a_label_the_loader_could_not_translate_is_dropped_rather_than_written()
     line = observed_line(observation_for(cycle), control_labels(cycle))
 
     assert line["control"] == {}
+
+
+def test_a_recorded_line_names_the_file_the_cycle_read(tmp_path):
+    """#230's recorder half. The name is carried, not rebuilt.
+
+    Two records for one issue at one attempt - what an infrastructure failure
+    followed by a task failure leaves behind, since exit 2 consumes no attempt -
+    and `write_result` files the second under the next free name rather than
+    over the first. The cycle was handed the second; `record_path(issue,
+    attempt)` names the first.
+
+    The two disagree on their exit code, which is `AttemptFact.spends_budget`
+    and so the attempt count. A line naming the wrong one replays as a
+    different run from the one it was recorded from.
+    """
+    from swarm.orchestrator.shadow import observation_for
+
+    write_result(a_result(4, attempt=0, exit_code=EXIT_INFRASTRUCTURE, minute=0), tmp_path)
+    read = a_result(4, attempt=0, exit_code=EXIT_TASK_FAILED, minute=5)
+    write_result(read, tmp_path)
+
+    latest = latest_named(load_named(tmp_path))
+    cycle = report(entry(4, label=READY))
+    line = observed_line(
+        observation_for(cycle, results={ref(4): latest[4][1]}),
+        control_labels(cycle),
+        result_names={ref(4): latest[4][0]},
+    )
+
+    assert line["results"] == ["issue-4-attempt-1.json"]
+    # The name the field would have rebuilt, which holds the other record.
+    assert record_path("", 4, read.attempt).name == "issue-4-attempt-0.json"
+
+
+def test_a_recorder_with_no_names_still_writes_the_rebuilt_one(tmp_path):
+    """The fallback, for a caller holding an `Observation` and no directory.
+
+    Exactly right whenever no two records share an attempt, which is every run
+    that never hit infrastructure trouble - and every hand-written corpus line
+    that predates the argument.
+    """
+    from swarm.orchestrator.shadow import observation_for
+
+    cycle = report(entry(4, label=READY))
+    line = observed_line(
+        observation_for(cycle, results={ref(4): a_result(4, attempt=2, exit_code=1, minute=0)}),
+        control_labels(cycle),
+    )
+
+    assert line["results"] == ["issue-4-attempt-2.json"]
+
+
+def test_the_recorded_line_replays_as_the_record_the_cycle_was_handed(tmp_path):
+    """The seam, closed end to end: recorder out, loader in.
+
+    `observed_line` writes the name and `fixtures/corpus._cycle` reads it back,
+    over a directory where the name is the only thing telling two records
+    apart. The `AttemptFact` the replay builds has to be the record this cycle
+    resolved on - the exit code included, because that is what decides whether
+    the attempt spent budget.
+    """
+    from fixtures.corpus import _cycle, _load_results
+    from swarm.orchestrator.shadow import observation_for
+
+    write_result(a_result(4, attempt=0, exit_code=EXIT_INFRASTRUCTURE, minute=0), tmp_path)
+    write_result(a_result(4, attempt=0, exit_code=EXIT_TASK_FAILED, minute=5), tmp_path)
+
+    latest = latest_named(load_named(tmp_path))
+    cycle = report(entry(4, label=READY))
+    line = observed_line(
+        observation_for(cycle, results={ref(4): latest[4][1]}),
+        control_labels(cycle),
+        result_names={ref(4): latest[4][0]},
+    )
+
+    replayed = _cycle(
+        {**line, "cycle": 1},
+        results=_load_results(tmp_path),
+        default_run_id="run-1",
+        where="inline",
+    )
+
+    assert [(one.attempt, one.exit_code) for one in replayed.observation.results] == [
+        (0, EXIT_TASK_FAILED)
+    ]
 
 
 def test_the_recorder_never_raises_into_the_cycle(tmp_path, capsys):

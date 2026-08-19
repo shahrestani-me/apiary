@@ -64,6 +64,8 @@ from swarm.worker.result import (
     RunSummary,
     from_worker,
     has_result,
+    latest_named,
+    load_named,
     load_results,
     next_attempt,
     read_result,
@@ -496,6 +498,72 @@ def test_eleven_records_for_one_issue_still_have_a_newest(artifacts):
     # Content, not position: this is the key the reconciler's freshness guard
     # compares, and pinning on a stale record is what silenced the run.
     assert newest.identity == dead_host(10).identity
+
+
+def test_the_named_reduction_is_the_same_pick_as_the_summary(artifacts):
+    """`latest_named` is `summarise_dir(...).latest` with the filename attached.
+
+    Asserted rather than assumed, because `Reconciler._results` swapped one for
+    the other to get at the name and every rule in a cycle reads what it
+    returns. Eleven records, which is the arrangement #218 found `latest`
+    getting wrong, so the equivalence is claimed where it is hardest.
+    """
+    for minute in range(11):
+        write_result(dead_host(minute), artifacts)
+
+    picked = latest_named(load_named(artifacts))
+    summarised = summarise_dir(artifacts, run_id=RUN_ID).latest
+
+    assert {issue: record for issue, (_, record) in picked.items()} == summarised
+
+
+def test_the_name_follows_the_record_across_a_collision(artifacts):
+    """#177's collision, and the only case where the name carries information.
+
+    An infrastructure failure and then a task failure at the same attempt
+    number - exit 2 consumes none, so the retry runs at 0 again - leaves two
+    records that agree on `(issue, attempt)` and disagree on the one field the
+    budget arithmetic reads. `write_result` files the second under the next
+    free name rather than over the first, so `issue-7-attempt-1.json` holds a
+    record that says attempt 0.
+
+    Rebuilding the name from the field answers `issue-7-attempt-0.json` for
+    both, which names the record this cycle did *not* read.
+    """
+    write_result(dead_host(0), artifacts)
+    write_result(
+        a_record(
+            attempt=0,
+            exit_code=EXIT_TASK_FAILED,
+            started_at=_BASE + dt.timedelta(minutes=5),
+            finished_at=_BASE + dt.timedelta(minutes=5),
+        ),
+        artifacts,
+    )
+
+    name, record = latest_named(load_named(artifacts))[ISSUE]
+
+    assert record.attempt == 0
+    assert record.exit_code == EXIT_TASK_FAILED
+    assert name == f"issue-{ISSUE}-attempt-1.json"
+    # The name the field would have rebuilt, and the record it points at.
+    assert record_path("", ISSUE, record.attempt).name == f"issue-{ISSUE}-attempt-0.json"
+    assert load_named(artifacts)[f"issue-{ISSUE}-attempt-0.json"].exit_code == EXIT_INFRASTRUCTURE
+
+
+def test_an_unreadable_record_is_skipped_by_name_too(artifacts, capsys):
+    """`load_named` is `load_results`' promise, keyed differently.
+
+    One truncated file must not take the directory with it - the run this
+    happens to is the run somebody is trying to understand.
+    """
+    write_result(dead_host(0), artifacts)
+    (artifacts / f"issue-{ISSUE}-attempt-9.json").write_text("{not json", encoding="utf-8")
+
+    named = load_named(artifacts)
+
+    assert list(named) == [f"issue-{ISSUE}-attempt-0.json"]
+    assert "skipping" in capsys.readouterr().err
 
 
 def test_the_attempt_still_outranks_the_clock(artifacts):

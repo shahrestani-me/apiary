@@ -797,6 +797,55 @@ def summarise_dir(directory: str | Path, *, run_id: str | None = None) -> RunSum
     return summarise(load_results(directory), run_id=run_id)
 
 
+def load_named(directory: str | Path) -> dict[str, ResultRecord]:
+    """Every readable record in a directory, keyed by **the file it came from**.
+
+    `load_results` drops the name on the floor, which was right while the name
+    was a function of the record: `record_path(issue, attempt)` rebuilt it, so
+    keeping it would have been keeping a derived value. #177 ended that.
+    `write_result` now bumps the *filename* on a collision and leaves the
+    record's `attempt` alone, so three exit 2s - none of which consumes an
+    attempt - sit at `issue-51-attempt-0/1/2.json` while all three records say
+    attempt 0. From that point the name is the only thing that tells them
+    apart, and a caller that needs to say *which* record it read has to be
+    handed it.
+
+    Unreadable files are skipped for `load_results`' reason, and reported the
+    same way. No ordering promise: the caller that wants one asks
+    `record_order`, and `latest_named` below does.
+    """
+    records: dict[str, ResultRecord] = {}
+    for path in sorted(Path(directory).glob(RESULT_GLOB)):
+        try:
+            records[path.name] = read_result(path)
+        except ResultError as exc:
+            print(f"! skipping {path.name}: {exc}", file=sys.stderr)
+    return records
+
+
+def latest_named(named: Mapping[str, ResultRecord]) -> dict[int, tuple[str, ResultRecord]]:
+    """Issue number -> its newest record, **and the file that holds it**.
+
+    `RunSummary.latest`'s pick, addressed by name. The reduction is asked of
+    `RunSummary` rather than repeated here, because it has been wrong twice -
+    #218 found `latest` comparing the attempt alone, which left eleven records
+    for one issue tied and gave the answer to whichever a sorted glob put last -
+    and a second spelling would be a second thing to fix the next time that
+    ordering moves.
+
+    The name is recovered by looking the winning record back up rather than by
+    re-running the comparison. Records that compare equal are interchangeable
+    for every purpose a caller has - same issue, same attempt, same exit code -
+    so the last name wins among them, which is the tie-break `latest` itself
+    takes over `records`.
+    """
+    holder: dict[ResultRecord, str] = {}
+    for name, record in named.items():
+        holder[record] = name
+    summary = RunSummary(run_id="", records=tuple(named.values()))
+    return {issue: (holder[record], record) for issue, record in summary.latest.items()}
+
+
 # --------------------------------------------------------------------------
 # Timestamps
 # --------------------------------------------------------------------------

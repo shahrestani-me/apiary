@@ -76,7 +76,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping
 
 from swarm.artifacts import (
     CORPUS_MANIFEST_NAME,
@@ -100,7 +100,7 @@ from swarm.orchestrator.derived import (
     TaskFact,
 )
 from swarm.orchestrator.lifecycle import INTERNAL_STATE
-from swarm.worker.result import ResultRecord, record_path
+from swarm.worker.result import ResultRecord, latest_named
 
 #: Where the committed runs live. A directory rather than a roster, so a run
 #: added tomorrow is replayed because it exists - the same ratchet
@@ -285,7 +285,7 @@ def load_corpus(path: Path) -> CorpusRun:
             for one in manifest.get("expected_divergences") or ()
         ),
         events=read_events(path / EVENT_LOG_NAME),
-        results=results,
+        results=tuple(results.values()),
     )
 
 
@@ -297,7 +297,7 @@ def load_corpus(path: Path) -> CorpusRun:
 def _cycle(
     line: Mapping[str, Any],
     *,
-    results: Sequence[ResultRecord],
+    results: Mapping[str, ResultRecord],
     default_run_id: str,
     where: str,
 ) -> Cycle:
@@ -363,19 +363,21 @@ def _cycle(
         )
 
     visible = frozenset(str(name) for name in line.get("results") or ())
+    missing = visible - set(results)
+    if missing:
+        # A cycle claiming to have read a record the directory does not hold is
+        # a corpus editing mistake that would otherwise show up as a mysterious
+        # off-by-one in an attempt count several assertions later. Matched
+        # against the names the directory actually holds, which is what the
+        # recorder was listing when it wrote the line - a name is now the only
+        # thing that tells two records of one attempt apart (#177).
+        raise CorpusError(f"{where} cycle {index}: no such result file(s): {sorted(missing)}")
     facts = tuple(
         AttemptFact(
             ref=task_ref(record.issue), attempt=record.attempt, exit_code=record.exit_code
         )
-        for record in results
-        if _result_name(record) in visible
+        for _, record in sorted(_latest({name: results[name] for name in visible}).items())
     )
-    missing = visible - {_result_name(record) for record in results}
-    if missing:
-        # A cycle claiming to have read a record the directory does not hold is
-        # a corpus editing mistake that would otherwise show up as a mysterious
-        # off-by-one in an attempt count several assertions later.
-        raise CorpusError(f"{where} cycle {index}: no such result file(s): {sorted(missing)}")
 
     budget = line.get("budget") or {}
     observation = Observation(
@@ -438,20 +440,40 @@ def _ref(value: Any) -> TaskRef:
     return task_ref(int(text[1:]))
 
 
-def _result_name(record: ResultRecord) -> str:
-    """`worker.result.record_path`'s name, never a second spelling of it.
+def _latest(named: Mapping[str, ResultRecord]) -> dict[int, ResultRecord]:
+    """Issue number -> its newest record. `worker.result.latest_named`, not a copy.
 
-    The recorder (`orchestrator/shadow.observed_line`) builds the same name the
-    same way, so a rename in `worker/result.py` moves both sides at once."""
-    return record_path("", record.issue, record.attempt).name
+    **This is what makes the loader model a cycle rather than a directory.** A
+    live cycle never sees a list of records: `Reconciler._results` hands it
+    `summarise_dir(...).latest`, one record per task, and the recorder
+    (`shadow.observed_line`) writes the names of exactly those. The reduction
+    here is the same function the recorder's side of the seam uses, so the two
+    cannot drift - which is the property the old `_result_name` claimed and
+    stopped having when #177 unpinned the filename from the `attempt` field.
+
+    The name `latest_named` returns is what the loader matched on rather than
+    something it needs again, so only the record comes back.
+    """
+    return {issue: record for issue, (_, record) in latest_named(named).items()}
 
 
-def _load_results(directory: Path) -> tuple[ResultRecord, ...]:
+def _load_results(directory: Path) -> dict[str, ResultRecord]:
+    """Every record under `results/`, keyed by **the name on disk**.
+
+    Keyed by the filename rather than reconstructed from the record's `attempt`,
+    which is the coupling #177 broke: `write_result` bumps the *filename* on a
+    collision and leaves the field alone, so three exit 2s - none of which
+    consumes an attempt - live at `issue-51-attempt-0/1/2.json` while all three
+    records say attempt 0. Rebuilding the name from the field mapped every one
+    of them back onto the first, and a cycle that recorded seeing one record
+    replayed as having seen the whole directory.
+    """
     if not directory.is_dir():
-        return ()
-    return tuple(
-        ResultRecord.from_dict(_read_json(child)) for child in sorted(directory.glob("*.json"))
-    )
+        return {}
+    return {
+        child.name: ResultRecord.from_dict(_read_json(child))
+        for child in sorted(directory.glob("*.json"))
+    }
 
 
 def _read_json(path: Path) -> dict[str, Any]:
