@@ -1237,16 +1237,15 @@ class DivergenceTally:
     #: Zero over a run with coverage is the interesting reading: it says the
     #: labels never lied, not that nothing was believed.
     #:
-    #: **It counts events, so an overlay that repeats itself is a defect in the
-    #: overlay rather than in this number** (#201). Every kind
-    #: `orchestrator/authority.py` applies re-tests its own input each cycle and
-    #: is therefore news each time it fires - except `landed-stands`, which has
-    #: no lapse by design and would otherwise contribute one event per landed
-    #: task per remaining cycle. That would make this a measure of how long the
-    #: run lasted, and a reader would be right to read a climbing count as the
-    #: cutover misbehaving. `authority.believe` announces that one on the cycle
-    #: it starts standing and is quiet afterwards, which is what keeps the
-    #: number a count of decisions.
+    #: **It counts events, so a task stuck in one state contributes once per
+    #: cycle** (#201). `landed-stands` was the worst case - it re-tests nothing,
+    #: so it fired for every remaining cycle of the process on every landed task
+    #: - and `authority.believe` now announces it on the cycle it starts
+    #: standing and is quiet afterwards. `budget-spent` and
+    #: `infrastructure-ceiling` still repeat for a task that stays given up:
+    #: re-reading an input that cannot change is not news either. #201 scoped
+    #: only the ratchet, so **a climbing count is not by itself evidence of a
+    #: defect** - read it beside the task count before concluding anything.
     overrides: int = 0
     #: Kind -> count for the overrides that carried an account, and the task ids
     #: of the ones that did not. An unaccounted override is the label being

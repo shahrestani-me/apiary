@@ -233,8 +233,9 @@ dispatch, `budget-spent` re-reads the store, `infrastructure-ceiling` re-reads
 the run-scoped streak. This one's input is its own previous output - the state
 it writes is carried forward and read back as next cycle's `remembered` - which
 is defensible on "a merge cannot be taken back" and makes every *entry* into
-`landed` a permanent, silent decision. Three of the four routes in were wider
-than the paragraph above claims, and each is now narrowed:
+`landed` a permanent, silent decision. Three of the four ways it could be wrong
+were wider than the paragraph above claims - two entry points and one way back
+out - and each is now closed:
 
 - **A state that was never a belief.** The `UNRESOLVED` arm writes the label
   verbatim, because there is nothing else to write, and that value used to be
@@ -309,6 +310,8 @@ __all__ = [
     "Belief",
     "Grant",
     "Override",
+    # Exported for the tests, which construct one to drive a real carried
+    # belief. No caller has to know the type exists; see its docstring.
     "Remembered",
     "believe",
     "budget_spent",
@@ -469,6 +472,23 @@ def source_summary(source: str | None = None) -> str:
 # --------------------------------------------------------------------------
 # The belief
 # --------------------------------------------------------------------------
+
+
+def _unbelieved(state: str) -> str:
+    """A state that decides this cycle but may not seed the ratchet.
+
+    Named, rather than written as a bare assignment, because the distinction is
+    invisible at the call site otherwise. `states` is a `dict[str, str]` and
+    `Remembered` is a `str`, so mypy is equally happy with either and the only
+    thing marking the exception is a comment. Someone adding a fifth arm to the
+    overlay chain - the shape the `UNRESOLVED` arm already has - would write a
+    plain value and silently produce a non-belief that the next cycle's ratchet
+    would then trust.
+
+    So `Remembered` is what an arm copies, and `grep _unbelieved` returns the
+    one place that deliberately does not.
+    """
+    return str(state)
 
 
 class Remembered(str):
@@ -669,6 +689,13 @@ class Belief:
 
     def fold(self, transitions: Iterable[Any]) -> Belief:
         """Advance the belief by the label writes that landed. `fold`'s rule.
+
+        **Unguarded against `landed`, unlike `hold` ten lines below.** A
+        `Transition` is apiary's own write *this* cycle, not an overlay derived
+        from a stale selector, so it is the one input allowed to move a task the
+        ratchet is holding. `hold`'s guard exists because a revival is selected
+        from something read rather than something decided; that argument does
+        not reach here.
 
         `Transition.to_label` is apiary's own decision about a task, translated
         through the same table `lifecycle.py` announces with - not a label read
@@ -948,7 +975,7 @@ def believe(
             # task for the life of the process - a label reaching a permanent
             # decision outside the seam this module's docstring bounds, which is
             # the one thing #147 says must not happen.
-            states[entry.task_id] = was_stored
+            states[entry.task_id] = _unbelieved(was_stored)
             overrides.append(
                 Override(
                     task_id=entry.task_id,
@@ -1054,14 +1081,16 @@ def believe(
         # resumed run from resurrecting abandoned work.
         #
         # The one exception is the ratchet once it is already standing, and it
-        # is an exception about *repetition* rather than about importance. Every
-        # other overlay here re-tests something each cycle - `budget-spent`
-        # re-reads the store, `infrastructure-ceiling` re-reads the run-scoped
-        # streak, `revived` lapses on a dispatch - so a repeat of one of those is
-        # news. `landed-stands` re-tests nothing: it will report the same
-        # sentence about the same task on every remaining cycle of the process,
-        # and `artifacts.DivergenceTally.overrides` counts events rather than
-        # tasks. Announced on the cycle it starts standing, then quiet.
+        # is an exception about *repetition* rather than about importance.
+        # `landed-stands` re-tests nothing, so it reports the same sentence
+        # about the same task on every remaining cycle of the process - and
+        # `artifacts.DivergenceTally.overrides` counts events rather than tasks.
+        # Announced on the cycle it starts standing, then quiet.
+        #
+        # It is the worst case rather than the only one: `budget-spent` and
+        # `infrastructure-ceiling` re-read inputs that, for a task which stays
+        # given up, cannot change - so they repeat too. #201 scoped only the
+        # ratchet and this comment does not claim more than it fixed.
         if (believed != was_stored or kind) and not (kind == LANDED_STANDS and standing):
             overrides.append(
                 Override(
