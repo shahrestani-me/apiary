@@ -509,8 +509,28 @@ def test_no_module_on_the_tracker_path_names_an_unrouted_tracker_endpoint():
     )
 
 
-def test_the_scan_would_notice_a_call_that_bypassed_the_view():
-    """The scan is only worth having if it fails on the thing it is for."""
+def test_the_scan_would_notice_an_unrouted_endpoint():
+    """The scan is only worth having if it fails on the thing it is for.
+
+    **What it is for is an unrouted name, not a bypassed receiver**, and the two
+    are easy to conflate because the failure they guard against is the same one.
+    This scan walks `ast.Attribute` calls and keeps the attribute; it never asks
+    what the call was made *on*. So `client.create_issue_comment(...)` written
+    against a bare `GitHubClient` inside a tracker-path module passes here,
+    because that name is routed and the module is entitled to it - verified by
+    doing it, in `orchestrator/goal.py`, while reviewing #151.
+
+    That is not a hole, because it is not this test's job. A routed call made on
+    the wrong object is caught at runtime, where the receiver exists to be
+    asked: the whole-cycle tests at the top of this file run against a `Refuser`
+    code host that fails the test if a tracker question reaches it. Make
+    `TrackerView.create_issue_comment` delegate to `self._client` and two of
+    them go red.
+
+    Naming it after the bypass would leave a reader believing receivers are
+    statically guarded, and the cheapest thing to do with that belief is weaken
+    the runtime cycles that actually hold the line.
+    """
     module = ast.parse("def rule(client):\n    return client.list_milestones(state='open')\n")
     names: set[str] = {
         node.func.attr
