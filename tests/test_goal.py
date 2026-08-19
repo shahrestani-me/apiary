@@ -447,7 +447,7 @@ def test_the_revival_join_matches_the_ledger_on_the_ref() -> None:
     issue number. If `Assessment.abandoned` or `_revive_abandoned`'s match
     reverts to `entry.number`, this assessment names nothing the ledger
     recognises and the revival silently does nothing - so this fails."""
-    client = RevivalClient(issues=[open_issue(2), open_issue(3)])
+    client = RevivalClient(issues=[open_issue(2), open_issue(3), open_issue(4)])
 
     revived = _revive_abandoned(
         client,
@@ -455,20 +455,22 @@ def test_the_revival_join_matches_the_ledger_on_the_ref() -> None:
             entry(1, label=DONE),
             entry(2, label=FAILED, attempt=5, streak=3),
             entry(3, label=FAILED, attempt=5, streak=3),
+            entry(4, label=FAILED, attempt=5, streak=3),
         ),
-        Assessment(abandoned=(task_ref(2),)),
+        Assessment(abandoned=(task_ref(2), task_ref(4))),
         max_attempts=3,
         max_total_attempts=9,
     )
 
-    # #2 was named and is revived; #3 is just as revivable and was not named,
-    # so it is untouched. Both halves matter: the first fails if the join stops
-    # matching, the second fails if it stops discriminating and the function
-    # quietly revives every abandoned entry in the ledger instead.
-    assert [action.number for action in revived] == [2]
-    assert client.added == [(2, (READY,))]
-    assert client.removed == [(2, FAILED)]
-    assert [number for number, _ in client.comments] == [2]
+    # #2 and #4 were named and are revived; #3 is just as revivable and was not
+    # named, so it is untouched. Three things fail here, and each is a way the
+    # join can break: it stops matching (nothing is revived), it stops
+    # discriminating and revives every abandoned entry in the ledger, or it
+    # honours only the first ref it was given and drops the rest.
+    assert [action.number for action in revived] == [2, 4]
+    assert client.added == [(2, (READY,)), (4, (READY,))]
+    assert client.removed == [(2, FAILED), (4, FAILED)]
+    assert [number for number, _ in client.comments] == [2, 4]
 
 
 def test_a_ref_no_ledger_entry_carries_revives_nothing() -> None:
