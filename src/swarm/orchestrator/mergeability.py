@@ -86,10 +86,14 @@ pull request's number is a `PullRef` now (`swarm/taskref.py`, minted in
 it, so mypy rejects the swap in both directions.
 
 **The rule is therefore "a task is a `TaskRef`; a pull request is a `PullRef`;
-an API address that is neither is a number".** Exactly one int of the third kind
-is left in this module - `Decision.number`, the issue number
-`apply_mergeability` posts this cycle's comment with. It is not a second
-numbering in disguise: it is the *task's* own address, ADR 0001's code-host half
+and a number survives only where a call needs one in a URL - a task's own
+included".** The last clause splits on *use*, not on subject, and it has to:
+`docs/issue-contract.md` and ADR 0001 §2 both split identity from addressing,
+and a rule phrased around what a number *refers to* leaves the one int this
+module still holds uncovered by its own first clause. Exactly one such int
+remains here - `Decision.number`, the issue number `apply_mergeability` posts
+this cycle's comment with. It is not a second numbering in disguise: it is the
+*task's* own address, ADR 0001's code-host half
 of the identity `Decision.ref` mints from it, and the field it used to be
 confusable with is now a different type. Retyping it to a `TaskRef` outright is
 #174's unfinished migration rather than this one - `checks.py`'s report surface

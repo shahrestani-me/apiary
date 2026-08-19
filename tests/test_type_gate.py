@@ -157,10 +157,14 @@ def test_the_same_read_with_a_ref_is_clean(reproduction_findings: str) -> None:
 #: what the assertions below look up, so inserting a case cannot silently point
 #: an assertion at its neighbour.
 #:
-#: Every `WRONG` line is sourced the way the bug was: the pull request's number
-#: read into the field that holds the issue's. Every `RIGHT` line is the same
-#: call with the issue's number in it. A checker that flags both is worth
-#: nothing, which is why the pairs are here rather than the errors alone.
+#: Both directions are covered, and the comment has to say so because they are
+#: not symmetrical to a reader. Most `WRONG` lines are sourced the way the bug
+#: was - the pull request's number read into the field that holds the issue's -
+#: but the `Mergeability` pair is the reverse, an issue's `int` into a `PullRef`
+#: field. A newtype that rejected only one direction would let the other swap
+#: through unremarked. Every `RIGHT` line is the same call sourced correctly: a
+#: checker that flags both is worth nothing, which is why the pairs are here
+#: rather than the errors alone.
 MIS_SOURCING = """\
 from swarm.orchestrator.checks import Merge, PullState
 from swarm.orchestrator.mergeability import Decision, Mergeability

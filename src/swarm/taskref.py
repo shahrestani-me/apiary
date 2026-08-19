@@ -59,6 +59,21 @@ deliberately *not* siblings under a common base - a base class is a hole,
 because anything annotated with it accepts both again and the two vocabularies
 re-merge at the first helper that takes one.
 
+## Why `PullRef` is here and not in `github/refs.py`
+
+Its minters are there, so the pair is split across the line and that deserves an
+answer rather than an accident. `refs.py` is the **tracker** adapter -
+`branches.py` says so outright, "a Linear adapter would replace it wholesale" -
+and a code-host type parked inside it would be deleted by a tracker swap that
+has nothing to do with pull requests. ADR 0001 §4 keeps the code host GitHub
+permanently; the tracker is the half that moves. So the type outlives `refs.py`
+and lives where things that outlive adapters live, while the minting - which
+*is* GitHub's spelling and *would* move - stays down there with the rest of it.
+
+The cost is that this module's summary line overstates by one word: it holds the
+identity of a task, and one address that is not a task at all. Read the next
+paragraph before assuming the two are the same kind of thing.
+
 `PullRef` is *not* opaque in `TaskRef`'s sense, and the asymmetry is ADR 0001's.
 A task system is pluggable, so core may not know how its ids are spelled; the
 *code host* is GitHub and stays GitHub-shaped, so a pull request's number is an
@@ -68,6 +83,14 @@ it is ordinary rather than a smell: a `PullRef` exists precisely so that it can
 be handed back to `PUT /pulls/{n}/merge` in the end. What the type buys is that
 the hand-back is a written-out call at the API boundary rather than an int
 drifting through four records on its way there.
+
+**Ordering is deliberately absent, and it is the next thing this needs.**
+`TaskRef` sorts (see the note above on determinism in `find_cycle`); `PullRef`
+does not, because nothing in the orchestrator ordered pull requests by number at
+the time it was introduced. `derived.py` does - twice, `sorted(..., key=lambda
+one: one.number)` - which is exactly why `PullFact.number` is still an `int`.
+Retyping it is blocked on this, and the fix is to reuse `_natural_key` rather
+than to invent a second ordering.
 
 **What this does not yet buy.** `LedgerEntry` carries a `number` beside its
 `ref`, and the modules above still read that number wherever they address the

@@ -60,10 +60,9 @@ from ..artifacts import (
 )
 from ..github.branches import parse_task_branch
 from ..github.readiness import BLOCKED, READY
-from ..github.refs import issue_number
+from ..github.refs import issue_number, pull_number
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord
-from ..github.refs import pull_number
 from .checks import CheckSet, PullState
 from .dispatcher import CLAIMED, REVIEW
 from .reconcile import DONE, FAILED, CycleReport, Transition

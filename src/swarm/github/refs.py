@@ -1,4 +1,4 @@
-"""Minting and un-minting GitHub's task refs. **The only module that may.**
+"""Minting and un-minting GitHub's task and pull-request refs. **The only module that may.**
 
 `TaskRef` is opaque above this line (`swarm/taskref.py`), which is only true if
 exactly one place knows that this tracker spells a ref `#42`. That place is
