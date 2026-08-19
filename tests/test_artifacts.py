@@ -159,9 +159,13 @@ class ScriptedDocker:
         return subprocess.CompletedProcess(list(argv), 0, self.replies.get(argv[1], ""), "")
 
 
-def ps_line(container_id: str, run_id: str, issue: int) -> str:
-    """One row in `_PS_FORMAT`: id, name, image, run label, issue label."""
-    return f"{container_id}\tapiary-worker\tapiary-worker\t{run_id}\t{issue}\n"
+def ps_line(container_id: str, run_id: str, issue: int, state: str = "exited") -> str:
+    """One row in `_PS_FORMAT`: id, name, image, run label, issue label, state.
+
+    `exited` by default: an orphan is a container nobody was left to wait on,
+    and this sink exists to write down what it said before it goes.
+    """
+    return f"{container_id}\tapiary-worker\tapiary-worker\t{run_id}\t{issue}\t{state}\n"
 
 
 # --------------------------------------------------------------------------

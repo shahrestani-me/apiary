@@ -238,7 +238,20 @@ class Daemon:
         if not any(f.startswith("label=") for f in filters):
             raise AssertionError(f"a listing with no label filter: {list(argv)}")
         rows = [
-            "\t".join([c.id, c.name or "probe", "apiary-worker", c.run_id, str(c.issue or "")])
+            "\t".join(
+                [
+                    c.id,
+                    c.name or "probe",
+                    "apiary-worker",
+                    c.run_id,
+                    str(c.issue or ""),
+                    # `docker ps --format {{.State}}` (#187). `exited` unless a
+                    # test says otherwise, because `holders` counts a stopped
+                    # container of a live run as a claim somebody is honouring
+                    # - reading its exit code is #22's row, not this module's.
+                    c.state or "exited",
+                ]
+            )
             for c in self.containers
             if all(_matches(c, f) for f in filters)
         ]
@@ -344,6 +357,26 @@ def test_a_claim_a_live_container_is_holding_is_never_touched():
 
     assert plan.transitions == ()
     assert plan.held == (Held(ref(4), f"a container of run {run.id!r} is holding it"),)
+
+
+def test_a_container_that_exited_still_holds_the_claim_of_a_live_run():
+    """The other side of #187: this module must keep reading stopped containers.
+
+    `find_containers` can now be asked for running containers only, and asking
+    here would be wrong. Reading the exit code and moving the label is #22's
+    row; a second module deciding the same issue from "the process is gone" is
+    how two of them end up writing one label.
+    """
+    run = make_run()
+    daemon = Daemon([Handle(id="a" * 64, run_id=run.id, issue=4, state="exited")])
+
+    plan = recovery(FakeClient(), daemon, run=run).plan(ledger(entry(4)))
+
+    assert plan.transitions == ()
+    assert [item.ref for item in plan.held] == [ref(4)]
+    # And it was listed at all, which is the half a `status=running` filter
+    # would have removed.
+    assert not [part for call in daemon.calls for part in call if part.startswith("status=")]
 
 
 def test_a_sibling_run_the_caller_declared_live_does_not_lose_its_claim():
