@@ -94,6 +94,7 @@ than left to look like a ticket nobody opened a PR for.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import dataclass, field, replace
@@ -125,6 +126,7 @@ __all__ = [
     "COLUMNS",
     "local_containers",
     "project_store",
+    "worker_log",
 ]
 
 #: `authority.WAITING`, imported rather than respelled: it is the set that
@@ -154,12 +156,88 @@ COLUMNS: tuple[tuple[str, str], ...] = (
 _PASSING = frozenset({"success", "neutral", "skipped"})
 
 
+#: `Handle.short_id`'s length - what `docker ps` prints, what a card carries,
+#: and the shortest thing `worker_log` will resolve.
+SHORT_ID_CHARS = 12
+
+
 class BoardError(ValueError):
     """A refusal an operator can fix, with the fix attached."""
 
     def __init__(self, message: str, *, fix: str = "") -> None:
         super().__init__(message)
         self.fix = fix
+
+
+def _docker() -> Any:
+    """This module's one way to reach the daemon, and it redacts.
+
+    `DockerCLI` takes the redactor as an argument, so "does this call site
+    redact" was a question with a per-call-site answer - and `local_containers`
+    answered no, which was harmless while the only thing read here was a `ps`
+    listing of names and labels. #133 reads `docker logs` from a container
+    running LLM-written code that was handed a push token, and the answer has
+    to stop being per-call-site. One constructor, enrolled from this process's
+    environment exactly as `artifacts._default_redactor` is, so a page cannot
+    render a credential that a run could not have written to disk.
+    """
+    from .containers.manager import DockerCLI, Redactor
+
+    redactor = Redactor()
+    redactor.add_env(os.environ)
+    return DockerCLI(redact=redactor)
+
+
+def worker_log(container: str) -> dict[str, Any] | None:
+    """What one worker is printing, now - or `None` if this is not our container.
+
+    The gap #133 names: `RunArtifacts.log_sink` is wired to the reaper, so a
+    container's log reaches the run directory when the container is
+    **disposed**. For the two to three minutes an operator most wants to watch,
+    the only copy is inside a container nothing was reading.
+
+    **The caller's string is compared, never executed.** It arrives from a
+    query parameter, and the id this function hands `docker logs` is the one
+    the *daemon* just listed, matched by prefix against it. So an id that names
+    somebody's database - or anything else on this machine that apiary did not
+    label - has nothing to match and gets `None`, and the console cannot be
+    talked into reading a container it does not own. `find_containers` is
+    already filtered on `apiary.run` for the reaper's version of this concern.
+
+    Listed with `running=False` on purpose, unlike `local_containers`: a worker
+    that exited three seconds ago still has its output and is exactly what an
+    operator is looking at when a task stops moving. `running` rides on the
+    answer so the page can say which it is rather than the row going blank at
+    the moment the tail became interesting.
+    """
+    from .containers.manager import find_containers, tail_logs
+
+    wanted = (container or "").strip()
+    if len(wanted) < SHORT_ID_CHARS:
+        # A prefix is a prefix, and `next` takes the first match: `container=c`
+        # would answer with whichever worker the daemon happened to list first,
+        # which is a different worker's log under the right heading. The short
+        # id is what a card carries and what `docker ps` prints, so requiring
+        # it costs the caller nothing and makes the match unambiguous in
+        # practice rather than by luck.
+        raise BoardError(
+            f"name the container to read, by at least its {SHORT_ID_CHARS}-character id",
+            fix="press Watch on a claimed ticket; its card carries the id",
+        )
+    docker = _docker()
+    handle = next(
+        (h for h in find_containers(docker) if h.id.startswith(wanted)),
+        None,
+    )
+    if handle is None:
+        return None
+    return {
+        "container": handle.short_id,
+        "issue": handle.issue,
+        "image": handle.image,
+        "running": handle.running,
+        "text": tail_logs(handle, docker),
+    }
 
 
 def local_containers() -> list[ContainerFact]:
@@ -176,7 +254,7 @@ def local_containers() -> list[ContainerFact]:
     function deciding "no docker means no containers" would make an unreachable
     daemon indistinguishable from an idle one.
     """
-    from .containers.manager import DockerCLI, find_containers
+    from .containers.manager import find_containers
 
     return [
         ContainerFact(
@@ -185,7 +263,7 @@ def local_containers() -> list[ContainerFact]:
             ref=task_ref(int(handle.issue)),
             running=True,
         )
-        for handle in find_containers(DockerCLI(), running=True)
+        for handle in find_containers(_docker(), running=True)
         if handle.issue is not None
     ]
 
@@ -325,11 +403,19 @@ class BoardReader:
         )
         verdicts = _with_store(observation, entries)
 
+        # The live worker holding each task, if this machine's daemon has one.
+        # Built here rather than asked per card: `containers` is the listing
+        # this poll already paid for, and the resolver read the same tuple to
+        # decide `claimed` - so the card's watch link and the column it sits in
+        # cannot disagree about whether a worker is running.
+        holders = {fact.ref: fact for fact in containers if fact.running}
+
         columns: dict[str, list[dict[str, Any]]] = {key: [] for key, _ in COLUMNS}
         needs_human: list[dict[str, Any]] = []
         for entry in entries:
             verdict = verdicts[entry.ref]
-            card = self._card(repo, entry, verdict, by_ref.get(entry.ref))
+            card = self._card(repo, entry, verdict, by_ref.get(entry.ref),
+                              holders.get(entry.ref))
             if verdict.state == NEEDS_HUMAN:
                 #: Open only. The strip's title is "needs a human", and a
                 #: closed ticket was already answered - closed as not planned
@@ -375,6 +461,7 @@ class BoardReader:
         entry: LedgerEntry,
         verdict: Verdict,
         pr: Mapping[str, Any] | None,
+        container: ContainerFact | None = None,
     ) -> dict[str, Any]:
         # Every URL is built from the validated slug and an integer, never
         # lifted from API payloads: titles are model-written text, and the
@@ -400,6 +487,14 @@ class BoardReader:
         if pr is not None:
             card["pr"] = int(pr["number"])
             card["pr_url"] = f"https://github.com/{repo}/pull/{int(pr['number'])}"
+        if container is not None:
+            # Present means "a worker on this machine is holding this task
+            # right now", which is exactly when its output is worth watching
+            # (#133) - so the page needs no second rule about which rows may be
+            # expanded. Short id, because that is what an operator sees in
+            # `docker ps` and what `worker_log` matches by prefix; the full one
+            # is 64 characters of noise on a card.
+            card["container"] = container.id[:SHORT_ID_CHARS]
         return card
 
     def _post_merge_ci(

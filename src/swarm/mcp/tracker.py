@@ -171,17 +171,26 @@ CODE_HOST: dict[str, str] = {
 #: classified rather than quietly joining the direct path.
 #:
 #: **`get_issue` is on this list, and finding out why is what the static scan in
-#: that file was for.** It reads like a tracker read and every caller in the
-#: orchestrator is the marker's read-modify-write: `reconcile.bump_attempt`,
-#: `checks._patch_body` and `mergeability._patch_body` each fetch the issue to
-#: rewrite the `<!-- apiary ... -->` marker in its body and put it back. `docs/issue-contract.md`
-#: §5 *requires* that read to be fresh, because a human editing in between would
-#: otherwise have their edit overwritten by a patch built from a stale copy - so
-#: it cannot be served from the cycle's cached listing, and the three-capability
-#: contract has nothing to serve it with either. Routing it to a refusal would
-#: therefore not move the marker onto MCP; it would stop the attempt counter
-#: being written at all, which grants every failing task an unbounded retry
-#: budget. It goes direct, with the rest of the plane it belongs to.
+#: that file was for.** It reads like a tracker read, and its one caller in the
+#: orchestrator is the marker's read-modify-write: `reconcile.bump_attempt`
+#: fetches the issue to rewrite the `<!-- apiary ... -->` marker in its body and
+#: put it back. `docs/issue-contract.md` §5 *requires* that read to be fresh,
+#: because a human editing in between would otherwise have their edit
+#: overwritten by a patch built from a stale copy - so it cannot be served from
+#: the cycle's cached listing, and the three-capability contract has nothing to
+#: serve it with either. Routing it to a refusal would therefore not move the
+#: marker onto MCP; it would stop the attempt counter being written at all,
+#: which grants every failing task an unbounded retry budget. It goes direct,
+#: with the rest of the plane it belongs to.
+#:
+#: **One caller, and it used to be three.** `checks._patch_body` and
+#: `mergeability._patch_body` each did the same fetch-rewrite-put in order to
+#: carry a CI failure or a conflict alongside the counter. #152 deleted those
+#: blocks - nothing read them - and with the extra payload gone both functions
+#: *were* `bump_attempt`, so they collapsed into it. The classification above is
+#: unchanged and its reason is now narrower and stronger: the read this list
+#: exists to protect happens in one function, so the ticket that removes the
+#: marker removes it in one place.
 #:
 #: The read `resolve_states` used it for - genuinely a tracker read - is handled
 #: instead by `INTAKE_IS_AUTHORITATIVE`, which removes the call rather than

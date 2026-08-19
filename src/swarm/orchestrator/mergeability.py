@@ -41,12 +41,15 @@ computes wrong:
   re-dispatches it from a fresh base commit: the dispatcher (#21) spawns a worker
   against the current base head, so "start from a fresh base" falls out of
   returning the issue to the queue rather than needing a mechanism of its own.
-  What the next attempt needs and would not otherwise have is *why* - and it does
-  not get it. The base and the conflicting files used to be written onto the
-  issue body before the label moved; **#152 removed that write** for
-  `checks.write_feedback`'s reason, which is that nothing read it. They are still
-  worked out and still reported on the `Decision`, and the conflict is on the
-  pull request. #248 tracks the retry actually being told.
+  What the next attempt needs and would not otherwise have is *why*, and since
+  #248 it gets it - as a comment whose first line is the one
+  `worker/entrypoint.fetch_feedback` greps for. The base and the conflicting
+  files used to be written onto the issue *body* before the label moved; **#152
+  removed that write** for `checks`' reason, which is that nothing read it. The
+  text was never wrong, it was written where nothing looked. `checks`' module
+  docstring carries the ADR 0001 argument for the comment being a write apiary
+  may make; in one line, `comment` is one of the three capabilities that ADR
+  defines and it appends rather than overwriting.
 - **Merges are serialised.** Merging N green pull requests in one cycle under a
   strict policy means N-1 immediately go stale; merge one, let the rest update,
   repeat. It costs a cycle per merge and buys a queue that drains.
@@ -142,8 +145,9 @@ from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
     Transition,
-    post_comment,
     bump_attempt,
+    post_comment,
+    retry_comment,
     write_labels,
 )
 
@@ -188,17 +192,14 @@ DEFAULT_MERGES_PER_CYCLE = 1
 ROUNDS_ENV = "APIARY_MAX_UPDATE_ROUNDS"
 MERGES_PER_CYCLE_ENV = "APIARY_MERGES_PER_CYCLE"
 
-#: The delimiters of the conflict block in an issue body, and the sibling of
-#: `checks.FEEDBACK_OPEN`. A separate block rather than the same one because the
-#: two say different things to the next attempt - "your code failed a test" and
-#: "your branch no longer applies" need different responses - and a reader that
-#: found one sentence where the other belonged would act on the wrong one.
-CONFLICT_OPEN = "<!-- apiary:conflict -->"
-CONFLICT_CLOSE = "<!-- /apiary:conflict -->"
-
 #: How much conflict detail to carry, matching `checks.FEEDBACK_CHARS`: this text
-#: lands in an issue body a human reads and a model is meant to be given, and a
-#: pull request touching four hundred files is neither.
+#: lands in a **comment** a human reads and a model is meant to be given, and a
+#: pull request touching four hundred files is neither. It used to land in the
+#: issue body; #249 stopped writing there and #250 gave it the channel the worker
+#: actually reads. The two blocks that used to delimit it in the body are gone
+#: with the write - the distinction they carried, "your code failed a test"
+#: against "your branch no longer applies", is now carried by the two comments
+#: saying different sentences, which is where it always belonged.
 CONTEXT_CHARS = 4000
 
 
@@ -790,6 +791,10 @@ def _decide_conflicted(
             context=context,
         )
 
+    reason = (
+        f"the branch conflicts with {facts.base_name}; re-dispatching from a fresh "
+        f"base commit rather than retrying the same diff"
+    )
     return Decision(
         number=entry.number,
         pull=pull,
@@ -799,12 +804,15 @@ def _decide_conflicted(
             ref=entry.ref,
             from_state=REVIEW_STATE,
             to_state=ELIGIBLE,
-            reason=(
-                f"the branch conflicts with {facts.base_name}; re-dispatching from a fresh "
-                f"base commit rather than retrying the same diff"
-            ),
+            reason=reason,
             task_id=entry.task_id,
             attempt=attempt,
+            # #248. The context travels as `detail`, not as `verify_output`:
+            # `conflict_context` is prose this repository wrote, so it carries
+            # none of the `## Verify`-at-column-0 hazard a foreign log does, and
+            # fencing it would render its own file list as literal text to the
+            # human reading the issue.
+            comment=retry_comment(attempt, reason, detail=context),
         ),
         held=held,
         context=context,

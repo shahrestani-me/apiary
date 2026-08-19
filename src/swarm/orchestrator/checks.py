@@ -42,14 +42,24 @@ and the worker ended up reading *comments* instead
 (`worker/entrypoint.fetch_feedback`), so nothing ever read the block. The failing
 check itself is on the pull request, which is where a human looking for it goes.
 
-**What a retry after a red check does not get is the reason**, and that is older
-and larger than this module: the retry transition below carries no `comment`, and
-`fetch_feedback` matches only the `apiary: attempt N failed` comment that
-`reconcile._retry_or_give_up` posts on the *worker-result* path. So a worker
-re-dispatched by this module has never had the CI output, block or no block. See
-#248 - a gap to close deliberately, not a side effect to smuggle into a deletion.
-Until it does, the block is still what a human reads to find out why an issue is
-on its third attempt.
+**A retry after a red check now carries its reason as a comment** (#248). It did
+not before, and the gap was older and larger than the block: the retry transition
+carried no `comment`, and `fetch_feedback` matches only the
+`apiary: attempt N failed` line that `reconcile._retry_or_give_up` posts on the
+*worker-result* path. So a worker re-dispatched by this module had never had the
+CI output, block or no block - charged an attempt and told nothing, which is the
+exact case the paragraph above says is not worth creating.
+
+**And a comment is a write ADR 0001 sanctions, which is the question #248 asked
+to be answered rather than assumed.** ADR 0001 forbids apiary writing its own
+*vocabulary and workflow* into a customer's tracker - the `swarm:*` labels, the
+state machine, the counter in the body. A comment is not that: `comment` is one
+of the three capabilities the ADR defines ("post the PR link or flag
+needs-human", `mcp/contract.CAPABILITIES`), it goes over the MCP path like every
+other tracker write since #151, and it *appends* rather than overwriting, which
+was the specific sin of the body `PATCH` #152 removed - a comment cannot lose a
+human's edit. The give-up branch has always commented and nobody thought that
+needed an argument; the retry branch differs only in who reads it next.
 
 **Some failures are not the worker's to fix.** A PR can pass its own
 `## Verify` and still break CI, because another ticket's tests assert behaviour
@@ -110,6 +120,7 @@ from .reconcile import (
     PULLS_METHOD,
     Transition,
     post_comment,
+    retry_comment,
     bump_attempt,
     write_labels,
 )
@@ -154,13 +165,6 @@ DEFAULT_ZERO_CHECK_GRACE_S = 300.0
 ADMIN_OVERRIDE_ENV = "APIARY_MERGE_ADMIN_OVERRIDE"
 MERGE_METHOD_ENV = "APIARY_MERGE_METHOD"
 
-#: The delimiters of the retry-feedback block in an issue body. HTML comments,
-#: for `docs/issue-contract.md` §2's reason for putting identity in one: they
-#: are invisible in rendered markdown, survive edits above and below them, and
-#: are preserved verbatim by GitHub's editor.
-FEEDBACK_OPEN = "<!-- apiary:ci-failure -->"
-FEEDBACK_CLOSE = "<!-- /apiary:ci-failure -->"
-
 #: Every line of quoted CI output is indented by this much. Not decoration: a
 #: check log containing `## Verify` at column 0 would otherwise add a second
 #: `## Verify` section to the body and make the issue malformed
@@ -170,8 +174,12 @@ FEEDBACK_CLOSE = "<!-- /apiary:ci-failure -->"
 QUOTE_INDENT = "    "
 
 #: How much of a failure to carry. The same bound the worker's own record uses
-#: (`worker/result.tail`), because this text lands in an issue body that a human
-#: reads and a model is meant to be given, and a megabyte of CI log is neither.
+#: (`worker/result.tail`), because this text lands in a **comment** a human reads
+#: and a model is meant to be given, and a megabyte of CI log is neither. It used
+#: to land in the issue body; #249 stopped writing there and #250 gave it the
+#: channel the worker actually reads (`reconcile.retry_comment`, whose first line
+#: `worker.entrypoint.fetch_feedback` greps for). The bound is unchanged - the
+#: reason for it never depended on which of the two the text travelled in.
 FEEDBACK_CHARS = 4000
 
 #: Extensions a failing path may carry. An allow-list, because the shapes below
@@ -1026,6 +1034,16 @@ def _retry_or_give_up(
     increment rides on the transition so it is persisted *before* the label goes
     back to `swarm:ready` (`docs/issue-contract.md` §5), and a crash between the
     two costs an attempt rather than granting a free one.
+
+    **Both branches comment, and the retry's is the one #248 was about.** The
+    give-up branch has always said why, because a human is about to read it. The
+    retry branch said nothing to anybody: the CI output went into a delimited
+    block in the issue body that nothing ever read, and the worker looks for its
+    feedback in the *comments* - so a task re-dispatched because CI went red was
+    charged an attempt and told nothing. `reconcile.retry_comment` is the
+    formatter, not a second one, because its first line is the string
+    `worker.entrypoint.fetch_feedback` greps for and a second speller of that
+    line is how the contract drifts.
     """
     attempt = entry.attempt + 1
     cap = max(int(max_attempts), 1)
@@ -1049,6 +1067,7 @@ def _retry_or_give_up(
             ),
             feedback=feedback,
         )
+    reason = f"{named} failed on the pull request"
     return Outcome(
         number=entry.number,
         verdict=FAILING,
@@ -1057,9 +1076,13 @@ def _retry_or_give_up(
             ref=entry.ref,
             from_state=REVIEW_STATE,
             to_state=ELIGIBLE,
-            reason=f"{named} failed on the pull request",
+            reason=reason,
             task_id=entry.task_id,
             attempt=attempt,
+            # The CI output travels as `verify_output`, which is fenced and
+            # clipped: it is a foreign log, and a line of it reading `## Verify`
+            # at column 0 would corrupt the contract while reporting a failure.
+            comment=retry_comment(attempt, reason, feedback),
         ),
         feedback=feedback,
     )
@@ -1073,11 +1096,18 @@ def _retry_or_give_up(
 def _quote(text: str) -> str:
     """CI output, indented so no line of it can be markdown or a section heading.
 
-    See `QUOTE_INDENT`. Applied everywhere the output is written - the body
-    block and both comments - because the hazard is the same in all three: a log
-    line reading `## Verify` at column 0 makes the issue malformed, and the
-    module that reports a CI failure must not be the one that corrupts the
-    contract while doing it.
+    See `QUOTE_INDENT`. Applied wherever this module writes the output itself,
+    which since #249 is the two escalation comments and no longer the body block
+    - the hazard is the same in each: a log line reading `## Verify` at column 0
+    makes the issue malformed, and the module that reports a CI failure must not
+    be the one that corrupts the contract while doing it.
+
+    **The retry comment neutralises the same hazard a different way**, and the
+    two are worth telling apart rather than unifying. `reconcile.retry_comment`
+    fences the output instead of indenting it, and its docstring argues the
+    split: a fence is right for the text a *model* is about to be handed, an
+    indent is right where the surrounding prose is a sentence to a human. Both
+    are safe; neither is a fallback for the other.
     """
     body = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not body:
@@ -1319,8 +1349,9 @@ def apply_checks(
                 # The counter, and nothing else. The failure text used to ride
                 # along in a delimited block; #152 removed it - nothing read it
                 # (`read_feedback` was exported for a worker call site never
-                # written, and the worker reads comments), and the failing check
-                # is on the pull request. #248 is the retry not being told.
+                # written, and the worker reads comments). It travels as the
+                # transition's `comment` since #248, posted below, which is where
+                # `fetch_feedback` looks.
                 bump_attempt(
                     client, issue_number(transition.ref), transition.task_id, transition.attempt
                 )

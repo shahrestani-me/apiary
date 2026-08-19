@@ -487,6 +487,8 @@ class Console:
             return self._swarm_status(path)
         if method == "GET" and path.startswith("/swarm/board"):
             return self._swarm_board(path)
+        if method == "GET" and path.startswith("/swarm/worker"):
+            return self._swarm_worker(path)
         if method == "GET" and path.startswith("/swarm/external"):
             return self._swarm_external(path)
         if method == "GET" and path.startswith("/swarm/outcome"):
@@ -966,6 +968,42 @@ class Console:
                 f"{type(exc).__name__}: {exc}", 502,
                 fix="is GITHUB_TOKEN exported in the console's shell, and does it reach this repo?",
             )
+
+    def _swarm_worker(self, path: str) -> Response:
+        """What one worker container is printing, right now (#133).
+
+        Thin, like the board route beside it: which containers may be read,
+        what bounds the answer and where the redaction happens are all
+        `console_board.worker_log`'s, because they are the decisions - and a
+        second copy of the "only our containers" rule at the transport is the
+        copy that gets missed.
+
+        404 rather than an error for an id the daemon does not list: a worker
+        finishing between the board poll that drew the card and the click that
+        expanded it is the ordinary case, not a fault.
+        """
+        import urllib.parse
+
+        from .console_board import worker_log
+
+        _, _, query = path.partition("?")
+        wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        container = urllib.parse.unquote(wanted.get("container", ""))
+        try:
+            log = worker_log(container)
+        except BoardError as exc:
+            return Response.error(str(exc), 400, fix=exc.fix)
+        except Exception as exc:  # noqa: BLE001 - an unreachable daemon belongs on the page
+            return Response.error(
+                f"{type(exc).__name__}: {exc}", 502,
+                fix="is the Docker daemon this console can see the one running the workers?",
+            )
+        if log is None:
+            return Response.error(
+                "no apiary container by that id", 404,
+                fix="the worker has been disposed; its full log is in the run directory",
+            )
+        return Response.json(log)
 
     # -- projects -----------------------------------------------------------
     #

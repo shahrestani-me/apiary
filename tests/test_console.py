@@ -785,3 +785,76 @@ def test_every_subcommand_still_parses():
     actions = [a for a in parser._actions if a.dest == "command"]
 
     assert set(actions[0].choices) == {"run", "doctor", "runs", "show", "console", "local"}
+
+
+def test_a_claimed_row_offers_a_watch_control_and_the_strip_carries_the_log():
+    """#133 on the page. The control appears from `card.container` alone - the
+    server decides which rows have a live worker - and the output goes to a
+    full-width strip under the columns, because a board column is ~130px wide
+    and a verify command rendered in there is a ribbon three words across."""
+    script = asset("app.js")
+
+    assert "if (c.container) {" in script
+    assert "watchWorker(c)" in script
+    assert "function workerStrip" in script
+    assert 'api("/swarm/worker?container=" + encodeURIComponent(id))' in script
+    assert "var WORKER_POLL_MS = 2000" in script
+    assert "button.watch" in asset("app.css")
+
+
+def test_the_watched_worker_survives_the_board_redrawing_under_it():
+    """`renderBoard` wipes and rebuilds everything every five seconds. Without
+    the text and the scroll offset held outside the DOM, the strip would flash
+    empty until the next fetch returned and jump back to the tail while the
+    operator was reading it."""
+    script = asset("app.js")
+
+    assert "var workerWatching = \"\", workerCard = null, workerText = \"\"" in script
+    assert "pre(workerText || " in script          # refilled from the cache
+    assert "strip.restore();" in script            # ...and put back where it was
+    assert "TAIL_SLACK_PX" in script               # following the tail, or not
+
+
+def test_the_poll_stops_with_the_tab_and_is_picked_up_by_the_board():
+    """The chain must not poll a page nobody is looking at, and it must not be
+    left dead when the operator comes back - so `renderBoard` restarts it, and
+    only when nothing is polling: `workerTimer` is null while a request is in
+    flight too, so restarting off that would put two chains on one container."""
+    script = asset("app.js")
+
+    assert "var workerTimer = null, workerPolling = false" in script
+    assert 'if (!id || !current || current.kind !== "swarm") { workerPolling = false; return; }' \
+        in script
+    assert "if (!workerPolling) workerTick();" in script
+
+
+def test_a_reply_from_a_watch_that_was_stopped_does_not_start_a_second_chain():
+    """Watch, Stop, Watch on the same ticket inside one round-trip leaves the
+    first reply looking current - it is the same container - and it schedules a
+    second chain on the single timer, where `clearTimeout` can only cancel the
+    later of the two. The same defence `runGeneration` makes one layer up."""
+    script = asset("app.js")
+
+    assert "var workerGeneration = 0;" in script
+    assert "var generation = workerGeneration;" in script
+    assert "if (generation !== workerGeneration) return;" in script
+
+
+def test_only_one_worker_is_watched_at_a_time_and_stopping_releases_it():
+    """The console-side half of "output is bounded in memory": the page holds
+    one worker's tail, never a cache of every worker it has ever watched."""
+    script = asset("app.js")
+
+    assert "function stopWatching" in script
+    assert 'workerText = "";                               // the one thing held' in script
+    assert "if (workerWatching === card.container) { stopWatching(); return; }" in script
+
+
+def test_a_disposed_worker_says_where_its_log_went_rather_than_erroring():
+    """404 is how this ends every time: the reaper disposes the container and
+    the full log lands in the run directory. A red error card for the normal
+    ending of every worker would train the operator to ignore it."""
+    script = asset("app.js")
+
+    assert "this worker has been disposed" in script
+    assert "the worker has not printed anything yet" in script
