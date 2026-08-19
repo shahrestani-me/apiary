@@ -75,6 +75,11 @@ class Container:
     name: str = "probe"
     image: str = "apiary-worker"
     logs: str = ""
+    #: What `docker ps --format {{.State}}` would print for it. `exited` is the
+    #: default because that is what an orphan usually is by the time a sweep
+    #: finds it: nobody was left to `docker wait` on it, and it has been
+    #: sitting on a clone ever since.
+    state: str = "exited"
 
     @property
     def labels(self) -> dict[str, str]:
@@ -130,6 +135,7 @@ class Daemon:
                     container.image,
                     container.labels.get(RUN_LABEL, ""),
                     container.labels.get(ISSUE_LABEL, ""),
+                    container.state,
                 ]
             )
             for container in self.containers
@@ -171,6 +177,11 @@ class Daemon:
 
 
 def _matches(container: Container, spec: str) -> bool:
+    if spec.startswith("status="):
+        # Honoured for real, so a sweep that narrowed itself to running
+        # containers would visibly stop finding the orphans it exists for
+        # rather than quietly keep passing against a double that ignored it.
+        return container.state == spec.split("=", 1)[1]
     if not spec.startswith("label="):
         return True
     key = spec.split("=", 1)[1]
@@ -213,6 +224,53 @@ def test_a_container_whose_run_is_gone_is_reaped():
     assert [handle.id for handle in swept.reaped] == ["aaa"]
     assert daemon.ids == []
     assert swept.ok
+
+
+def test_an_exited_container_is_reaped_and_its_logs_come_with_it():
+    """The one caller that must keep seeing what has already stopped (#187).
+
+    `find_containers` grew a `running=` filter so a caller asking about
+    liveness stops reading a corpse as a live worker. This sweep must never use
+    it: an exited container still holds the clone it made and the only account
+    of why the run went wrong, and "nobody read its exit code" is the
+    definition of the orphan this module exists for.
+    """
+    run = make_run()
+    daemon = Daemon(
+        [Container("stopped", run_id=DEAD_RUN, issue=7, state="exited", logs="clone failed\n")]
+    )
+    written: list[Handle] = []
+
+    swept = make_reaper(daemon, run=run, sink=written.append).startup()
+
+    assert [handle.id for handle in swept.reaped] == ["stopped"]
+    assert daemon.ids == []
+    # Carried, not selected on: the summary can say what state it removed.
+    assert [handle.state for handle in swept.reaped] == ["exited"]
+    assert [handle.captured for handle in written] == ["clone failed\n"]
+
+
+def test_no_sweep_ever_narrows_its_listing_to_running_containers():
+    """Pinned, because narrowing here is a one-word change with no failing test.
+
+    A sweep that asked the daemon for `status=running` would leave precisely
+    the containers that need reaping most, and every existing assertion here
+    would still pass - the orphans in them are removed while running.
+    """
+    run = make_run()
+    daemon = Daemon(
+        [
+            Container("stopped", run_id=DEAD_RUN, issue=7, state="exited"),
+            Container("working", run_id=DEAD_RUN, issue=9, state="running"),
+        ]
+    )
+
+    swept = make_reaper(daemon, run=run).startup()
+
+    assert sorted(handle.id for handle in swept.reaped) == ["stopped", "working"]
+    for argv in daemon.argvs_for("ps"):
+        assert not [part for part in argv if part.startswith("status=")]
+        assert "--all" in argv
 
 
 def test_this_runs_own_containers_survive_a_startup_sweep():
@@ -695,6 +753,29 @@ def test_the_logs_of_a_container_nobody_watched_finish_survive_it(two_runs):
     # system holds an account of what it did.
     assert "cloned at 02:14" in swept.reaped[0].captured
     assert [handle.captured for handle in received] == [swept.reaped[0].captured]
+    assert doomed.find() == []
+
+
+@pytest.mark.docker
+def test_a_container_that_already_exited_is_still_found_and_still_disposed(two_runs):
+    """Against a real daemon, the state #187 added must not narrow this sweep.
+
+    An exited orphan is the common one - the orchestrator died, so nothing ever
+    read the exit code - and it holds its clone and its logs until something
+    removes it.
+    """
+    doomed, _ = two_runs
+    handle = probe(doomed, 'echo "clone failed at 02:14"; exit 1', issue=12)
+    assert doomed.wait(handle) == 1
+
+    listed = doomed.find()
+    assert [h.state for h in listed] == ["exited"]
+
+    swept = Reaper(scope={doomed.run.id}).sweep()
+
+    assert swept.ok, swept.summary()
+    assert [h.id for h in swept.reaped] == [handle.id]
+    assert "clone failed at 02:14" in swept.reaped[0].captured
     assert doomed.find() == []
 
 

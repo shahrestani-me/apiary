@@ -85,16 +85,16 @@ derived state stops reproducing label state, and a harness tuned until it agrees
 would have told us nothing.
 
 **And one of the four that do come out clean needs a fact the container layer
-does not currently expose.** `claimed` is "a live worker container", and
-`containers.find_containers` runs `docker ps --all` with a format string asking
+did not expose.** `claimed` is "a live worker container", and
+`containers.find_containers` ran `docker ps --all` with a format string asking
 for id, name, image and two labels - not the container's state. So the listing
-returns the *exited* container whose worker finished this cycle, and a resolver
-reading it as it stands would hold a task in `claimed` from the moment its
-worker exited until the reaper got to it. That is precisely the cycle in which
-`claimed` and `review` disagree, so it is not a rare window. `ContainerFact`
-therefore carries `running` and `containers.manager.Handle` does not; adding
-`{{.State}}` to `_PS_FORMAT` is a one-token change in a module this ticket does
-not own, and #146 cannot run a shadow window without it.
+returned the *exited* container whose worker finished this cycle, and a
+resolver reading it as it stood would hold a task in `claimed` from the moment
+its worker exited until the reaper got to it. That is precisely the cycle in
+which `claimed` and `review` disagree, so it is not a rare window. `#187` added
+`{{.State}}` to `_PS_FORMAT`, so `containers.manager.Handle` now carries the
+state and answers `running`; `ContainerFact.running` is that fact, and wiring
+the two together is #146's, since a shadow window cannot run without it.
 
 ## Where the attempt counter is read from, and why not the issue body
 
@@ -252,14 +252,14 @@ class ContainerFact:
     """One container the daemon listed, reduced to the three fields that decide.
 
     `running` is not decoration and it is the field `containers.manager.Handle`
-    does not have. `find_containers` runs `docker ps --all`, so an *exited*
+    lacked until #187. `find_containers` runs `docker ps --all`, so an *exited*
     container is still listed - and a worker that finished thirty seconds ago
     is exactly the case where `claimed` and `review` disagree. A resolver
-    reading the listing as it stands today would hold a task in `claimed` from
+    reading that listing without the state would hold a task in `claimed` from
     the moment its worker exited until the reaper got to it. So the liveness
-    the ADR's table means by "a live worker container" has to be read out of
-    `docker ps --format {{.State}}`, which is one word the current format string
-    does not ask for.
+    the ADR's table means by "a live worker container" is read out of
+    `docker ps --format {{.State}}`, which the format string now asks for and
+    `Handle.running` answers from.
 
     `run_id` is kept rather than filtered at the edge because
     `orchestrator/recovery.py` makes liveness a question about *whose* run:

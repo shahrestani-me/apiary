@@ -539,8 +539,8 @@ def test_a_listing_reports_the_issue_each_container_belongs_to():
     manager, runner = make_manager()
     runner.replies["ps"] = Reply(
         stdout=(
-            f"{CONTAINER_ID}\tapiary-run-issue-7-ab2c\tapiary-worker\t{make_run().id}\t7\n"
-            f"{'d' * 64}\tapiary-run-issue-9-zz9y\tapiary-worker\tsome-other-run\tnonsense\n"
+            f"{CONTAINER_ID}\tapiary-run-issue-7-ab2c\tapiary-worker\t{make_run().id}\t7\trunning\n"
+            f"{'d' * 64}\tapiary-run-issue-9-zz9y\tapiary-worker\tsome-other-run\tnonsense\texited\n"
         )
     )
 
@@ -562,7 +562,9 @@ def test_a_listing_can_be_narrowed_to_one_issue():
 def test_containers_of_every_run_are_findable_without_a_run_object():
     """#20 sweeps runs whose orchestrator is dead and whose `Run` is gone."""
     runner = ScriptedRunner()
-    runner.replies["ps"] = Reply(stdout=f"{CONTAINER_ID}\tapiary-x\tapiary-worker\tdead-run-1\t4\n")
+    runner.replies["ps"] = Reply(
+        stdout=f"{CONTAINER_ID}\tapiary-x\tapiary-worker\tdead-run-1\t4\texited\n"
+    )
     docker = DockerCLI(runner=runner)
 
     handles = find_containers(docker)
@@ -573,6 +575,78 @@ def test_containers_of_every_run_are_findable_without_a_run_object():
     # And the same disposal, so a foreign container's logs are captured too.
     assert dispose_container(handles[0], docker) == ""
     assert runner.commands == ["ps", "logs", "rm"]
+
+
+# --------------------------------------------------------------------------
+# Liveness (#187)
+#
+# `docker ps --all` lists a container that has exited, so a listing without the
+# state cannot tell a worker that is still working from one that finished this
+# cycle - and that window is precisely where the derived resolver's `claimed`
+# and `review` disagree.
+# --------------------------------------------------------------------------
+
+
+def test_the_listing_asks_the_daemon_for_the_container_state():
+    """The format string, pinned. Without this column there is nothing to read."""
+    manager, runner = make_manager()
+
+    manager.find()
+
+    fmt = runner.flag("ps", "--format")
+    assert "{{.State}}" in fmt
+    # One word from a closed set, not the human sentence that would need parsing.
+    assert "{{.Status}}" not in fmt
+
+
+def test_a_listing_reads_each_container_state_off_the_daemon():
+    manager, runner = make_manager()
+    runner.replies["ps"] = Reply(
+        stdout=(
+            f"{CONTAINER_ID}\tapiary-a\tapiary-worker\t{manager.run.id}\t7\trunning\n"
+            f"{'d' * 64}\tapiary-b\tapiary-worker\t{manager.run.id}\t9\texited\n"
+        )
+    )
+
+    handles = manager.find()
+
+    assert [handle.state for handle in handles] == ["running", "exited"]
+    # The field the resolver actually asks for, and the one `Handle` lacked.
+    assert [handle.running for handle in handles] == [True, False]
+
+
+def test_a_handle_that_came_from_no_listing_does_not_claim_to_be_running():
+    """`spawn` infers nothing: an unread state is not a live worker.
+
+    A container can be started and be gone in the same second - that is the
+    ordinary shape of a worker - so a handle asserting liveness the daemon
+    never confirmed would be wrong in exactly the window this field exists for.
+    """
+    manager, _ = make_manager()
+
+    handle = spawned(manager)
+
+    assert handle.state == ""
+    assert handle.running is False
+
+
+def test_a_caller_asking_for_running_containers_says_so_to_the_daemon():
+    """The exited container is never listed, rather than listed and discarded."""
+    manager, runner = make_manager()
+
+    manager.find(running=True)
+
+    assert "status=running" in runner.flags("ps", "--filter")
+
+
+def test_a_listing_asks_for_every_state_by_default():
+    """The reaper and `recovery.holders` both need what has already stopped."""
+    manager, runner = make_manager()
+
+    manager.find()
+
+    assert not [f for f in runner.flags("ps", "--filter") if f.startswith("status=")]
+    assert "--all" in runner.argv_for("ps")
 
 
 # --------------------------------------------------------------------------
@@ -686,6 +760,47 @@ def test_labels_are_readable_back_off_a_live_container(live: ContainerManager):
         assert found[0].image == live.image
     finally:
         live.dispose(handle)
+
+
+@pytest.mark.docker
+def test_a_container_that_exited_reads_back_as_exited_not_as_absent(live: ContainerManager):
+    """The round trip #187 is about, against a real daemon.
+
+    The whole bug is that this container is still *listed* - `docker ps --all`
+    is what makes the reaper possible - while saying nothing about having
+    stopped. A resolver reading the listing held its task in `claimed` from
+    here until the reaper arrived.
+    """
+    handle = shell(live, 'echo "done"', issue=7)
+    try:
+        assert live.wait(handle) == 0
+
+        listed = live.find()
+
+        # Still there, which is the reaper's whole premise, and #29's.
+        assert [h.id for h in listed] == [handle.id]
+        assert listed[0].state == "exited"
+        assert listed[0].running is False
+    finally:
+        live.dispose(handle)
+
+
+@pytest.mark.docker
+def test_a_caller_that_asked_for_running_containers_gets_only_those(live: ContainerManager):
+    working = shell(live, "sleep 300", issue=42)
+    finished = shell(live, "true", issue=7)
+    try:
+        assert live.wait(finished) == 0
+
+        assert {h.id for h in live.find()} == {working.id, finished.id}
+        assert [h.id for h in live.find(running=True)] == [working.id]
+        assert [h.state for h in live.find(running=True)] == ["running"]
+        # And the narrowing composes with the per-task filter.
+        assert live.find(ref=task_ref(7), running=True) == []
+        assert [h.id for h in live.find(ref=task_ref(7))] == [finished.id]
+    finally:
+        live.dispose(working)
+        live.dispose(finished)
 
 
 def test_a_manager_refuses_to_carry_the_boot_key_into_a_container(monkeypatch):

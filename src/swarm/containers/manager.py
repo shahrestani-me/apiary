@@ -155,9 +155,38 @@ MISSING_RE = re.compile(r"no such container|is already in progress", re.I)
 
 #: `docker ps` columns, tab-separated because a container name cannot contain a
 #: tab and an image reference cannot either.
+#:
+#: `{{.State}}` is the last column and it is load-bearing rather than
+#: decorative: this listing is `docker ps --all`, so an *exited* container is
+#: still in it, and without the state a reader cannot tell the worker that is
+#: still working from the one that finished thirty seconds ago. `{{.State}}`
+#: rather than `{{.Status}}`, which is the human sentence ("Exited (0) 3
+#: minutes ago") and would have to be parsed; the state is one word from a
+#: closed set.
 _PS_FORMAT = (
-    '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Label "' + RUN_LABEL + '"}}\t{{.Label "' + ISSUE_LABEL + '"}}'
+    '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Label "'
+    + RUN_LABEL
+    + '"}}\t{{.Label "'
+    + ISSUE_LABEL
+    + '"}}\t{{.State}}'
 )
+
+#: How many columns `_PS_FORMAT` asks for. A row with fewer came from a daemon
+#: that answered something other than what was asked, and is skipped rather
+#: than guessed at.
+_PS_FIELDS = 6
+
+#: The `docker ps` filter that means "still working". Applied by the daemon
+#: rather than by this module, exactly as the label filter is: the listing a
+#: caller asked for is the listing it gets, and the argv still reads as
+#: something a human can paste.
+_RUNNING_FILTER = "status=running"
+
+#: The one value of `{{.State}}` that means a worker is still working. The rest
+#: - `created`, `restarting`, `paused`, `removing`, `exited`, `dead` - are all
+#: "not running now", and a caller that meant liveness must read none of them
+#: as a live worker.
+RUNNING_STATE = "running"
 
 #: Container names carry a random tail for the same reason run ids do: a second
 #: attempt at one issue inside one run must not collide with the corpse of the
@@ -475,12 +504,34 @@ class Handle:
     issue: int | None = None
     name: str = ""
     image: str = ""
+    #: The daemon's own word for what this container is doing, as `docker ps`
+    #: printed it - `running`, `exited`, `created`, and the rest of the closed
+    #: set. Read, never inferred: `spawn` leaves it empty even after a
+    #: successful `docker start`, because a container that started and exited
+    #: in the same breath is the ordinary case for a worker and a handle that
+    #: claimed otherwise would be lying about the exact window this field
+    #: exists for. Empty means "no listing said", which `running` reads as
+    #: false - the direction that cannot mistake a corpse for a live worker.
+    state: str = ""
     captured: str | None = None
     removed: bool = False
 
     @property
     def short_id(self) -> str:
         return self.id[:12]
+
+    @property
+    def running(self) -> bool:
+        """Was this container still working when the listing was taken?
+
+        The question `docker ps --all` does not answer on its own, and the one
+        the derived-state resolver (#146) asks: a task is `claimed` while a
+        *live* worker holds it, and a container that exited this cycle has
+        already opened its pull request. Reading the listing without this held
+        every task in `claimed` from the moment its worker exited until the
+        reaper arrived.
+        """
+        return self.state == RUNNING_STATE
 
     def __str__(self) -> str:
         label = self.name or self.short_id
@@ -492,6 +543,7 @@ def find_containers(
     *,
     run_id: str | None = None,
     task: str | None = None,
+    running: bool = False,
 ) -> list[Handle]:
     """Containers this system created, newest first, optionally one run's only.
 
@@ -504,11 +556,24 @@ def find_containers(
     caller derives. Taking the token rather than the ref is what keeps this
     function - and the reaper that calls it - free of any opinion about what a
     task id looks like.
+
+    **`running` is off by default and that default is deliberate.** The listing
+    is `docker ps --all` because the two callers that matter most need what has
+    already stopped: the reaper disposes exited containers - they still hold a
+    clone and their logs are the run's most valuable - and `recovery.holders`
+    counts an exited container of a live run as a claim somebody is honouring.
+    Narrowing the default would break both. `running=True` is for the caller
+    that means liveness and had, until now, no way to say so; the daemon
+    applies it, so an exited container is not fetched and discarded, it is
+    never listed. Every handle carries `state` either way, so a caller taking
+    the whole listing can still tell the two apart.
     """
     label = f"label={RUN_LABEL}" + (f"={validate_run_id(run_id)}" if run_id else "")
     args = ["ps", "--all", "--no-trunc", "--filter", label]
     if task is not None:
         args += ["--filter", f"label={ISSUE_LABEL}={task}"]
+    if running:
+        args += ["--filter", _RUNNING_FILTER]
     args += ["--format", _PS_FORMAT]
 
     handles: list[Handle] = []
@@ -516,9 +581,11 @@ def find_containers(
         if not line.strip():
             continue
         fields = line.split("\t")
-        if len(fields) < 5:
+        if len(fields) < _PS_FIELDS:
             continue
-        container_id, name, image, run_label, issue_label = (part.strip() for part in fields[:5])
+        container_id, name, image, run_label, issue_label, state = (
+            part.strip() for part in fields[:_PS_FIELDS]
+        )
         handles.append(
             Handle(
                 id=container_id,
@@ -526,6 +593,7 @@ def find_containers(
                 issue=int(issue_label) if issue_label.isdigit() else None,
                 name=name,
                 image=image,
+                state=state,
             )
         )
     return handles
@@ -839,18 +907,23 @@ class ContainerManager:
         """Capture, then destroy. Idempotent; see `dispose_container`."""
         return dispose_container(handle, self._cli)
 
-    def find(self, *, ref: TaskRef | None = None) -> list[Handle]:
+    def find(self, *, ref: TaskRef | None = None, running: bool = False) -> list[Handle]:
         """This run's containers, running or not, optionally one task's only.
 
         The filter is `ref.label_value`, the same token `spawn` labelled the
         container with. The ref is not taken apart and no adapter is consulted,
         which is the property that lets a run against a tracker whose ids are
         `ENG-123` find its own containers.
+
+        `running=True` narrows the answer to live workers - see
+        `find_containers`, which explains why that is not the default. Whatever
+        comes back, each handle carries the `state` the daemon reported.
         """
         return find_containers(
             self._cli,
             run_id=self.run.id,
             task=None if ref is None else ref.label_value,
+            running=running,
         )
 
     # --- plumbing -------------------------------------------------------

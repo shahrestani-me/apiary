@@ -42,6 +42,17 @@ exit code, nobody read its output, and the reason the run went wrong is in
 there. Those logs are the most valuable in the run and they are gone the
 instant the container is. `sink` is where #29 receives them.
 
+**An exited container is the point of this sweep, not an edge case in it.**
+`find_containers` grew a `running=` filter (#187) so that a caller asking about
+*liveness* stops reading a corpse as a live worker. This module is the caller
+that must never use it. A stopped container is still a container: it holds the
+clone it made, the disk that clone sits on, and the logs nobody has read - and
+"nobody read its exit code" is the definition of the orphan this module exists
+for. Narrowing the listing to running containers would leave exactly the
+containers that need reaping most, and leave them holding the only copy of why
+the run went wrong. The state is *carried* on every handle, because a summary
+that says what it removed is worth having; it is never *selected* on.
+
 **Ctrl-C is a shutdown.** `guard()` sweeps on entry, installs `SIGINT` and
 `SIGTERM` handlers, sweeps on exit, and chains to whatever handler it displaced
 so the process still dies when the human asked it to. Without the handlers the
@@ -204,6 +215,9 @@ class Reaper:
         With a `scope` the filter carries the run id, so the daemon never even
         reports a container from another run - which is what makes a sweep on a
         shared development machine safe to run at all.
+
+        Never `running=True`. See the module docstring: the containers this
+        sweep exists for are the ones that have already stopped.
         """
         if self.scope is None:
             return find_containers(self._cli)
