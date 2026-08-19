@@ -350,7 +350,7 @@ def test_every_derived_limit_reaches_the_docker_command():
     runner = RecordingRunner()
     manager = ContainerManager(run=make_run(), limits=budget.limits, env={}, runner=runner)
 
-    manager.spawn(19, BASE_COMMIT)
+    manager.spawn(task_ref(19), BASE_COMMIT, issue=19)
 
     assert runner.flag("create", "--cpus") == "2"
     assert runner.flag("create", "--memory") == "4096m"
@@ -458,7 +458,9 @@ def runaway(trivial_image: str) -> ContainerManager:
 
 
 def shell(manager: ContainerManager, script: str, issue: int = 19) -> Handle:
-    return manager.spawn(issue, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", script])
+    return manager.spawn(
+        task_ref(issue), BASE_COMMIT, issue=issue, entrypoint="/bin/sh", command=["-c", script]
+    )
 
 
 def inspected(manager: ContainerManager, handle: Handle, template: str) -> str:

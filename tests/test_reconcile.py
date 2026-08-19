@@ -280,7 +280,15 @@ class FakeFleet:
         self.handles.pop(handle.issue, None)
         return ""
 
-    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle:
+    def spawn(
+        self,
+        task: TaskRef,
+        base_commit: str,
+        *,
+        issue: int | None = None,
+        image: str | None = None,
+    ) -> Handle:
+        assert issue is not None and task.label_value == str(issue)
         self.log.append(f"spawn #{issue}")
         handle = Handle(id=f"{issue:0>64x}", run_id=RUN_ID, issue=issue, image=image or "")
         self.handles[issue] = handle

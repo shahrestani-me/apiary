@@ -99,3 +99,45 @@ def test_a_ref_another_adapter_minted_is_refused_rather_than_guessed():
     """Addressing some unrelated issue in this repository is the worse failure."""
     with pytest.raises(ValueError, match="not minted by the GitHub adapter"):
         issue_number(TaskRef("ENG-123"))
+
+
+# --------------------------------------------------------------------------
+# The Docker-safe form the container layer labels with
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, token",
+    [
+        ("#42", "42"),
+        ("#9", "9"),
+        ("ENG-123", "ENG-123"),
+        ("PROJ_7", "PROJ_7"),
+        ("probe", "probe"),
+        ("a b/c", "abc"),
+    ],
+)
+def test_label_value_keeps_only_what_docker_allows_in_a_name(value, token):
+    assert TaskRef(value).label_value == token
+
+
+def test_a_github_ref_labels_a_container_exactly_as_the_issue_number_did():
+    """Why moving `containers/` onto `label_value` broke no wire format.
+
+    The label was `apiary.issue=42` and the container was named
+    `...-issue-42-...` when both came from an `int`. They still are, because a
+    GitHub ref reduced to Docker's character set *is* its number. This is the
+    property that made the change safe to ship without a compatibility window,
+    so it is asserted rather than left to be rediscovered.
+    """
+    assert all(task_ref(n).label_value == str(n) for n in (1, 9, 42, 1234))
+
+
+def test_a_ref_with_no_docker_safe_form_is_refused_rather_than_labelled():
+    """Unreachable for any real tracker, and a `docker create` failure if not.
+
+    Blaming the container layer for a ref it was handed is the confusing
+    version of this error, so it is raised where the ref is.
+    """
+    with pytest.raises(ValueError, match="no Docker-safe form"):
+        TaskRef("#/#").label_value

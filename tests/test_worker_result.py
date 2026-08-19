@@ -41,6 +41,7 @@ from fixtures.github import response
 from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 
 from swarm.containers.manager import ContainerManager, ContainerTimeout, Handle
+from swarm.github.refs import task_ref
 from swarm.run import Run
 from swarm.state import FileEdit, WorkerOutput
 from swarm.worker.entrypoint import (
@@ -336,7 +337,7 @@ def test_a_timeout_kill_still_yields_a_result(artifacts):
         }
     )
     manager = ContainerManager(run=Run.start(REPO, "add retry logic"), runner=runner, env={})
-    spawned = manager.spawn(ISSUE, BASE_COMMIT)
+    spawned = manager.spawn(task_ref(ISSUE), BASE_COMMIT, issue=ISSUE)
     started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=600)
 
     with pytest.raises(ContainerTimeout):

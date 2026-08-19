@@ -143,7 +143,19 @@ class FakeSwarm:
 
     # --- Spawner --------------------------------------------------------
 
-    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle:
+    def spawn(
+        self,
+        task: TaskRef,
+        base_commit: str,
+        *,
+        issue: int | None = None,
+        image: str | None = None,
+    ) -> Handle:
+        # The fake keeps docker's int-keyed bookkeeping; only the seam changed.
+        # `issue` is asserted rather than ignored: the dispatcher has to pass
+        # both, and a caller that stopped would leave the worker without the
+        # number it needs to open a pull request.
+        assert issue is not None and task.label_value == str(issue)
         # The image is in the log, because #99's whole question is which one a
         # task got and the ordering assertions read this log.
         self.log.append(f"spawn #{issue}" + (f" [{image}]" if image else ""))

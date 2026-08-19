@@ -1105,7 +1105,7 @@ def write_plan(
         )
 
     planned = {draft.task_id for draft in ordered}
-    for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].number):
+    for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref):
         if task_id not in planned:
             actions.append(_drop(client, entry, states, retire=retire_dropped))
 

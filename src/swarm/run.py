@@ -306,7 +306,7 @@ def live_entries(ledger: Ledger) -> tuple[LedgerEntry, ...]:
     unfinished = (
         entry for entry in ledger.entries.values() if entry.state_label not in TERMINAL_LABELS
     )
-    return tuple(sorted(unfinished, key=lambda entry: entry.number))
+    return tuple(sorted(unfinished, key=lambda entry: entry.ref))
 
 
 def attach(run: Run, ledger: Ledger) -> Attachment:

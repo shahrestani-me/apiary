@@ -697,7 +697,7 @@ def plan_checks(
     moment = now or dt.datetime.now(dt.timezone.utc)
     outcomes: list[Outcome] = []
 
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         if entry.state_label != REVIEW or pulls is None:
             continue
         pull = pulls.get(entry.branch)

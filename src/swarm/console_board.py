@@ -123,7 +123,7 @@ class BoardReader:
 
         columns: dict[str, list[dict[str, Any]]] = {key: [] for key, _ in COLUMNS}
         failed: list[dict[str, Any]] = []
-        for entry in sorted(ledger.entries.values(), key=lambda e: e.number):
+        for entry in sorted(ledger.entries.values(), key=lambda e: e.ref):
             pr = by_head.get(entry.branch)
             card = self._card(repo, entry, pr)
             if entry.state_label == "swarm:failed":

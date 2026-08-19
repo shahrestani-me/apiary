@@ -278,7 +278,14 @@ class Spawner(Protocol):
     ordering rule above is a test that does not run.
     """
 
-    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle: ...
+    def spawn(
+        self,
+        task: TaskRef,
+        base_commit: str,
+        *,
+        issue: int | None = None,
+        image: str | None = None,
+    ) -> Handle: ...
 
     #: The safe-release probe. A spawn that raised may still have left a
     #: container running - `docker start` can fail this process's read after
@@ -314,7 +321,7 @@ def held_files(entries: Iterable[LedgerEntry]) -> dict[str, int]:
     over it either way, which is the decision that matters.
     """
     held: dict[str, int] = {}
-    for entry in sorted(entries, key=lambda entry: entry.number):
+    for entry in sorted(entries, key=lambda entry: entry.ref):
         for path in entry.files:
             held.setdefault(normalise(path), entry.number)
     return held
@@ -399,7 +406,7 @@ def plan_dispatch(
 
     in_flight: list[LedgerEntry] = []
     candidates: list[LedgerEntry] = []
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         if entry.state_label in RESERVING_LABELS:
             in_flight.append(entry)
             continue
@@ -648,7 +655,12 @@ def dispatch(
             failed.append(DispatchFailure(entry.number, f"claim failed: {exc}", fatal=True))
             break
         try:
-            handle = manager.spawn(entry.number, base_commit, image=image)
+            # Both, and they are not the same fact: the container is labelled
+            # and named by task, and the worker is handed the issue number it
+            # needs to read a contract and open a pull request against it.
+            handle = manager.spawn(
+                entry.ref, base_commit, issue=entry.number, image=image
+            )
         except ContainerError as exc:
             fatal = daemon_is_down(exc)
             if missing_image(exc):

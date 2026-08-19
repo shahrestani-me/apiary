@@ -201,13 +201,13 @@ def shipped(ledger: Ledger) -> tuple[LedgerEntry, ...]:
     evidence that its work landed.
     """
     entries = (entry for entry in ledger.entries.values() if entry.state_label == "swarm:done")
-    return tuple(sorted(entries, key=lambda entry: entry.number))
+    return tuple(sorted(entries, key=lambda entry: entry.ref))
 
 
 def abandoned(ledger: Ledger) -> tuple[LedgerEntry, ...]:
     """The tasks the swarm gave up on, in issue order."""
     entries = (entry for entry in ledger.entries.values() if entry.state_label == "swarm:failed")
-    return tuple(sorted(entries, key=lambda entry: entry.number))
+    return tuple(sorted(entries, key=lambda entry: entry.ref))
 
 
 def live(ledger: Ledger) -> tuple[LedgerEntry, ...]:
@@ -215,7 +215,7 @@ def live(ledger: Ledger) -> tuple[LedgerEntry, ...]:
     entries = (
         entry for entry in ledger.entries.values() if entry.state_label not in TERMINAL_LABELS
     )
-    return tuple(sorted(entries, key=lambda entry: entry.number))
+    return tuple(sorted(entries, key=lambda entry: entry.ref))
 
 
 def _catalogue(entries: Sequence[LedgerEntry]) -> str:

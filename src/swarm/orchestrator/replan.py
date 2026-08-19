@@ -169,7 +169,7 @@ def brief(ledger: Ledger, verdict: Verdict) -> tuple[str, str]:
     signals = dict(observation.signals) if observation is not None else {}
 
     lines: list[str] = []
-    for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].number):
+    for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref):
         signal = signals.get(task_id)
         evidence = signal.evidence if signal is not None else ""
         # One line per task: a traceback pasted verbatim would put lines
@@ -185,7 +185,7 @@ def brief(ledger: Ledger, verdict: Verdict) -> tuple[str, str]:
 
     tracked = "\n".join(
         f"- {task_id} ({entry.state_label}): {entry.goal[:120]}"
-        for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].number)
+        for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref)
     ) or "- none"
     return failures, tracked
 

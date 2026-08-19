@@ -652,8 +652,14 @@ def two_runs(trivial_image: str) -> Iterator[tuple[ContainerManager, ContainerMa
 @pytest.mark.docker
 def test_a_real_dead_runs_container_does_not_hold_its_claim_and_a_live_ones_does(two_runs):
     dead, live = two_runs
-    dead.spawn(DEAD_ISSUE, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", "sleep 300"])
-    live.spawn(LIVE_ISSUE, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", "sleep 300"])
+    dead.spawn(
+        ref(DEAD_ISSUE), BASE_COMMIT, issue=DEAD_ISSUE,
+        entrypoint="/bin/sh", command=["-c", "sleep 300"],
+    )
+    live.spawn(
+        ref(LIVE_ISSUE), BASE_COMMIT, issue=LIVE_ISSUE,
+        entrypoint="/bin/sh", command=["-c", "sleep 300"],
+    )
     client = FakeClient(
         issues={
             DEAD_ISSUE: issue_payload(DEAD_ISSUE),
@@ -675,7 +681,10 @@ def test_a_real_dead_runs_container_does_not_hold_its_claim_and_a_live_ones_does
 @pytest.mark.docker
 def test_recovering_a_claim_leaves_the_orphaned_container_for_the_reaper(two_runs):
     dead, _ = two_runs
-    dead.spawn(DEAD_ISSUE, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", "sleep 300"])
+    dead.spawn(
+        ref(DEAD_ISSUE), BASE_COMMIT, issue=DEAD_ISSUE,
+        entrypoint="/bin/sh", command=["-c", "sleep 300"],
+    )
     client = FakeClient(issues={DEAD_ISSUE: issue_payload(DEAD_ISSUE)})
 
     Recovery(client=client, run=make_run()).startup()

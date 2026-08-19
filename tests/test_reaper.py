@@ -46,6 +46,7 @@ from swarm.containers.manager import (
     find_containers,
 )
 from swarm.containers.reaper import REAPED_SIGNALS, Reaper, Sweep
+from swarm.github.refs import task_ref
 from swarm.run import RUN_LABEL, Run
 
 REPO = "shahrestani-me/apiary"
@@ -634,7 +635,9 @@ def make_manager(image: str, run: Run) -> ContainerManager:
 
 
 def probe(manager: ContainerManager, script: str, issue: int) -> Handle:
-    return manager.spawn(issue, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", script])
+    return manager.spawn(
+        task_ref(issue), BASE_COMMIT, issue=issue, entrypoint="/bin/sh", command=["-c", script]
+    )
 
 
 @pytest.fixture()

@@ -1158,7 +1158,7 @@ def run_mergeability(
     files: dict[int, tuple[str, ...]] = {}
     if open_pulls is not None:
         states = {}
-        for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+        for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
             if entry.state_label != REVIEW:
                 continue
             pull = open_pulls.get(entry.branch)

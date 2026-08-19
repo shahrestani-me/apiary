@@ -34,6 +34,13 @@ message a human reads is unchanged by the retype. That is a property of the
 adapter's chosen spelling, not a promise core may rely on: core prints refs, it
 does not build them.
 
+**Labellable.** `label_value` is the ref reduced to the characters Docker
+permits in a container name, and it exists so that `swarm/containers/` can
+label, name and find a worker's container without importing an adapter to
+un-mint the ref first. A tracker id is not a safe token - `#42` cannot be a
+container name - so somebody has to make one, and the choice is between the
+type that owns the value and every consumer inventing its own rule.
+
 **What this does not yet buy.** `LedgerEntry` carries a `number` beside its
 `ref`, and the modules above still read that number wherever they address the
 GitHub API - a branch name, a label write, a comment. `TaskRef` is opaque; the
@@ -53,6 +60,10 @@ from functools import lru_cache, total_ordering
 #: ordering - it never tells a caller what the parts mean, which is the line
 #: between sorting an opaque value and parsing one.
 _DIGITS = re.compile(r"(\d+)")
+
+#: The punctuation Docker allows in a container name; `str.isalnum` covers the
+#: rest. Anything else is dropped by `TaskRef.label_value`.
+_SAFE = frozenset("_.-")
 
 
 # Cached because `__lt__` recomputes both operands' keys on every comparison,
@@ -109,3 +120,35 @@ class TaskRef:
         if not isinstance(other, TaskRef):
             return NotImplemented
         return _natural_key(self.value) < _natural_key(other.value)
+
+    @property
+    def label_value(self) -> str:
+        """This ref as a Docker-safe token: a label value and a name fragment.
+
+        Docker names match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so the rule is to keep
+        exactly those characters and drop the rest. `#42` becomes `42` and
+        `ENG-123` stays `ENG-123` - which is why moving the container layer onto
+        this changed no label and no container name for the tracker apiary
+        currently speaks to. That is a consequence, not the design: the point is
+        that `containers/` derives the token from the ref it was handed, so a
+        tracker whose ids are `ENG-123` labels its containers correctly rather
+        than by whatever integer happened to be passed alongside.
+
+        **Not injective, deliberately.** Two ids differing only in characters
+        Docker forbids collapse to one token. Within a run that cannot happen -
+        one run reads one tracker, whose ids share a format - and the label is a
+        *filter* narrowing a listing that is already scoped to `apiary.run`,
+        never the authority on what a task is. The ledger is that. A tracker
+        that needed the distinction would need a reversible encoding here, and
+        an unreadable one: this stays readable because a human greps
+        `docker ps` with it.
+        """
+        token = "".join(char for char in self.value if char in _SAFE or char.isalnum())
+        token = token.lstrip("_.-")
+        if not token:
+            # No real ref reaches this - every tracker's ids carry something
+            # alphanumeric - but a token that is empty or starts with a
+            # separator is one Docker refuses at `create`, and finding that out
+            # at spawn time would blame the container layer for a bad ref.
+            raise ValueError(f"task ref {self.value!r} has no Docker-safe form")
+        return token
