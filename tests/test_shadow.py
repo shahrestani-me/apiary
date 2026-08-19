@@ -351,6 +351,67 @@ def test_the_control_side_is_the_labels_this_cycle_left_not_the_ones_it_read():
     assert control_labels(moved) == {"task-4": READY}
 
 
+def test_a_task_mergeability_escalated_is_in_the_control_map():
+    """The fourth writer of a terminal label, and the one the cycle never folds.
+
+    `lifecycle._landed_or_human` names all four - the reconciler, the recovery
+    sweep, mergeability and the check gate - and `Reconciler.cycle` folds three
+    of them. A pull request that will not rebase inside its update budget is
+    escalated by `apply_mergeability` alone, so a control map built without it
+    would report every starved task as a divergence the resolver invented.
+    """
+    from swarm.orchestrator.mergeability import MergeabilityPlan, MergeabilityReport
+    from swarm.orchestrator.reconcile import Transition
+
+    starved = report(
+        entry(4, label=REVIEW),
+        checks=None,
+    )
+    starved = replace(
+        starved,
+        mergeability=MergeabilityReport(
+            plan=MergeabilityPlan(),
+            applied=(
+                Transition(
+                    ref=ref(4),
+                    task_id="task-4",
+                    from_label=REVIEW,
+                    to_label=FAILED,
+                    reason="its branch could not be updated within the round cap",
+                ),
+            ),
+        ),
+    )
+
+    assert control_labels(starved) == {"task-4": FAILED}
+
+
+def test_the_check_gate_wins_over_mergeability_for_the_same_task():
+    """The gate runs after mergeability, and step 1 already carries its answer -
+    so the earlier writer must not be allowed to overwrite the later one."""
+    from swarm.orchestrator.checks import ChecksPlan, ChecksReport
+    from swarm.orchestrator.mergeability import MergeabilityPlan, MergeabilityReport
+    from swarm.orchestrator.reconcile import Transition
+
+    def moved(to_label: str) -> Any:
+        return Transition(
+            ref=ref(4),
+            task_id="task-4",
+            from_label=REVIEW,
+            to_label=to_label,
+            reason="moved",
+        )
+
+    both = replace(
+        report(entry(4, label=DONE), checks=ChecksReport(
+            plan=ChecksPlan(), applied=(moved(DONE),)
+        )),
+        mergeability=MergeabilityReport(plan=MergeabilityPlan(), applied=(moved(FAILED),)),
+    )
+
+    assert control_labels(both) == {"task-4": DONE}
+
+
 def test_a_dispatch_that_claimed_and_failed_to_spawn_still_counts_as_claimed():
     """`DispatchFailure.claimed` is exactly "the label was written and no
     container is running under it" - a claim the control plane is holding

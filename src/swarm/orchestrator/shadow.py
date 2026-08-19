@@ -256,20 +256,28 @@ def shadow_enabled(env: Mapping[str, str] | None = None) -> bool:
 def control_labels(report: CycleReport) -> dict[str, str]:
     """The `swarm:*` label each task wore when this cycle finished. By task id.
 
-    Four sources, in the order the cycle writes them, so the last word wins:
+    Five sources, in the order the cycle writes them, so the last word wins:
 
     1. `report.ledger`, which `cycle` has already folded with what `apply_plan`,
        the recovery sweep and the check gate **applied** - `fold`'s rule, and
        for `fold`'s reason: a label write GitHub refused left the task where it
        was, and crediting it would diff against a state the control plane never
        reached.
-    2. the readiness pass, which writes `swarm:ready` / `swarm:blocked` and
-       whose result the cycle does not fold back into the ledger. Its verdicts
-       cover exactly the transitionable entries, so nothing here can overwrite
-       a `claimed`, `review`, `done` or `failed` that step 1 established.
-    3. the dispatcher's claims, which are written after readiness and are also
+    2. mergeability, which is the fourth writer of a terminal label
+       (`lifecycle._landed_or_human` names all four) and the one the cycle does
+       **not** fold back: a pull request that will not rebase inside its update
+       budget is escalated here, and a control map built without it would report
+       every starved task as a divergence the resolver invented. Skipped for a
+       task the check gate also wrote, because the gate runs after this one and
+       step 1 already carries its answer.
+    3. the readiness pass, which writes `swarm:ready` / `swarm:blocked` and
+       whose result the cycle does not fold back into the ledger either. Its
+       verdicts cover exactly the transitionable entries, so nothing here can
+       overwrite a `claimed`, `review`, `done` or `failed` that step 1
+       established.
+    4. the dispatcher's claims, which are written after readiness and are also
        not folded.
-    4. a dispatch that claimed and then failed to spawn. `DispatchFailure.claimed`
+    5. a dispatch that claimed and then failed to spawn. `DispatchFailure.claimed`
        is precisely "the label was written and no container is running under
        it", which is a claim the control plane is holding whether or not the
        spawn worked - and the case #35's recovery sweep exists for.
@@ -284,6 +292,15 @@ def control_labels(report: CycleReport) -> dict[str, str]:
     for entry in report.ledger.entries.values():
         if entry.task_id:
             labels[entry.task_id] = entry.state_label
+    if report.mergeability is not None:
+        gated = {
+            transition.task_id
+            for transition in getattr(report.checks, "applied", ()) or ()
+            if transition.task_id
+        }
+        for transition in report.mergeability.applied:
+            if transition.task_id and transition.task_id not in gated:
+                labels[transition.task_id] = transition.to_label
     if report.readiness is not None:
         for verdict in report.readiness.verdicts:
             if verdict.task_id:
