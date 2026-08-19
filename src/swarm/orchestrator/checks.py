@@ -165,12 +165,18 @@ DEFAULT_ZERO_CHECK_GRACE_S = 300.0
 ADMIN_OVERRIDE_ENV = "APIARY_MERGE_ADMIN_OVERRIDE"
 MERGE_METHOD_ENV = "APIARY_MERGE_METHOD"
 
-#: Every line of quoted CI output is indented by this much. Not decoration: a
-#: check log containing `## Verify` at column 0 would otherwise add a second
-#: `## Verify` section to the body and make the issue malformed
-#: (`docs/issue-contract.md` §1.1), and the parser's heading anchor allows no
-#: leading whitespace. Indenting is also what makes the block render as code
-#: without a fence the log could itself close.
+#: Every line of quoted CI output is indented by this much. Still not decoration,
+#: but **no longer for the reason it was written for**: it said a check log with
+#: `## Verify` at column 0 would add a second section to the body and make the
+#: issue malformed (`docs/issue-contract.md` §1.1). The contract is parsed from
+#: the issue *body* only - `ledger.parse_contract(number, issue.get("body"))` -
+#: and since #249 nothing here writes a body. Every remaining caller of `_quote`
+#: writes a comment, which the parser never reads, so that hazard is gone.
+#:
+#: What survives is the second half of the original sentence, and it is enough on
+#: its own: indenting makes the block render as code **without a fence the log
+#: could itself close**. A log containing three backticks at column 0 would end a
+#: fence early and spill the rest of itself into the comment as markdown.
 QUOTE_INDENT = "    "
 
 #: How much of a failure to carry. The same bound the worker's own record uses
@@ -1097,10 +1103,12 @@ def _quote(text: str) -> str:
     """CI output, indented so no line of it can be markdown or a section heading.
 
     See `QUOTE_INDENT`. Applied wherever this module writes the output itself,
-    which since #249 is the two escalation comments and no longer the body block
-    - the hazard is the same in each: a log line reading `## Verify` at column 0
-    makes the issue malformed, and the module that reports a CI failure must not
-    be the one that corrupts the contract while doing it.
+    which since #249 is the two escalation comments and no longer the body block.
+    The hazard it now guards is markdown rather than the contract: a comment is
+    not parsed by `ledger.parse_contract`, so a log line reading `## Verify` at
+    column 0 can no longer make an issue malformed - it can only render as a
+    heading in the middle of a failure report, and three backticks at column 0
+    can close a fence the log is sitting inside.
 
     **The retry comment neutralises the same hazard a different way**, and the
     two are worth telling apart rather than unifying. `reconcile.retry_comment`
