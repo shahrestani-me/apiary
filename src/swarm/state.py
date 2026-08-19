@@ -79,8 +79,21 @@ class Plan(BaseModel):
 
 
 class FileEdit(BaseModel):
+    """One whole-file write - or, when `content` is empty, a deletion.
+
+    Empty content deletes the file rather than emptying it (see
+    `worker.edit.apply_edits` for the full weighing): a `deleted: bool` field
+    would change this structured-decoding schema for every model call, and an
+    intentionally empty source file is not an output this tool should produce
+    anyway.
+    """
+
     path: str = Field(description="repo-relative path")
-    content: str = Field(description="the COMPLETE new contents of the file")
+    content: str = Field(
+        description=(
+            "the COMPLETE new contents of the file; empty content DELETES the file"
+        )
+    )
 
 
 class WorkerOutput(BaseModel):

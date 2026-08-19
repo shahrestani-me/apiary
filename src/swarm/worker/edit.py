@@ -70,8 +70,10 @@ never a fragment, never "... rest unchanged".
 
 Edit ONLY the files listed as editable. The read-only context is there to be
 imitated, not modified: an edit to any other path is discarded and the task
-fails. If a file should be created, include it with its full contents. Keep
-changes minimal and focused on the goal.
+fails. If a file should be created, include it with its full contents. To
+DELETE a file, return it with empty content - removing an obsolete file is
+often the right edit for a cleanup goal. Keep changes minimal and focused on
+the goal.
 
 Third-party packages exist for your code ONLY if they are declared in
 requirements.txt, which is installed before the verify command runs (when the
@@ -185,19 +187,27 @@ class SourceFile:
 
 @dataclass(frozen=True)
 class Applied:
-    """What reached the disk, and what was turned away and why.
+    """What reached the disk, what left it, and what was turned away and why.
 
     Refusals are kept rather than counted: they are the evidence that the guard
     rail fired, they belong in the container log #15 captures, and "the model
     tried to edit a file it was not given" is the single most useful line in a
     post-mortem of a bad task.
+
+    `deleted` is separate from `written` rather than folded in, because every
+    downstream consumer treats the two differently: the syntax gate parses
+    written files and must not look for deleted ones, the collection audit
+    demands written test files be collected while a deleted test file has
+    nothing left to collect, and a PR body that listed a deletion as a write
+    would tell a reviewer the opposite of what happened.
     """
 
     written: tuple[str, ...] = ()
     refused: tuple[tuple[str, str], ...] = ()
+    deleted: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
-        return bool(self.written)
+        return bool(self.written or self.deleted)
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +381,37 @@ def _normalise(path: str) -> str:
 def apply_edits(root: Path, edits: Iterable[FileEdit], allowed: Sequence[str]) -> Applied:
     """Write the edits the task is authorised to make. Refuse the rest.
 
+    **Empty content means delete.** An edit whose content is empty - or
+    whitespace-only, since a file of two spaces is never what anyone intended -
+    removes the file instead of writing it. This overloads the one schema the
+    model already emits rather than adding a `deleted: bool` field to
+    `FileEdit`, and the trade was weighed rather than assumed: a new field
+    changes the structured-decoding schema for every model call, needs every
+    old record and prompt to be reconsidered, and buys expressiveness for
+    exactly one case - an intentionally empty source file - that this tool has
+    no business producing anyway. Nothing in this codebase treats an empty
+    write as meaningful (an empty generated file was, before this, simply a
+    smell that slipped through), and a task that truly needs an empty file has
+    an honest workaround: a single comment line. What the overload buys is the
+    thing three live attempts proved impossible: a cleanup task can now
+    actually remove the files its goal names, instead of emptying them and
+    failing the collection audit for it.
+
+    A deletion is held to the same two checks as a write - the model may only
+    delete what it was allowed to edit - and deleting a file that is not there
+    is a refusal, not a no-op: a model asking to remove a file that does not
+    exist is confused about the tree it was shown, and that confusion belongs
+    in the log next to the other refusals. After a deletion, parent directories
+    left empty are pruned up to (never including) the checkout root, because a
+    commit cannot express an empty directory and leaving one behind would make
+    the working tree disagree with what the PR says happened.
+
+    Edits are applied in order and the ledger reports *net effect* per path: a
+    file written and then deleted in the same output ends deleted if it existed
+    before this batch, and ends as nothing at all if the batch itself created
+    it - reporting a path both written and deleted would hand `commit_edits` a
+    path `git add` may find nothing to stage for.
+
     Two checks, and neither is redundant:
 
     **Membership in the declared set.** This is v1's guard rail, kept verbatim
@@ -394,6 +435,11 @@ def apply_edits(root: Path, edits: Iterable[FileEdit], allowed: Sequence[str]) -
     permitted = {_normalise(path) for path in allowed}
     written: list[str] = []
     refused: list[tuple[str, str]] = []
+    deleted: list[str] = []
+    #: Whether each path existed before this batch first touched it - recorded
+    #: at first touch, because it is what decides whether a later deletion is a
+    #: real deletion or merely undoes this batch's own write.
+    before: dict[str, bool] = {}
 
     for edit in edits:
         path = _normalise(edit.path)
@@ -407,11 +453,54 @@ def apply_edits(root: Path, edits: Iterable[FileEdit], allowed: Sequence[str]) -
         if root not in target.parents:
             refused.append((edit.path, "resolves outside the checkout"))
             continue
+
+        if not edit.content.strip():
+            # The delete branch. Whitespace-only counts: no file of two spaces
+            # was ever intended, and treating it as a write would let a model's
+            # stray newline quietly produce the emptied-not-removed file this
+            # feature exists to end.
+            if path not in before:
+                before[path] = target.is_file()
+            if not target.is_file():
+                refused.append((edit.path, "deletes a file that does not exist"))
+                continue
+            target.unlink()
+            if path in written:
+                written.remove(path)
+            if path in deleted:
+                deleted.remove(path)
+            if before[path]:
+                deleted.append(path)
+            _prune_empty_dirs(root, target.parent)
+            continue
+
+        if path not in before:
+            before[path] = target.is_file()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(edit.content, encoding="utf-8")
-        written.append(path)
+        if path in deleted:
+            deleted.remove(path)
+        if path not in written:
+            written.append(path)
 
-    return Applied(written=tuple(written), refused=tuple(refused))
+    return Applied(written=tuple(written), refused=tuple(refused), deleted=tuple(deleted))
+
+
+def _prune_empty_dirs(root: Path, directory: Path) -> None:
+    """Remove directories a deletion emptied, up to and never including `root`.
+
+    git cannot commit an empty directory, so one left behind exists only in the
+    working tree - invisible to the PR, and a lie the next reader of the tree
+    has to notice. Walking stops at the first non-empty parent (an occupied
+    directory is somebody else's), at anything that is not a real directory,
+    and always before the checkout root itself, which must survive even a task
+    that deleted the last file in the repository.
+    """
+    while directory != root and root in directory.parents:
+        if not directory.is_dir() or directory.is_symlink() or any(directory.iterdir()):
+            return
+        directory.rmdir()
+        directory = directory.parent
 
 
 def syntax_failure(root: Path, written: Sequence[str]) -> str | None:
