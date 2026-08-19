@@ -260,13 +260,16 @@ rather than by a convention a writer has to keep:
   `review` charged an attempt to a brand-new issue.
 - **The revival overlay.** `Reconciler._carry_forward` applies
   `{task: ELIGIBLE for task in revived_tasks(report)}` unconditionally, which
-  could clear the one fact this exists to make unundoable. It is reachable:
-  `nodes/planner._update` still selects its revival on `entry.state_label ==
-  FAILED` rather than on the belief, so a `swarm:done` issue a human relabels
-  `swarm:failed` mid-run is revived by any replan that keeps the task. (The goal
-  gate is not a route: since #205 `goal._revive_abandoned` selects
+  could clear the one fact this exists to make unundoable. It *was* reachable:
+  `nodes/planner._update` selected its revival on `entry.state_label == FAILED`
+  rather than on the belief, so a `swarm:done` issue a human relabelled
+  `swarm:failed` mid-run was revived by any replan that kept the task. (The goal
+  gate was never a route: since #205 `goal._revive_abandoned` selects
   `abandoned(ledger, believed)`, which is `needs-human`, and `landed` never
-  reads as that.) `Belief.hold` now refuses to move a task out of `landed`.
+  reads as that.) #212 converted that planner, so no revival in the tree now
+  reaches a task this run believes landed. `Belief.hold` keeps refusing to move
+  one out of `landed` all the same, and the reasoning for keeping a guard whose
+  caller is gone is on the guard itself.
 
 The fourth route in - the label on a task this process has never carried - is
 **kept**, and the reasoning is in `docs/issue-contract.md` §4 beside the human
@@ -626,11 +629,13 @@ class Belief:
         """Advance the belief by the label writes that landed. `fold`'s rule.
 
         **Unguarded against `landed`, unlike `hold` ten lines below.** A
-        `Transition` is apiary's own write *this* cycle, not an overlay derived
-        from a stale selector, so it is the one input allowed to move a task the
-        ratchet is holding. `hold`'s guard exists because a revival is selected
-        from something read rather than something decided; that argument does
-        not reach here.
+        `Transition` is apiary's own write *this* cycle, so it is the one input
+        allowed to move a task the ratchet is holding. `hold`'s guard exists
+        because the overlay reaching it is applied unconditionally, from a
+        selection some earlier stage made - and since #212 that selection reads
+        the belief, which is a better argument for the guard than the stale
+        selector it replaced rather than a reason to drop it. Neither half of
+        that argument reaches here.
 
         `Transition.to_label` is apiary's own decision about a task, translated
         through the same table `lifecycle.py` announces with - not a label read
@@ -707,10 +712,18 @@ class Belief:
         # landed would silently clear the ratchet the module docstring exists to
         # justify - and the next cycle's resolver, which cannot see a merged pull
         # request, would read `eligible` and put a worker on work already on the
-        # default branch. It is reachable: `nodes/planner._update` still selects
-        # its revival on `entry.state_label == FAILED`, so a `swarm:done` issue a
-        # human relabelled `swarm:failed` mid-run is revived by a replan that
-        # keeps the task, while the belief above it is still `landed`.
+        # default branch.
+        #
+        # **No revival reaches here any more** (#212): `nodes/planner._update`
+        # selected on `entry.state_label == FAILED`, which was the whole of how a
+        # `swarm:done` issue relabelled `swarm:failed` mid-run got revived, and
+        # it now selects on `authority.state_of` like every other decision path.
+        # The guard stays regardless, and not out of habit - it is the only thing
+        # standing between an overlay written as an unconditional dict
+        # comprehension and a fact this system treats as unundoable. A guard
+        # whose argument for existing is "a caller might" is worth less than one
+        # whose argument is "this map may not lose a merge", which is what it now
+        # has.
         #
         # The guard is on `states` alone, not on `stored`. `planner.revive` does
         # write `swarm:ready` to the issue, and that write is real: the label

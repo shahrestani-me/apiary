@@ -2546,9 +2546,12 @@ class Reconciler:
             replans=self._replans,
             verify=self.verify or None,
             proposer=self.proposer,
-            # Nothing in the replan branches on this. It decides how each task
-            # is *named* in the brief the model reads, and a `swarm:*` string in
-            # a prompt is the vocabulary #141 and epic #140 are removing.
+            # Two things read this, and only one of them decides. It names each
+            # task in the brief the model is shown - a `swarm:*` string in a
+            # prompt is the vocabulary #141 and epic #140 are removing - and
+            # since #212 it is also what `planner.write_plan` selects its
+            # revivals and retirements on. `report.ledger` is the read this very
+            # belief was built from, which is what makes handing both down safe.
             believed=believed,
         )
         if result.replanned:

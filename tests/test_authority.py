@@ -1441,18 +1441,26 @@ def test_a_revival_cannot_clear_a_merge():
     resolver, which cannot see a merged pull request, reads `eligible` and a
     worker goes onto code that is already on the default branch.
 
-    **Reachability, which #201 left open.** The goal gate is not a route: since
-    #205 `goal._revive_abandoned` selects `abandoned(ledger, believed)`, which is
-    `needs-human`, and `landed` never reads as that. The replan is: `_update`
-    still selects its revival on `entry.state_label == FAILED` and takes no
-    belief at all, so a `swarm:done` issue a human relabels `swarm:failed`
-    mid-run - which the ratchet keeps believing landed, correctly - is revived by
-    any replan that keeps the task. That selector is pinned below, because the
-    guard here is only worth what the argument for needing it is worth.
+    **Reachability, which #201 left open and #212 closed.** The goal gate was
+    never a route: since #205 `goal._revive_abandoned` selects
+    `abandoned(ledger, believed)`, which is `needs-human`, and `landed` never
+    reads as that. The replan was: `_update` selected its revival on
+    `entry.state_label == FAILED` and took no belief at all, so a `swarm:done`
+    issue a human relabels `swarm:failed` mid-run - which the ratchet keeps
+    believing landed, correctly - was revived by any replan that kept the task.
+    The assertion below is therefore the **inverse** of the one this test shipped
+    with: the planner takes the cycle's belief, and the relabel it used to revive
+    is pinned in `test_planner_issues.py` on the selection itself.
+
+    The guard is kept all the same, and the reason is not habit. The overlay is
+    still an unconditional dict comprehension over `revived_tasks(report)`, so
+    what stands between it and a lost merge is this refusal rather than the
+    current shape of one caller - and everything below still holds with the
+    planner converted.
     """
     from swarm.nodes.planner import _update
 
-    assert "believed" not in inspect.signature(_update).parameters
+    assert "believed" in inspect.signature(_update).parameters
 
     merged = entry(4, label=DONE)
     book = ledger(merged)
