@@ -68,6 +68,23 @@ services:
       APIARY_PROVISION_TOKEN: ${APIARY_PROVISION_TOKEN:-}
       GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
 
+      # The task system, reached over MCP (ADR 0001). A third credential, and a
+      # third lifetime: it belongs to the customer's tracker, not to GitHub, and
+      # it is pre-minted rather than negotiated - none of the target MCP servers
+      # offers the client_credentials grant, so there is no OAuth flow for the
+      # orchestrator to drive (#143).
+      #
+      # Passed to *this* service only. `ContainerManager.INHERITED_ENV` carries
+      # GITHUB_TOKEN and OLLAMA_HOST and nothing else, so a worker never holds
+      # this - which is what makes `mcp.linear.app` on the allowlist below the
+      # orchestrator's destination rather than everyone's, since tinyproxy
+      # filters on hostname and cannot tell two containers apart.
+      #
+      # Empty rather than required: every command that does not touch a tracker
+      # works without it, and swarm.mcp.client fails by name when one does.
+      APIARY_TRACKER_MCP_URL: ${APIARY_TRACKER_MCP_URL:-}
+      APIARY_TRACKER_TOKEN: ${APIARY_TRACKER_TOKEN:-}
+
       # Which image carries which stack's toolchain (#99). This block is an
       # explicit list, not a passthrough, so an override that is not named here
       # simply never reaches a containerised orchestrator - it would read the
@@ -239,6 +256,11 @@ services:
 # files.pythonhosted.org, and a package index that accepts uploads is an
 # exfiltration channel. That is a decision to make per target repository, out
 # loud. See docs/security.md.
+#
+# `mcp.linear.app` is the tracker MCP endpoint of ADR 0001 (#149), and it is
+# the only one: GitHub is reached through a *local* stdio MCP server that talks
+# to api.github.com, already three lines above, and Jira is deferred. See
+# security.MCP_HOSTS for why the remote GitHub server is deliberately absent.
 configs:
   egress-allowlist:
     content: |
@@ -246,6 +268,7 @@ configs:
       ^(.*\.)?api\.github\.com$
       ^(.*\.)?codeload\.github\.com$
       ^(.*\.)?host\.docker\.internal$
+      ^(.*\.)?mcp\.linear\.app$
 
   tinyproxy-conf:
     content: |
