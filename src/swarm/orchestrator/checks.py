@@ -92,8 +92,9 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
-from ..github.refs import issue_number
+from ..github.refs import issue_number, task_ref
 from ..store import StoreError, TaskStore, record_judgement
+from ..taskref import TaskRef
 from ..worker.result import tail
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
@@ -223,6 +224,37 @@ _LOCATION = re.compile(rf"(?P<path>{_QUALIFIED_PATH}):\d+")
 #: `test_go_test_output_names_a_file_judge_cannot_see` exists to say so out
 #: loud rather than leaving it to be discovered.
 _GO_TEST_LINE = re.compile(r"(?m)^\s+(?P<path>[\w.+-]+_test\.go):\d+:")
+
+
+# --------------------------------------------------------------------------
+# The one fault the merge gate may not swallow
+# --------------------------------------------------------------------------
+
+
+class UnresolvedJoin(LookupError):
+    """A key this gate had to resolve was not in the map it was handed.
+
+    Every join here and in `mergeability.py` is between two facts *one cycle
+    read about one task* - a check set and the ledger entry it was read for, an
+    outcome and the entry it was decided from, a held merge and the outcome it
+    holds. Both sides are built in the same pass over the same entries, so a
+    miss is never data. It is the two sides having drifted apart, and there is
+    no neutral value to stand in for the answer:
+
+    - **an absent check set is not an empty one.** `CheckSet()` has verdict
+      `EMPTY`, and `EMPTY` past its grace period is `swarm:failed` - so a
+      lookup that missed would escalate a healthy issue to a human, and the
+      ledger cannot tell that from attempts genuinely exhausted;
+    - **an absent ledger entry is not "no such issue".** It drops the issue out
+      of mergeability, and an issue the staleness gate never decided is a merge
+      it never inspected. The module's entire purpose, switched off with no log
+      line saying so.
+
+    So the miss raises. That aborts the cycle - loud, recoverable, and what a
+    wiring bug deserves - where both fail-open alternatives write a label
+    nobody afterwards can tell from a real one. #174 is the ticket; #142 is why
+    the shape recurs, because a `dict.get` default is how a retype ships green.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -580,7 +612,16 @@ class Merge:
     explicit rather than a default nobody sees.
     """
 
+    #: The issue this merge closes - a GitHub issue number, and the same one
+    #: the `Outcome` carrying this record holds. Documented rather than retyped
+    #: (#174): every consumer of it is the reporting surface - it is the key of
+    #: `ChecksReport.merged` and `ChecksReport.merge_commits`, and `lifecycle.py`
+    #: joins it against the issue-numbered half of its own index - so moving it
+    #: is that surface's migration rather than this gate's. **Nothing keys a
+    #: `TaskRef` map on it**; the joins this gate makes go through `Outcome.ref`.
     number: int
+    #: The pull request GitHub is asked to merge. A *different* numbering from
+    #: `number`, which is why both are spelled out: `#23: merge PR #101`.
     pull: int
     branch: str
     sha: str = ""
@@ -605,13 +646,16 @@ class Outcome:
     attempt must be told.
     """
 
-    #: The issue this row is about. Still a number, where `Transition.ref` -
-    #: the field right below - is a `TaskRef`: #142 retyped the *task-identity
-    #: model* (the dependency graph, readiness and the reconciler's transition)
-    #: and stopped there deliberately, so these policy rows are one vocabulary
-    #: behind. They are internally consistent - built from the same `entry`,
-    #: compared only against each other - and nothing keys a `TaskRef` map on
-    #: one. Moving them is a follow-up, not an oversight.
+    #: The issue this row is about, as GitHub numbers it. `ChecksPlan.escalated`
+    #: prints it, `apply_checks` addresses the API with it, and `lifecycle.py`
+    #: joins it against the issue-numbered half of its index - all three are the
+    #: code-host vocabulary, which ADR 0001 says stays GitHub-shaped.
+    #:
+    #: **`ref` below is the half that joins.** #142 retyped the task-identity
+    #: model and stopped here, and #174 is what that cost: `plan_mergeability`
+    #: looked its entry up by this number, and a miss returned `None` and
+    #: dropped the issue out of the staleness gate in silence. The lookup is on
+    #: the ref now and raises `UnresolvedJoin` instead.
     number: int
     verdict: str
     detail: str = ""
@@ -626,6 +670,11 @@ class Outcome:
 
     def __str__(self) -> str:
         return f"#{self.number}: {self.verdict} - {self.detail}"
+
+    @property
+    def ref(self) -> TaskRef:
+        """This row's task, in the internal model's vocabulary. See `number`."""
+        return task_ref(self.number)
 
 
 @dataclass(frozen=True)
@@ -677,7 +726,7 @@ def plan_checks(
     ledger: Ledger,
     *,
     pulls: Mapping[str, PullState] | None,
-    checks: Mapping[int, CheckSet],
+    checks: Mapping[TaskRef, CheckSet],
     policy: MergePolicy | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     now: dt.datetime | None = None,
@@ -685,9 +734,18 @@ def plan_checks(
     """Decide every `swarm:review` issue. Pure - no API call, no daemon, no model.
 
     `pulls` is the open pull requests by head ref (`None` when this cycle could
-    not look), `checks` the folded check set per issue number, and `now` the
-    moment the grace period is measured against. All three are facts somebody
-    else read; keeping the I/O out of here is what makes the rules assertable.
+    not look), `checks` the folded check set per task ref, and `now` the moment
+    the grace period is measured against. All three are facts somebody else
+    read; keeping the I/O out of here is what makes the rules assertable.
+
+    **`checks` must carry every issue this loop reaches, and a miss raises.**
+    The caller reads a check set for exactly the entries selected below - in
+    `swarm:review`, with an open pull request - so the two sets are the same set
+    or somebody has broken the wiring. There is no default to fall back on:
+    `CheckSet()` reads as `EMPTY`, and `EMPTY` past its grace period escalates
+    the issue to `swarm:failed`. That is `UnresolvedJoin`'s first bullet and
+    #174's headline - a healthy task marked as needing a human because its
+    check runs could not be looked up.
 
     Issues with no open PR are skipped rather than decided: that is #22's row -
     it reads a `swarm:review` issue whose branch has no open PR as a PR closed
@@ -704,9 +762,18 @@ def plan_checks(
         pull = pulls.get(entry.branch)
         if pull is None:
             continue
-        outcomes.append(
-            _decide(entry, pull, checks.get(entry.number, CheckSet()), rules, max_attempts, moment)
-        )
+        try:
+            found = checks[entry.ref]
+        except KeyError:
+            raise UnresolvedJoin(
+                f"no check set for {entry.ref} ({entry.task_id}), whose pull request "
+                f"{pull.ref} this cycle listed as open. The caller reads one check set per "
+                f"reviewable entry, so this is the two halves having drifted apart - and "
+                f"the miss cannot be defaulted: an absent check set reads as an empty one, "
+                f"which escalates this issue to swarm:failed. Keys held: "
+                f"{sorted(str(key) for key in checks)}"
+            ) from None
+        outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment))
 
     return ChecksPlan(outcomes=tuple(outcomes), blind=pulls is None, policy=rules)
 
@@ -1250,12 +1317,15 @@ def run_checks(
     `orchestrator/reconcile.py`, which is outside this ticket's file set.
     """
     pulls = read_pulls(client)
-    checks: dict[int, CheckSet] = {}
+    # Keyed on the ref and built from exactly the entries `plan_checks` selects:
+    # the two loops are the same loop, and `plan_checks` raises rather than
+    # defaulting if they ever stop being.
+    checks: dict[TaskRef, CheckSet] = {}
     if pulls is not None:
         for entry in ledger.entries.values():
             pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
             if pull is not None:
-                checks[entry.number] = read_checks(client, pull.ref)
+                checks[entry.ref] = read_checks(client, pull.ref)
     plan = plan_checks(
         ledger,
         pulls=pulls,

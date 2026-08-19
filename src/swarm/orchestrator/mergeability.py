@@ -86,7 +86,8 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
-from ..github.refs import issue_number
+from ..github.refs import issue_number, task_ref
+from ..taskref import TaskRef
 from ..worker.result import tail
 from .checks import (
     QUOTE_INDENT,
@@ -94,6 +95,7 @@ from .checks import (
     Merge,
     Outcome,
     PullState,
+    UnresolvedJoin,
     read_pulls,
 )
 from ..store import StoreError, TaskStore, record_judgement
@@ -232,38 +234,45 @@ class UpdateBudget:
     """
 
     cap: int = DEFAULT_MAX_UPDATE_ROUNDS
-    rounds: dict[int, int] = field(default_factory=dict)
+    #: Rounds spent, per task. Keyed on `TaskRef` (#174) because this is the one
+    #: map in the merge gate that **survives across cycles**: everything else
+    #: here is built and consumed inside one pass, where a key of the wrong
+    #: vocabulary at least fails in the same breath it was written. This one is
+    #: written by cycle 3 and read by cycle 9, and a `.get(..., 0)` on a key
+    #: that no longer matches reads as "this branch has never been updated" -
+    #: which is exactly the answer that switches the starvation cap off.
+    rounds: dict[TaskRef, int] = field(default_factory=dict)
 
-    def spent(self, number: int) -> int:
-        return self.rounds.get(number, 0)
+    def spent(self, ref: TaskRef) -> int:
+        return self.rounds.get(ref, 0)
 
-    def spend(self, number: int) -> int:
-        """Charge one round to an issue. Returns the new total."""
-        self.rounds[number] = self.spent(number) + 1
-        return self.rounds[number]
+    def spend(self, ref: TaskRef) -> int:
+        """Charge one round to a task. Returns the new total."""
+        self.rounds[ref] = self.spent(ref) + 1
+        return self.rounds[ref]
 
-    def exhausted(self, number: int) -> bool:
-        return self.spent(number) >= max(int(self.cap), 1)
+    def exhausted(self, ref: TaskRef) -> bool:
+        return self.spent(ref) >= max(int(self.cap), 1)
 
-    def clear(self, number: int) -> None:
-        """Forget an issue: it merged, or it is going round again as new work."""
-        self.rounds.pop(number, None)
+    def clear(self, ref: TaskRef) -> None:
+        """Forget a task: it merged, or it is going round again as new work."""
+        self.rounds.pop(ref, None)
 
-    def retain(self, numbers: Iterable[int]) -> None:
-        """Drop every issue not in this cycle's review queue.
+    def retain(self, refs: Iterable[TaskRef]) -> None:
+        """Drop every task not in this cycle's review queue.
 
         Without it a long run accumulates a count per task it ever opened, and -
         worse - an issue re-dispatched and re-reviewed would inherit the rounds
         its previous pull request spent.
         """
-        keep = set(numbers)
-        for number in [n for n in self.rounds if n not in keep]:
-            del self.rounds[number]
+        keep = set(refs)
+        for ref in [counted for counted in self.rounds if counted not in keep]:
+            del self.rounds[ref]
 
     def summary(self) -> str:
         if not self.rounds:
             return "no pull request has needed updating"
-        spent = ", ".join(f"#{n}x{c}" for n, c in sorted(self.rounds.items()))
+        spent = ", ".join(f"{ref}x{count}" for ref, count in sorted(self.rounds.items()))
         return f"update rounds (cap {self.cap}): {spent}"
 
 
@@ -283,6 +292,14 @@ class Mergeability:
     than an error path.
     """
 
+    #: **The pull request's number, not the issue's** - `from_payload` reads it
+    #: straight off `GET /pulls/{n}`. Documented rather than moved to a
+    #: `TaskRef` (#174 lists it beside three issue-numbered fields): a pull
+    #: request is not a task, has no ref, and giving it one would invent an
+    #: identity `github/refs.py` never minted. The task these facts are about is
+    #: the key this record is stored under, never a field on it - which is why
+    #: `_decide` takes `entry` and `state` as two arguments rather than reading
+    #: the issue out of here.
     number: int
     branch: str = ""
     mergeable: bool | None = None
@@ -400,7 +417,12 @@ class BranchUpdate:
     about how close this pull request is to being given up on.
     """
 
-    number: int
+    #: The task whose branch is being dragged forward. A `TaskRef` rather than
+    #: an issue number (#174), because `apply_mergeability` charges the round
+    #: with it - `UpdateBudget.rounds` is keyed on refs and outlives the cycle,
+    #: and a record carrying the other vocabulary is how the two would drift.
+    ref: TaskRef
+    #: The pull request to update. A *different* numbering from `ref`'s issue.
     pull: int
     branch: str
     base: str = ""
@@ -409,7 +431,7 @@ class BranchUpdate:
 
     def __str__(self) -> str:
         return (
-            f"#{self.number}: update PR #{self.pull} ({self.branch}) from "
+            f"{self.ref}: update PR #{self.pull} ({self.branch}) from "
             f"{self.base or 'the base branch'}, round {self.round} of {self.cap}"
         )
 
@@ -424,14 +446,18 @@ class Decision:
     going ahead this cycle.
     """
 
-    #: The issue this row is about. Still a number, where `Transition.ref` -
-    #: the field right below - is a `TaskRef`: #142 retyped the *task-identity
-    #: model* (the dependency graph, readiness and the reconciler's transition)
-    #: and stopped there deliberately, so these policy rows are one vocabulary
-    #: behind. They are internally consistent - built from the same `entry`,
-    #: compared only against each other - and nothing keys a `TaskRef` map on
-    #: one. Moving them is a follow-up, not an oversight.
+    #: The issue this row is about, as GitHub numbers it: what
+    #: `apply_mergeability` addresses the comment API with, what `Failure` and
+    #: `MergeabilityPlan.held` print. ADR 0001's code-host half, which stays
+    #: GitHub-shaped.
+    #:
+    #: **`ref` below is the half that joins.** `_admit` matches these rows
+    #: against `checks.Outcome`s to subtract the merges this gate is holding,
+    #: and #174 is what keying that on the number cost: a row that did not match
+    #: took its hold with it, and the merge went ahead uninspected.
     number: int
+    #: The pull request this row is about. A *different* numbering from
+    #: `number`, kept visibly apart for `docs/issue-contract.md` §2's reason.
     pull: int
     verdict: str
     detail: str = ""
@@ -448,6 +474,11 @@ class Decision:
 
     def __str__(self) -> str:
         return f"#{self.number}: {self.verdict} - {self.detail}"
+
+    @property
+    def ref(self) -> TaskRef:
+        """This row's task, in the internal model's vocabulary. See `number`."""
+        return task_ref(self.number)
 
 
 @dataclass(frozen=True)
@@ -511,19 +542,33 @@ def plan_mergeability(
     ledger: Ledger,
     checks: ChecksPlan,
     *,
-    states: Mapping[int, Mergeability] | None,
+    states: Mapping[TaskRef, Mergeability] | None,
     budget: UpdateBudget | None = None,
     policy: UpdatePolicy | None = None,
-    files: Mapping[int, Sequence[str]] | None = None,
+    files: Mapping[TaskRef, Sequence[str]] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
 ) -> MergeabilityPlan:
     """Gate #23's plan on the base branch. Pure - no API call, no daemon, no clock.
 
     `checks` is the plan the check gate computed this cycle, `states` each review
-    issue's mergeability (`None` when this cycle could not look), `budget` the
-    rounds already spent, and `files` the paths each pull request touches when
-    the client could say. All of them are facts somebody else read; keeping the
-    I/O out of here is what makes the rules assertable.
+    task's mergeability (`None` when this cycle could not look), `budget` the
+    rounds already spent, and `files` the paths each task's pull request touches
+    when the client could say. All of them are facts somebody else read; keeping
+    the I/O out of here is what makes the rules assertable.
+
+    **`states` and `files` are keyed on the task, and their values carry pull
+    request numbers.** Two numberings meet in this function - GitHub numbers
+    issues and pull requests from different sequences - so the key is a
+    `TaskRef` (#174) and nothing here can quietly index one with the other.
+    This docstring used to call `files` PR-keyed, which it never was.
+
+    **A key `checks` names and the ledger does not carry raises.** `states` and
+    `files` may legitimately be short - a cycle that could not read one pull
+    request still decides the rest - but the *ledger* is where each outcome came
+    from, so an outcome it cannot resolve is the two halves having drifted
+    apart. Dropping it was #174's second defect: the issue left mergeability
+    entirely, and a merge nothing here inspected is the staleness gate switched
+    off with no log line saying so.
 
     The round cap is `budget.cap` - a budget carries its own, and one built here
     takes it from the policy - so a caller raising `max_update_rounds` on a run
@@ -536,17 +581,29 @@ def plan_mergeability(
     """
     rules = policy or UpdatePolicy()
     spent = budget if budget is not None else UpdateBudget(cap=rules.max_update_rounds)
-    entries = {entry.number: entry for entry in ledger.entries.values()}
+    # `Ledger.by_ref` is the ledger's own ref index, and this module used to
+    # build a second one keyed on `entry.number` beside it (#174). Two indexes of
+    # one mapping is two things to keep in step, and the private one was the half
+    # that failed open.
+    entries = {ref: ledger.entries[task_id] for ref, task_id in ledger.by_ref.items()}
     seen = states or {}
     blind = checks.blind or states is None
 
     decisions: list[Decision] = []
-    candidates: list[tuple[int, int]] = []  # (rounds spent, issue number), for the merge slot
+    # (rounds spent, task ref), for the merge slot.
+    candidates: list[tuple[int, TaskRef]] = []
 
     for outcome in checks.outcomes:
-        entry = entries.get(outcome.number)
-        if entry is None:
-            continue
+        try:
+            entry = entries[outcome.ref]
+        except KeyError:
+            raise UnresolvedJoin(
+                f"no ledger entry for {outcome.ref}, whose checks this cycle decided "
+                f"({outcome.verdict}). The outcome was built from this ledger one call ago, "
+                f"so the two have drifted apart - and the miss cannot be skipped: an issue "
+                f"this gate never decides is a merge it never inspected. Refs held: "
+                f"{sorted(str(ref) for ref in entries)}"
+            ) from None
         if outcome.transition is not None and outcome.merge is None:
             # #23 has already moved this issue this cycle - a retry, an
             # escalation, a give-up. Two modules writing one issue's label is how
@@ -556,26 +613,26 @@ def plan_mergeability(
         decision = _decide(
             entry=entry,
             outcome=outcome,
-            state=seen.get(outcome.number),
+            state=seen.get(outcome.ref),
             budget=spent,
-            files=tuple((files or {}).get(outcome.number) or ()),
+            files=tuple((files or {}).get(outcome.ref) or ()),
             max_attempts=max_attempts,
             blind=blind,
         )
         decisions.append(decision)
         if outcome.merge is not None and not decision.held:
-            candidates.append((spent.spent(outcome.number), outcome.number))
+            candidates.append((spent.spent(outcome.ref), outcome.ref))
 
     decisions = _serialise(decisions, candidates, rules)
     # A cycle that merges makes every other open pull request stale the moment it
     # lands, so an update issued alongside it is work that is already undone -
     # and, worse, a round spent for nothing. The next cycle updates them against
     # the base this merge created.
-    merging = {number for _, number in candidates} & {d.number for d in decisions if not d.held}
+    merging = {ref for _, ref in candidates} & {d.ref for d in decisions if not d.held}
     if merging:
         decisions = [_defer(d) if d.update is not None else d for d in decisions]
 
-    held = {d.number: d.held for d in decisions if d.held}
+    held = {d.ref: d.held for d in decisions if d.held}
     return MergeabilityPlan(
         decisions=tuple(decisions),
         admitted=_admit(checks, held),
@@ -648,7 +705,10 @@ def _decide_conflicted(
             number=entry.number,
             pull=pull,
             verdict=CONFLICTED,
-            detail=f"conflicts with {facts.base_name}; {attempt} attempt(s) against a cap of {cap}",
+            detail=(
+                f"conflicts with {facts.base_name}; {attempt} attempt(s) against a cap "
+                f"of {cap}"
+            ),
             transition=Transition(
                 ref=entry.ref,
                 from_label=REVIEW,
@@ -706,8 +766,8 @@ def _decide_behind(
     cap = max(int(budget.cap), 1)
     held = f"the branch is behind {facts.base_name}"
 
-    if budget.exhausted(entry.number):
-        rounds = budget.spent(entry.number)
+    if budget.exhausted(entry.ref):
+        rounds = budget.spent(entry.ref)
         reason = (
             f"the base moved under this pull request {rounds} time(s) and it has been updated "
             f"as often; it is being starved by faster siblings rather than making progress"
@@ -744,11 +804,11 @@ def _decide_behind(
             f"passed against an older base"
         ),
         update=BranchUpdate(
-            number=entry.number,
+            ref=entry.ref,
             pull=pull,
             branch=facts.branch or entry.branch,
             base=facts.base,
-            round=budget.spent(entry.number) + 1,
+            round=budget.spent(entry.ref) + 1,
             cap=cap,
         ),
         held=held,
@@ -756,24 +816,26 @@ def _decide_behind(
 
 
 def _serialise(
-    decisions: list[Decision], candidates: list[tuple[int, int]], policy: UpdatePolicy
+    decisions: list[Decision], candidates: list[tuple[int, TaskRef]], policy: UpdatePolicy
 ) -> list[Decision]:
     """Hold every merge but this cycle's, and pick which one that is.
 
     The pull request with the most update rounds behind it wins, ties broken by
-    issue number. That direction is the whole anti-starvation argument: the
-    branch that has been invalidated most often is the one closest to being
-    given up on, so it goes first rather than last, and the round cap becomes a
-    bound nothing normally reaches instead of a queue's natural end state.
+    the task ref - whose order is natural, so `#9` still goes before `#10`
+    exactly as the integer tie-break did (`swarm/taskref.py`). That direction is
+    the whole anti-starvation argument: the branch that has been invalidated
+    most often is the one closest to being given up on, so it goes first rather
+    than last, and the round cap becomes a bound nothing normally reaches
+    instead of a queue's natural end state.
     """
     allowed = max(int(policy.merges_per_cycle), 1)
     if len(candidates) <= allowed:
         return decisions
 
     ranked = sorted(candidates, key=lambda item: (-item[0], item[1]))
-    winners = {number for _, number in ranked[:allowed]}
-    queued = {number for _, number in candidates} - winners
-    names = ", ".join(f"#{n}" for n in sorted(winners))
+    winners = {ref for _, ref in ranked[:allowed]}
+    queued = {ref for _, ref in candidates} - winners
+    names = ", ".join(str(ref) for ref in sorted(winners))
     return [
         replace(
             decision,
@@ -783,7 +845,7 @@ def _serialise(
             ),
             detail=f"{decision.detail}; queued behind {names}",
         )
-        if decision.number in queued
+        if decision.ref in queued
         else decision
         for decision in decisions
     ]
@@ -801,23 +863,41 @@ def _defer(decision: Decision) -> Decision:
     )
 
 
-def _admit(checks: ChecksPlan, held: Mapping[int, str]) -> ChecksPlan:
+def _admit(checks: ChecksPlan, held: Mapping[TaskRef, str]) -> ChecksPlan:
     """#23's plan with the held merges - and their `swarm:done` - taken out.
 
     `dataclasses.replace` rather than a new type, so what reaches
     `checks.apply_checks` is the same shape it computed and the gate is
     subtractive: this module can stop a merge and can never invent one.
+
+    **A hold that matches no outcome raises.** This is the join where the whole
+    module's answer is applied, and its failure is the quietest one there is:
+    the hold is simply not found, the outcome passes through carrying its merge,
+    and a pull request this gate decided was stale lands with a `swarm:done` and
+    no log line anywhere saying the decision was dropped. `held` is built from
+    decisions built from these very outcomes, so a miss is a wiring fault, and
+    `UnresolvedJoin` is what a wiring fault gets (#174).
     """
     if not held:
         return checks
+    decided = {outcome.ref for outcome in checks.outcomes}
+    lost = sorted(str(ref) for ref in held if ref not in decided)
+    if lost:
+        raise UnresolvedJoin(
+            f"held merge(s) for {lost} match no outcome in the plan they gate. Every hold "
+            f"comes from a decision made about one of these outcomes, so this is the two "
+            f"halves having drifted apart - and the miss cannot be ignored: an unapplied "
+            f"hold is a stale pull request merged with a swarm:done nobody can tell from a "
+            f"real one. Outcomes: {sorted(str(ref) for ref in decided)}"
+        )
     outcomes = tuple(
         replace(
             outcome,
             merge=None,
             transition=None,
-            detail=f"{outcome.detail}; not merged: {held[outcome.number]}",
+            detail=f"{outcome.detail}; not merged: {held[outcome.ref]}",
         )
-        if outcome.number in held and outcome.merge is not None
+        if outcome.ref in held and outcome.merge is not None
         else outcome
         for outcome in checks.outcomes
     )
@@ -944,17 +1024,20 @@ def strip_conflict(body: str) -> str:
 
 @dataclass(frozen=True)
 class Failure:
-    """One thing this pass could not do, and to which issue.
+    """One thing this pass could not do, and to which task.
 
     Collected rather than raised, as `checks.apply_checks` collects: one branch
     GitHub will not update must not stop the other nineteen from being decided.
+
+    Keyed on the ref, like `reconcile.Failure` (#142): `str(ref)` is the
+    adapter's own spelling, so the line a human reads is unchanged.
     """
 
-    number: int
+    ref: TaskRef
     reason: str
 
     def __str__(self) -> str:
-        return f"#{self.number}: {self.reason}"
+        return f"{self.ref}: {self.reason}"
 
 
 @dataclass(frozen=True)
@@ -962,7 +1045,8 @@ class MergeabilityReport:
     """What one pass actually achieved."""
 
     plan: MergeabilityPlan
-    updated: tuple[int, ...] = ()
+    #: The tasks whose branches were dragged forward this pass.
+    updated: tuple[TaskRef, ...] = ()
     applied: tuple[Transition, ...] = ()
     failures: tuple[Failure, ...] = ()
     #: Branches that needed updating and this client cannot update - see the
@@ -972,7 +1056,7 @@ class MergeabilityReport:
     unupdatable: tuple[str, ...] = ()
     #: Comments this client had no method to post. `reconcile.post_comment`
     #: printed them instead.
-    uncommented: tuple[int, ...] = ()
+    uncommented: tuple[TaskRef, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -994,7 +1078,7 @@ class MergeabilityReport:
                 + " or ".join(UPDATE_METHODS)
             )
         if self.uncommented:
-            names = ", ".join(f"#{n}" for n in self.uncommented)
+            names = ", ".join(str(ref) for ref in self.uncommented)
             parts.append(f"could not comment on {names} - the client has no {COMMENT_METHOD}")
         return ", ".join(parts)
 
@@ -1045,18 +1129,18 @@ def apply_mergeability(
     `Reconciler` always passes one, because an attempt consumed without its
     signature recorded is an attempt that renews somebody's budget for free.
     """
-    updated: list[int] = []
+    updated: list[TaskRef] = []
     applied: list[Transition] = []
     failures: list[Failure] = []
     unupdatable: list[str] = []
-    uncommented: list[int] = []
+    uncommented: list[TaskRef] = []
 
     if dry_run:
         return MergeabilityReport(plan=plan)
 
     for update in plan.updates:
         if budget is not None:
-            budget.spend(update.number)
+            budget.spend(update.ref)
         try:
             if not update_branch(client, update):
                 unupdatable.append(update.branch)
@@ -1071,9 +1155,9 @@ def apply_mergeability(
             # A 422 (the branch is not behind after all, or is already updating)
             # or a 403. The issue keeps `swarm:review` and the next cycle re-reads
             # the pull request; the round is charged either way.
-            failures.append(Failure(update.number, f"updating PR #{update.pull}: {exc}"))
+            failures.append(Failure(update.ref, f"updating PR #{update.pull}: {exc}"))
             continue
-        updated.append(update.number)
+        updated.append(update.ref)
 
     for decision in plan.decisions:
         transition = decision.transition
@@ -1098,16 +1182,16 @@ def apply_mergeability(
             if transition.from_label and transition.from_label != transition.to_label:
                 client.remove_label(number, transition.from_label)
         except (GitHubError, StoreError) as exc:
-            failures.append(Failure(decision.number, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(decision.ref, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
         # The pull request this issue was being counted for is finished with -
         # merged, abandoned or about to be replaced by a re-dispatch's - so the
         # rounds it spent must not be inherited by whatever opens next.
         if budget is not None:
-            budget.clear(decision.number)
+            budget.clear(decision.ref)
         if transition.comment and not post_comment(client, decision.number, transition.comment):
-            uncommented.append(decision.number)
+            uncommented.append(decision.ref)
 
     return MergeabilityReport(
         plan=plan,
@@ -1173,8 +1257,11 @@ def run_mergeability(
     rules = policy or UpdatePolicy()
     spent = budget if budget is not None else UpdateBudget(cap=rules.max_update_rounds)
 
-    states: dict[int, Mergeability] | None = None
-    files: dict[int, tuple[str, ...]] = {}
+    # Both keyed on the task, never on either of the two numberings that meet
+    # here: the values carry pull request numbers, and #174's audit found this
+    # module's docstring already claiming one of them was PR-keyed.
+    states: dict[TaskRef, Mergeability] | None = None
+    files: dict[TaskRef, tuple[str, ...]] = {}
     if open_pulls is not None:
         states = {}
         for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
@@ -1184,9 +1271,9 @@ def run_mergeability(
             if pull is None:
                 continue
             state = read_mergeability(client, pull)
-            states[entry.number] = state
+            states[entry.ref] = state
             if state.verdict == CONFLICTED:
-                files[entry.number] = read_touched_files(client, pull)
+                files[entry.ref] = read_touched_files(client, pull)
         spent.retain(states)
 
     plan = plan_mergeability(
@@ -1214,7 +1301,7 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
     live = load_ledger(gh, adopt=False)
     open_pulls = read_pulls(gh)
     seen = {
-        entry.number: read_checks(gh, (open_pulls or {})[entry.branch].ref)
+        entry.ref: read_checks(gh, (open_pulls or {})[entry.branch].ref)
         for entry in live.entries.values()
         if entry.state_label == REVIEW and entry.branch in (open_pulls or {})
     }

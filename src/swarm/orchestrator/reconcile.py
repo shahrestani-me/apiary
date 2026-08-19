@@ -1716,7 +1716,7 @@ class Reconciler:
         # against what it is landing on. `plan.admitted` is what survives.
         mergeability = None
         checks = None
-        check_runs: dict[int, Any] = {}
+        check_runs: dict[TaskRef, Any] = {}
         if self.merge_gate:
             from .checks import apply_checks, plan_checks, read_checks
             from .mergeability import run_mergeability
@@ -1725,7 +1725,7 @@ class Reconciler:
                 for entry in ledger.entries.values():
                     pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
                     if pull is not None:
-                        check_runs[entry.number] = read_checks(snapshot, pull.ref)
+                        check_runs[entry.ref] = read_checks(snapshot, pull.ref)
             checks_plan = plan_checks(
                 ledger,
                 pulls=pulls,
