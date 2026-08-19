@@ -110,6 +110,7 @@ __all__ = [
     "RUN_STARTED",
     "SCHEMA_VERSION",
     "STATE_DIVERGENCE",
+    "STATE_OVERRIDE",
     "STATE_SHADOW",
     "SUMMARY_FILE_NAME",
     "TASK_CLAIMED",
@@ -770,6 +771,18 @@ TASK_NEEDS_HUMAN = "task.needs_human"
 STATE_SHADOW = "state.shadow"
 STATE_DIVERGENCE = "state.divergence"
 
+#: The cutover (#147). `state.divergence` is sampled at the *end* of a cycle and
+#: says the label and the resolver disagree; this one is sampled at the top,
+#: before anything is decided, and says the orchestrator **acted on the
+#: resolver's answer rather than the label's**. They are not the same claim and
+#: they cannot be the same event: a divergence the cycle then repaired leaves no
+#: `state.divergence` line at all, and "a human edited a label mid-run and the
+#: swarm carried on" is precisely the thing #147 has to be able to show.
+#: `kind` names the account when `orchestrator/authority.py` moved the answer off
+#: the resolver's own verdict - one of ADR 0001's three non-derivable states -
+#: and is empty when the label was simply stale.
+STATE_OVERRIDE = "state.override"
+
 
 # --------------------------------------------------------------------------
 # Writing a run
@@ -1217,6 +1230,19 @@ class DivergenceTally:
     #: compatible with every disagreement being on the one state ADR 0001
     #: reports outbound.
     unexplained_tasks: tuple[str, ...] = ()
+    #: The cutover's own number (#147): task-cycles where the orchestrator acted
+    #: on the resolver rather than on the label. Kept apart from `total` because
+    #: it is sampled at the other end of the cycle and answers the other
+    #: question - not "do the two agree afterwards" but "which one decided".
+    #: Zero over a run with coverage is the interesting reading: it says the
+    #: labels never lied, not that nothing was believed.
+    overrides: int = 0
+    #: Kind -> count for the overrides that carried an account, and the task ids
+    #: of the ones that did not. An unaccounted override is the label being
+    #: stale, which is ordinary; an accounted one is apiary knowing something
+    #: the code host cannot show, which is one of ADR 0001's three.
+    override_kinds: tuple[tuple[str, int], ...] = ()
+    override_tasks: tuple[str, ...] = ()
 
     @classmethod
     def from_events(cls, events: Iterable[Mapping[str, Any]]) -> DivergenceTally:
@@ -1228,9 +1254,26 @@ class DivergenceTally:
         unexplained = 0
         kinds: dict[str, int] = {}
         tasks: list[str] = []
+        overrides = 0
+        override_kinds: dict[str, int] = {}
+        override_tasks: list[str] = []
         ran = False
         for payload in events:
             name = payload.get("event")
+            if name == STATE_OVERRIDE:
+                # Deliberately **not** setting `ran`: an override is evidence
+                # about the cutover, not about the shadow window, and a run with
+                # `APIARY_DERIVED_SHADOW=0` still emits these. Reporting "the
+                # shadow ran" off them would put unmeasured back where the whole
+                # of this class exists to keep it out.
+                overrides += 1
+                kind = str(payload.get("kind") or "")
+                task = str(payload.get("task") or "")
+                if kind:
+                    override_kinds[kind] = override_kinds.get(kind, 0) + 1
+                elif task and task not in override_tasks:
+                    override_tasks.append(task)
+                continue
             if name == STATE_SHADOW:
                 ran = True
                 cycles += 1
@@ -1262,22 +1305,29 @@ class DivergenceTally:
             unexplained=unexplained,
             by_kind=tuple(sorted(kinds.items(), key=lambda one: (-one[1], one[0]))),
             unexplained_tasks=tuple(tasks),
+            overrides=overrides,
+            override_kinds=tuple(
+                sorted(override_kinds.items(), key=lambda one: (-one[1], one[0]))
+            ),
+            override_tasks=tuple(override_tasks),
         )
 
     def text(self) -> str:
         """The lines `swarm show` prints. Coverage first, because a divergence
         count with no coverage beside it is a number that cannot be read."""
         if not self.ran:
-            return "derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)"
+            head = "derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)"
+            return "\n".join([head, *self._override_lines()])
         if not self.compared:
             # Every other branch below would print "0 unexplained" for this,
             # which is true and reads as a clean run. It is not one: the window
             # ran and compared nothing.
-            return (
+            head = (
                 f"derived shadow: ran for {self.cycles} cycle(s) and compared no tasks"
                 + (f" ({self.blind} blind)" if self.blind else "")
                 + " - this run is unmeasured, not clean"
             )
+            return "\n".join([head, *self._override_lines()])
         lines = [
             f"derived shadow: {self.compared} task-cycle(s) compared over "
             f"{self.cycles} cycle(s)"
@@ -1290,7 +1340,32 @@ class DivergenceTally:
         lines.append(head)
         if self.unexplained_tasks:
             lines.append("  unexplained on: " + ", ".join(self.unexplained_tasks))
+        lines += self._override_lines()
         return "\n".join(lines)
+
+    def _override_lines(self) -> list[str]:
+        """What the cutover did, printed whether or not the shadow ran.
+
+        Silent when nothing was overridden, because a line reading "0 overrides"
+        on every run of a system whose labels are usually right is a line people
+        stop seeing - and unlike the coverage number above, zero here is not
+        ambiguous: the overrides are emitted by the decision path itself, so
+        none means none rather than unmeasured.
+        """
+        if not self.overrides:
+            return []
+        head = (
+            f"  {self.overrides} state override(s): the orchestrator's answer differed "
+            "from the label, the resolver, or both"
+        )
+        if self.override_kinds:
+            head += " (" + ", ".join(
+                f"{kind} {count}" for kind, count in self.override_kinds
+            ) + ")"
+        lines = [head]
+        if self.override_tasks:
+            lines.append("  stale labels on: " + ", ".join(self.override_tasks))
+        return lines
 
 
 @dataclass(frozen=True)

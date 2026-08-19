@@ -133,6 +133,14 @@ from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord, summarise_dir, tail
+from .authority import Belief, believe, label_state, revived_tasks, state_source
+# **Bare `CLAIMED` and `REVIEW` here are `swarm:*` labels; the `_STATE` pair are
+# ADR 0001's internal states.** `shadow.py`'s convention, imported for its
+# reason: the one time the two were confused, every classification in that file
+# stopped matching and nothing failed.
+from .derived import CLAIMED as CLAIMED_STATE
+from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN, Budget
+from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import CLAIMED, REVIEW, Capacity, DispatchReport, Spawner, dispatch
 
 #: The two labels no other module owns, and therefore the only two spelled out
@@ -868,6 +876,31 @@ def _retry_or_give_up(
     )
 
 
+#: `TERMINAL_LABELS` in ADR 0001's vocabulary. Same two rows of §4, read through
+#: whichever control plane this cycle believes.
+FINISHED_STATES = frozenset({LANDED, NEEDS_HUMAN})
+
+
+def _now(entry: LedgerEntry, believed: Belief | None) -> str:
+    """What this task **is**, as the cycle's authority has it (#147)."""
+    return believed.state(entry.task_id) if believed is not None else label_state(entry.state_label)
+
+
+def _was(
+    entry: LedgerEntry, believed: Belief | None, previous: Mapping[str, str] | None
+) -> str:
+    """What this task **was** when the orchestrator last looked. See `plan_reconcile`.
+
+    Falls back to `_now` when nothing remembers this task, which under the
+    labels is the same answer and under the resolver is the first cycle of a
+    process. `Reconciler` seeds `previous` from the labels for exactly that
+    case - see `authority.Belief.seed`, which is where the argument for it is.
+    """
+    if previous is None:
+        return _now(entry, believed)
+    return previous.get(entry.task_id) or _now(entry, believed)
+
+
 def plan_reconcile(
     ledger: Ledger,
     *,
@@ -876,6 +909,8 @@ def plan_reconcile(
     results: Mapping[TaskRef, ResultRecord] | None = None,
     running: Collection[TaskRef] = (),
     labels: Mapping[TaskRef, frozenset[str]] | None = None,
+    believed: Belief | None = None,
+    previous: Mapping[str, str] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
     infrastructure: Mapping[TaskRef, int] | None = None,
@@ -892,6 +927,32 @@ def plan_reconcile(
     The rules are ordered, and the order is the priority: a closed issue is out
     of the run whatever else is true of it, because a human closing an issue is
     the one input this system may never argue with.
+
+    `believed` is the cycle's authority on state (#147) and `previous` is what
+    it believed **last** cycle. Both, because this function is *incremental* and
+    the resolver is *absolute*, and the label was quietly doing both jobs:
+
+    - Rules 1, 2 and 4's guards ask what a task **is** - closed, finished,
+      in review - and those come from `believed`.
+    - Rules 3 and 4's *triggers* ask what a task **was** - it was claimed and a
+      worker has since finished, it was in review and its pull request has since
+      gone - and no absolute reading of the world carries a "was". A worker that
+      failed leaves an exited container and no pull request, so the resolver says
+      `eligible` and a reconciler waiting for `claimed` would never observe a
+      failed attempt again: no retry comment, no counter, no give-up. A pull
+      request closed unmerged is not in `Snapshot`'s open listing at all, so the
+      resolver says `eligible` there too and a reconciler waiting for `review`
+      would forgive every rejection. `previous` is what the label was standing
+      in for, and it self-clears the same way: once this function has moved a
+      task, the belief carried forward is the state it moved it to.
+
+    `believed=None` reads the labels for both, which is `APIARY_STATE_SOURCE=labels`
+    and is exactly what this function did before #147.
+
+    `from_label` on every transition below stays `entry.state_label` whatever
+    the source, and that is not an oversight: it is the label the write has to
+    *remove*, so a hand-edited issue is relabelled correctly rather than left
+    carrying two.
     """
     states = states or {}
     results = results or {}
@@ -909,7 +970,9 @@ def plan_reconcile(
 
     for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         state = states.get(entry.ref)
-        terminal = entry.state_label in TERMINAL_LABELS
+        now = _now(entry, believed)
+        was = _was(entry, believed, previous)
+        terminal = now in FINISHED_STATES
 
         # 1. GitHub wins. A closed issue leaves the run, and its container goes
         #    with it - that is #22's acceptance criterion. The same rule reads
@@ -944,7 +1007,7 @@ def plan_reconcile(
         #    does not.
         record = results.get(entry.ref)
         finished = record is not None and record.attempt >= entry.attempt
-        if entry.state_label == CLAIMED and finished and record is not None:
+        if was == CLAIMED_STATE and finished and record is not None:
             transition, disposal = _observe(
                 entry,
                 record,
@@ -959,7 +1022,7 @@ def plan_reconcile(
                 disposals.append(disposal)
             continue
 
-        if entry.state_label != REVIEW:
+        if now != REVIEW_STATE and was != REVIEW_STATE:
             continue
 
         # 4. A PR that is no longer open, on an issue that is not closed - so it
@@ -967,7 +1030,11 @@ def plan_reconcile(
         #    the work was done and rejected, and a retry that costs nothing can
         #    be rejected forever. Skipped entirely when `open_branches` is None,
         #    because "we could not list PRs" must never read as "the PR is gone".
-        if open_branches is not None and entry.branch not in open_branches:
+        if (
+            was == REVIEW_STATE
+            and open_branches is not None
+            and entry.branch not in open_branches
+        ):
             transitions.append(
                 _retry_or_give_up(
                     entry,
@@ -1690,6 +1757,23 @@ class Reconciler:
     #: cycle. Typed loosely and built through a local import for `_lifecycle`'s
     #: reason. It reads nothing the cycle decides and decides nothing itself.
     _shadow: Any = field(default_factory=_shadow_window, repr=False)
+    #: Which control plane this run believes (#147), read once at construction
+    #: so that a mid-run environment edit cannot make one cycle derive its state
+    #: and the next one read it off a label. `APIARY_STATE_SOURCE=labels` is the
+    #: escape hatch and `authority.state_source` is loud on anything else.
+    _source: str = field(default_factory=state_source, repr=False)
+    #: What this process believed at the end of the previous cycle, by task id.
+    #: `plan_reconcile` is incremental and the resolver is absolute; this is the
+    #: "was" the label used to carry. Run-scoped, like `_infrastructure` and
+    #: `update_budget`, and seeded from the labels for a task never seen - see
+    #: `authority.Belief.seed`.
+    _believed: dict[str, str] = field(default_factory=dict, repr=False)
+    #: Tasks `planner.revive` returned to the run, and the attempt counter each
+    #: was at. A revival grants exactly one attempt and lapses when it is spent
+    #: (`authority._budget_spent`); without this the resolver re-escalates a
+    #: revived task on the same arithmetic that failed it, and the goal gate can
+    #: never unstick a run.
+    _revived: dict[TaskRef, int] = field(default_factory=dict, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1725,6 +1809,58 @@ class Reconciler:
         # this cycle. No API call either way - `Snapshot` caches the listing -
         # but three walks of it to build the same mapping is three walks.
         states = snapshot.states()
+
+        # Local, because `shadow` imports this module. `build_observation` is
+        # #146's, and its docstring says why it takes raw inputs rather than a
+        # finished report: "an observation can be built before the cycle decides
+        # anything - which is the shape #147 needs when the derived state becomes
+        # the thing decided *on*". This is that call.
+        from .checks import read_pulls
+        from .shadow import build_observation
+
+        # Read here rather than after `apply_plan`, which is where it used to
+        # sit. It costs nothing extra - `open_branches()` has already forced
+        # `Snapshot`'s one pull-request listing, so this is a fold over payloads
+        # the cycle is holding - and the belief cannot be formed without it.
+        pulls = read_pulls(snapshot)
+        observation = (
+            None
+            if pulls is None
+            else build_observation(
+                cycle=index,
+                entries=ledger.entries.values(),
+                # The raw listing, not `handles`: two containers under one task
+                # is a fact a first-wins map cannot express, and it is the fact
+                # that decides whether one of them is holding a claim.
+                containers=containers,
+                pulls=pulls,
+                results=results,
+                states=states,
+                budget=Budget(
+                    max_attempts=self.max_attempts,
+                    max_total_attempts=self.max_total_attempts,
+                ),
+                live_run_ids=(self.run.id,),
+            )
+        )
+        # `pulls is None` is "this cycle could not look", and `believe` reads it
+        # as a reason to fall back to the labels wholesale rather than as an
+        # empty listing. Conflating the two would resolve every task in review
+        # to `eligible` and dispatch a second worker over an open pull request's
+        # files - `checks.read_pulls`' distinction, one level worse than where
+        # it usually bites.
+        belief = believe(
+            ledger,
+            observation,
+            source=self._source,
+            infrastructure=self._infrastructure,
+            infrastructure_cap=self.infrastructure_policy.cap,
+            revived=self._revived,
+            max_attempts=self.max_attempts,
+            max_total_attempts=self.max_total_attempts,
+        )
+        previous = belief.seed(self._believed)
+        self._announce_overrides(index, belief)
         plan = plan_reconcile(
             ledger,
             states=states,
@@ -1732,6 +1868,8 @@ class Reconciler:
             results=results,
             running=tuple(handles),
             labels=snapshot.labels(),
+            believed=belief,
+            previous=previous,
             max_attempts=self.max_attempts,
             max_total_attempts=self.max_total_attempts,
             infrastructure=self._infrastructure,
@@ -1746,11 +1884,22 @@ class Reconciler:
             dry_run=self.dry_run,
         )
         ledger = fold(ledger, result.applied)
+        # The belief advances exactly where the ledger does, and by exactly what
+        # the ledger does: a stage that sees a folded entry must see the belief
+        # that goes with it, and one that does not must not. Anything else and
+        # the two disagree in the middle of a cycle, which is the bug `fold`
+        # exists to prevent, doubled.
+        belief = belief.fold(result.applied)
         # Folded from what actually **landed**, not from what was planned: a
         # label write GitHub refused left the issue where it was, so counting
         # it would escalate a task on the strength of a move that never
         # happened. Same rule `fold` follows one line up, for the same reason.
         self._infrastructure = infrastructure_streaks(self._infrastructure, result.applied)
+
+        # Containers this cycle actually removed. Read from what `apply_plan`
+        # and the recovery sweep report rather than from what they planned, for
+        # `fold`'s reason. The dispatcher subtracts it below.
+        disposed_this_cycle: set[TaskRef] = set(result.disposed)
 
         # A claim with no container behind it is undispatchable forever, and the
         # window that produces one is the dispatcher's own claim-then-spawn gap.
@@ -1769,19 +1918,8 @@ class Reconciler:
                 open_branches=snapshot.open_branches(),
             )
             ledger = fold(ledger, recovered.result.applied)
-
-        # Local, because `checks` imports this module: it is the policy over the
-        # state this one folds, so the dependency points this way and a
-        # top-level import would be a cycle.
-        from .checks import read_pulls
-
-        # Read outside the merge gate, and free: `open_branches()` above already
-        # forced `Snapshot`'s one pull-request listing, so this is a fold over
-        # payloads the cycle is holding. Outside the gate because a run merging
-        # by hand still wants `pr.opened` in its event log - the gate being off
-        # is not a reason for the run directory to stop recording that a task
-        # reached review.
-        pulls = read_pulls(snapshot)
+            belief = belief.fold(recovered.result.applied)
+            disposed_this_cycle |= set(getattr(recovered.result, "disposed", ()) or ())
 
         # The merge gate. Mergeability runs first and *subtracts* from the plan
         # checks built: a PR that is green against a base that has since moved
@@ -1797,7 +1935,11 @@ class Reconciler:
 
             if pulls is not None:
                 for entry in ledger.entries.values():
-                    pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
+                    # Exactly the entries `plan_checks` selects below, which is
+                    # what `UnresolvedJoin` is raised on: the two loops are the
+                    # same loop and both read the same authority (#147).
+                    reviewing = belief.holds(entry.task_id, REVIEW_STATE)
+                    pull = pulls.get(entry.branch) if reviewing else None
                     if pull is not None:
                         check_runs[entry.ref] = read_checks(snapshot, pull.ref)
             try:
@@ -1811,6 +1953,7 @@ class Reconciler:
                     # merge - silently does nothing.
                     policy=self.merge_policy,
                     max_attempts=self.max_attempts,
+                    believed=belief,
                 )
                 mergeability = run_mergeability(
                     snapshot,
@@ -1826,6 +1969,7 @@ class Reconciler:
                     # counter they bump.
                     store=self.store,
                     dry_run=self.dry_run,
+                    believed=belief,
                 )
                 checks = apply_checks(
                     snapshot, mergeability.plan.admitted, store=self.store, dry_run=self.dry_run
@@ -1854,6 +1998,7 @@ class Reconciler:
                 print(f"! the merge gate could not resolve a join: {exc}", file=sys.stderr)
             else:
                 ledger = fold(ledger, checks.applied)
+                belief = belief.fold(checks.applied)
 
         readiness: ReadinessPlan | None = None
         dispatched: DispatchReport | None = None
@@ -1863,6 +2008,10 @@ class Reconciler:
                     snapshot,  # type: ignore[arg-type]
                     ledger=ledger,
                     dry_run=self.dry_run,
+                    # The one thing readiness used a label for: which entries
+                    # are its to speak about. Everything else it decides is a
+                    # question about the code host and is untouched (#147).
+                    transitionable=belief.waiting(),
                 )
             except DependencyCycleError as exc:
                 # Nothing was written - readiness detects the ring before its
@@ -1880,6 +2029,18 @@ class Reconciler:
                         ready=readiness.ready,
                         dry_run=self.dry_run,
                         images=self.images,
+                        believed=belief,
+                        # Every task a container **exists** for, live or not,
+                        # minus the ones this cycle has already removed. See
+                        # `plan_dispatch`: the resolver reads liveness and is
+                        # right to, and a dispatcher deciding whether to act has
+                        # to read existence or it can spawn a second worker over
+                        # a dead one's file set. The subtraction is `fold`'s
+                        # rule again - what actually **landed**, so a disposal
+                        # the daemon refused still blocks - and it is what keeps
+                        # an infrastructure retry dispatchable in the cycle that
+                        # released it, exactly as the label did.
+                        holding=tuple(set(handles) - disposed_this_cycle),
                     )
 
         report = CycleReport(
@@ -1895,6 +2056,11 @@ class Reconciler:
             live=len(live_entries(ledger)),
         )
         judged = self._judge(snapshot, report, results=results)
+        # After `_judge`, because that is where both callers of `planner.revive`
+        # run, and before the belief is carried forward, so a task revived this
+        # cycle is already holding its granted attempt when the next one asks.
+        self._record_revivals(judged)
+        self._believed = self._carry_forward(belief, judged)
         # Last, and on the grown report: the announcement (#141) is a projection
         # of a cycle that has already decided, already written and already been
         # judged, which is what makes "this changes no behaviour" a structural
@@ -1946,6 +2112,83 @@ class Reconciler:
             record=self.record,
         )
         return judged
+
+    def _announce_overrides(self, index: int, belief: Belief) -> None:
+        """One `state.override` per task the orchestrator does not read off its
+        label. **The observable proof the cutover happened.**
+
+        Emitted at the *top* of the cycle, before anything is decided, which is
+        the opposite end from `shadow.ShadowWindow` and deliberately so: a label
+        a human edited and readiness then repaired leaves no `state.divergence`
+        line at all, and "the swarm carried on and said so" is exactly what
+        #147's acceptance criteria ask to be able to see.
+
+        Keyed by task id and speaking ADR 0001's vocabulary on both sides -
+        #141's rule for everything in `events.jsonl`, and the reason no
+        `swarm:*` string appears in a payload here.
+        """
+        if self.events is None or not belief.overrides:
+            return
+        from ..artifacts import STATE_OVERRIDE
+
+        for one in belief.overrides:
+            self.events(
+                STATE_OVERRIDE,
+                cycle=index,
+                task=one.task_id,
+                believed=one.believed,
+                stored=one.stored,
+                derived=one.derived,
+                kind=one.kind,
+                why=one.why,
+            )
+
+    def _carry_forward(self, belief: Belief, report: CycleReport) -> dict[str, str]:
+        """What this cycle ended believing, for the next cycle's `previous`.
+
+        The same enumeration `shadow.control_labels` walks, from the other side
+        and for the same reason: three of a cycle's writers do not produce a
+        `Transition` and are not folded back, so a belief advanced only by
+        `fold` would forget them. It matters for exactly one of the three and
+        the case is not rare - a task the dispatcher claimed this cycle whose
+        worker exits before the next one would be remembered as never having
+        run, and `plan_reconcile`'s rule 3 would never observe its result.
+
+        Order matches `control_labels`, last word wins: revivals, then readiness
+        (whose verdicts cover only the waiting entries, so nothing here can
+        overwrite a claim), then the dispatcher's claims - including the claim a
+        failed spawn leaves standing, which is a claim the control plane is
+        holding whether or not the spawn worked.
+        """
+        carried = belief.fold(getattr(report.mergeability, "applied", ()) or ())
+        overlay: dict[str, str] = {task: ELIGIBLE for task in revived_tasks(report)}
+        if report.readiness is not None:
+            for verdict in report.readiness.verdicts:
+                if verdict.task_id:
+                    overlay[verdict.task_id] = label_state(verdict.label)
+        if report.dispatched is not None:
+            slugs = {entry.ref: entry.task_id for entry in report.ledger.entries.values()}
+            for item in report.dispatched.dispatched:
+                if item.entry.task_id:
+                    overlay[item.entry.task_id] = CLAIMED_STATE
+            for failure in report.dispatched.failed:
+                task = slugs.get(task_ref(int(failure.number)), "")
+                if failure.claimed and task:
+                    overlay[task] = CLAIMED_STATE
+        return dict(carried.hold(overlay).states)
+
+    def _record_revivals(self, report: CycleReport) -> None:
+        """Remember the one attempt each revival granted. See `_revived`.
+
+        The counter is read *before* the revived task runs again, because
+        `planner.revive` "deliberately resets nothing" - so the attempt on the
+        entry is the one the revival is granting, and the grant lapses the
+        moment a result carries it (`authority._budget_spent`).
+        """
+        for task in revived_tasks(report):
+            entry = report.ledger.entries.get(task)
+            if entry is not None:
+                self._revived[entry.ref] = entry.attempt
 
     # --- step 5 ----------------------------------------------------------
 

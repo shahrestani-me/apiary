@@ -6,6 +6,15 @@ Step 3 of `docs/architecture-v2.md`'s orchestration loop, and the row of
 *which* issues may run; this module decides *how many* and *which of those at
 once*, and it is the only thing in the system that spawns a worker.
 
+**What "ready" means moved in #147.** `plan_dispatch` used to read three
+`swarm:*` labels - reserving, terminal, and `swarm:ready` - and now reads the
+cycle's `authority.Belief` instead: a container is spawned because the world
+says the task is waiting and nothing is holding its files, not because a label
+says so. Everything this module *writes* is unchanged, which is what keeps a
+human watching the repository from noticing (#152 removes the writes, not this).
+`APIARY_STATE_SOURCE=labels` restores the label reads exactly; the two spellings
+sit side by side in `plan_dispatch` so that a reader can check the claim.
+
 **Claim, then spawn. Never the other way round.** Both orders have a crash
 window and they are not equally bad. Claiming first can strand a
 `swarm:claimed` issue with no container, which #35 recovers by looking for a
@@ -65,7 +74,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Protocol
+from typing import Any, Collection, Iterable, Protocol
 
 from ..config import SETTINGS
 from ..containers.limits import Budget, HostBudget, LimitError
@@ -81,6 +90,11 @@ from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
 from ..run import TERMINAL_LABELS
 from ..taskref import TaskRef
+from .authority import Belief
+from .derived import BLOCKED as BLOCKED_STATE
+from .derived import CLAIMED as CLAIMED_STATE
+from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN
+from .derived import REVIEW as REVIEW_STATE
 
 #: The label this module writes, and the one it writes it over. `READY` is
 #: imported rather than respelled because readiness (#11) owns that string; no
@@ -129,6 +143,29 @@ REVIEW = "swarm:review"
 #: - the PR merges to `swarm:done` or falls back to `swarm:ready` (§4) - so
 #: reserving cannot deadlock, it can only defer.
 RESERVING_LABELS = frozenset({CLAIMED, REVIEW})
+
+#: The same two sets in ADR 0001's vocabulary, which is what this module reads
+#: since #147. The `_STATE` suffixes are `shadow.py`'s convention and exist for
+#: its reason: `CLAIMED` here is a `swarm:*` label and `claimed` is an internal
+#: state, and the one time those were confused every classification in that file
+#: silently stopped matching.
+RESERVING_STATES = frozenset({CLAIMED_STATE, REVIEW_STATE})
+FINISHED_STATES = frozenset({LANDED, NEEDS_HUMAN})
+
+#: What a task must be believed to be for this cycle to consider dispatching it.
+#: `blocked` is in here and `eligible` alone is not, and the reason is in
+#: `authority.py`'s docstring: the resolver decides whether a task is *waiting*,
+#: and `github/readiness.py` - which sees dependency rings, unresolvable refs
+#: and dependencies that are not tasks in the plan - decides which of the two
+#: waiting states it is in. Its verdict arrives as `ready` and is the filter;
+#: believing the resolver's own half of that split instead would hold every task
+#: waiting on a hand-written issue blocked forever, because `derived._landed`
+#: only sees the plan's own work items.
+#:
+#: **Only when a readiness pass ran.** Without one there is no second opinion,
+#: so the resolver's `eligible` is all there is and `blocked` is not admitted -
+#: a lower bound, which is the direction a dispatcher should be wrong in.
+WAITING_STATES = frozenset({ELIGIBLE, BLOCKED_STATE})
 
 #: The host property the cap is really about. Read from the environment rather
 #: than from `Settings` because it belongs to the Ollama server, not to us;
@@ -388,6 +425,8 @@ def plan_dispatch(
     *,
     capacity: Capacity | None = None,
     ready: Iterable[TaskRef] | None = None,
+    believed: Belief | None = None,
+    holding: Collection[TaskRef] = (),
 ) -> DispatchPlan:
     """Choose this cycle's issues. Pure - no API call, no daemon, no model.
 
@@ -398,28 +437,65 @@ def plan_dispatch(
 
     `ready` is the readiness pass's own verdict (`ReadinessPlan.ready`), passed
     when the two run in one cycle so the labels it just wrote need not be read
-    back. Without it the labels on the ledger decide, which is the resumption
-    case: a fresh process reads `swarm:ready` from GitHub, exactly as
-    architecture-v2 intends.
+    back. Without it the resolver's own `eligible` decides, which is the
+    resumption case: a fresh process reads the world rather than a label,
+    exactly as ADR 0001 intends.
+
+    `believed` is the cycle's authority on state (#147). `None` reads the
+    labels, which is what `APIARY_STATE_SOURCE=labels` produces and what the
+    `__main__` dry run below has. **The three label reads this loop makes are
+    the whole of the cutover for this module** - which issues are holding files,
+    which are finished with, and which may be picked up - and each is spelled
+    twice below rather than once behind a helper, because the two vocabularies
+    are different sets of strings and a reader checking the flag has to be able
+    to see both.
+
+    `holding` is the tasks a container **exists** for, and it is consulted only
+    under the resolver. `orchestrator/shadow.py` argues the distinction and then
+    hands this ticket the bill: ADR 0001's `claimed` is a *live* worker, so
+    `derived.py` reads `docker ps --format {{.State}}` and a container that
+    exited without writing a result reads as no claim at all. That is the true
+    reading and it was the safe one only while nothing decided on it. `release`
+    takes the opposite reading - any container blocks - "because it is deciding
+    whether to *act*, and 'existence blocks' is the only reading that cannot
+    produce two workers over one file set", and dispatch is the other half of
+    that same decision. The label carried existence for free (a claim stays
+    `swarm:claimed` until something releases it), so under `labels` this is not
+    consulted and nothing changes.
     """
     limit = capacity if capacity is not None else Capacity.detect()
     allowed = None if ready is None else set(ready)
+    derived = believed is not None and believed.derived
+    startable = WAITING_STATES if allowed is not None else frozenset({ELIGIBLE})
+    held_by_a_container = set(holding) if derived else set()
 
     in_flight: list[LedgerEntry] = []
     candidates: list[LedgerEntry] = []
     for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
-        if entry.state_label in RESERVING_LABELS:
+        state = believed.state(entry.task_id) if believed is not None else ""
+        reserving = state in RESERVING_STATES if derived else entry.state_label in RESERVING_LABELS
+        finished = state in FINISHED_STATES if derived else entry.state_label in TERMINAL_LABELS
+        may_start = state in startable if derived else entry.state_label == READY
+        if reserving:
             in_flight.append(entry)
             continue
-        if entry.state_label in TERMINAL_LABELS:
+        if finished:
+            continue
+        if entry.ref in held_by_a_container:
+            # In flight rather than deferred, which is where the labels put it:
+            # a `swarm:claimed` issue whose worker had exited reserved its files
+            # and spent a slot until something released the claim, and the
+            # release is `recovery.py`'s job in the same cycle. Deferring
+            # instead would leave the files free for a sibling task while the
+            # dead worker's branch is still unmerged.
+            in_flight.append(entry)
             continue
         # A caller's list is a filter, never a promotion: an issue readiness
-        # called ready but whose label says otherwise is still not dispatched,
-        # because §3 makes the label set the authority.
-        if allowed is None:
-            if entry.state_label != READY:
-                continue
-        elif entry.ref not in allowed or entry.state_label != READY:
+        # called ready but whose state says otherwise is still not dispatched.
+        # Under the labels that was §3 making the label set the authority; under
+        # the resolver it is the same rule with the authority moved, and it is
+        # still an *intersection* - both have to agree before a container runs.
+        if not may_start or (allowed is not None and entry.ref not in allowed):
             continue
         candidates.append(entry)
 
@@ -601,6 +677,8 @@ def dispatch(
     ready: Iterable[TaskRef] | None = None,
     dry_run: bool = False,
     images: StackImages | None = None,
+    believed: Belief | None = None,
+    holding: Collection[TaskRef] = (),
 ) -> DispatchReport:
     """Claim and spawn this cycle's issues, one at a time, in that order.
 
@@ -638,7 +716,9 @@ def dispatch(
 
     `dry_run=True` returns the plan and writes nothing at all.
     """
-    plan = plan_dispatch(ledger, capacity=capacity, ready=ready)
+    plan = plan_dispatch(
+        ledger, capacity=capacity, ready=ready, believed=believed, holding=holding
+    )
     if dry_run:
         return DispatchReport(plan=plan)
 

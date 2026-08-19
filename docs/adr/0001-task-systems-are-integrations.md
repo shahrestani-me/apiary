@@ -169,9 +169,89 @@ resolver that decides nothing should read what is true rather than what is safe.
 
 **And one finding that is a gap rather than a limit.** A work item a human
 closed *as not planned* escalates to `needs-human` through
-`reconcile._closed_verdict`, and the resolver has no rule for it even though
+`reconcile._closed_verdict`, and the resolver had no rule for it even though
 `TaskFact.state_reason` carries the fact. Unlike the three above it is
-derivable, and #147 should derive it.
+derivable, and #147 derived it (`derived.TaskFact.abandoned`). The
+classification is kept and should now never fire: if it does, `state_reasons`
+has stopped reaching the observation, which is a defect in the wiring and
+belongs in the log under a name rather than in the unexplained count.
+
+### What the orchestrator does about the three, now that the resolver decides (#147)
+
+#147 made the derived value authoritative: `github/readiness.py`,
+`orchestrator/dispatcher.py`, `orchestrator/reconcile.py` and the merge gate
+(`checks.plan_checks`, `mergeability.run_mergeability`) take their state from
+`orchestrator/authority.py` rather than from a `swarm:*` label. Making a
+value decisive does not make it complete, and this section is the answer to the
+question that follows: **what does the orchestrator do about the three states
+above, when the thing that cannot see them is the thing deciding?**
+
+The short answer is ADR 0002's sentence, applied literally. The authority is the
+resolver **plus apiary's own store and its own run-scoped counters**, and the
+join is one module. Each of the three, and its cost:
+
+**The infrastructure ceiling stays in the orchestrator's own counter.** A task
+whose streak has reached `APIARY_MAX_INFRASTRUCTURE` is `needs-human` whatever
+the resolver says. The counter was always run-scoped; what the label added was
+that its *consequence* survived a restart, and it no longer does — a resumed run
+gives a mechanically-broken task another `cap` free failures before escalating
+again. Exit 2 consumes no attempt, so that costs cycles rather than budget.
+
+**The retry budget is read from the store, in both directions.** The resolver's
+`needs-human` is arithmetic over code-host evidence and is now *advisory*:
+`_retry_or_give_up` gives up on `streak`, so the store decides, with ADR 0002's
+own fallback (a missing judgment reads as the attempt counter — absence
+escalates and never grants). The second direction is the one that was not
+obvious and is the more dangerous: a task apiary has given up on leaves **no
+code-host evidence at all** once its process is gone. Results live in the run
+directory and a run directory is per run; the observation takes branch names off
+*open* pull requests, because a remote branch listing is a call no cycle makes.
+So a failed task resolves to `eligible` from scratch on the next process, and
+`swarm:failed` was what carried the verdict across the restart. The store
+carries it now.
+
+**A revival is recorded as what it is — one granted attempt.**
+`planner.revive` "deliberately resets nothing", so a revived task reads spent
+from every source there is; under the resolver it would be re-escalated the
+instant it was revived and the goal gate could never unstick a run. The grant is
+held run-scoped and lapses the moment the attempt it granted is spent, where the
+streak revive never reset caps the task again. A restart forgets a pending
+revival, which is the safe direction — a forgotten revival escalates, it never
+grants a budget — and it is the opposite of what the label did.
+
+Two further findings, both from making the value decide rather than observe:
+
+**`plan_reconcile` is incremental and the resolver is absolute.** The label was
+quietly doing double duty as the *previous* state, and two of reconcile's rules
+are edge-triggered: "a claimed task whose worker finished" (the worker exits, no
+pull request exists, the resolver correctly says `eligible`) and "a task in
+review whose pull request was closed unmerged" (a closed pull request is not in
+the listing at all). Waiting for `claimed` or `review` would have silently
+removed the retry engine and forgiven every rejected pull request. The
+orchestrator therefore carries its previous belief, in the register
+`_infrastructure` and the update budget already occupy. A task a process has
+never seen is seeded from the label, which is the one place a label still
+reaches a decision and is documented as such; #152 moves that seam to the store.
+
+**`claimed` is liveness, and a dispatcher has to read existence.** The resolver
+reads `docker ps --format {{.State}}` and is right to — that is what "a live
+worker container" means, and #187 exists because reading existence held every
+task in `claimed` from the moment its worker exited. But `dispatcher.release`
+takes the opposite reading *because it is deciding whether to act*, and dispatch
+is the other half of that decision: a container that exists blocks a spawn, or
+two workers can end up over one file set. The label carried existence for free.
+
+And one of the three above the shadow window found is now closed rather than
+classified: a work item closed **as not planned** is derivable, and
+`derived.TaskFact.abandoned` derives it.
+
+**The cutover shipped before its own gate.** #146's criterion was ten
+consecutive greenfield runs with zero unexplained divergences, and no credential
+in this environment can run one — the same wall the corpus README and
+`docs/demo-run.md` hit. `APIARY_STATE_SOURCE=labels` restores the pre-#147
+behaviour completely and is the guarantee that replaced it. That is weaker than a
+clean window, and it is recorded here rather than left for whoever reads the
+first real run.
 
 ### What a clean shadow window is evidence of
 

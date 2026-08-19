@@ -633,6 +633,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     """
     from .containers.manager import INHERITED_ENV, ContainerManager
     from .containers.reaper import Reaper
+    from .orchestrator.authority import source_summary
     from .orchestrator.checks import MergePolicy
     from .orchestrator.mergeability import UpdateBudget, UpdatePolicy
     from .orchestrator.recovery import Recovery
@@ -711,6 +712,11 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     print(f"» {infrastructure_policy.summary()}")
     print(f"» {images.summary()}")
     print(f"» {store.summary()}")
+    # Read here as well as inside `Reconciler`, for the policies' reason: the
+    # line that reports what a run believes should be the line that chose it,
+    # and `state_source` raises on a typo - which has to happen before a
+    # container is spawned rather than on the first cycle.
+    print(f"» {source_summary()}")
     if args.no_goal_check:
         print("» goal gate: off; the run stops when the plan is exhausted")
 

@@ -39,6 +39,7 @@ from swarm.artifacts import (
     CORPUS_MANIFEST_NAME,
     OBSERVED_LOG_NAME,
     STATE_DIVERGENCE,
+    STATE_OVERRIDE,
     STATE_SHADOW,
     DivergenceTally,
     RunArtifacts,
@@ -65,6 +66,7 @@ from swarm.orchestrator.shadow import (
     CLOSED_NOT_PLANNED,
     CONTAINER_CREATED,
     DISPATCHED_THIS_CYCLE,
+    EXPECTED_KINDS,
     INFRASTRUCTURE_CEILING,
     MERGED_THIS_CYCLE,
     REVIVED,
@@ -492,7 +494,14 @@ def test_a_dry_run_neither_shadows_nor_records(tmp_path):
     loop.record = artifacts.observed
     loop.cycle()
 
-    assert [one for one in seen if one[0].startswith("state.")] == []
+    # The shadow window and the recorder, which are what the two reasons above
+    # are about. **Not** `state.override` (#147): that one is sampled before
+    # anything is folded and writes nothing to the corpus, so neither reason
+    # applies to it - and a dry run that could not say "the label says claimed,
+    # the world says eligible, and a real cycle would have acted on eligible"
+    # would be answering a different question than the one it was asked.
+    assert [one for one in seen if one[0] in {STATE_SHADOW, STATE_DIVERGENCE}] == []
+    assert [one[0] for one in seen if one[0] == STATE_OVERRIDE] == [STATE_OVERRIDE]
     assert not (artifacts.path / OBSERVED_LOG_NAME).exists()
     assert not (artifacts.path / CORPUS_MANIFEST_NAME).exists()
 
@@ -769,17 +778,32 @@ def test_a_merge_over_a_derived_blocked_is_not_the_merge_window():
     assert found.explained[0].divergence.derived == "blocked"
 
 
-def test_a_work_item_closed_as_not_planned_is_named_as_a_gap_not_a_law():
-    """The one classified kind that is a **gap in the resolver** rather than a
-    limit of derivation: `TaskFact.state_reason` carries the fact and
-    `derived.py` has no rule reading it, so #147 can close this one."""
-    found, _ = shadow(
-        report(entry(4, label=FAILED)),
+def test_a_work_item_closed_as_not_planned_no_longer_diverges_at_all():
+    """The one classified kind that was a **gap in the resolver** rather than a
+    limit of derivation, and #147 closed it.
+
+    `TaskFact.state_reason` carried the fact all along and `derived.py` had no
+    rule reading it; it does now (`TaskFact.abandoned`), so the two sides agree
+    and there is nothing left to classify. Asserted as *no divergence* rather
+    than as a different kind, because a rule that still fired would mean the
+    resolver had merely learned a second way of being wrong.
+    """
+    # `closed=True` on the entry as well as in `states`, which is what a real
+    # cycle hands both sides: the ledger reads `state="all"` and the snapshot is
+    # the same listing. `TaskFact.closed` comes from the entry and
+    # `TaskFact.state_reason` from the states map, so a fixture that set only
+    # one of them was testing a world no cycle produces.
+    found, seen = shadow(
+        report(replace(entry(4, label=FAILED), closed=True)),
         states={ref(4): IssueState(ref=ref(4), state="closed", state_reason="not_planned")},
     )
 
-    assert [one.kind for one in found.explained] == [CLOSED_NOT_PLANNED]
-    assert "#147 can close it" in found.explained[0].why
+    assert found.explained == ()
+    assert divergences(seen) == []
+    # And the classification is still reachable code: if `state_reasons` ever
+    # stops reaching the observation the divergence comes back, and it should
+    # come back *named* rather than as an unexplained one in the go/no-go count.
+    assert CLOSED_NOT_PLANNED in EXPECTED_KINDS
 
 
 def test_a_closed_completed_item_reads_landed_rather_than_diverging():
@@ -799,7 +823,11 @@ def test_a_closed_completed_item_reads_landed_rather_than_diverging():
     assert completed.explained == ()
     # The same closed issue, closed differently, is a different lifecycle
     # state - which is the whole reason the reason is carried.
-    assert [one.divergence.derived for one in abandoned.explained] == ["eligible"]
+    # `needs-human` rather than `eligible` since #147 taught the resolver
+    # `state_reason`; the label on this fixture is `swarm:done`, so the two
+    # still disagree - a work item somebody closed as not planned is not a
+    # completed one however it is labelled.
+    assert [one.divergence.derived for one in abandoned.explained] == ["needs-human"]
 
 
 # --------------------------------------------------------------------------

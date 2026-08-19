@@ -96,6 +96,7 @@ from ..github.refs import issue_number, pull_number, pull_ref, task_ref
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
+from .authority import Belief, in_review
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
     COMMENT_METHOD,
@@ -800,8 +801,16 @@ def plan_checks(
     policy: MergePolicy | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     now: dt.datetime | None = None,
+    believed: Belief | None = None,
 ) -> ChecksPlan:
-    """Decide every `swarm:review` issue. Pure - no API call, no daemon, no model.
+    """Decide every task in review. Pure - no API call, no daemon, no model.
+
+    "In review" is the cycle's authority since #147 (`authority.in_review`), not
+    the `swarm:review` label: a gate that still read the label would merge, or
+    refuse to merge, on a label a human edited mid-run - and not changing what
+    the orchestrator does on such an edit is the whole of that ticket. Both
+    sides say the same thing in the ordinary case; `believed=None` reads the
+    label, which is every caller outside `Reconciler.cycle`.
 
     `pulls` is the open pull requests by head ref (`None` when this cycle could
     not look), `checks` the folded check set per task ref, and `now` the moment
@@ -837,7 +846,7 @@ def plan_checks(
     outcomes: list[Outcome] = []
 
     for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
-        if entry.state_label != REVIEW or pulls is None:
+        if not in_review(entry, believed) or pulls is None:
             continue
         pull = pulls.get(entry.branch)
         if pull is None:
@@ -1447,7 +1456,7 @@ def run_checks(
     checks: dict[TaskRef, CheckSet] = {}
     if pulls is not None:
         for entry in ledger.entries.values():
-            pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
+            pull = pulls.get(entry.branch) if in_review(entry) else None
             if pull is not None:
                 checks[entry.ref] = read_checks(client, pull.ref)
     plan = plan_checks(
