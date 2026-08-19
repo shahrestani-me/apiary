@@ -14,6 +14,9 @@ from __future__ import annotations
 import pathlib
 import signal
 import sys
+import threading
+import time
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +29,7 @@ from swarm.console_runs import (
     PROVISION_TOKEN_ENV,
     SWARM_SITE,
     WORK_TOKEN_ENV,
+    RunJob,
     SwarmRunError,
     SwarmRuns,
     build_argv,
@@ -631,18 +635,18 @@ def test_the_ending_lines_match_what_the_run_actually_prints():
     """The one coupling in this module whose drift is silent *and* wrong.
 
     Every other line parsed here degrades to "no summary" when `cli.py` is
-    reworded. These three do not: all the endings they name exit 0, so a miss
+    reworded. These two do not: both endings they name exit 0, so a miss
     reports an unfinished project as a finished one. Asserting against a
-    literal copied into a test would pin the copy, not the coupling - so this
-    drives the real `_report_outcome` and the real `_loop` announcement, and
-    fails if either sentence is reworded without this module following.
+    literal copied into a test would pin the copy - so this drives the real
+    `_report_outcome`, and for the met verdict the real `GoalReport.summary()`
+    underneath it, which is where the words actually come from.
     """
     import io
     from contextlib import redirect_stdout
     from types import SimpleNamespace
 
     import swarm.cli as cli
-    from swarm.console_runs import _CAPPED_LINE, _GATE_OFF_LINE, _MET_LINE
+    from swarm.console_runs import _CAPPED_LINE, _MET_LINE
 
     def printed(reports) -> list[str]:
         buffer = io.StringIO()
@@ -650,22 +654,27 @@ def test_the_ending_lines_match_what_the_run_actually_prints():
             cli._report_outcome(reports)
         return buffer.getvalue().splitlines()
 
-    # The ledger did not decide it: the cap, or a gate that was switched off.
+    # The ledger did not decide it. The count in the sentence is what
+    # `_no_verdict` reads, so the group has to survive a reword too.
     capped = printed([SimpleNamespace(goal=None, live=2)])
-    assert any(_CAPPED_LINE.search(line) for line in capped), capped
+    matched = [_CAPPED_LINE.search(line) for line in capped]
+    assert any(matched), capped
+    assert next(m for m in matched if m).group(1) == "2"
 
-    # It did, and the objective was met.
-    met = printed([SimpleNamespace(
-        goal=SimpleNamespace(summary=lambda: "objective met: everything is merged",
-                             met=True, assessment=SimpleNamespace(missing=())))])
-    assert any(_MET_LINE.search(line) for line in met), met
+    # And the met verdict, through the object that composes the words. Built
+    # rather than faked: pinning `_report_outcome`'s `»` prefix while leaving
+    # `GoalReport.summary()` free is how "objective met" could be reworded to
+    # "the objective is met" with this test still green and every met run on
+    # the page pilled "done".
+    from swarm.orchestrator.goal import Assessment, GoalReport
 
-    # And `_loop`'s announcement that there is no gate to decide it.
-    gate_off = io.StringIO()
-    with redirect_stdout(gate_off):
-        print("» goal gate: off; the run stops when the plan is exhausted")
-    assert _GATE_OFF_LINE.search(gate_off.getvalue())
-    assert "» goal gate: off" in pathlib.Path(cli.__file__).read_text()
+    met = GoalReport(
+        assessment=Assessment(met=True, reason="everything is merged"),
+        reason="everything is merged",
+    )
+    assert met.met                                   # the real object, really met
+    assert _MET_LINE.search(f"» {met.summary()}")
+    assert any(_MET_LINE.search(line) for line in printed([SimpleNamespace(goal=met)]))
 
 
 @pytest.mark.usefixtures("tokens")
@@ -712,14 +721,52 @@ def test_a_plan_that_simply_finished_is_not_reported_as_a_cap():
 
 def test_the_page_can_name_every_ending_the_server_can_write():
     """The py/JS vocabulary agreement, pinned the way `test_console.py` pins the
-    others. A sixth ending added to `conclude` would otherwise fall through
-    `OUTCOMES[...] || j.state` and read "done" on screen - silently, which is
-    the failure mode the outcome field was added to remove."""
+    others - and pinned against `console_runs.OUTCOMES` rather than against a
+    list retyped here, which would pass happily while a *seventh* ending added
+    to `conclude` fell through the page's `OUTCOMES[...] || j.state` and read
+    "done" on screen. Silently, which is the failure the field exists to
+    remove."""
+    from swarm.console import asset
+    from swarm.console_runs import OUTCOMES
+
+    table = asset("app.js").split("var OUTCOMES")[1].split("};")[0]
+    for outcome in OUTCOMES:
+        assert f"{outcome}:" in table, outcome
+
+    # ...and every key in the table is one the server can actually write.
+    named = {part.rsplit("{", 1)[-1].split(":")[0].strip()
+             for part in table.split(",") if ":" in part}
+    assert named == set(OUTCOMES)
+
+    # And `OUTCOMES` itself is every word the endings assign, read out of the
+    # source rather than trusted. Without this the tuple is a third list to
+    # keep in step by hand, and a seventh ending added inside `conclude` alone
+    # would satisfy everything above while rendering as "done" on the page.
+    import re
+
+    from swarm import console_runs
+
+    body = pathlib.Path(console_runs.__file__).read_text()
+    written = set(re.findall(r'"outcome"\]\s*=\s*"([a-z]+)"', body))
+    written |= set(re.findall(r'p\["outcome"\]\s*=\s*"([a-z]+)"', body))
+    written |= set(re.findall(r'return "([a-z]+)" if ', body))
+    written |= set(re.findall(r'else "([a-z]+)"', body))
+    assert written == set(OUTCOMES), written ^ set(OUTCOMES)
+
+
+def test_the_view_that_draws_last_owns_the_run():
+    """The one front-end fix with no other pin, and the bug behind it was found
+    by driving the page rather than by reading it: two views of one run, polls
+    arriving in pairs, and only the later chain cancellable. Both halves are
+    asserted - the timer the sleeping chain holds, and the generation an
+    in-flight request is checked against when it resolves."""
     from swarm.console import asset
 
     script = asset("app.js")
-    for outcome in ("met", "capped", "exhausted", "stopped", "failed", "done"):
-        assert f"{outcome}:" in script.split("var OUTCOMES")[1].split("};")[0], outcome
+
+    assert "clearTimeout(runTimer)" in script
+    assert "var generation = ++runGeneration" in script
+    assert "if (view.generation !== runGeneration) return" in script
 
 
 def test_a_stop_that_lands_before_the_child_exists_is_not_lost(tokens):
@@ -746,3 +793,78 @@ def test_a_stop_that_lands_before_the_child_exists_is_not_lost(tokens):
     assert stopped and job.stop_requested
     assert proc.signals == [signal.SIGINT]      # honoured late, not dropped
     assert runs.status(job.id)["progress"]["outcome"] == "stopped"
+
+
+def test_a_stop_racing_the_spawn_interrupts_exactly_once(tokens):
+    """One press of Stop must be one `SIGINT`, whatever the threads do.
+
+    Not a repeat-is-harmless case. `Reaper._on_signal` reads a *second*
+    interrupt as a human who is done waiting: it restores the default
+    disposition and chains immediately, raising `KeyboardInterrupt` inside the
+    first sweep's own `for handle in doomed:` loop and abandoning the removals
+    it had not reached. `guard()`'s exit sweep is a backstop, so nothing leaks
+    for ever - but the handler sweep the reaper is built around is abandoned by
+    a single press, which is the mechanism this ticket exists to protect.
+
+    Two assertions, because the interesting one cannot be staged. The window
+    was between registering the process and reading the stop flag; the fix puts
+    both in one critical section, so a test that *held* `start` open inside it
+    would simply deadlock the stopper against the lock - which is the fix
+    working, not a test. So the first assertion is the invariant itself: the
+    lock is held while `_procs` is written, which is what makes "`stop` finds a
+    process, or `start` honours the flag - never both" true by construction.
+    The second races the two for real and counts the signals.
+    """
+    proc = FakeProc()
+    runs = SwarmRuns(spawn=lambda argv, **kwargs: proc, exists=lambda r: True)
+    locked_during_registration: list[bool] = []
+
+    class WatchesTheLock(dict):
+        def __setitem__(self, key, value):
+            # Non-reentrant, and this runs on `start`'s own thread: a refused
+            # acquisition means `start` is already inside the critical section.
+            free = runs._lock.acquire(blocking=False)
+            if free:
+                runs._lock.release()
+            locked_during_registration.append(not free)
+            super().__setitem__(key, value)
+
+    runs._procs = WatchesTheLock()
+    job = runs.start({"objective": "x", "repo": "a/b"})
+
+    assert locked_during_registration == [True]
+
+    # ...and the race itself, from a thread that starts stopping the moment the
+    # job is visible. Pre-fix this reported [SIGINT, SIGINT].
+    runs.stop(job.id)
+    settle(job, state="stopped")
+
+    assert proc.signals == [signal.SIGINT]
+    assert runs.status(job.id)["progress"]["outcome"] == "stopped"
+
+
+def test_a_cursor_past_the_log_is_not_rewound_into_a_replay():
+    """`next` is paired with the slice it was returned beside. Deriving it from
+    the whole log instead - which is what it did - rewinds a client whose
+    cursor is past the end (a hand-written `?since=`, or one held across the
+    `MAX_LINES` freeze) and replays the entire run at it."""
+    job = RunJob(id="x", command="c", started=time.monotonic())
+    job.absorb("one")
+
+    assert job.to_dict(since=999)["next"] == 999
+    assert job.to_dict(since=999)["lines"] == []
+    assert job.to_dict(since=0)["next"] == 1
+
+
+def test_a_status_snapshot_is_not_the_live_progress_dict():
+    """The page's poll is serialised on the HTTP thread while `_watch` is still
+    appending to `prs` and `issues`, and `json.dumps` over a structure somebody
+    else is mutating raises rather than answering."""
+    job = RunJob(id="x", command="c", started=time.monotonic())
+    job.absorb("» cycle 1: opened PR #4 for add-store")
+
+    snapshot = job.to_dict()
+
+    assert snapshot["progress"]["prs"] == [4]
+    assert snapshot["progress"] is not job.progress
+    assert snapshot["progress"]["prs"] is not job.progress["prs"]

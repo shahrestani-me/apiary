@@ -218,16 +218,6 @@ class BuildReport:
 # The form
 # --------------------------------------------------------------------------
 
-#: Served under its own key on `/sites`, exactly as `SWARM_SITE` is and for the
-#: same reason: nothing that iterates model-call sites may pick up a form with
-#: no prompt behind it.
-#:
-#: The stack is **required** here although it is optional on the swarm tab, and
-#: that difference is the whole ticket in one field. There, `Bootstrap.for_prompt`
-#: asks `choose_stack` when the operator leaves it blank; here there is no
-#: model to ask, and the answer is needed twice before anything is created —
-#: `doctor.preflight` checks the worker image for it, and the generated CI
-#: workflow sets up its toolchain.
 def _from_swarm(name: str) -> dict[str, Any]:
     """One of the swarm tab's field descriptors, by name, copied not retyped.
 
@@ -240,6 +230,16 @@ def _from_swarm(name: str) -> dict[str, Any]:
     raise KeyError(f"the swarm tab has no {name!r} field")
 
 
+#: Served under its own key on `/sites`, exactly as `SWARM_SITE` is and for the
+#: same reason: nothing that iterates model-call sites may pick up a form with
+#: no prompt behind it.
+#:
+#: The stack is **required** here although it is optional on the swarm tab, and
+#: that difference is the whole ticket in one field. There, `Bootstrap.for_prompt`
+#: asks `choose_stack` when the operator leaves it blank; here there is no
+#: model to ask, and the answer is needed twice before anything is created —
+#: `doctor.preflight` checks the worker image for it, and the generated CI
+#: workflow sets up its toolchain.
 BUILD_SITE: dict[str, Any] = {
     "key": "build",
     "kind": "build",

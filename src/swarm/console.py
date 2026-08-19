@@ -74,7 +74,7 @@ from .console_board import BoardError, BoardReader
 from .console_build import BUILD_SITE, BUILD_SITE_KEY, BuildError, Builder
 from .console_intake import QUESTIONS as INTAKE_QUESTIONS
 from .console_projects import ProjectError, ProjectStore
-from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns
+from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns, check_run_values
 
 __all__ = [
     "ASSETS",
@@ -616,8 +616,8 @@ class Console:
         # with no swarm on it, which is exactly the "a human has to go and
         # delete it" cost the build-side gate was added to avoid.
         with self._lock:
-            building = self._running and getattr(
-                self.jobs.get(self._running), "site", "") == BUILD_SITE_KEY
+            running = self.jobs.get(self._running) if self._running else None
+            building = running is not None and running.site == BUILD_SITE_KEY
         if building:
             return Response.error(
                 "a build is in flight, and the run it is about to start needs the "
@@ -651,7 +651,7 @@ class Console:
             except Exception as exc:  # noqa: BLE001 - bookkeeping must not mask the run
                 print(f"! projects: could not record {values.get('repo')!r}: {exc}",
                       file=sys.stderr)
-        return Response.json(job.to_dict(), 202)
+        return Response.json(self.runs.status(job.id), 202)
 
     # -- Start building ---------------------------------------------------
 
@@ -680,23 +680,22 @@ class Console:
 
         values = {k: str(v) for k, v in (data.get("values") or {}).items()}
         # Free here, expensive afterwards - `console_build`'s own ordering rule,
-        # applied to the two fields the *run* needs. Both are only read by
+        # applied to the fields the *run* needs. They are only read by
         # `_start_run`, minutes later and after a repository exists, so a blank
         # objective or a cap reading "ten" bought a repository and a backlog
-        # and then failed to run. `Builder` cannot check either: it derives its
+        # and then failed to run. `Builder` cannot catch either: it derives its
         # prompt from the plan's reasoning when the objective is blank, so it
         # succeeds precisely where the run cannot.
-        if not (values.get("objective") or "").strip():
-            return Response.error(
-                "a run needs an objective, and this build starts one", 400,
-                fix="type the objective on the planner tab before pressing Start building",
-            )
-        cycles = (values.get("max_cycles") or "").strip()
-        if cycles and not cycles.isdigit():
-            return Response.error(
-                f"max cycles must be a number, got {cycles!r}", 400,
-                fix="a whole number, or leave it empty",
-            )
+        #
+        # `check_run_values` rather than the same checks retyped: the refusals
+        # and their fixes belong to `target` and `_cycles_flag`, and a second
+        # copy here is the one that would still say "leave it empty" after the
+        # original learned to say something else. The repository is not checked
+        # - this build is about to create it.
+        try:
+            check_run_values(dict(values, repo="owner/name"))
+        except SwarmRunError as exc:
+            return Response.error(str(exc), 400, fix=exc.fix)
         try:
             source = self.jobs.get(validate_capture_id(str(data.get("plan", ""))))
         except ConsoleError as exc:

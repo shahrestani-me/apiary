@@ -393,11 +393,14 @@
       var runBox = el("div", "stack");
       show([buildCard(job.result), runBox]);
       var started = job.result && job.result.run;
-      if (!started) { busyRun(false); return; }
-      //: The same latch a swarm-tab run takes. Without it the Fire button and
-      //: the project selector stay live under a run this page started, and
-      //: `absorb` calls `busyRun(false)` when the run ends - releasing a latch
-      //: nobody took.
+      if (!started) return;          // no run to latch for, and none was taken
+      //: The same latch a swarm-tab run takes, so `absorb`'s `busyRun(false)`
+      //: at the end of the run releases something that was actually held. It
+      //: is the *second* guard rather than the first: the build itself runs
+      //: for minutes before this line, and through all of it the only thing
+      //: stopping a second build or a competing run is the server's own gate
+      //: in `_swarm_build` / `_swarm_start`. This one keeps the page honest
+      //: about what it is already doing; that one keeps two of them apart.
       busyRun(true);
       pollSwarm(started.id, swarmView(started, runBox));
     });
@@ -537,17 +540,23 @@
   // ---- the swarm tab: the board, and a whole run streamed ------------------
 
   var boardTimer = null, runTimer = null, runRepo = "";
-  //: The job id of the run the page is currently drawing a view for. One, not
-  //: a set: #130 lets a run view be drawn on the planner tab (under a finished
-  //: build) as well as in the swarm tab's run area, and until this existed the
-  //: page happily owned both at once. Switching tabs calls `show()`, which
-  //: detaches the planner's view, and `swarmShow` then adopts the same run
-  //: from /swarm/latest and starts a second `pollSwarm` - two chains assigning
-  //: the single `runTimer`, so `clearTimeout` could only ever cancel the
-  //: later one, and the earlier polled a node nobody could see or press Stop
-  //: on until the run ended. Whoever draws a view claims the run here and
-  //: cancels the poller that held it.
-  var followingRun = "";
+  //: Which view owns the run area, as a number that only ever goes up. #130
+  //: lets a run view be drawn on the planner tab (under a finished build) as
+  //: well as in the swarm tab's run area, and until this existed the page
+  //: owned both at once: switching tabs calls `show()`, which detaches the
+  //: planner's view, and `swarmShow` then adopts the same run and starts a
+  //: second `pollSwarm`. Two chains assigning the single `runTimer`, so
+  //: `clearTimeout` could only ever cancel the later - the earlier polled a
+  //: node with no reachable Stop until the run ended.
+  //:
+  //: A generation rather than a job id, because both chains poll the *same*
+  //: id and an id cannot tell them apart. And a generation rather than the
+  //: `clearTimeout` alone, because that closes only the sleeping half of the
+  //: window: a request already in flight when the new view is drawn still
+  //: resolves afterwards and reschedules itself, which is the same two chains
+  //: through a narrower door. `pollSwarm` checks its own generation before it
+  //: touches anything.
+  var runGeneration = 0;
   //: Runs this console process spawned, by their swarm run id (parsed from the
   //: log). The external view skips these - the same run must not appear twice,
   //: once from memory and once from its artifacts.
@@ -1110,13 +1119,13 @@
 
     var box = into || panel().runBox;
     box.textContent = "";
-    //: Whoever draws last owns the run. Cancelling here rather than at each
-    //: call site is what makes that true by construction: every path that
-    //: shows a run - swarmFire, adoption, a build's chained run - goes through
-    //: this function, and none of them can forget.
+    //: Whoever draws last owns the run. Claiming here rather than at each call
+    //: site is what makes that true by construction: every path that shows a
+    //: run - swarmFire, adoption, a build's chained run - goes through this
+    //: function, and none of them can forget to.
     clearTimeout(runTimer);
     runTimer = null;
-    followingRun = job.id;
+    var generation = ++runGeneration;
     //: Only when this view is taking over the swarm tab's run area. Nulling it
     //: while drawing into a build card would drop the external view's handle
     //: on a card still sitting in `panel().runBox`, which then stops updating.
@@ -1126,6 +1135,7 @@
 
     var view = {
       next: 0,
+      generation: generation,
       absorb: function (j) {
         var p = j.progress || {};
         //: `state` cannot say this on its own: a run that met its objective
@@ -1135,6 +1145,10 @@
         var ended = OUTCOMES[p.outcome] || j.state;
         state.textContent = ended + (j.state === "failed" && j.returncode !== null
                                      ? " · exit " + j.returncode : "");
+        //: Neutral for a cap, because unfinished work is not a failure and
+        //: not a success. `exhausted` falls through to "ok" deliberately: the
+        //: gate was off, so the run did exactly the work that was planned and
+        //: there is nothing left it was asked for.
         state.className = "pill " + (j.state === "running" ? ""
                                      : p.outcome === "capped" ? ""
                                      : j.state === "done" ? "ok" : "bad");
@@ -1194,6 +1208,12 @@
   function pollSwarm(id, view) {
     api("/swarm/status?id=" + encodeURIComponent(id) + "&since=" + view.next)
       .then(function (res) {
+        //: A newer view took the run area while this request was in flight.
+        //: Absorbing would write into a node that is no longer on the page,
+        //: and rescheduling would put a second chain back on the one timer -
+        //: which is the bug the generation exists to close, arriving through
+        //: the half `clearTimeout` cannot reach.
+        if (view.generation !== runGeneration) return;
         if (!res.ok) { busyRun(false); return; }
         view.absorb(res.body);
         if (res.body.state === "running") {
