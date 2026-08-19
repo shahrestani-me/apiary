@@ -45,6 +45,7 @@ from swarm.containers.manager import (
 )
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry
+from swarm.github.refs import issue_number, task_ref
 from swarm.orchestrator import dispatcher
 from swarm.orchestrator.dispatcher import (
     CLAIMED,
@@ -56,6 +57,7 @@ from swarm.orchestrator.dispatcher import (
     held_files,
     plan_dispatch,
 )
+from swarm.taskref import TaskRef
 
 READY = "swarm:ready"
 BLOCKED = "swarm:blocked"
@@ -141,7 +143,19 @@ class FakeSwarm:
 
     # --- Spawner --------------------------------------------------------
 
-    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle:
+    def spawn(
+        self,
+        task: TaskRef,
+        base_commit: str,
+        *,
+        issue: int | None = None,
+        image: str | None = None,
+    ) -> Handle:
+        # The fake keeps docker's int-keyed bookkeeping; only the seam changed.
+        # `issue` is asserted rather than ignored: the dispatcher has to pass
+        # both, and a caller that stopped would leave the worker without the
+        # number it needs to open a pull request.
+        assert issue is not None and task.label_value == str(issue)
         # The image is in the log, because #99's whole question is which one a
         # task got and the ordering assertions read this log.
         self.log.append(f"spawn #{issue}" + (f" [{image}]" if image else ""))
@@ -152,7 +166,9 @@ class FakeSwarm:
         self.handles[issue] = handle
         return handle
 
-    def find(self, *, issue: int | None = None) -> list[Handle]:
+    def find(self, *, ref: TaskRef | None = None) -> list[Handle]:
+        # The fake keeps its int-keyed bookkeeping; the seam is what changed.
+        issue = None if ref is None else issue_number(ref)
         self.log.append(f"find #{issue}")
         if self.find_error is not None:
             raise self.find_error
@@ -330,7 +346,7 @@ def test_only_ready_issues_are_candidates():
 def test_a_readiness_verdict_narrows_the_candidates_but_never_promotes_one():
     entries = ledger(entry(4), entry(5), entry(6, label=BLOCKED))
 
-    plan = plan_dispatch(entries, capacity=capacity(4), ready=[5, 6])
+    plan = plan_dispatch(entries, capacity=capacity(4), ready=[task_ref(5), task_ref(6)])
 
     # The readiness pass just wrote these labels, so passing its verdict saves
     # reading them back. It is a filter, not an authority: §3 makes the label

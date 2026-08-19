@@ -49,6 +49,7 @@ from swarm.containers.manager import (
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
 from swarm.github.readiness import BLOCKED, READY, IssueState
+from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, claim
 from swarm.orchestrator.reconcile import DONE, FAILED
 from swarm.orchestrator.recovery import (
@@ -100,7 +101,7 @@ def handle(issue: int, run_id: str) -> Handle:
 
 
 def closed(number: int, reason: str | None = "completed") -> IssueState:
-    return IssueState(number=number, state="closed", state_reason=reason)
+    return IssueState(ref=ref(number), state="closed", state_reason=reason)
 
 
 def body(task_id: str, *, attempt: int = 0) -> str:
@@ -305,13 +306,13 @@ def test_only_claimed_issues_are_considered_at_all():
 
 
 def test_an_issue_closed_by_hand_is_left_to_the_reconciler():
-    plan = plan_recovery(ledger(entry(4)), states={4: closed(4)})
+    plan = plan_recovery(ledger(entry(4)), states={ref(4): closed(4)})
 
     # GitHub wins, but what a closed issue becomes - `done` or `failed` - is
     # #22's judgement, and answering it from here would be a second opinion on
     # one fact.
     assert plan.transitions == ()
-    assert [item.number for item in plan.held] == [4]
+    assert [item.ref for item in plan.held] == [ref(4)]
     assert "reconciler" in plan.held[0].reason
 
 
@@ -330,7 +331,7 @@ def test_a_claim_a_live_container_is_holding_is_never_touched():
     )
 
     assert plan.transitions == ()
-    assert plan.held == (Held(4, f"a container of run {run.id!r} is holding it"),)
+    assert plan.held == (Held(ref(4), f"a container of run {run.id!r} is holding it"),)
 
 
 def test_a_sibling_run_the_caller_declared_live_does_not_lose_its_claim():
@@ -345,8 +346,8 @@ def test_a_sibling_run_the_caller_declared_live_does_not_lose_its_claim():
     # "One orchestrator per repository" is the default, not a law. A scheduler
     # driving several names them here, and stealing a running sibling's claim
     # would put a second container on the same file set.
-    assert plan.numbers == (5,)
-    assert [item.number for item in plan.held] == [4]
+    assert plan.refs == (ref(5),)
+    assert [item.ref for item in plan.held] == [ref(4)]
 
 
 def test_a_container_of_a_dead_run_speaks_for_nothing_and_is_not_removed():
@@ -373,7 +374,7 @@ def test_a_container_wearing_an_id_this_system_could_not_have_minted_keeps_its_c
     # not ours to remove; the claim over it is not ours to release either, and
     # the reason is reported rather than swallowed.
     assert plan.transitions == ()
-    assert [item.number for item in plan.held] == [4]
+    assert [item.ref for item in plan.held] == [ref(4)]
 
 
 def test_a_container_carrying_no_issue_label_holds_no_claim():
@@ -423,7 +424,7 @@ def test_a_live_container_outranks_an_open_pull_request():
     # A worker that has pushed may still be running - it labels, it writes its
     # record, and only then does it exit. Nothing here is stale.
     assert plan.transitions == ()
-    assert [item.number for item in plan.held] == [4]
+    assert [item.ref for item in plan.held] == [ref(4)]
 
 
 def test_an_unreadable_pull_request_list_does_not_leave_the_claim_unreachable():
@@ -483,8 +484,8 @@ def test_one_issue_that_cannot_be_relabelled_does_not_cost_the_others_their_reco
     # A human deleting or relabelling an issue between the read and the write
     # lands here. It is a fact about one issue, not a reason to abandon a sweep
     # that was about to free four others.
-    assert report.numbers == (5,)
-    assert [failure.number for failure in report.result.failures] == [4]
+    assert report.refs == (ref(5),)
+    assert [failure.ref for failure in report.result.failures] == [ref(4)]
     assert report.ok is False
 
 
@@ -495,7 +496,7 @@ def test_a_dry_run_writes_nothing_and_still_says_what_it_would_do():
 
     assert client.log == ["list_issues all"]
     assert client.labels_on(4) == {CLAIMED}
-    assert report.plan.numbers == (4,)
+    assert report.plan.refs == (ref(4),)
     assert report.applied == ()
 
 
@@ -532,7 +533,7 @@ def test_a_claim_left_by_a_killed_orchestrator_is_back_at_ready_on_restart():
 
     assert client.labels_on(4) == {READY}
     assert client.attempt_on(4) == 1
-    assert report.ok and report.numbers == (4,)
+    assert report.ok and report.refs == (ref(4),)
 
 
 def test_a_second_sweep_finds_nothing_left_to_do():
@@ -572,8 +573,8 @@ def test_a_mid_cycle_sweep_recovers_the_claims_a_spawn_never_reached():
         max_attempts=3,
     )
 
-    assert [item.number for item in plan.held] == [4]
-    assert plan.numbers == (5, 6)
+    assert [item.ref for item in plan.held] == [ref(4)]
+    assert plan.refs == (ref(5), ref(6))
     assert {transition.to_label for transition in plan.transitions} == {READY}
 
 
@@ -651,8 +652,14 @@ def two_runs(trivial_image: str) -> Iterator[tuple[ContainerManager, ContainerMa
 @pytest.mark.docker
 def test_a_real_dead_runs_container_does_not_hold_its_claim_and_a_live_ones_does(two_runs):
     dead, live = two_runs
-    dead.spawn(DEAD_ISSUE, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", "sleep 300"])
-    live.spawn(LIVE_ISSUE, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", "sleep 300"])
+    dead.spawn(
+        ref(DEAD_ISSUE), BASE_COMMIT, issue=DEAD_ISSUE,
+        entrypoint="/bin/sh", command=["-c", "sleep 300"],
+    )
+    live.spawn(
+        ref(LIVE_ISSUE), BASE_COMMIT, issue=LIVE_ISSUE,
+        entrypoint="/bin/sh", command=["-c", "sleep 300"],
+    )
     client = FakeClient(
         issues={
             DEAD_ISSUE: issue_payload(DEAD_ISSUE),
@@ -668,13 +675,16 @@ def test_a_real_dead_runs_container_does_not_hold_its_claim_and_a_live_ones_does
     assert client.labels_on(DEAD_ISSUE) == {READY}
     assert client.attempt_on(DEAD_ISSUE) == 1
     assert client.labels_on(LIVE_ISSUE) == {CLAIMED}
-    assert [item.number for item in report.plan.held] == [LIVE_ISSUE]
+    assert [item.ref for item in report.plan.held] == [ref(LIVE_ISSUE)]
 
 
 @pytest.mark.docker
 def test_recovering_a_claim_leaves_the_orphaned_container_for_the_reaper(two_runs):
     dead, _ = two_runs
-    dead.spawn(DEAD_ISSUE, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", "sleep 300"])
+    dead.spawn(
+        ref(DEAD_ISSUE), BASE_COMMIT, issue=DEAD_ISSUE,
+        entrypoint="/bin/sh", command=["-c", "sleep 300"],
+    )
     client = FakeClient(issues={DEAD_ISSUE: issue_payload(DEAD_ISSUE)})
 
     Recovery(client=client, run=make_run()).startup()

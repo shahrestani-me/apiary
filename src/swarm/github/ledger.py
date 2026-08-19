@@ -19,7 +19,10 @@ problems, and `_scan` solves both before anything else runs.
 **Identity is the marker id, not the issue number.** The number addresses an
 issue; the slug identifies the work. Replanning (#10) matches on the slug,
 which the planner regenerates and which can never equal an integer - keying on
-the number would fork the whole ledger on every replan.
+the number would fork the whole ledger on every replan. The dependency graph
+now says the same thing: `blocked_by` holds `TaskRef`s, minted here and opaque
+above this package (`swarm/taskref.py`, #142), so the one place that decides
+what may run no longer assumes identity is an integer.
 
 **The status mapping is lossy in both directions.** `ready`/`blocked` collapse
 into `pending` and `claimed`/`review` collapse into `running`, so `TaskStatus`
@@ -35,7 +38,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..state import TaskRecord, TaskStatus
+from ..taskref import TaskRef
 from .client import GitHubClient
+from .refs import task_ref
 
 # The sections a body must have. Order matters only for reporting the first
 # missing one, so the error a human sees names the section they would have
@@ -208,9 +213,11 @@ class TaskContract:
     """What one issue body says, with nothing derived from labels or siblings.
 
     `task_id` is `None` when the body carries no marker - a hand-written issue,
-    which the loader adopts. `blocked_by` holds issue *numbers*, because that is
-    what the body contains; the translation to task ids needs the rest of the
-    ledger and happens in `load_ledger`.
+    which the loader adopts. `blocked_by` holds `TaskRef`s: the body contains
+    issue numbers, and this is the boundary at which they stop being numbers -
+    the parse mints one ref per reference and nothing above the adapter reads
+    them back (`swarm/taskref.py`). The translation to task ids needs the rest
+    of the ledger and happens in `load_ledger`.
     """
 
     task_id: str | None
@@ -218,7 +225,7 @@ class TaskContract:
     goal: str
     files: tuple[str, ...]
     verify: str
-    blocked_by: tuple[int, ...]
+    blocked_by: tuple[TaskRef, ...]
     #: What the body's optional `## Stack` said, or `None` when it said
     #: nothing. `LedgerEntry.stack` is the resolved value; this one is the
     #: parse, and keeping them distinct is what makes "the body did not
@@ -252,6 +259,11 @@ class LabelRepair:
     kept: str
     removed: tuple[str, ...]
 
+    @property
+    def ref(self) -> TaskRef:
+        """This repair's task, as the internal model names it."""
+        return task_ref(self.number)
+
     def __str__(self) -> str:
         return (
             f"issue #{self.number}: {len(self.removed) + 1} state labels, kept {self.kept}, "
@@ -275,7 +287,7 @@ class LedgerEntry:
     goal: str
     files: tuple[str, ...]
     verify: str
-    blocked_by: tuple[int, ...]
+    blocked_by: tuple[TaskRef, ...]
     state_label: str
     labels: frozenset[str]
     #: The stack this task targets, resolved. `TaskContract.stack` is optional;
@@ -299,6 +311,15 @@ class LedgerEntry:
     #: failed task that still wants a human from one that was already closed
     #: as superseded.
     closed: bool = False
+
+    @property
+    def ref(self) -> TaskRef:
+        """This task's identity for the internal model - the graph, readiness,
+        the reconciler's transitions. `number` stays alongside it because the
+        GitHub API addresses issues by number and always will; the two are the
+        same fact in the two vocabularies, and `github/refs.py` is the only
+        module allowed to convert between them."""
+        return task_ref(self.number)
 
     @property
     def generated(self) -> tuple[str, ...]:
@@ -350,9 +371,15 @@ class Ledger:
         return {task_id: entry.to_task_record() for task_id, entry in self.entries.items()}
 
     @property
-    def by_number(self) -> dict[int, str]:
-        """Issue number → task id, for resolving `## Blocked by` refs and PRs."""
-        return {entry.number: task_id for task_id, entry in self.entries.items()}
+    def by_ref(self) -> dict[TaskRef, str]:
+        """Task ref → task id, for resolving what a `## Blocked by` ref names.
+
+        Keyed on the ref rather than the number, like everything else the graph
+        touches (#142). A caller holding an issue *number* - a pull request's
+        `Closes #<n>`, say - has to mint one first (`github/refs.task_ref`)
+        rather than indexing this with an int, which would miss in silence.
+        """
+        return {entry.ref: task_id for task_id, entry in self.entries.items()}
 
 
 # --------------------------------------------------------------------------
@@ -605,15 +632,19 @@ def _refuse_generated_files(number: int, files: Sequence[str], stack: str | None
         )
 
 
-def _parse_blocked_by(number: int, lines: Sequence[tuple[str, bool]]) -> tuple[int, ...]:
-    """Issue numbers from `- #N` items. No items at all means no dependencies.
+def _parse_blocked_by(number: int, lines: Sequence[tuple[str, bool]]) -> tuple[TaskRef, ...]:
+    """Task refs from `- #N` items. No items at all means no dependencies.
+
+    This is where the wire format stops. The section still says `#N` - nothing
+    about the contract changes - and every number it names is minted into a
+    `TaskRef` here, so the graph downstream never sees an integer.
 
     A `#N` on a non-list line is malformed rather than ignored, because that is
     exactly the shape of a dependency that gets silently dropped - and a task
     that runs before its prerequisite is the failure this whole contract
     exists to prevent.
     """
-    refs: list[int] = []
+    refs: list[TaskRef] = []
     for line, fenced in lines:
         if fenced or not line.strip():
             continue
@@ -632,7 +663,7 @@ def _parse_blocked_by(number: int, lines: Sequence[tuple[str, bool]]) -> tuple[i
                     "Blocked by",
                     f"cross-repository reference {ref['repo']}#{ref['number']}",
                 )
-            refs.append(int(ref["number"]))
+            refs.append(task_ref(int(ref["number"])))
     return tuple(dict.fromkeys(refs))
 
 
@@ -855,11 +886,11 @@ def load_ledger(
     # survive verbatim on `LedgerEntry.blocked_by`, which is what readiness
     # (#11) reads - it resolves each ref's issue state, and "closed" is a fact
     # the projection cannot represent.
-    by_number = {entry.number: task_id for task_id, entry in entries.items()}
+    by_ref = {entry.ref: task_id for task_id, entry in entries.items()}
     resolved = {
         task_id: replace(
             entry,
-            depends_on=tuple(by_number[ref] for ref in entry.blocked_by if ref in by_number),
+            depends_on=tuple(by_ref[ref] for ref in entry.blocked_by if ref in by_ref),
         )
         for task_id, entry in entries.items()
     }
