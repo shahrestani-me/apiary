@@ -6,8 +6,8 @@ Date: 2026-08-19
 ## The one-line summary
 
 **apiary's orchestration is its own loop.** No agent framework's types appear in
-the modules that do the work, so replacing LangGraph costs a module rather than a
-rewrite.
+the modules that do the work — so a framework can be replaced, or run alongside
+another, without touching them.
 
 ## Context
 
@@ -49,19 +49,48 @@ only place that knows a provider SDK exists. Structured output — the one thing
 apiary genuinely relies on — is named in apiary's own terms, not
 `with_structured_output`'s.
 
-**3. `swarm local` is where the framework lives, and its fate is decided
-explicitly rather than by neglect.** Either it is a supported second execution
-model, in which case it is documented as the one LangGraph-dependent surface, or
-it is retired. What it must not be is an undecided path that quietly makes the
-framework load-bearing again — which is exactly what happened between the v2
-rewrite and #135.
+**3. The runner is the unit of execution, and runners may coexist.** A runner is
+a top-level entry point owning a complete execution model and composing the
+framework-free modules beneath it. `swarm run` and `swarm local` are two of them
+today. A Hermes runner would be a third, and adding one is additive work that
+touches no existing runner.
 
-**4. No framework abstraction layer.** Explicitly rejected. Writing an adapter so
-that LangGraph or Hermes could be swapped is building a second framework to avoid
-depending on the first, and it is the same mistake ADR 0001 identified in the
-tracker adapters. The protection is the *absence* of coupling in the working
-modules, verified by a test — not an indirection that stands between them and
-anything.
+The framework is an implementation detail *of a runner*, which is what makes
+"support LangGraph and Hermes at once" cost nothing structurally: they never meet.
+
+**4. A runner declares its capabilities, and a user's choice is presented in those
+terms — never as a framework name.** This is the rule the existing pair already
+violates, which is why it is written down.
+
+`swarm run` and `swarm local` did not diverge in implementation. They diverged in
+what they can do:
+
+| | `swarm run` | `swarm local` |
+|---|---|---|
+| Container sandbox | yes | **no** |
+| Pull request and CI gate | yes | **no** |
+| Merge queue | yes | **no** |
+| Egress policy | yes | **no** |
+
+`nodes/verifier.py` runs the verify command with `shell=True` on the host, in a
+worktree of model-generated code — so the local runner bypasses the entire
+argument of `docs/security.md`, while the CLI offers it as "a local checkout, no
+GitHub". A convenience framing on a security decision.
+
+So: whatever a user is choosing between, it is capabilities. Somebody selecting
+"Hermes" must not thereby be selecting "no container isolation" without being
+told. A runner that drops a capability says so where the choice is made.
+
+**5. No unifying framework abstraction.** Rejected, and this is narrower than it
+sounds: what is rejected is an adapter interface that makes frameworks
+interchangeable *inside one runner*. That is building a second framework to avoid
+depending on the first — the mistake ADR 0001 identified in the tracker adapters —
+and such an interface can only expose the intersection of what the frameworks do,
+which is less than either.
+
+Coexisting runners need no such layer, which is the point. Decision 3 gets the
+multi-framework outcome by composition; this decision refuses to get it by
+indirection.
 
 ## Consequences
 
@@ -75,9 +104,22 @@ anything.
 - The import-boundary test is the load-bearing artefact of this ADR. Without it
   this is a preference, and preferences decay — as `graph.py` demonstrated by
   becoming live again without anyone deciding it should.
+- Every runner is a surface to test and maintain. Two exist and their capability
+  gap went unnoticed and undocumented; a third makes that arithmetic worse, not
+  better. Coexistence is cheap structurally and is not free operationally.
+- `swarm local`'s missing sandbox needs documenting or gating either way, and is
+  not blocked on the open question below.
 
 ## What this does not claim
 
-That apiary should leave LangGraph. It is a reasonable dependency and nothing
-here argues against it. The claim is only that the decision stay cheap to
-revisit, which today it accidentally is and tomorrow it accidentally might not be.
+That apiary should leave LangGraph, or that adopting another framework means
+retiring it. It is a reasonable dependency, runners may use different ones at the
+same time, and nothing here argues against either. The claim is only that the
+decision stay cheap to revisit, which today it accidentally is and tomorrow it
+accidentally might not be.
+
+## Still open
+
+Whether `swarm local` is a supported runner or is retired. Decision 4 says that if
+it stays, its capability gap is stated where the choice is made; it does not
+decide whether it stays. That is the maintainer's call.
