@@ -81,6 +81,7 @@ from swarm.orchestrator.mergeability import (
 )
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
 from swarm.taskref import TaskRef
+from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 
 
 # --------------------------------------------------------------------------
@@ -424,7 +425,7 @@ def test_a_fresh_pull_request_is_handed_straight_back_to_the_check_gate():
     assert plan.updates == ()
     assert plan.held == ()
     assert [m.pull for m in plan.merges] == [pull_ref(101)]
-    assert plan.admitted.transitions[0].to_label == DONE
+    assert plan.admitted.transitions[0].to_state == LANDED
 
 
 # --------------------------------------------------------------------------
@@ -516,7 +517,7 @@ def test_a_conflict_re_dispatches_from_a_fresh_base_rather_than_retrying_the_dif
 
     assert plan.merges == ()
     assert decision.transition is not None
-    assert decision.transition.to_label == READY
+    assert decision.transition.to_state == ELIGIBLE
     # §5: the counter rides on the transition, so it is persisted before the
     # issue can be dispatched again. A conflict *is* the attempt's problem, which
     # is why it costs one - unlike the starvation case below.
@@ -537,7 +538,7 @@ def test_a_conflict_at_the_attempt_cap_goes_to_a_human():
     transition = plan.decisions[0].transition
 
     assert transition is not None
-    assert transition.to_label == FAILED
+    assert transition.to_state == NEEDS_HUMAN
     assert "against a cap of 3" in transition.reason
 
 
@@ -571,7 +572,7 @@ def test_a_pull_request_invalidated_too_often_is_handed_over_rather_than_parked(
     # failure mode this ticket exists to remove.
     assert plan.updates == ()
     assert transition is not None
-    assert transition.to_label == FAILED
+    assert transition.to_state == NEEDS_HUMAN
     assert "starved" in transition.reason
     # The attempt budget is untouched: nothing about the work was wrong, and
     # charging it would take the retry away from whatever goes wrong next.
@@ -642,7 +643,7 @@ def test_an_issue_the_check_gate_already_decided_is_not_decided_twice():
                                        "conclusion": "failure",
                                        "output": {"summary": "FAILED tests/test_mod23.py"}}])},
     )
-    assert checks.transitions[0].to_label == READY  # #23 is already being retried
+    assert checks.transitions[0].to_state == ELIGIBLE  # #23 is already being retried
 
     plan = plan_mergeability(tasks, checks, states={task_ref(23): conflicted(101, issue=23)})
 

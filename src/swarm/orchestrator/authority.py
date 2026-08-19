@@ -641,7 +641,7 @@ class Belief:
         selector it replaced rather than a reason to drop it. Neither half of
         that argument reaches here.
 
-        `Transition.to_label` is apiary's own decision about a task, translated
+        `Transition.to_state` is apiary's own decision about a task, already
         through the same table `lifecycle.py` announces with - not a label read
         back off the code host. The distinction matters: this is the cycle
         learning what it just did, which is the only thing the label vocabulary
@@ -661,7 +661,7 @@ class Belief:
             task_id = getattr(transition, "task_id", "")
             if not task_id:
                 continue
-            state = _internal(transition.to_label)
+            state = transition.to_state
             applied[task_id] = state
             ref = getattr(transition, "ref", None)
             if ref is None:
