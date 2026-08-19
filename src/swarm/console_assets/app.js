@@ -814,7 +814,7 @@
     //: Reported only when it was measured. Nothing increments the inference
     //: clock yet, and printing "0% inference" off an unmeasured field would be
     //: a claim about the model rather than about the recording.
-    fact(facts, "wall clock", hms(o.wall_s) + (
+    fact(facts, "wall clock", (hms(o.wall_s) || "not recorded") + (
       o.inference_share === null || o.inference_share === undefined
         ? " · inference not recorded"
         : " · " + Math.round(o.inference_share * 100) + "% inference"));
@@ -857,14 +857,24 @@
     view.outcomeAsked = true;
     var ask = function (retry) {
       api("/swarm/outcome?run=" + encodeURIComponent(runId)).then(function (res) {
+        //: Both ways a view can stop owning the run area while this request is
+        //: in flight, and neither is reachable from the other: the console's
+        //: own views carry a generation, and the artifacts view is identified
+        //: by the card it drew. Without the second one, a run fired in the
+        //: half-second after this fetch left gets the *previous* run's ending
+        //: inserted into its card stack.
         if (view.generation !== undefined && view.generation !== runGeneration) return;
+        if (view.root && !box.contains(view.root)) return;
         if (!box.childNodes.length) return;            // the view was replaced
         if (!res.ok) {
           if (res.status === 404 && retry) setTimeout(function () { ask(false); }, 1500);
           return;
         }
+        //: `remove()` rather than `removeChild`: `querySelector` searches
+        //: descendants, and handing `removeChild` a node that is not a direct
+        //: child throws rather than replacing anything.
         var old = box.querySelector(".outcome");
-        if (old) box.removeChild(old);
+        if (old) old.remove();
         box.insertBefore(outcomeCard(res.body), box.childNodes[1] || null);
       });
     };

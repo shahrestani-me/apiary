@@ -61,7 +61,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .artifacts import EVENT_LOG_NAME, RunView, list_runs, read_events
+from .artifacts import (
+    EVENT_LOG_NAME,
+    ArtifactsError,
+    RunView,
+    list_runs,
+    load_run,
+    read_events,
+)
+from .run import RunError
 
 __all__ = ["ACTIVE_WITHIN_S", "latest_external", "run_outcome"]
 
@@ -167,10 +175,7 @@ def run_outcome(run_id: str = "", root: str | Path | None = None) -> dict[str, A
     two answers an operator is actually sorting for, and a single "8 tasks"
     hides the second behind the first.
     """
-    runs = list_runs(root)
-    if not runs:
-        return None
-    view = _named(runs, run_id)
+    view = _view(run_id, root)
     if view is None or not view.complete:
         return None
 
@@ -222,13 +227,24 @@ def run_outcome(run_id: str = "", root: str | Path | None = None) -> dict[str, A
     }
 
 
-def _named(runs: tuple[RunView, ...], run_id: str) -> RunView | None:
+def _view(run_id: str, root: str | Path | None) -> RunView | None:
     """The run the caller asked for, or the newest when it asked for none.
+
+    One directory read for a named run rather than `list_runs`, which builds a
+    `RunView` per run - a results glob and an event-line count each - to answer
+    a question about one of them. Both views that ask hold an id, so the
+    listing is the exceptional path here rather than the usual one.
 
     A miss is `None` rather than a fallback to the newest: the caller that
     passes an id is a page holding one run's card, and answering it with a
     different run's ending is the one wrong answer this panel must not give.
+    `load_run` refuses a malformed id before it becomes a path (`RunError`) and
+    an absent one after (`ArtifactsError`); both are "no such run" here.
     """
     if not run_id:
-        return runs[-1]
-    return next((view for view in runs if view.run_id == run_id), None)
+        runs = list_runs(root)
+        return runs[-1] if runs else None
+    try:
+        return load_run(run_id, root)
+    except (ArtifactsError, RunError):
+        return None
