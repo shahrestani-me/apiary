@@ -2270,7 +2270,7 @@ class Reconciler:
         `planner.revive` "deliberately resets nothing" - so the attempt on the
         entry is the one the revival is granting, and the grant lapses the
         moment a result carries it *or* the moment a worker is dispatched on it
-        (`authority._budget_spent`, `_spend_revivals`).
+        (`authority.budget_spent`, `_spend_revivals`).
         """
         for task in revived_tasks(report):
             entry = report.ledger.entries.get(task)

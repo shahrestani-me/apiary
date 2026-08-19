@@ -784,6 +784,9 @@
     if (c.ci) head.appendChild(el("span", "pill" + (c.ci === "red" ? " bad" : ""),
                                  "post-merge CI: " + c.ci));
     if (c.attempt) head.appendChild(el("span", "pill", "attempt " + c.attempt));
+    //: From apiary's own store, and only when there is one: a renewed budget is
+    //: why a task with more attempts than the cap is still running.
+    if (c.renewals) head.appendChild(el("span", "pill", "budget renewed " + c.renewals + "x"));
     t.appendChild(head);
     t.appendChild(el("div", "ttitle", c.title));
     return t;

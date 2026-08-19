@@ -25,6 +25,7 @@ from swarm.console_board import BoardError, BoardReader, COLUMNS
 from swarm.github.branches import task_branch
 from swarm.github.refs import task_ref
 from swarm.orchestrator.derived import ContainerFact
+from swarm.store import TaskJudgement
 
 HOST = {"Host": "127.0.0.1:8117"}
 MARKER = "<!-- apiary:task id={tid} attempt={attempt} -->"
@@ -108,9 +109,33 @@ class FakeClient:
         return list(self.checks.get(ref, []))
 
 
-def reader(client: FakeClient, containers: list[ContainerFact] | None = None) -> BoardReader:
+@dataclass
+class FakeStore:
+    """`TaskStore`'s three methods over a dict of judgments."""
+
+    judgements: dict[Any, Any] = field(default_factory=dict)
+    closed: bool = False
+
+    def read(self) -> dict[Any, Any]:
+        return dict(self.judgements)
+
+    def write(self, judgement: Any) -> None:  # pragma: no cover - a board never writes
+        raise AssertionError("a board must never write to the store")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def judged(number: int, *, attempt: int, streak: int | None, renewals: int = 0) -> Any:
+    return TaskJudgement(ref=task_ref(number), attempt=attempt, blocker="pytest",
+                         streak=streak, renewals=renewals)
+
+
+def reader(client: FakeClient, containers: list[ContainerFact] | None = None,
+           store: Any = None) -> BoardReader:
     return BoardReader(client_for=lambda repo: client,
-                       containers_for=lambda: list(containers or []))
+                       containers_for=lambda: list(containers or []),
+                       store_for=lambda repo: store)
 
 
 def cards(board: dict[str, Any], column: str) -> list[int]:
@@ -179,10 +204,14 @@ def test_a_work_item_closed_as_completed_lands_without_a_pull_request():
 
 
 def test_a_spent_attempt_budget_is_the_strip():
-    """Three attempts, three pull requests closed unmerged: needs a human. The
-    evidence is the attempt number in the branch names - code host, not label."""
+    """Three attempts, the pull request closed unmerged: needs a human. The
+    evidence is the attempt number in the branch name - code host, not label.
+
+    The marker carries the same 3, because the marker *is* the counter's home
+    (`docs/issue-contract.md` §5) and the worker read it there to name that very
+    branch. With no store, ADR 0002's fallback reads the streak off it."""
     client = FakeClient(
-        issues=[issue(9, "swarm:ready")],
+        issues=[issue(9, "swarm:ready", attempt=3)],
         prs=[pr(13, branch(9, attempt=3), closed=True)],
     )
 
@@ -200,7 +229,8 @@ def test_a_work_item_closed_as_not_planned_leaves_the_strip():
     superseded, still haunting the strip."""
     client = FakeClient(issues=[
         issue(9, "swarm:failed", closed=True, state_reason="not_planned"),
-        issue(10, "swarm:failed"),  # open, budget spent: still wants its human
+        # Open, budget spent: still wants its human.
+        issue(10, "swarm:failed", attempt=3),
     ], prs=[pr(13, branch(10, attempt=3), closed=True)])
 
     board = reader(client).read("me/thing")
@@ -249,6 +279,108 @@ def test_every_card_carries_the_fact_that_placed_it():
     card = reader(client).read("me/thing")["columns"]["review"][0]
 
     assert "pull request #11 is open" in card["because"]
+
+
+# --------------------------------------------------------------------------
+# apiary's own store: the half of the authority that is not the resolver
+# --------------------------------------------------------------------------
+
+
+def test_a_renewed_budget_keeps_a_ticket_off_the_strip():
+    """#158's review finding. `_retry_or_give_up` gives up on the *streak*, and
+    a renewal resets the streak while the attempt counter keeps climbing - so
+    code-host arithmetic reads a cap the orchestrator does not. A strip showing
+    it displays a verdict the machine has already withdrawn."""
+    client = FakeClient(
+        issues=[issue(9, "swarm:claimed", attempt=4)],
+        prs=[pr(13, branch(9, attempt=4))],
+    )
+    store = FakeStore({task_ref(9): judged(9, attempt=4, streak=1, renewals=2)})
+
+    board = reader(client, store=store).read("me/thing")
+
+    assert board["needs_human"] == []
+    assert cards(board, "review") == [9]           # the lenient verdict, not a bare "not failed"
+    card = board["columns"]["review"][0]
+    assert card["renewals"] == 2
+    assert "budget is not spent" in card["because"]
+
+
+def test_a_store_that_says_the_budget_is_spent_puts_a_ticket_on_the_strip():
+    """The other direction: a task apiary gave up on leaves no code-host
+    evidence at all once its run is over and its branches are gone, so the
+    resolver reads `eligible` from scratch. Under the labels `swarm:failed`
+    carried that verdict across the restart; the store carries it now."""
+    client = FakeClient(issues=[issue(9, "swarm:ready", attempt=3)])
+    store = FakeStore({task_ref(9): judged(9, attempt=3, streak=3)})
+
+    board = reader(client, store=store).read("me/thing")
+
+    assert [c["number"] for c in board["needs_human"]] == [9]
+    assert "apiary gave up on this task" in board["needs_human"][0]["because"]
+
+
+def test_the_store_never_outranks_a_running_container():
+    """`authority.believe` bounds the same overlay to the waiting states: a live
+    container is stronger evidence about *now* than a budget row is."""
+    client = FakeClient(issues=[issue(9, "swarm:ready", attempt=3)])
+    store = FakeStore({task_ref(9): judged(9, attempt=3, streak=3)})
+
+    board = reader(client, containers=[container(9)], store=store).read("me/thing")
+
+    assert cards(board, "claimed") == [9]
+    assert board["needs_human"] == []
+
+
+def test_a_poll_closes_the_store_it_opened():
+    """The connection is the poll's, not the page's: a console holding one open
+    across every poll would keep a lock on a file a live run is writing."""
+    store = FakeStore()
+    client = FakeClient(issues=[issue(2, "swarm:ready")])
+
+    reader(client, store=store).read("me/thing")
+
+    assert store.closed
+
+
+def test_a_project_this_machine_never_ran_needs_no_note():
+    """`project_store` answers `None` on `StoreMissing`, because a project with
+    no store has no renewals for the strip to be wrong about. A permanent
+    warning for the ordinary case would be noise on every poll."""
+    client = FakeClient(issues=[issue(2, "swarm:ready")])
+
+    board = reader(client, store=None).read("me/thing")
+
+    assert board["notes"] == []
+    assert cards(board, "eligible") == [2]
+
+
+def test_an_untrustworthy_store_is_a_note_not_a_traceback():
+    """Anything other than "absent" propagates out of `project_store` - ADR
+    0002's "failing loudly is a feature" - and the board turns it into the
+    degradation it actually is, naming what may now be wrong on screen."""
+
+    def explode(repo: str) -> Any:
+        raise RuntimeError("holds a judgment with no task ref")
+
+    client = FakeClient(issues=[issue(2, "swarm:ready")])
+    board = BoardReader(client_for=lambda repo: client,
+                        containers_for=lambda: [],
+                        store_for=explode).read("me/thing")
+
+    assert cards(board, "eligible") == [2]
+    assert any("task store could not be read" in note for note in board["notes"])
+    assert any("renewed" in note for note in board["notes"])
+
+
+def test_the_board_opens_the_real_store_read_only():
+    """`create=False`, and it is the load-bearing argument: an empty store reads
+    as "every task is on attempt 0 with no blocker", so a console that created
+    one beside a live run would hand it a fresh retry budget for every task it
+    had already given up on."""
+    from swarm.console_board import project_store
+
+    assert project_store("owner/never-run-here") is None
 
 
 # --------------------------------------------------------------------------

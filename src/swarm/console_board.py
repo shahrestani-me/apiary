@@ -30,16 +30,43 @@ and the pull request listing is `state="all"` as it always was, so merged and
 closed pull requests - the evidence for `landed` and for spent attempts - are
 in the read the board already paid for.
 
+**The resolver is not the whole authority, and the strip is where that bites.**
+`orchestrator/authority.py` joins the resolver to apiary's own store, because
+the resolver's `needs-human` is arithmetic over code-host evidence and apiary
+can have *renewed* the budget that arithmetic is counting against. On a board
+that skipped the join, the needs-human strip showed tasks the orchestrator had
+already stopped considering failed - a verdict the machine has withdrawn, on
+the one element this board must never let hide. So the board reads the store
+too (`load_ledger(store=...)`, ADR 0002) and applies `authority.budget_spent` -
+that function rather than a second copy of the give-up arithmetic, for the
+reason its own docstring gives.
+
+Two of the orchestrator's overlays are *not* reachable here, and the difference
+from the renewal above is the whole point of naming them separately:
+
+- **A revival** (`nodes/planner.revive`) grants one attempt and "resets
+  nothing", so it lives only in `Reconciler`'s memory for the length of a run.
+  A revived task therefore still reads capped on this board, which is the
+  direction a projection should fail in - it over-reports a task wanting a
+  human rather than hiding one.
+- **The infrastructure streak** is not derivable at all, by
+  `reconcile.infrastructure_streaks`' own argument: exit 2 does not bump the
+  attempt, so N mechanical failures write one result filename and no artifact
+  can count them. A task escalated on that ceiling reads here as whatever it
+  would otherwise be.
+
 **What this board cannot see, said out loud.** The resolver reads containers
 from the local daemon, so a repository being run by an orchestrator on another
 machine shows its claimed tasks wherever their code-host evidence puts them -
 usually `review`, since the worker's pull request opens early. A daemon that
-cannot be reached at all degrades the same way and lands in `notes`, the same
-"blind, not broken" shape the pull request listing already has. And the
-resolver's `needs-human` is arithmetic over code-host evidence - apiary's store
-can renew a budget the board cannot see (`orchestrator/authority.py` is where
-that join lives, run-scoped, inside the orchestrator). The board shows the
-world's answer; the orchestrator's own overlays are its own.
+cannot be reached degrades the same way and lands in `notes`, the same "blind,
+not broken" shape the pull request listing already has. The store is found the
+way `console_projects.py` finds `.swarm/projects.sqlite` - a relative path from
+the process's own directory - so a console started somewhere else, or watching a
+repository this machine has never run, simply has no store to read. That is the
+ordinary case rather than a degradation and gets no note: a project with no
+store has no renewals either, so the resolver's arithmetic is the whole answer.
+A store that exists and cannot be trusted is the opposite and says so.
 
 **Verified verdicts are cached, positively only.** A merge commit is
 immutable, so "its checks succeeded" can never become false; caching it saves
@@ -69,27 +96,40 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .config import SETTINGS
 from .github.branches import BRANCH_PREFIX, parse_task_branch
 from .github.client import GitHubClient
 from .github.ledger import LedgerEntry, load_ledger
 from .github.refs import task_ref
+from .orchestrator.authority import WAITING, budget_spent
 from .orchestrator.derived import (
     LANDED,
     NEEDS_HUMAN,
     Budget,
     ContainerFact,
+    Observation,
     PullFact,
     Verdict,
     observe,
     resolve,
 )
+from .store import StoreMissing, TaskStore
 from .taskref import TaskRef
 
-__all__ = ["BoardError", "BoardReader", "COLUMNS", "local_containers"]
+__all__ = [
+    "BoardError",
+    "BoardReader",
+    "COLUMNS",
+    "local_containers",
+    "project_store",
+]
+
+#: `authority.WAITING`, imported rather than respelled: it is the set that
+#: module bounds the same store overlay to, and two copies of it would be two
+#: answers to "may a budget row outrank a running container".
 
 #: `owner/name` - the same shape `run.py` and `console_runs.py` accept.
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -150,14 +190,42 @@ def local_containers() -> list[ContainerFact]:
     ]
 
 
+def project_store(repo: str) -> TaskStore | None:
+    """This project's judgment store, or `None` when this machine has none.
+
+    **`create=False`, and that is the load-bearing argument.** A board is a
+    reader - the same rule `adopt=False` enforces one call along - and creating
+    a store is a write. It would also be a write with consequences: an empty
+    store reads as "every task is on attempt 0 with no blocker", so a console
+    that created one beside a run in flight would hand that run a fresh retry
+    budget for every task it had already given up on.
+
+    `StoreMissing` becomes `None` rather than a refusal because it is the
+    ordinary case, not a fault: a project this machine has never run has no
+    store, and a project with no store has no renewals for the strip to be
+    wrong about. Every other failure - a file that is not a database, a schema
+    this build does not know, another project's store - propagates, because
+    ADR 0002's "failing loudly is a feature" is about exactly those and the
+    caller turns them into a note the operator can act on.
+    """
+    from .store import SqliteTaskStore
+
+    try:
+        return SqliteTaskStore.open(repo, create=False)
+    except StoreMissing:
+        return None
+
+
 @dataclass
 class BoardReader:
-    """Read one repository's board. `client_for` and `containers_for` are the
-    test seams - the second also being how a console that knows it has no
-    daemon (a hosted deployment, say) would hand in an empty listing."""
+    """Read one repository's board. `client_for`, `containers_for` and
+    `store_for` are the test seams - the last two also being how a console that
+    knows it has neither daemon nor store (a hosted deployment, say) hands in
+    the empty answer rather than paying for the failure every poll."""
 
     client_for: Callable[[str], Any] = GitHubClient.from_env
     containers_for: Callable[[], Iterable[ContainerFact]] = local_containers
+    store_for: Callable[[str], TaskStore | None] = project_store
     _verified: set[tuple[str, int]] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -166,10 +234,33 @@ class BoardReader:
             raise BoardError(f"repo must be 'owner/name', got {repo!r}",
                              fix="e.g. kamyar-finlex/apiary-sandbox")
         client = self.client_for(repo)
-        # `adopt=False`: a board is a reader. Adoption writes markers onto
-        # hand-written issues, and a page polling every few seconds must not
-        # be the thing that edits somebody's backlog.
-        ledger = load_ledger(client, adopt=False)
+        notes: list[str] = []
+        # apiary's own judgments about its own execution: the renewal that keeps
+        # a task off the strip, and the streak that keeps a given-up one on it
+        # after its run directory is gone. Read before the ledger because
+        # `load_ledger` is where the join happens (ADR 0002: the store holds
+        # only fields the tracker never had, so it is an assignment rather than
+        # a reconciliation).
+        store = None
+        try:
+            store = self.store_for(repo)
+        except Exception as exc:  # noqa: BLE001 - blind, not broken; say which
+            notes.append(
+                f"apiary's task store could not be read ({type(exc).__name__}: {exc}); "
+                f"a task whose retry budget was renewed may show on the strip as though "
+                f"it still wanted a human"
+            )
+        try:
+            # `adopt=False`: a board is a reader. Adoption writes markers onto
+            # hand-written issues, and a page polling every few seconds must not
+            # be the thing that edits somebody's backlog.
+            ledger = load_ledger(client, adopt=False, store=store)
+        finally:
+            # The connection is this poll's, not the page's: a console holding
+            # one open across every poll of every project would keep a lock on
+            # a file a live run is writing.
+            if store is not None:
+                store.close()
         # Blind, not broken, when the token cannot list PRs - the same refusal
         # shape `orchestrator/checks.py` uses. A fine-grained PAT minted with
         # issues but not pull requests answers 403 here while the ledger read
@@ -177,7 +268,6 @@ class BoardReader:
         # the ledger alone can still fill. The resolver runs either way; with
         # no pull facts a ticket in review shows as eligible or claimed, which
         # the note owns up to.
-        notes: list[str] = []
         blind = False
         try:
             pulls = client.list_pull_requests(state="all")
@@ -213,7 +303,7 @@ class BoardReader:
             )
 
         entries = sorted(ledger.entries.values(), key=lambda e: e.ref)
-        resolution = resolve(observe(
+        observation = observe(
             # A poll is not a cycle; the board has no cycle counter and the
             # resolver only echoes the number back.
             cycle=0,
@@ -232,8 +322,8 @@ class BoardReader:
             # that watches whatever this machine is running.
             live_run_ids=(),
             state_reasons={entry.ref: entry.state_reason for entry in entries},
-        ))
-        verdicts = resolution.by_ref
+        )
+        verdicts = _with_store(observation, entries)
 
         columns: dict[str, list[dict[str, Any]]] = {key: [] for key, _ in COLUMNS}
         needs_human: list[dict[str, Any]] = []
@@ -301,6 +391,12 @@ class BoardReader:
             # the issue to find out why.
             "because": verdict.because,
         }
+        if entry.renewals:
+            # `store.TaskJudgement.renewals`: "the one thing a human reading a
+            # capped task wants to know, and the only place it was ever written
+            # down was prose in a comment". Never zero-filled - a card wearing
+            # "renewed 0x" says nothing and costs a line on every ticket.
+            card["renewals"] = entry.renewals
         if pr is not None:
             card["pr"] = int(pr["number"])
             card["pr_url"] = f"https://github.com/{repo}/pull/{int(pr['number'])}"
@@ -332,6 +428,95 @@ class BoardReader:
                 self._verified.add((repo, number))
             return "green"
         return "red"
+
+
+#: Suppressing the budget rule means resolving against a cap nothing can reach,
+#: rather than teaching `derived.resolve` a second mode. `authority.py` spells
+#: the same sentinel for the same reason: the resolver stays a pure function of
+#: an observation, the suppression is expressed in the observation, and the two
+#: answers are directly comparable because they came from one input.
+_UNBOUNDED = 1_000_000_000
+
+
+def _with_store(
+    observation: Observation, entries: Sequence[LedgerEntry]
+) -> dict[TaskRef, Verdict]:
+    """The resolver's verdicts, with apiary's own budget judgment applied.
+
+    `authority.believe`'s budget overlay, and only that one: the board has no
+    run memory, so `landed-stands` (which needs what this process believed last
+    cycle) and the infrastructure ceiling (which is not derivable at all) are
+    not its to apply. What is left is the half that lives on disk, and it runs
+    in both directions:
+
+    - The store says the budget is **spent** and the world shows nothing -
+      a task whose run is over and whose pull requests were deleted resolves to
+      `eligible` from scratch. Without this it would sit in Eligible looking
+      like work about to start, when in fact apiary abandoned it and a human is
+      the only thing that will move it.
+    - The store says the budget is **not** spent and the world says it is - the
+      renewal case, which is #158's review finding. `_retry_or_give_up` gives up
+      on the *streak*, and a renewal resets the streak while the attempt counter
+      keeps climbing, so code-host arithmetic reads a cap the orchestrator does
+      not. The lenient resolution is what the task would have been without the
+      budget rule - `review` while its pull request is open, `claimed` while its
+      worker runs - which is a better answer than a bare "not needs-human".
+
+    Bounded to `WAITING` in the spent direction for `authority.believe`'s
+    reason: a live container or an open pull request is stronger evidence about
+    now than a budget row, and `landed` outranks everything. With no store the
+    entries carry the marker's legacy fields and this is very nearly the
+    identity - which is why a project this machine never ran needs no note.
+    """
+    strict = resolve(observation).by_ref
+    # Two resolutions over one input, which is the only comparison that says
+    # anything about either.
+    lenient = resolve(replace(
+        observation,
+        budget=Budget(max_attempts=_UNBOUNDED, max_total_attempts=_UNBOUNDED),
+    )).by_ref
+    cap = SETTINGS.max_attempts_per_task
+    total_cap = SETTINGS.max_total_attempts_per_task
+
+    verdicts: dict[TaskRef, Verdict] = {}
+    for entry in entries:
+        verdict = strict[entry.ref]
+        # `grant=None`: an `authority.Grant` is `Reconciler` state that lapses
+        # with the process, so a board cannot know a revival happened. It
+        # therefore over-reports a revived task as wanting a human, which is the
+        # direction a projection should fail in.
+        spent = budget_spent(
+            entry,
+            verdict.attempts_spent,
+            None,
+            max_attempts=cap,
+            max_total_attempts=total_cap,
+        )
+        if verdict.state in WAITING and spent:
+            verdicts[entry.ref] = replace(
+                verdict,
+                state=NEEDS_HUMAN,
+                because=(
+                    f"apiary gave up on this task (streak={entry.streak}, "
+                    f"attempt={entry.attempt}) against a cap of {cap}, and the code "
+                    f"host accounts for only {verdict.attempts_spent} attempt(s) - a "
+                    f"task whose run is over and whose branches are gone leaves none"
+                ),
+            )
+        elif verdict.state == NEEDS_HUMAN and not spent:
+            relaxed = lenient.get(entry.ref, verdict)
+            verdicts[entry.ref] = replace(
+                relaxed,
+                because=(
+                    f"the code host accounts for {verdict.attempts_spent} attempt(s) "
+                    f"against a cap of {cap}, but apiary's own record says the budget "
+                    f"is not spent (streak={entry.streak}, attempt={entry.attempt}, "
+                    f"renewed {entry.renewals}x), so {relaxed.state} stands"
+                ),
+            )
+        else:
+            verdicts[entry.ref] = verdict
+    return verdicts
 
 
 def _pull_facts(

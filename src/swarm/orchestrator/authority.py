@@ -83,7 +83,7 @@ cycles rather than budget, and the escalation still arrives.
 not on `attempt`, and a renewal is an ADR 0002 store judgment no branch,
 container or result can see. So the resolver's `needs-human` - which is
 arithmetic over code-host evidence - is **advisory**, and the store decides.
-`_budget_spent` below is `_retry_or_give_up`'s own test, run against the same
+`budget_spent` below is `_retry_or_give_up`'s own test, run against the same
 two numbers, with ADR 0002's own fallback for a task the store has never
 judged: absence reads as the attempt counter, which is the largest streak
 consistent with it, so a miss gives up sooner and never later.
@@ -265,6 +265,7 @@ __all__ = [
     "Grant",
     "Override",
     "believe",
+    "budget_spent",
     "in_review",
     "label_state",
     "revived_tasks",
@@ -706,7 +707,7 @@ def believe(
 
         believed, kind, why = verdict.state, "", ""
         grant = grants.get(entry.ref)
-        spent = _budget_spent(
+        spent = budget_spent(
             entry,
             verdict.attempts_spent,
             grant,
@@ -811,7 +812,7 @@ def believe(
     )
 
 
-def _budget_spent(
+def budget_spent(
     entry: LedgerEntry,
     attempts_spent: int,
     grant: Grant | None,
@@ -825,6 +826,18 @@ def _budget_spent(
     two numbers, rather than a second opinion about them: a give-up rule and the
     state that reports it disagreeing would be a task escalated by one and
     dispatched by the other, forever.
+
+    **Public because the console board is the second caller** (#158's review).
+    A board projecting the resolver alone reported `needs-human` on a task whose
+    per-blocker budget apiary had *renewed* - a verdict the machine had already
+    withdrawn, on the one element that ticket says must never hide. The renewal
+    is in the store, so the board can read it; what the board must not do is
+    make its own version of this test, which is the same argument the paragraph
+    above makes one caller earlier. `grant=None` is the honest answer from a
+    caller with no run memory: a `Grant` is `Reconciler` state that lapses with
+    the process, so a board cannot know a revival happened and reads the task as
+    capped - escalating rather than granting budget, which is the direction a
+    projection should fail in.
 
     The hard total cap is checked against the **code host's** count, because
     `max_total_attempts` bounds the task rather than one blocker and the
