@@ -323,6 +323,23 @@ Every legal transition, and the one component permitted to make it. Without the
 writer column the dispatcher, the worker, the reconciler and a human all write
 labels and fight.
 
+**This table is now a description of what is written, not of what is read.**
+#147 moved the orchestrator's *reads* to `orchestrator/authority.py`: the state
+a decision runs on is derived from the code host, the containers, the run
+artifacts and apiary's own store ([ADR 0001](adr/0001-task-systems-are-integrations.md),
+[ADR 0002](adr/0002-apiary-owns-a-thin-task-store.md)), and the labels below are
+written and compared but not believed. Two consequences for anyone reading this
+table as a specification:
+
+- The two `any -> …` rows a **human** writes no longer move the swarm. An issue
+  relabelled by hand mid-run is reported as a `state.override` and the
+  orchestrator carries on from what the world says. Closing the issue still
+  works, and always did: "GitHub wins, every cycle" is about the issue being
+  closed, not about its labels.
+- `APIARY_STATE_SOURCE=labels` restores every row here as a read as well as a
+  write. #152 removes the writes, at which point this section describes the
+  GitHub Issues adapter and nothing else.
+
 | From | To | Trigger | Writer |
 |---|---|---|---|
 | — | `ready` | issue created with all deps met | planner (#10) |

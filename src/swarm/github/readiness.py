@@ -50,12 +50,28 @@ review, done or failed is somebody else's row in the state machine; relabelling
 one because its dependency graph changed would yank an issue out from under a
 running container. Those entries still take part in the graph - they are what
 everything else is waiting on.
+
+**Which entries those are is no longer read off the label (#147).** The one
+thing this module used a `swarm:*` label to decide was that set, and
+`compute_readiness` now takes it as `transitionable`: the task ids the caller's
+authority says are waiting rather than in flight or finished
+(`orchestrator/authority.py`). Nothing else here changes, because nothing else
+here was ever reading a state - the dependency arithmetic has always been a
+question about the code host, and `Verdict.current_label` stays the label that
+is really on the issue because it is the one `_relabel` has to remove.
+
+The division of labour is in `authority.py`'s docstring and is worth repeating
+from this side: the resolver decides whether a task is *waiting*, and this
+module decides which of the two waiting states it is in. It keeps that half
+because it is the half it is better at - it sees a ring in the graph, it tells
+an unresolvable `#404` from an open issue, and it resolves dependencies that are
+not tasks in the plan at all, which the resolver's own `_landed` cannot.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
 from ..taskref import TaskRef
 from .client import GitHubClient, GitHubHTTPError
@@ -353,13 +369,23 @@ def _state(states: Mapping[TaskRef, IssueState], ref: TaskRef) -> IssueState:
 
 
 def compute_readiness(
-    ledger: Ledger, states: Mapping[TaskRef, IssueState]
+    ledger: Ledger,
+    states: Mapping[TaskRef, IssueState],
+    *,
+    transitionable: Collection[str] | None = None,
 ) -> ReadinessPlan:
     """Decide each transitionable entry's label. Raises on a dependency cycle.
 
     Pure: `states` is every referenced issue's open/closed fact, already
     resolved. Keeping the I/O out of here is what lets the interesting graphs -
     a diamond, a ring, a ref to a cancelled issue - be tested as data.
+
+    `transitionable` is the task ids this pass may speak about, as decided by
+    whoever holds the authority on state (#147). `None` falls back to the label,
+    which is what `APIARY_STATE_SOURCE=labels` produces and what a caller with
+    no resolver behind it - the `__main__` dry run below - has to use. Task ids
+    rather than refs, because that is the key `Belief` is built on and the join
+    to a ref happens once, where the belief is built, rather than here as well.
     """
     cycle = find_cycle(_live_edges(ledger, states))
     if cycle is not None:
@@ -380,7 +406,12 @@ def compute_readiness(
             unmet.append(UnmetRef(ref, state.reason, error=unresolvable))
             if unresolvable:
                 errors.append(UnresolvableReferenceError(entry.ref, ref, state.reason))
-        if entry.state_label not in TRANSITIONABLE or _state(states, entry.ref).closed:
+        mine = (
+            entry.state_label in TRANSITIONABLE
+            if transitionable is None
+            else entry.task_id in transitionable
+        )
+        if not mine or _state(states, entry.ref).closed:
             # Claimed, in review, done or failed - somebody else's row of §4.
             # Or closed: `docs/architecture-v2.md` makes "a human can close a
             # task mid-run and have the swarm respect it" a feature of putting
@@ -476,6 +507,7 @@ def apply_readiness(
     *,
     ledger: Ledger | None = None,
     dry_run: bool = False,
+    transitionable: Collection[str] | None = None,
 ) -> ReadinessPlan:
     """Compute readiness against the live tracker and write the two labels.
 
@@ -493,7 +525,7 @@ def apply_readiness(
     # the issue rather than in the ledger.
     entries = tuple(entry.ref for entry in ledger.entries.values())
     states = resolve_states(client, (*referenced_refs(ledger), *entries))
-    plan = compute_readiness(ledger, states)
+    plan = compute_readiness(ledger, states, transitionable=transitionable)
 
     if not dry_run:
         for verdict in plan.transitions:

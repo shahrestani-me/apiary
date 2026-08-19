@@ -113,6 +113,15 @@ services:
       # IMAGES=0 below), which is the narrowing working as designed. SETUP.md
       # step 4 is the command.
       APIARY_WORKER_IMAGES: ${APIARY_WORKER_IMAGES:-}
+
+      # The state cutover (#147) and the window that measures it (#146). Named
+      # here for the reason the block above gives, and this pair is the case
+      # that reason was written for: `APIARY_STATE_SOURCE=labels` is the way
+      # back from a bad cutover, and a way back that silently does nothing
+      # inside the container is the `APIARY_EGRESS_ALLOW` mistake with teeth.
+      # Empty means the default - derived, with the shadow on.
+      APIARY_STATE_SOURCE: ${APIARY_STATE_SOURCE:-}
+      APIARY_DERIVED_SHADOW: ${APIARY_DERIVED_SHADOW:-}
       OLLAMA_HOST: ${APIARY_OLLAMA_HOST:-http://host.docker.internal:11434}
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       HTTP_PROXY: http://egress-proxy:8888

@@ -134,6 +134,7 @@ from .checks import (
     render_keys,
 )
 from ..store import StoreError, TaskStore, record_judgement
+from .authority import Belief, in_review
 from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
@@ -1297,8 +1298,14 @@ def run_mergeability(
     max_attempts: int = SETTINGS.max_attempts_per_task,
     store: TaskStore | None = None,
     dry_run: bool = False,
+    believed: Belief | None = None,
 ) -> MergeabilityReport:
     """Read, decide, write, and hand `report.plan.admitted` to `checks.apply_checks`.
+
+    `believed` is the cycle's authority on which tasks are in review (#147);
+    `None` reads the `swarm:review` label, which is every caller outside
+    `Reconciler.cycle` and what `APIARY_STATE_SOURCE=labels` produces. See
+    `authority.in_review`.
 
     Called with the ledger and the check plan a cycle already computed, so it
     costs one `get_pull_request` per `swarm:review` issue with an open pull
@@ -1322,7 +1329,7 @@ def run_mergeability(
     if open_pulls is not None:
         states = {}
         for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
-            if entry.state_label != REVIEW:
+            if not in_review(entry, believed):
                 continue
             pull = open_pulls.get(entry.branch)
             if pull is None:

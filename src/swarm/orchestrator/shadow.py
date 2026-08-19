@@ -1,4 +1,15 @@
-"""The derived resolver, run beside the labels and believed by nothing (#146).
+"""The derived resolver, run beside the labels and compared with them (#146).
+
+**Since #147 the comparison runs in reverse.** This module's title used to end
+"and believed by nothing"; `orchestrator/authority.py` now takes the resolver's
+answer and decides on it, and the labels are the side being checked. Nothing in
+*this* file changed direction - it still reads only what the cycle already read,
+still cannot fail a cycle, and still decides nothing - but what a divergence
+here *means* did: it used to say "the derived value is not ready to be
+believed", and it now says "the label has drifted from what the orchestrator
+acted on". Both are worth an event and they are not the same claim, which is
+why `authority.py` emits its own at the point of belief rather than reusing
+this one.
 
 `orchestrator/derived.py` computes ADR 0001's five lifecycle states from the
 code host, the containers and the run artifacts. #145 proved that reducer
@@ -11,9 +22,17 @@ of reality matches reality.
 This module is where that question is asked. Every cycle, it builds the
 `Observation` out of facts the cycle **has already read**, resolves it, diffs
 the answer against what the control plane ended the cycle holding, and writes
-the disagreements into `events.jsonl`. Labels stay authoritative; nothing here
-is read by any decision. Making the derived value authoritative is #147, and
-#147 does not start until this reports clean.
+the disagreements into `events.jsonl`. Nothing here is read by any decision -
+that is `authority.py`'s job since #147, and this window is what a reader
+checks it against.
+
+**#147 shipped before this window's own gate was met, deliberately.** The
+acceptance criterion was ten consecutive greenfield runs with zero unexplained
+divergences, and no credential in this environment can run one - the same wall
+#145's corpus README, #146 and `docs/demo-run.md` all hit. So the cutover is
+guarded by `APIARY_STATE_SOURCE=labels` instead, which restores this module's
+world in full. That is a weaker guarantee than a clean window and it is written
+down here rather than left for whoever reads the first real run.
 
 ## Three properties, and each one is a way this could have been worthless
 
@@ -124,12 +143,16 @@ argument. `Explained.kind` is empty for the ones nobody has an account of, and
 | `merged-this-cycle` | The merge gate landed it after the world was read. |
 | `dispatched-this-cycle` | The dispatcher claimed and spawned after the container listing was taken. |
 | `container-created` | A container between `docker create` and `docker start`. See below. |
-| `closed-not-planned` | A human closed the work item as not planned; `reconcile._closed_verdict` escalates and `derived.py` has no rule for it. |
+| `closed-not-planned` | **Closed by #147.** A human closed the work item as not planned; `reconcile._closed_verdict` escalated and `derived.py` had no rule for it. `TaskFact.abandoned` now derives it, so this should never fire again - the rule is kept because a divergence that reappears here means `state_reasons` stopped reaching the observation, which is worth a named line rather than an unexplained one. |
 
-The last one is the only entry here that is a **gap rather than a finding**: it
-is derivable - `TaskFact.state_reason` carries the fact - and `derived.py`
-simply has no rule reading it. It is classified so the log stays readable and
-named so #147 has something to fix, not because it is a law of nature.
+The last one was the only entry here that was a **gap rather than a finding**:
+it is derivable - `TaskFact.state_reason` carries the fact - and `derived.py`
+simply had no rule reading it. #147 added the rule (`TaskFact.abandoned`), so
+the two sides now agree and no divergence is raised at all. The classification
+stays, unreachable, for the reason a `container-created` line would be news: if
+one ever appears, something stopped passing `state_reasons` into the
+observation, and that is a defect worth naming rather than one to discover in
+the unexplained count.
 
 ### The create-to-start window, decided explicitly
 
@@ -201,6 +224,7 @@ from ..github.readiness import SATISFYING_STATE_REASONS, IssueState
 from ..github.refs import issue_number, pull_number, task_ref
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord, record_path
+from .authority import BUDGET_RENEWED, INFRASTRUCTURE_CEILING, REVIVED, revived_tasks
 from .checks import PullState
 # **Bare `CLAIMED` and `REVIEW` in this module are ADR 0001's internal states**,
 # and the two `swarm:*` labels that store them are imported under names that say
@@ -264,9 +288,12 @@ SHADOW_ENV = "APIARY_DERIVED_SHADOW"
 
 #: The seven accounts a divergence can have. Empty string means none, and the
 #: count of those is what #147's gate reads - see the module docstring.
-INFRASTRUCTURE_CEILING = "infrastructure-ceiling"
-BUDGET_RENEWED = "budget-renewed"
-REVIVED = "revived"
+#:
+#: The first three are **imported from `orchestrator/authority.py`**, which is
+#: where the same three names became decisions rather than explanations: a
+#: divergence this window classifies `infrastructure-ceiling` and an override
+#: that module applies for the same reason are one phenomenon, and two spellings
+#: of it in `events.jsonl` would be two things to join.
 MERGED_THIS_CYCLE = "merged-this-cycle"
 DISPATCHED_THIS_CYCLE = "dispatched-this-cycle"
 CONTAINER_CREATED = "container-created"
@@ -696,10 +723,10 @@ def classify(
             kind = CLOSED_NOT_PLANNED
             why = (
                 "a human closed the work item as not planned, which "
-                "`reconcile._closed_verdict` escalates. `TaskFact.state_reason` "
-                "carries the fact and `derived.py` has no rule reading it - so this "
-                "one is a gap in the resolver rather than a limit of derivation, and "
-                "#147 can close it."
+                "`reconcile._closed_verdict` escalates. #147 taught the resolver the "
+                "same rule (`TaskFact.abandoned`), so reaching this line means the "
+                "observation was built without `state_reasons` - a defect in the "
+                "wiring rather than a limit of derivation."
             )
         elif one.derived == NEEDS_HUMAN and _renewed(judgment, spent, max_attempts):
             kind = BUDGET_RENEWED
@@ -1144,24 +1171,12 @@ class ShadowWindow:
             )
 
 
-def revived_tasks(report: CycleReport) -> frozenset[str]:
-    """Tasks `planner.revive` returned to `swarm:ready` during this cycle.
-
-    Two callers reach it and both run before this window: `replan` through
-    `_judge`, and the goal gate. Neither result is folded into the ledger, so
-    without this the control map reports `needs-human` for a task the cycle left
-    `ready` - which under-reports rather than manufactures (the derived side
-    says `needs-human` too, so the divergence is simply not emitted until the
-    next cycle, where it lands as `revived`), but the enumeration in
-    `control_labels` claims to be exhaustive and this is the sixth.
-    """
-    found: set[str] = set()
-    for source in (getattr(report.replanned, "plan", None), report.goal):
-        for action in getattr(source, "revived", ()) or ():
-            task = getattr(action, "task_id", "")
-            if task:
-                found.add(str(task))
-    return frozenset(found)
+# `revived_tasks` moved to `orchestrator/authority.py` in #147 and is re-exported
+# from here. Two callers want it now - this window, to build the control map a
+# cycle actually left behind, and `Reconciler`, to record the one attempt a
+# revival grants - and the module that *decides* on it is the one that should
+# own it. Nothing about the answer changed; `control_labels` still overlays it
+# before readiness, for the reason its own docstring gives.
 
 
 def written_this_cycle(report: CycleReport) -> frozenset[str]:

@@ -1,0 +1,737 @@
+"""Who the orchestrator believes about a task's state (#147). The cutover.
+
+#145 built the resolver, #146 ran it beside the labels and believed nothing it
+said. This is where the derived value starts being the one that decides:
+`github/readiness.py`, `orchestrator/dispatcher.py` and
+`orchestrator/reconcile.py` take their state from here rather than from
+`LedgerEntry.state_label`.
+
+The merge gate is a fourth, and it is not scope creep. #147 names three files
+and the criterion it is really about is larger than the file list - a label a
+human edits mid-run must not change what the orchestrator *does*, and merging is
+the most consequential thing it does. `checks.plan_checks` and
+`mergeability.run_mergeability` selected on `swarm:review`, so a task somebody
+relabelled while its green pull request sat open was silently un-mergeable. They
+ask `in_review` below, with the same `None`-reads-the-label default everything
+else here has.
+
+Labels keep being written and keep being compared. #152 removes the writes;
+this ticket changes only who is *believed*, which is why the observable proof
+that it happened is a task whose label a human edits mid-run: the orchestrator
+does not change what it does, and the disagreement is reported.
+
+## The escape hatch, and why it is the load-bearing part
+
+`APIARY_STATE_SOURCE=labels` restores the previous behaviour **completely**.
+Not "for the scheduler but not the merge gate": there is exactly one function
+in this package that answers "what state is this task in", every decision path
+calls it, and with `labels` it returns `lifecycle.internal_state` of the label
+and nothing else. `tests/test_authority.py` proves that by running the same
+cycle under both settings against hand-edited labels and asserting the
+decisions swap.
+
+That is not ceremony. apiary develops itself on this control plane, so a
+misbehaving cutover blocks its own repair, and a cutover with no way back
+cannot be repaired by the system it broke. The flag is what makes shipping
+this before #146's ten-clean-run gate has been met a decision rather than a
+gamble - and the gate has *not* been met, because no credential in this
+environment can run a greenfield swarm (#145's corpus README, #146, and
+`docs/demo-run.md` all say so).
+
+## The resolver is not the whole authority. The store is the other half
+
+ADR 0001 names five lifecycle states and then, in "Three of these are not
+derivable from the code host alone", takes three of them back. ADR 0002 says
+what the missing half is: *"the five lifecycle states are derived from the code
+host, the containers, the run artifacts, **and apiary's own store**."*
+
+So the authority is the resolver **plus apiary's own judgments**, and this
+module is the join. `derived.py` answers what the world says; the store and the
+run-scoped counters answer what apiary decided about its own execution. Neither
+alone is enough, and reading the label instead of either was what made it look
+as though one was.
+
+Each of ADR 0001's three, and what the orchestrator now does about it:
+
+**1. The infrastructure ceiling.** Not derivable at all: exit 2 does not bump
+the attempt, so N mechanical failures write one result filename and the
+artifacts cannot tell one from three (`reconcile.infrastructure_streaks`
+counts *transitions*, which are writes). The orchestrator therefore keeps
+believing its own counter: a task whose streak has reached
+`APIARY_MAX_INFRASTRUCTURE` is `needs-human` whatever the resolver says, and
+the override is reported. The counter is run-scoped, exactly as it was before
+this ticket - what the label added was that its *consequence* survived a
+restart. It no longer does: a resumed run gives an infrastructure-capped task
+another `cap` mechanical failures before escalating again. Those attempts are
+free by construction (§4 does not consume one for exit 2), so the cost is
+cycles rather than budget, and the escalation still arrives.
+
+**2. A renewed per-blocker budget.** `_retry_or_give_up` gives up on `streak`,
+not on `attempt`, and a renewal is an ADR 0002 store judgment no branch,
+container or result can see. So the resolver's `needs-human` - which is
+arithmetic over code-host evidence - is **advisory**, and the store decides.
+`_budget_spent` below is `_retry_or_give_up`'s own test, run against the same
+two numbers, with ADR 0002's own fallback for a task the store has never
+judged: absence reads as the attempt counter, which is the largest streak
+consistent with it, so a miss gives up sooner and never later.
+
+The rule runs in both directions and the second one was not obvious. A task
+apiary has given up on leaves **no code-host evidence at all** once the process
+that ran it is gone: results live in the run directory and a run directory is
+per run, and `build_observation` takes branch names off *open* pull requests
+because a remote branch listing is a call no cycle makes. So a task that failed
+three times, with its pull requests closed and its run over, resolves to
+`eligible` from scratch on the next process - and under the labels
+`swarm:failed` was what carried the verdict across the restart. The store
+carries it now (`budget-spent`), which is why the escape hatch is not the only
+thing standing between this cutover and a run that resurrects abandoned work.
+
+**3. A revival.** `planner.revive` "deliberately resets nothing", so a revived
+task reads spent from every code-host source there is. Under the labels it was
+`swarm:ready` and the dispatcher believed that; under the resolver it would be
+re-escalated the instant it was revived, and the goal gate could never unstick
+a run. So a revival is recorded here as what it actually is - apiary granting
+one more attempt - and it lapses the moment that attempt is spent, which is
+where `_retry_or_give_up`'s arithmetic takes over again and caps the task on
+the streak it never reset. Run-scoped, for the same reason `_infrastructure`
+and `update_budget` are, and failing the same way: a restart forgets a pending
+revival and the task waits for a human. That is the safe direction - a
+forgotten revival escalates, it never grants a budget - and it is the opposite
+of what the label did, where a restart preserved the granted retry.
+
+None of the three is made derivable by making the resolver authoritative, and
+pretending otherwise is how a cutover ships a run that cannot stop retrying.
+
+## What the resolver is *not* asked to decide, and why
+
+**`eligible` versus `blocked`.** The resolver has a rule for it - every
+dependency landed - and `github/readiness.py` has a better one: it sees a ring
+in the graph and refuses to plan at all, it tells an unresolvable `#404` from
+an open issue, and it resolves the state of dependencies that are *not tasks in
+the plan*. That last one is not a nicety. `derived._landed` builds from the
+observation's own tasks, so a hand-written issue somebody closed by hand - "half
+of what a real plan waits on", by its own docstring - is not in it, and a
+resolver believed on this split would hold every dependant `blocked` forever.
+
+So the division is: the resolver decides whether a task is *waiting* at all -
+landed, needs-human, claimed, review, or none of those - and readiness decides
+which of the two waiting states it is in. Readiness reads no label to do it;
+what it reads from here is which entries are its to speak about, which is the
+one thing it used the label for.
+
+## What no absolute reading of the world can replace
+
+`plan_reconcile` is **incremental** and the resolver is **absolute**, and the
+label was quietly doing double duty as the previous state. Two of reconcile's
+rules are edge-triggered and neither survives a naive flip:
+
+- *"a claimed task whose worker finished"* - the worker exits, its container
+  stops, no pull request exists, and the resolver correctly says `eligible`. A
+  reconciler that waited for `claimed` would never observe a failed attempt
+  again: no retry comment, no counter, no give-up, and a task re-dispatched
+  from scratch every cycle with nothing counting.
+- *"a task in review whose pull request was closed unmerged"* - `Snapshot`
+  lists open pull requests only, so a closed one is invisible and the resolver
+  says `eligible`. A reconciler that waited for `review` would forgive every
+  rejected pull request, which is the "a retry that costs nothing can be
+  rejected forever" that rule exists to prevent.
+
+Both need the *previous* belief, so `Reconciler` carries one - `_believed`,
+what this process last held, in exactly the register `_infrastructure`,
+`_stalls` and `update_budget` already are. It self-clears the way the label
+did: once the reconciler has acted, the belief it carries forward is the state
+it moved the task to, so the rule cannot fire twice on one attempt.
+
+A task this process has never seen has no previous belief, and there the label
+**is** seeded - see `Belief.previous`. It is the only durable record of the last
+belief this system held, epic #140 has not removed it yet, and the alternative
+is that every restart forgives one rejected pull request, one unaccounted
+result, and - the worst of the three - every merge whose issue is no longer
+closed. A task already in the map is never re-seeded, which is precisely why a
+label edited *mid-run* changes nothing: #147's criterion is about a run in
+progress, and a label edited before the process started is the only record
+there is. When #152 deletes the labels this seam becomes the store's, and the
+docstring on `Belief.previous` says so.
+
+**`landed` is the third thing `previous` decides, and it is a ratchet rather
+than a trigger.** A merge is terminal within a run (`docs/issue-contract.md`
+§4) and the world stops showing it: a merged pull request leaves the open
+listing, so the only remaining evidence is the work item being closed as
+completed. Two ordinary things take that evidence away - `checks._decide_passed`
+writes `swarm:done` *before* GitHub has honoured `Closes #<n>`, and a human can
+reopen a finished issue - and in both the resolver reads `eligible` and the
+dispatcher puts a worker back on code that is already on the default branch.
+So once this run has believed a task landed, it stays landed.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field, replace
+from typing import Any, Iterable, Mapping
+
+from ..github.ledger import Ledger, LedgerEntry
+from ..taskref import TaskRef
+from .derived import (
+    BLOCKED,
+    CLAIMED,
+    ELIGIBLE,
+    LANDED,
+    NEEDS_HUMAN,
+    REVIEW,
+    Budget,
+    Observation,
+    Resolution,
+    resolve,
+)
+
+__all__ = [
+    "BUDGET_RENEWED",
+    "BUDGET_SPENT",
+    "DERIVED",
+    "INFRASTRUCTURE_CEILING",
+    "LABELS",
+    "LANDED_STANDS",
+    "REVIVED",
+    "SOURCES",
+    "STATE_SOURCE_ENV",
+    "UNRESOLVED",
+    "WAITING",
+    "Belief",
+    "Override",
+    "believe",
+    "in_review",
+    "label_state",
+    "revived_tasks",
+    "source_summary",
+    "state_source",
+]
+
+#: The switch, and the reason the rest of this module is safe to ship. Defaults
+#: to `derived`, which is the cutover; `labels` restores what #146 shipped.
+STATE_SOURCE_ENV = "APIARY_STATE_SOURCE"
+
+DERIVED = "derived"
+LABELS = "labels"
+SOURCES: tuple[str, ...] = (DERIVED, LABELS)
+
+#: The two states a task that is neither in flight nor finished can be in, and
+#: the set `github/readiness.py` owns the split of. See the module docstring.
+WAITING: frozenset[str] = frozenset({ELIGIBLE, BLOCKED})
+
+#: Why a belief is not simply the resolver's verdict. The first three are ADR
+#: 0001's three non-derivable states, spelled the same as
+#: `orchestrator/shadow.py`'s classification kinds **and imported from here by
+#: it**, so a divergence the shadow explains and an override this module
+#: applies are recognisably the same phenomenon in `events.jsonl`.
+INFRASTRUCTURE_CEILING = "infrastructure-ceiling"
+BUDGET_RENEWED = "budget-renewed"
+REVIVED = "revived"
+#: The other direction of the same rule, and it has no entry in `shadow.py`
+#: because the shadow window never had to decide anything. A task apiary gave up
+#: on leaves **no code-host evidence at all** once its run directory is gone -
+#: results are per run (`Reconciler._results`) and `build_observation` reads
+#: branch names off *open* pull requests, so a task that failed three times with
+#: nothing open reads `eligible` from scratch on the next process. Under the
+#: labels `swarm:failed` carried that verdict across the restart; under the
+#: resolver the store has to, which is the half of ADR 0002 that is not about
+#: renewals.
+BUDGET_SPENT = "budget-spent"
+#: `landed` is terminal **within a run** - `docs/issue-contract.md` §4 says so in
+#: as many words, and a merge is the one thing on the code host that cannot be
+#: taken back. It is a kind rather than an assumption because the world stops
+#: showing it: a merged pull request is not in `Snapshot`'s open listing, so once
+#: `Closes #<n>` has been honoured the *only* evidence left is the closed issue -
+#: and a human who reopens that issue, or a pull request merged without the
+#: keyword, takes that evidence away. The resolver then reads `eligible` and the
+#: dispatcher spawns a worker over work that is already on main.
+LANDED_STANDS = "landed-stands"
+
+#: The last is not one of ADR 0001's: it is a task the resolver had no verdict
+#: for at all, which `Resolution.state` reports as `""` rather than as a state
+#: because "nothing was said" is not an opinion. The label stands, and the
+#: fallback is counted rather than silent - a cutover that silently fell back to
+#: the labels for every task would look exactly like a clean one.
+UNRESOLVED = "unresolved"
+
+#: Suppressing the budget rule means resolving against a cap nothing can reach,
+#: rather than teaching `derived.resolve` a second mode. The resolver stays a
+#: pure function of an observation, the suppression is expressed in the
+#: observation, and the two answers are directly comparable because they came
+#: from one input.
+_UNBOUNDED = 1_000_000_000
+
+
+def state_source(env: Mapping[str, str] | None = None) -> str:
+    """Which control plane decides. **Loud on garbage**, unlike the shadow flag.
+
+    `shadow.shadow_enabled` reads a mistyped value as its default and argues the
+    case: that flag decides whether an *observer* runs, and a `ValueError` out of
+    it would be a shadow taking down a cycle. This one decides who the
+    orchestrator believes, so it belongs with `checks._env_flag` and
+    `dispatcher._env_int` instead - an operator who typed `APIARY_STATE_SOURCE=lables`
+    to get back to the old behaviour after a bad cutover must not silently get
+    the new one.
+    """
+    raw = (env or os.environ).get(STATE_SOURCE_ENV)
+    if raw is None or not raw.strip():
+        return DERIVED
+    value = raw.strip().lower()
+    if value not in SOURCES:
+        raise ValueError(
+            f"{STATE_SOURCE_ENV}={raw!r} is not one of {', '.join(SOURCES)}"
+        )
+    return value
+
+
+def in_review(entry: Any, believed: Belief | None = None) -> bool:
+    """Is this task in review - as the cycle's authority has it, or as its label?
+
+    The merge gate's own predicate, and the reason it lives here rather than
+    being spelled a third and fourth time in `checks.py` and `mergeability.py`:
+    #147's criterion is that a label a human edits mid-run does not change what
+    the orchestrator does, and a gate that still read the label would merge, or
+    refuse to merge, on that edit. `believed=None` reads the label, which is
+    every existing caller, both `__main__` dry runs and
+    `APIARY_STATE_SOURCE=labels`.
+
+    Both sides say the same thing in the ordinary case, and it is worth naming
+    which fact each is: the label is a record of `worker/pr.py` having opened a
+    pull request, and the derived state is that pull request being open now.
+    """
+    if believed is None:
+        return bool(_internal(entry.state_label) == REVIEW)
+    return believed.holds(entry.task_id, REVIEW)
+
+
+def source_summary(source: str | None = None) -> str:
+    """The line worth printing at startup, because it names what is believed.
+
+    `checks.MergePolicy.summary`'s job, and its rule: the line that reports a
+    setting is read at the same call site that chose it, so a run's transcript
+    cannot claim one thing while the loop does another.
+    """
+    chosen = state_source() if source is None else source
+    if chosen == LABELS:
+        return (
+            "state source: the `swarm:*` labels ("
+            f"{STATE_SOURCE_ENV}={LABELS}) - the pre-#147 behaviour, restored"
+        )
+    return (
+        "state source: derived from the code host, the containers and apiary's own "
+        f"store; the labels are written and compared but not believed "
+        f"({STATE_SOURCE_ENV}={LABELS} to go back)"
+    )
+
+
+# --------------------------------------------------------------------------
+# The belief
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Override:
+    """One task the orchestrator believes something other than its label.
+
+    The observable record of the cutover, and the thing #147's acceptance
+    criteria are really about: a hand-edited label produces one of these, the
+    orchestrator carries on, and the disagreement is announced.
+
+    `kind` is empty for a plain disagreement - the resolver simply read the
+    world differently from what the label stored - and carries one of the five
+    constants above when this module *itself* moved the answer off the
+    resolver's verdict. Both are worth a line in `events.jsonl` and they are
+    not the same event: the first is the label being stale, the second is
+    apiary knowing something the code host cannot show. An accounted override
+    is recorded even when it agrees with the label, because `budget-spent`
+    usually does and it is the overlay a reader most needs to see.
+    """
+
+    task_id: str
+    ref: TaskRef
+    believed: str
+    stored: str
+    #: What the resolver said, before this module's overlays. Equal to
+    #: `believed` unless `kind` is set.
+    derived: str = ""
+    kind: str = ""
+    why: str = ""
+
+    def __str__(self) -> str:
+        head = f"{self.task_id} ({self.ref}): believed {self.believed}, label stores {self.stored}"
+        return f"{head} [{self.kind}: {self.why}]" if self.kind else head
+
+
+@dataclass(frozen=True)
+class Belief:
+    """What the orchestrator holds true about every task in one ledger.
+
+    Frozen and folded rather than mutated, for `reconcile.fold`'s reason: a
+    cycle writes labels part-way through and every stage after that write has
+    to see the new state, so the belief advances by the transitions that
+    actually **landed** and by nothing else. A belief advanced by a planned
+    write GitHub refused would hand the dispatcher a view of a world that never
+    existed, which is the one failure `fold` exists to prevent.
+    """
+
+    source: str = DERIVED
+    #: task id -> the internal state this orchestrator acts on.
+    states: Mapping[str, str] = field(default_factory=dict)
+    #: task id -> the internal state the `swarm:*` label is storing. Kept so a
+    #: divergence can be reported at the point of belief rather than only at
+    #: the end of the cycle, where the shadow window takes it.
+    stored: Mapping[str, str] = field(default_factory=dict)
+    overrides: tuple[Override, ...] = ()
+    #: task id -> what the orchestrator believed **last** cycle, with the label
+    #: standing in for a task this process has never seen. `plan_reconcile`'s
+    #: two edge-triggered rules read it; see this module's docstring for why no
+    #: absolute reading of the world can replace it, and why seeding from the
+    #: label is the honest answer until #152 moves the seam to the store.
+    previous: Mapping[str, str] = field(default_factory=dict)
+    #: The resolution the belief was built from, or `None` under `labels`.
+    #: Retained for a caller that wants the verdict's own sentence; nothing
+    #: here decides on it a second time.
+    resolution: Resolution | None = None
+
+    @property
+    def derived(self) -> bool:
+        """Is the resolver being believed at all? The one branch that differs."""
+        return self.source == DERIVED
+
+    def state(self, task_id: str) -> str:
+        """This task's believed state, or `""` for a task not in the ledger.
+
+        The empty string rather than a default, `derived.Resolution.state`'s
+        rule: a task nothing here has an opinion about must not be handed one,
+        and `blocked` would be an opinion.
+        """
+        return self.states.get(task_id, "")
+
+    def holds(self, task_id: str, *states: str) -> bool:
+        """Is this task believed to be in any of `states`? The readers' idiom."""
+        return self.states.get(task_id, "") in states
+
+    def fold(self, transitions: Iterable[Any]) -> Belief:
+        """Advance the belief by the label writes that landed. `fold`'s rule.
+
+        `Transition.to_label` is apiary's own decision about a task, translated
+        through the same table `lifecycle.py` announces with - not a label read
+        back off the code host. The distinction matters: this is the cycle
+        learning what it just did, which is the only thing the label vocabulary
+        is still used for here.
+        """
+        applied = {
+            transition.task_id: _internal(transition.to_label)
+            for transition in transitions
+            if getattr(transition, "task_id", "")
+        }
+        if not applied:
+            return self
+        return replace(
+            self,
+            states={**self.states, **applied},
+            stored={**self.stored, **applied},
+        )
+
+    def waiting(self) -> frozenset[str]:
+        """The task ids `github/readiness.py` may speak about. See its docstring.
+
+        Under `labels` this is exactly `readiness.TRANSITIONABLE` translated,
+        which is what that module was computing for itself before #147 - the
+        flag restores the behaviour rather than approximating it.
+        """
+        return frozenset(task for task, state in self.states.items() if state in WAITING)
+
+    def hold(self, states: Mapping[str, str]) -> Belief:
+        """Overlay states this cycle produced through something other than a
+        transition. The three writers `fold` cannot see.
+
+        `shadow.control_labels` enumerates them and this is the same list from
+        the other side: the readiness pass's verdicts, the dispatcher's claims
+        and `planner.revive`, none of which is a `Transition` and none of which
+        is folded back into the ledger. They matter here for one reason -
+        `Reconciler` carries the belief forward as next cycle's *previous*, and
+        a task the dispatcher claimed this cycle whose worker exits before the
+        next one would otherwise be remembered as never having run.
+        """
+        if not states:
+            return self
+        return replace(self, states={**self.states, **states}, stored={**self.stored, **states})
+
+    def summary(self) -> str:
+        if not self.derived:
+            return f"state source: {self.source} ({STATE_SOURCE_ENV}={LABELS})"
+        explained = sum(1 for one in self.overrides if one.kind)
+        return (
+            f"state source: the resolver over {len(self.states)} task(s), "
+            f"{len(self.overrides)} disagreeing with the label "
+            f"({explained} accounted for)"
+        )
+
+
+# --------------------------------------------------------------------------
+# Believing
+# --------------------------------------------------------------------------
+
+
+def believe(
+    ledger: Ledger,
+    observation: Observation | None,
+    *,
+    source: str = DERIVED,
+    infrastructure: Mapping[TaskRef, int] | None = None,
+    infrastructure_cap: int = 3,
+    revived: Mapping[TaskRef, int] | None = None,
+    remembered: Mapping[str, str] | None = None,
+    max_attempts: int = 3,
+    max_total_attempts: int = 9,
+) -> Belief:
+    """One cycle's belief about every entry in the ledger. Pure.
+
+    `observation=None` means the resolver was not asked - a cycle that could
+    not list pull requests, or `source=labels`. It is **not** an empty
+    observation: `checks.read_pulls` and `shadow.ShadowWindow.run` both go to
+    lengths to keep "could not look" apart from "nothing there", and the cost of
+    conflating them is one level worse here than it is in the shadow. A cycle
+    that read no pull requests and believed the resolver anyway would resolve
+    every task in review to `eligible` and **dispatch a second worker over an
+    open pull request's file set**. So a blind cycle falls back to the labels
+    wholesale and says so, which is the same answer `plan_reconcile` already
+    gives its own blind rules: they did not run; they did not fail.
+
+    `remembered` is what this process believed last cycle. It becomes
+    `Belief.previous`, seeded from the labels for a task never seen - the one
+    place a label still reaches a decision, argued in the module docstring - and
+    it is read here for one rule: `landed` is terminal within a run, so a task
+    already believed landed stays landed.
+    """
+    infrastructure = infrastructure or {}
+    revived = revived or {}
+    entries = sorted(ledger.entries.values(), key=lambda entry: entry.ref)
+
+    by_label = {entry.task_id: _internal(entry.state_label) for entry in entries}
+    previous = {**by_label, **(remembered or {})}
+
+    if source != DERIVED or observation is None:
+        return Belief(
+            source=LABELS, states=dict(by_label), stored=by_label, previous=previous
+        )
+
+    resolution = resolve(observation)
+    # The same observation with the budget rule suppressed, so a task whose
+    # budget apiary has not in fact spent can be given the state it would
+    # otherwise have had - `claimed` while its revived attempt runs, `review`
+    # while its pull request is open - rather than a bare fallback to the
+    # label. Two resolutions over one input, which is the only comparison that
+    # says anything about either (`shadow.py`'s rule, one level along).
+    lenient = resolve(
+        replace(
+            observation,
+            budget=Budget(max_attempts=_UNBOUNDED, max_total_attempts=_UNBOUNDED),
+        )
+    ).by_task
+    verdicts = resolution.by_task
+
+    states: dict[str, str] = {}
+    stored: dict[str, str] = {}
+    overrides: list[Override] = []
+    cap = max(int(infrastructure_cap), 0)
+
+    for entry in entries:
+        # Shadowing the module-level `label_state` here would be a name a reader
+        # has to disambiguate in the one function that holds both sides.
+        was_stored = _internal(entry.state_label)
+        stored[entry.task_id] = was_stored
+        verdict = verdicts.get(entry.task_id)
+        if verdict is None:
+            states[entry.task_id] = was_stored
+            overrides.append(
+                Override(
+                    task_id=entry.task_id,
+                    ref=entry.ref,
+                    believed=was_stored,
+                    stored=was_stored,
+                    kind=UNRESOLVED,
+                    why=(
+                        "the resolver returned no verdict for this task, so there is "
+                        "nothing to believe instead of the label. Counted rather than "
+                        "silent: a cutover that fell back for every task would look "
+                        "exactly like a clean one."
+                    ),
+                )
+            )
+            continue
+
+        believed, kind, why = verdict.state, "", ""
+        spent = _budget_spent(
+            entry,
+            verdict.attempts_spent,
+            revived.get(entry.ref),
+            max_attempts=max_attempts,
+            max_total_attempts=max_total_attempts,
+        )
+
+        if believed != LANDED and previous.get(entry.task_id) == LANDED:
+            # Ahead of every other overlay, because it is the only one that is
+            # about a fact nothing can undo. It also removes a transient the
+            # merge gate would otherwise produce every time it lands a task:
+            # `swarm:done` is written *before* GitHub has honoured `Closes #<n>`
+            # (`checks._decide_passed` says why), so the merged pull request has
+            # already left the open listing while the issue still reads open.
+            believed, kind = LANDED, LANDED_STANDS
+            why = (
+                "this run has already seen this task land, and a merge is terminal "
+                "within a run (`docs/issue-contract.md` §4). The merged pull request "
+                "is not in the open listing and the work item is not closed as "
+                f"completed, so the resolver reads {verdict.state} - which would put a "
+                "worker back on work that is already on the default branch."
+            )
+        elif cap and believed != LANDED and infrastructure.get(entry.ref, 0) >= cap:
+            streak = infrastructure.get(entry.ref, 0)
+            believed, kind = NEEDS_HUMAN, INFRASTRUCTURE_CEILING
+            why = (
+                f"{streak} consecutive infrastructure verdict(s) against a cap of "
+                f"{cap}. Exit 2 does not bump the attempt, so N mechanical failures "
+                "write one result filename and no artifact can count them - ADR 0001's "
+                f"first non-derivable state. The resolver reads {verdict.state}."
+            )
+        elif believed in WAITING and spent:
+            # The store decides `needs-human`, and the resolver's arithmetic is
+            # a lower bound it falls back on. Bounded to the *waiting* states on
+            # purpose: a live container or an open pull request is stronger
+            # evidence about now than a budget row is, `landed` outranks
+            # everything, and apiary's own judgment is only ever being asked to
+            # choose between "wait" and "a human, please".
+            believed, kind = NEEDS_HUMAN, BUDGET_SPENT
+            why = (
+                f"apiary gave up on this task (streak={entry.streak}, "
+                f"attempt={entry.attempt}) against a cap of {max_attempts}, and the "
+                f"code host accounts for only {verdict.attempts_spent} attempt(s) - "
+                "a failed task whose run directory is gone and whose pull requests "
+                f"are closed leaves none. The resolver reads {verdict.state}."
+            )
+        elif believed == NEEDS_HUMAN and not spent:
+            lenient_verdict = lenient.get(entry.task_id)
+            believed = lenient_verdict.state if lenient_verdict is not None else ELIGIBLE
+            kind = REVIVED if entry.ref in revived else BUDGET_RENEWED
+            why = (
+                f"the code host accounts for {verdict.attempts_spent} attempt(s) "
+                f"against a cap of {max_attempts}, but apiary's own record says the "
+                f"budget is not spent (streak={entry.streak}, attempt={entry.attempt}"
+                + (f", revived at attempt {revived[entry.ref]}" if entry.ref in revived else "")
+                + f"). `_retry_or_give_up` gives up on the streak, so {believed} stands."
+            )
+
+        states[entry.task_id] = believed
+        # Recorded when the belief differs from the label **or** from the
+        # resolver, and `kind` is what tells a reader which. The second half is
+        # not decoration: `budget-spent` usually restores exactly what the label
+        # already said, and an event log that only reported disagreements with
+        # the label would show nothing at all for the one overlay that keeps a
+        # resumed run from resurrecting abandoned work.
+        if believed != was_stored or kind:
+            overrides.append(
+                Override(
+                    task_id=entry.task_id,
+                    ref=entry.ref,
+                    believed=believed,
+                    stored=was_stored,
+                    derived=verdict.state,
+                    kind=kind,
+                    why=why or verdict.because,
+                )
+            )
+
+    return Belief(
+        source=DERIVED,
+        states=states,
+        stored=stored,
+        previous=previous,
+        overrides=tuple(overrides),
+        resolution=resolution,
+    )
+
+
+def _budget_spent(
+    entry: LedgerEntry,
+    attempts_spent: int,
+    revived_at: int | None,
+    *,
+    max_attempts: int,
+    max_total_attempts: int,
+) -> bool:
+    """Has apiary in fact spent this task's retry budget? `_retry_or_give_up`'s test.
+
+    Deliberately the same two comparisons that function makes, against the same
+    two numbers, rather than a second opinion about them: a give-up rule and the
+    state that reports it disagreeing would be a task escalated by one and
+    dispatched by the other, forever.
+
+    The hard total cap is checked against the **code host's** count, because
+    `max_total_attempts` bounds the task rather than one blocker and the
+    counter it runs on is monotonic - a lower bound from a branch or a result is
+    a lower bound on it too, and over-counting there gives up sooner.
+
+    A revival grants exactly one attempt and lapses when it is spent, which is
+    the whole of what `planner.revive` does: it "resets nothing", so the moment
+    the granted attempt produces a result the streak it never reset caps the
+    task again.
+
+    The fallback for a task the store has never judged is ADR 0002's own -
+    `previous_streak = entry.attempt if entry.streak is None else entry.streak`,
+    quoted because that document names simplifying it to `0` as the change that
+    would open the hole it thought it had closed.
+    """
+    cap = max(int(max_attempts), 1)
+    if attempts_spent >= max(int(max_total_attempts), cap):
+        return True
+    if revived_at is not None and attempts_spent <= revived_at:
+        return False
+    streak = entry.attempt if entry.streak is None else entry.streak
+    return int(streak) >= cap
+
+
+def label_state(label: str) -> str:
+    """The internal state a `swarm:*` label stores. `lifecycle.internal_state`.
+
+    Public because two modules need it *without* being able to import
+    `lifecycle` - `reconcile`, which `lifecycle` imports, and this one. It is the
+    translation, not a reading: a caller reaching for it is either advancing a
+    belief by a write apiary just made or falling back to the labels on purpose.
+    """
+    return _internal(label)
+
+
+def _internal(label: str) -> str:
+    """`lifecycle.internal_state`, reached through a local import.
+
+    `lifecycle` imports `reconcile` and `reconcile` imports this module, so a
+    top-level import here would close the ring. The same reason `reconcile`
+    reaches `checks` and `mergeability` from inside `cycle`.
+    """
+    from .lifecycle import internal_state
+
+    return internal_state(label)
+
+
+def revived_tasks(report: Any) -> frozenset[str]:
+    """Tasks `planner.revive` returned to `swarm:ready` during one cycle.
+
+    Two callers reach `revive` and both run inside `Reconciler._judge`: the
+    replanner through `_update`, and the goal gate through
+    `_revive_abandoned`. Neither result is folded into the ledger, so this is
+    the only account of them.
+
+    Read by two modules for two purposes and therefore living below both:
+    `orchestrator/shadow.py` needs it to build the control map a cycle actually
+    left behind, and `Reconciler` needs it to record the one attempt a revival
+    grants. Typed loosely because a `CycleReport` lives in `reconcile`, which
+    imports this module.
+    """
+    found: set[str] = set()
+    for source in (getattr(getattr(report, "replanned", None), "plan", None), getattr(report, "goal", None)):
+        for action in getattr(source, "revived", ()) or ():
+            task = getattr(action, "task_id", "")
+            if task:
+                found.add(str(task))
+    return frozenset(found)

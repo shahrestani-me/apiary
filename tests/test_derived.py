@@ -157,8 +157,33 @@ def test_a_dependency_closed_as_not_planned_discharges_nothing() -> None:
             TaskFact(ref=ref(2), task_id="dep", closed=True, state_reason="not_planned"),
         )
     )
-    assert state(observation, "dep") == ELIGIBLE
+    # The abandoned item itself was `eligible` here until #147, which is the
+    # gap #146 classified as `closed-not-planned` and ADR 0001 called "a gap
+    # rather than a limit": `reconcile._closed_verdict` had escalated on this
+    # fact since #22 and the resolver had no rule for it. It has one now.
+    assert state(observation, "dep") == NEEDS_HUMAN
     assert state(observation) == BLOCKED
+
+
+def test_a_work_item_closed_as_not_planned_is_needs_human_and_not_landed() -> None:
+    """The rule #147 added, on its own rather than as a dependency.
+
+    Both halves matter and they are the two ways of getting it wrong. Reading
+    only `closed` would make an abandoned item `landed`, which unblocks every
+    dependant on work somebody explicitly decided not to build. Reading nothing
+    would leave it `eligible`, which is what shipped between #145 and #147 and
+    made the swarm and its own control plane disagree about every issue a human
+    cancelled.
+    """
+    abandoned = world(
+        tasks=(TaskFact(ref=ref(1), task_id="solo", closed=True, state_reason="not_planned"),)
+    )
+    completed = world(
+        tasks=(TaskFact(ref=ref(1), task_id="solo", closed=True, state_reason="completed"),)
+    )
+
+    assert state(abandoned) == NEEDS_HUMAN
+    assert state(completed) == LANDED
 
 
 def test_a_running_container_for_this_task_is_a_claim() -> None:

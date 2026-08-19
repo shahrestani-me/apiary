@@ -10,10 +10,18 @@ false, the ADR is wrong and the labels are load-bearing.
 
 This module is the half of the answer that computes. It reads the code host,
 the container layer and the run artifacts, and it says what each task's state
-is. **Nothing here writes, and no decision reads it.** #146 wired it into the
-live cycle through `orchestrator/shadow.py`, which resolves every cycle beside
-the labels and records where the two disagree; making the derived value
-authoritative is #147, and it does not start until the shadow reports clean.
+is. **Nothing here writes.** #146 wired it into the live cycle through
+`orchestrator/shadow.py`, which resolves every cycle beside the labels and
+records where the two disagree; #147 made the answer authoritative through
+`orchestrator/authority.py`, which is the module that decides how much of it to
+believe. Nothing here reads a label to compute it, which is still the invariant
+the rest of this docstring is about.
+
+**Authoritative is not the same as sufficient.** `authority.py` joins this
+resolver to apiary's own store and its own run-scoped counters, because the
+three states named below stayed non-derivable after the cutover - making a
+value decisive does not make it complete. What #147 did fix here is the fourth
+item, the one #146 called a gap rather than a limit: see `TaskFact.abandoned`.
 
 ## The sourcing invariant, which is the entire point
 
@@ -50,8 +58,17 @@ Four of the five come out clean, each from exactly the fact ADR 0001 named:
 | `review` | an open pull request whose head branch carries this ref |
 | `eligible` | every dependency landed, and this task has not |
 
-`needs-human` does not, and the reasons are worth naming because they are
-findings about the ADR rather than gaps in this file.
+A fifth row was missing until #147 and belongs with these four rather than with
+the three below, because it really is a fact about the code host: a work item a
+human closed **as not planned** is `needs-human`, and `TaskFact.state_reason`
+carries it. `reconcile._closed_verdict` had escalated on that fact since #22
+and this module had no rule reading it, so #146's shadow window reported the
+disagreement on every abandoned issue and classified it `closed-not-planned` -
+"a gap rather than a limit", in ADR 0001's words. The classification should now
+never fire.
+
+The remaining `needs-human` does not come out clean, and the reasons are worth
+naming because they are findings about the ADR rather than gaps in this file.
 
 **The infrastructure ceiling is not in the artifacts.** ADR 0001 says
 `needs-human` is "attempts exhausted, **or the infrastructure cap hit**", and
@@ -252,6 +269,21 @@ class TaskFact:
     @property
     def closed_as_completed(self) -> bool:
         return self.closed and self.state_reason in SATISFYING_STATE_REASONS
+
+    @property
+    def abandoned(self) -> bool:
+        """Closed, and closed in a way that discharges nothing. **`needs-human`.**
+
+        The other edge of the field above, and the rule #146 found missing.
+        ADR 0001 calls it "one finding that is a gap rather than a limit": a
+        human closing a work item as *not planned* is escalated by
+        `reconcile._closed_verdict`, `state_reason` carries the fact, and this
+        module simply had no rule reading it - so the shadow window classified
+        the divergence as `closed-not-planned` and named #147 as the fix.
+        Unlike the three states ADR 0001 takes back, this one is derivable, and
+        as of #147 it is derived.
+        """
+        return self.closed and self.state_reason not in SATISFYING_STATE_REASONS
 
 
 @dataclass(frozen=True)
@@ -587,6 +619,21 @@ def _verdict(
             because=landed[fact.ref],
             attempts_spent=spent,
             pull=_merged_pull_number(fact.ref, observation),
+        )
+
+    # Before the budget, because a human's closure outranks apiary's arithmetic
+    # and because the sentence a reader wants is the one that names the human.
+    # After `landed`, because `closed_as_completed` and `abandoned` are the two
+    # halves of one field and a work item cannot be both.
+    if fact.abandoned:
+        reason = (fact.state_reason or "unknown").replace("_", " ")
+        return Verdict(
+            ref=fact.ref,
+            task_id=fact.task_id,
+            state=NEEDS_HUMAN,
+            because=f"the work item is closed as {reason}",
+            attempts_spent=spent,
+            pull=pull.number if pull is not None else None,
         )
 
     cap = max(int(observation.budget.max_attempts), 1)
