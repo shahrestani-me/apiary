@@ -156,6 +156,11 @@ COLUMNS: tuple[tuple[str, str], ...] = (
 _PASSING = frozenset({"success", "neutral", "skipped"})
 
 
+#: `Handle.short_id`'s length - what `docker ps` prints, what a card carries,
+#: and the shortest thing `worker_log` will resolve.
+SHORT_ID_CHARS = 12
+
+
 class BoardError(ValueError):
     """A refusal an operator can fix, with the fix attached."""
 
@@ -208,9 +213,17 @@ def worker_log(container: str) -> dict[str, Any] | None:
     from .containers.manager import find_containers, tail_logs
 
     wanted = (container or "").strip()
-    if not wanted:
-        raise BoardError("name the container to read",
-                         fix="expand a claimed ticket; its card carries the id")
+    if len(wanted) < SHORT_ID_CHARS:
+        # A prefix is a prefix, and `next` takes the first match: `container=c`
+        # would answer with whichever worker the daemon happened to list first,
+        # which is a different worker's log under the right heading. The short
+        # id is what a card carries and what `docker ps` prints, so requiring
+        # it costs the caller nothing and makes the match unambiguous in
+        # practice rather than by luck.
+        raise BoardError(
+            f"name the container to read, by at least its {SHORT_ID_CHARS}-character id",
+            fix="press Watch on a claimed ticket; its card carries the id",
+        )
     docker = _docker()
     handle = next(
         (h for h in find_containers(docker) if h.id.startswith(wanted)),
@@ -481,7 +494,7 @@ class BoardReader:
             # expanded. Short id, because that is what an operator sees in
             # `docker ps` and what `worker_log` matches by prefix; the full one
             # is 64 characters of noise on a card.
-            card["container"] = container.id[:12]
+            card["container"] = container.id[:SHORT_ID_CHARS]
         return card
 
     def _post_merge_ci(

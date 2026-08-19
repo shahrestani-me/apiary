@@ -828,6 +828,18 @@ def test_the_poll_stops_with_the_tab_and_is_picked_up_by_the_board():
     assert "if (!workerPolling) workerTick();" in script
 
 
+def test_a_reply_from_a_watch_that_was_stopped_does_not_start_a_second_chain():
+    """Watch, Stop, Watch on the same ticket inside one round-trip leaves the
+    first reply looking current - it is the same container - and it schedules a
+    second chain on the single timer, where `clearTimeout` can only cancel the
+    later of the two. The same defence `runGeneration` makes one layer up."""
+    script = asset("app.js")
+
+    assert "var workerGeneration = 0;" in script
+    assert "var generation = workerGeneration;" in script
+    assert "if (generation !== workerGeneration) return;" in script
+
+
 def test_only_one_worker_is_watched_at_a_time_and_stopping_releases_it():
     """The console-side half of "output is bounded in memory": the page holds
     one worker's tail, never a cache of every worker it has ever watched."""

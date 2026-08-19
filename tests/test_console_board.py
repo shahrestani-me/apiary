@@ -727,14 +727,21 @@ def test_a_container_apiary_did_not_label_cannot_be_read_through_the_console(mon
     assert docker.read_ids == []
 
 
-def test_naming_no_container_is_a_refusal_with_a_fix(monkeypatch):
+@pytest.mark.parametrize("named", ["", "  ", "c0ffee"])
+def test_an_id_too_short_to_be_unambiguous_is_refused(monkeypatch, named):
+    """A prefix is a prefix and the match takes the first hit, so `container=c`
+    would answer with whichever worker the daemon listed first - a different
+    worker's log under the right heading. The short id is what the card
+    carries, so requiring it costs the page nothing."""
     from swarm.console_board import worker_log
 
-    watched(monkeypatch, FakeDocker())
+    docker = FakeDocker(listing=ps_row("c0ffee" + "0" * 58))
+    watched(monkeypatch, docker)
 
     with pytest.raises(BoardError) as caught:
-        worker_log("  ")
+        worker_log(named)
     assert caught.value.fix
+    assert docker.read_ids == []
 
 
 def test_the_route_serves_a_tail_and_404s_once_the_worker_is_gone(monkeypatch):

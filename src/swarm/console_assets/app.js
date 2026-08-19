@@ -1191,6 +1191,13 @@
   //: polling the same container twice a second - the bug #130 fixed one layer
   //: up, arriving through a different door.
   var workerTimer = null, workerPolling = false;
+  //: Which watch a response belongs to, as a number that only ever goes up.
+  //: `workerWatching` cannot answer that: Watch, Stop, Watch on the same
+  //: ticket inside one round-trip leaves the first chain's reply looking
+  //: current - it is the same container - and it schedules a second chain on
+  //: the single timer, where `clearTimeout` can only ever cancel the later of
+  //: the two. Same defence, and the same reason, as `runGeneration`.
+  var workerGeneration = 0;
 
   //: Faster than the board's five seconds - this is the thing that is supposed
   //: to look live - and only while a strip is open.
@@ -1203,6 +1210,7 @@
 
   function watchWorker(card) {
     if (workerWatching === card.container) { stopWatching(); return; }
+    workerGeneration++;
     workerWatching = card.container;
     workerCard = card;
     workerText = "";
@@ -1214,6 +1222,7 @@
   function stopWatching() {
     clearTimeout(workerTimer);
     workerTimer = null;
+    workerGeneration++;
     workerWatching = "";
     workerCard = null;
     workerText = "";                               // the one thing held; released here
@@ -1270,12 +1279,13 @@
     //: page nobody is looking at, and `renderBoard` starts it again when the
     //: board comes back.
     if (!id || !current || current.kind !== "swarm") { workerPolling = false; return; }
+    var generation = workerGeneration;
     workerPolling = true;
     api("/swarm/worker?container=" + encodeURIComponent(id)).catch(function () {
       workerPolling = false;                        // a dead chain, restartable
       return { ok: false, status: 0, body: null };
     }).then(function (res) {
-      if (workerWatching !== id) { workerPolling = false; return; }
+      if (generation !== workerGeneration) return;  // a later watch owns the strip
       if (!res.status && !res.ok) { workerPolling = false; return; }
       if (!res.ok) {
         //: 404 is the ordinary ending, not an error: the reaper disposed the
