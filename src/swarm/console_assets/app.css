@@ -99,3 +99,11 @@ input.locked, textarea.locked { background:var(--card); color:var(--muted);
                  border-radius:4px; border:1px solid var(--line); }
 .why { margin:0 0 12px; font-size:13px; color:var(--muted); }
 .why strong { color:var(--fg); font-weight:600; }
+.facts { margin:12px 0 0; display:grid; grid-template-columns:auto 1fr; gap:5px 16px;
+         font-size:13px; }
+.facts dt { color:var(--muted); font-size:12.5px; }
+.facts dd { margin:0; }
+.card.outcome .failedstrip { margin-top:14px; }
+.card.outcome .failedstrip .links { margin:0; flex-wrap:wrap; }
+.runpath { margin:10px 0 0; font-family:var(--mono); font-size:12px; color:var(--muted);
+           overflow-wrap:anywhere; }

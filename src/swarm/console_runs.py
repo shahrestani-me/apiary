@@ -56,9 +56,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from .artifacts import OUTCOMES
 from .github.ledger import KNOWN_STACKS
 
 __all__ = [
+    "OUTCOMES",
     "SWARM_SITE",
     "SwarmRunError",
     "SwarmRuns",
@@ -128,13 +130,17 @@ _PR_REF = re.compile(r"\bPR #(\d+)")
 _ISSUE_LINE = re.compile(r"^\s*#(\d+): ")
 
 
-#: Every word `conclude` can write into `progress["outcome"]`. Declared once
-#: and read by `conclude` itself and by the test that pins `app.js`'s table
-#: against it - the same move `console_build._from_swarm` makes for the form
-#: fields, and for the same reason: a seventh ending added here would
-#: otherwise fall through the page's `OUTCOMES[...] || j.state` and render as
-#: "done", which is the silent wrong answer this whole field exists to remove.
-OUTCOMES = ("met", "capped", "exhausted", "stopped", "failed", "done")
+#: Every word `conclude` can write into `progress["outcome"]`, re-exported from
+#: `artifacts` rather than spelled again here. It was declared in this module
+#: first, when the ending existed only as something scraped off a child
+#: process's stdout; #134 gave the *run* an ending it records for itself
+#: (`cli._outcome` -> `summary.json`), and two tuples for one vocabulary is a
+#: third thing to keep in step - with a silent failure, because an ending the
+#: page has no word for falls through `OUTCOMES[...] || j.state` and renders
+#: as "done".
+#:
+#: Still named here, and still what `tests/test_console_run.py` pins `app.js`
+#: against: this module is where the page's table is answerable from.
 
 
 def check_run_values(values: Mapping[str, str]) -> None:

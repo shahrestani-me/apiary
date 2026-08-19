@@ -874,3 +874,80 @@ def test_a_status_snapshot_is_not_the_live_progress_dict():
     assert snapshot["progress"]["prs"] == [4]
     assert snapshot["progress"] is not job.progress
     assert snapshot["progress"]["prs"] is not job.progress["prs"]
+
+
+# --------------------------------------------------------------------------
+# The terminal panel (#134): what the page draws when a run stops
+# --------------------------------------------------------------------------
+
+
+def test_the_ending_panel_is_read_from_the_artifacts_in_both_views():
+    """A run that stops has to say so, and the console has two views that can
+    be looking when it does: its own job, and a run it did not start. Both draw
+    the panel from `/swarm/outcome` - the run's own summary - rather than from
+    the job in memory, which is what makes the answer survive a page reload and
+    exist at all for a run this process never spawned."""
+    from swarm.console import asset
+
+    script = asset("app.js")
+
+    assert 'api("/swarm/outcome?run=" + encodeURIComponent(runId))' in script
+    # The console's own run, at the moment it stops being "running"...
+    assert 'drawOutcome(this, p.run_id, box);' in script
+    # ...and the artifacts view, only once the summary proves it finished.
+    assert 'if (b.state === "finished") drawOutcome(extView, b.run_id, box);' in script
+
+
+def test_the_panel_quotes_the_run_and_never_hides_a_task_needing_a_person():
+    """Two of the four criteria, in the page's own source. The sentence is
+    `o.reason` - the run's, composed by `close_the_loop` and the goal gate -
+    and the tasks needing a human get their own strip rather than a share of a
+    total, because a total is where the one that must not scroll past goes."""
+    from swarm.console import asset
+
+    script = asset("app.js")
+    panel = script.split("function outcomeCard")[1].split("\n  function drawOutcome")[0]
+
+    assert 'el("p", "proposal", o.reason' in panel
+    assert '"needs a human"' in panel
+    assert "tasks.needs_human" in panel
+    # Counts and clock, each named rather than summed into one number.
+    for term in ('"tasks"', '"pull requests"', '"cycles"', '"wall clock"'):
+        assert term in panel, term
+
+
+def test_every_field_the_panel_reads_is_one_the_route_actually_sends(tmp_path):
+    """The py/JS agreement for this payload, pinned mechanically. A page
+    reading `o.walls` off a server sending `wall_s` renders an empty pill and
+    says nothing about it - which is the silent half of the failure this whole
+    panel exists to remove."""
+    import re
+
+    from swarm.console import asset
+    from swarm.console_external import run_outcome
+
+    from test_console_external import finished_run
+
+    finished_run(tmp_path)
+    payload = run_outcome(root=tmp_path)
+    script = asset("app.js")
+    panel = script.split("function outcomeCard")[1].split("\n  function drawOutcome")[0]
+    panel += script.split("function issueRef")[1].split("\n  function outcomeCard")[0]
+
+    read = set(re.findall(r"\bo\.([a-z_]+)", panel))
+
+    assert read, "the panel reads nothing off the payload - has it been rewritten?"
+    assert read <= set(payload), read - set(payload)
+
+
+def test_a_cap_is_neither_a_success_nor_a_failure_on_the_panel():
+    """The four endings have to render distinctly, and "distinctly" is not only
+    the word: work left open is not a failure, and `exhausted` is not a
+    disappointment - the goal gate was off, so the run did exactly what was
+    planned."""
+    from swarm.console import asset
+
+    rule = asset("app.js").split("function outcomeClass")[1].split("}")[0]
+
+    assert 'kind === "met" || kind === "exhausted" ? " ok"' in rule
+    assert 'kind === "failed" ? " bad" : ""' in rule

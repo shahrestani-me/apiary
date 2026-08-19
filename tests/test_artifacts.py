@@ -49,6 +49,7 @@ from swarm.artifacts import (
     CycleMetrics,
     RunArtifacts,
     RunMetrics,
+    RunOutcome,
     artifacts_root,
     list_runs,
     load_run,
@@ -891,3 +892,71 @@ def test_show_is_unchanged_for_a_run_recorded_before_the_lifecycle_existed(root)
             f"at {directory}",
         ]
     )
+
+
+# --------------------------------------------------------------------------
+# The ending the run recorded (#134)
+# --------------------------------------------------------------------------
+
+
+def test_the_ending_survives_the_process_that_knew_it(root):
+    """The claim step 6 rests on: `summary.json` carries which of the endings
+    it was and the run's own sentence for it, so a reader that never saw the
+    terminal - `swarm show`, or a console started tomorrow - can still say
+    whether the project finished."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+    artifacts.outcome = RunOutcome(
+        kind="capped", reason="stopped after 40 cycle(s) with 2 live issue(s)",
+        cycles=40, cap=40, live=2, merged=(7, 9), abandoned=("add-retry",),
+    )
+    artifacts.finish()
+
+    view = load_run(RUN_ID, root=root)
+
+    assert view.outcome.kind == "capped"
+    assert view.outcome.reason == "stopped after 40 cycle(s) with 2 live issue(s)"
+    assert view.outcome.merged == (7, 9)
+    assert view.outcome.abandoned == ("add-retry",)
+    assert view.outcome.cycles == 40 and view.outcome.cap == 40 and view.outcome.live == 2
+
+
+def test_show_names_the_ending_beside_the_finish_time(root):
+    """`finished` says the run reached its end; it cannot say which end. A met
+    objective and an exhausted cycle cap both write a `finished_at`."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+    artifacts.outcome = RunOutcome(kind="met", reason="objective met: every task merged",
+                                   cycles=6, cap=40)
+
+    text = show_text(artifacts.finish())
+
+    assert "ending     met after 6/40 cycle(s): objective met: every task merged" in text
+
+
+def test_a_run_that_recorded_no_ending_reads_back_empty_and_prints_nothing(root):
+    """Every run before this ticket, and every run whose loop never reached its
+    own end. `kind == ""` is how a reader spells that without a second flag,
+    and `swarm show` prints no ending line rather than an empty one."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+
+    text = show_text(artifacts.finish())
+
+    assert load_run(RUN_ID, root=root).outcome.kind == ""
+    assert "ending" not in text
+
+
+def test_a_summary_from_a_future_version_does_not_become_a_wrong_ending(root):
+    """The record is read back off a file, where a hand edit and a run from a
+    version that knows a seventh ending are both ordinary. An unknown word
+    reads as "no ending recorded" - which every reader already handles -
+    rather than reaching the page as a `kind` nothing has a name for."""
+    artifacts = RunArtifacts.open(a_run(), root=root)
+    artifacts.finish()
+    summary = artifacts.path / SUMMARY_FILE_NAME
+    payload = json.loads(summary.read_text())
+    payload["outcome"] = {"kind": "vaporised", "reason": "?", "merged": ["seven"]}
+    summary.write_text(json.dumps(payload))
+
+    outcome = read_run(artifacts.path).outcome
+
+    assert outcome.kind == ""
+    assert outcome.merged == ()          # "seven" is not an issue number
