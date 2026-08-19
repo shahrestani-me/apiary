@@ -349,6 +349,61 @@ cannot supply them for you and both fail quietly:
   no paging rule yet, so a project with more items than one page returns a
   partial ledger — and a task nothing lists is a task nothing looks at again.
 
+**A second tracker is a second block, and this is the whole of it.** Everything
+server-shaped is already in the `linear` profile — the endpoint, the tool names,
+the `issueId` comment argument, the `description` body field, and `identifier`
+as the ref rule, because `ENG-123` is branch-safe and Linear's uuid is not.
+What is left is one scope constant and one filter:
+
+```bash
+cat > .swarm/tracker/tracker.yaml <<'YAML'
+tracker:
+  mcp: linear
+  intake:
+    args:
+      teamId: 00000000-0000-0000-0000-000000000000
+      limit: 100
+  create:
+    args:
+      teamId: 00000000-0000-0000-0000-000000000000
+YAML
+export APIARY_LINEAR_TOKEN=lin_api_...   # https://linear.app/settings/api
+export APIARY_TRACKER_CONFIG=.swarm/tracker/tracker.yaml
+```
+
+**Note where `teamId` is, and where it is not.** A top-level `args:` merges into
+all three capabilities, which is what you want for GitHub's `owner`/`repo` — all
+three calls need them — and what you do not want here, because Linear's
+`create_comment` takes no `teamId` and is entitled to reject one. The scope
+constant is per-capability on this tracker and common on the other. That
+asymmetry is not visible in either profile, so it is written here.
+
+Your `teamId` is a uuid, and the same call proves the credential works:
+
+```bash
+curl -s https://api.linear.app/graphql -H "Authorization: $APIARY_LINEAR_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"query":"{ teams { nodes { id key name } } }"}'
+```
+
+**How far this gets you today: the read-only ladder, and not a run.** The block
+above validates offline against `python -m swarm.mcp.contract`, which is the
+only one of the three checks anyone has run on this tracker — the other two need
+a workspace and a credential, and running them is the point of configuring it.
+What happens *after* intake is the part already known not to work. The
+payloads are handed to the GitHub adapter unchanged (`mcp/tracker.py` says so at
+the line it happens), and that adapter mints a task ref out of a `number` field
+with a `number` field's type, so a Linear tracker ends up with the contract's
+`identifier` and the ledger's `#42` naming the same item in one cycle. See #260,
+which also carries the one unverified prerequisite underneath all of it:
+`mcp.linear.app` answers `WWW-Authenticate: Bearer realm="OAuth"`, and that a
+Linear API key is accepted directly is so far a claim in Linear's documentation
+rather than a call anyone here has made.
+
+So configure Linear to exercise the seam — transport, contract and intake are
+the part that tests whether a second tracker really costs configuration rather
+than code — and run the swarm against GitHub until #260 closes.
+
 **What still goes direct**, deliberately: pull requests, check runs, merges,
 branches and the repository tree are the *code host*, which is GitHub by design
 in this architecture. The six `swarm:*` labels and the attempt counter in the
