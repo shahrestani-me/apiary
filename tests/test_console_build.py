@@ -1294,3 +1294,27 @@ def test_the_decision_not_to_refuse_before_provisioning_is_written_down():
     doc = pathlib.Path(console_build.__file__).read_text()
 
     assert "Why the work key's blindness is *stated* rather than refused (#237)" in doc
+
+
+def test_a_rate_limited_write_is_not_reported_as_a_missing_permission():
+    """GitHub answers a secondary rate limit with 403, which the status branch
+    alone would read as `issues: write`. That is this ticket's own defect
+    arriving through the one status with two meanings - and the token is not
+    the problem, so nothing about it should be edited."""
+    from swarm.github.client import RateLimitError
+
+    class Throttled:
+        repo = "shahrestani-me/expense-tracker"
+
+        def list_issues(self, **_):
+            raise RateLimitError(403, "GET", "https://api.github.com/repos/x/y/issues",
+                                 b'{"message": "You have exceeded a secondary rate limit"}',
+                                 60.0)
+
+    console, _, _ = console_with(client_for=lambda repo: Throttled())
+
+    fix = build(console, planned(console))[1]["error"]["fix"]
+
+    assert "rate-limited" in fix
+    assert "issues: write" not in fix
+    assert "selected repositories" not in fix

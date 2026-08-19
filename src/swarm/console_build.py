@@ -376,9 +376,16 @@ def _write_failure_fix(repo: str, exc: BaseException) -> str:
     than no reason, because somebody acts on it.
 
     The status decides, because the client knows it: 404 is the scope wall,
-    403 is the permission. Anything else - a transport error, a rate limit, a
-    client with no status at all - gets both, scope first, because that is the
-    order of likelihood.
+    403 is the permission. Anything with no status at all - a transport error,
+    a client that raises something else - gets both, scope first, because that
+    is the order of likelihood.
+
+    **A rate limit is checked before the status is read**, because GitHub
+    answers a secondary rate limit with 403 and this function would otherwise
+    tell an operator to grant a permission they already have and whose absence
+    was never the problem - the same defect this ticket is about, arriving
+    through the one status that has two meanings. `RateLimitError` is the
+    client's own verdict on that, made where the headers are still readable.
 
     **The recovery command is annotated rather than offered bare.**
     `swarm run --repo ...` uses the *same* work key against the *same*
@@ -386,6 +393,8 @@ def _write_failure_fix(repo: str, exc: BaseException) -> str:
     token is edited. Offering it without saying so is the second wrong
     instruction in one message.
     """
+    from .github.client import RateLimitError
+
     status = getattr(exc, "status", None)
     resume = (
         f"Then resume with `swarm run --repo {repo} --objective \"...\"` - `--new` has "
@@ -403,7 +412,12 @@ def _write_failure_fix(repo: str, exc: BaseException) -> str:
         f"Then resume with `swarm run --repo {repo} --objective \"...\"`, which uses the "
         f"same key and fails the same way until you do."
     )
-    if status == 404:
+    if isinstance(exc, RateLimitError):
+        cause = (
+            f"GitHub rate-limited the write; the token is not the problem, so change "
+            f"nothing about it. Wait for the limit to clear, {resume[0].lower()}{resume[1:]}"
+        )
+    elif status == 404:
         cause = f"{scope_cause} {scope_remedy} {same_wall}"
     elif status == 403:
         cause = (
