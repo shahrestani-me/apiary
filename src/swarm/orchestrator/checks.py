@@ -93,6 +93,16 @@ outside this ticket's file set; both gaps degrade and neither is silent.
 Manual dry run against a real repo - reads only, merges nothing, writes nothing:
 
     GITHUB_TOKEN=... python -m swarm.orchestrator.checks shahrestani-me/apiary
+
+**`from_state` is the label the issue carries, not `review` (#243).** Every
+transition built here used to name `review` as a constant, on the reasoning
+that this gate only ever fires on a task in review - which is true of what the
+gate *believes* and not of what the issue is *wearing*. A human who relabels a
+task mid-review leaves the constant naming a label that is not there:
+`write_labels` then adds the new one and removes nothing, the issue ends up
+with two state labels, and §3's precedence reads the furthest-along of them.
+The rule is `reconcile.Transition`'s and this module now follows it, which also
+makes the property one rule rather than two.
 """
 
 from __future__ import annotations

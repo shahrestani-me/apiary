@@ -86,12 +86,13 @@ from swarm.orchestrator.reconcile import (
     signature,
     write_labels,
 )
-from swarm.orchestrator.lifecycle import lifecycle_events
+from swarm.orchestrator.lifecycle import internal_state, lifecycle_events
 from swarm.run import Run
 from swarm.store import STORE_DIR_ENV, SqliteTaskStore, TaskJudgement
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
+from swarm.orchestrator.authority import Belief
 from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import CLAIMED as CLAIMED_STATE
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
@@ -3354,3 +3355,175 @@ def test_the_transition_path_writes_labels_in_exactly_one_place():
     # `dispatcher.py` writes the claim, which is not a `Transition` and is #152's
     # to delete separately; `reconcile.py` is `write_labels`. Nothing else.
     assert set(writers) == {"reconcile.py", "dispatcher.py"}, writers
+
+
+# --------------------------------------------------------------------------
+# `from_state` is the label the issue carries, at the sites that build it (#243)
+# --------------------------------------------------------------------------
+#
+# `test_the_label_removed_is_the_one_the_issue_carries_not_the_one_believed`
+# above pins the property *given* a `Transition`. These pin the other half: the
+# transitions the reconciler actually builds carry the carried label in that
+# field. Measured by mutation - replacing a construction site with a fixed
+# state used to leave the suite green at four of eleven sites, which means four
+# of the rules could write the wrong label with nothing noticing.
+#
+# **The worlds below all disagree with themselves on purpose.** With the
+# carried label and the believed state equal, every one of these sites is
+# indistinguishable from every wrong version of itself; the disagreement is
+# what makes the assertion mean anything. A human relabelling a task mid-run is
+# the case, and it is not hypothetical - it is the case `plan_reconcile`'s
+# docstring cites for reading the label here in the first place.
+#
+# **And they all carry `swarm:done` rather than a state a rule here writes.**
+# A world whose carried label happens to be the state a mutation substitutes is
+# a world that cannot see that mutation: the first draft of these sweeps
+# carried `swarm:blocked` in the merge gate's cases and reported three sites
+# green against a `"blocked"` mutant that was, in those worlds, the original.
+# `landed` is written by no rule under test, so no substitution collides with
+# it by accident.
+
+
+def believing(state: str, *, was: str | None = None, task: str = "task-4") -> Belief:
+    """A cycle that believes `state` about one task, whatever its label says."""
+    return Belief(states={task: state}, previous={task: was or state})
+
+
+#: Every rule in `plan_reconcile` that builds a `Transition`, as a world where
+#: the carried label and the believed state disagree. Keyed by the rule, and
+#: the value is what that rule decides - so a case that stops reaching its rule
+#: fails on `to_state` rather than passing vacuously on a transition list that
+#: happens to be empty.
+#: The labels each case is run with. Two, and never one: a world whose carried
+#: label happens to equal the state a mutation substitutes cannot see that
+#: mutation, so one world per site pins the site against every constant *except
+#: its own*. Two worlds with different labels leave no such hole.
+CARRIED = (DONE, BLOCKED)
+
+#: The malformed-contract rule skips a terminal label on purpose - a task
+#: nobody will run again is not failed a second time every cycle - so its two
+#: are the non-terminal pair.
+CARRIED_NON_TERMINAL = (CLAIMED, BLOCKED)
+
+CARRIED_LABEL_RULES: tuple[
+    tuple[str, Callable[[str], ReconcilePlan], str, tuple[str, ...]], ...
+] = (
+    (
+        "a human closed the issue",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label)),
+            believed=believing(CLAIMED_STATE),
+            states={ref(4): closed(4)},
+        ),
+        LANDED,
+        CARRIED,
+    ),
+    (
+        "the worker published its pull request",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label)),
+            believed=believing(CLAIMED_STATE),
+            results={ref(4): record(4, 0)},
+        ),
+        REVIEW_STATE,
+        CARRIED,
+    ),
+    (
+        "the worker failed and the budget holds",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label)),
+            believed=believing(CLAIMED_STATE),
+            results={ref(4): record(4, 1)},
+            max_attempts=3,
+        ),
+        ELIGIBLE,
+        CARRIED,
+    ),
+    (
+        "the same failure hit the streak cap",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label, attempt=2, streak=2, blocker=signature("boom"))),
+            believed=believing(CLAIMED_STATE),
+            results={ref(4): record(4, 1, attempt=2, verify_output="boom")},
+            max_attempts=3,
+        ),
+        NEEDS_HUMAN,
+        CARRIED,
+    ),
+    (
+        "different failures spent the total cap",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label, attempt=8)),
+            believed=believing(REVIEW_STATE),
+            open_branches=(),                    # the pull request is gone
+            max_total_attempts=9,
+        ),
+        NEEDS_HUMAN,
+        CARRIED,
+    ),
+    (
+        "an infrastructure failure that costs nothing",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label)),
+            believed=believing(CLAIMED_STATE),
+            results={ref(4): record(4, 2, reason="the network was unreachable")},
+            infrastructure_policy=InfrastructurePolicy(cap=3),
+        ),
+        ELIGIBLE,
+        CARRIED,
+    ),
+    (
+        "infrastructure failures that hit their cap",
+        lambda label: plan_reconcile(
+            ledger(entry(4, label=label)),
+            believed=believing(CLAIMED_STATE),
+            results={ref(4): record(4, 2, reason="the network was unreachable")},
+            infrastructure={ref(4): 2},
+            infrastructure_policy=InfrastructurePolicy(cap=3),
+        ),
+        NEEDS_HUMAN,
+        CARRIED,
+    ),
+    (
+        # The one case that cannot carry `swarm:done`: this rule skips a
+        # terminal label on purpose, so a task nobody is going to run again is
+        # not failed a second time every cycle. `swarm:claimed` is the
+        # hand-typed label here, and the belief disagrees just as loudly.
+        "a malformed contract",
+        lambda label: plan_reconcile(
+            ledger(errors=(ContractError(4, "Verify", "section is missing"),)),
+            believed=believing(ELIGIBLE),
+            labels={ref(4): frozenset({label})},
+        ),
+        NEEDS_HUMAN,
+        CARRIED_NON_TERMINAL,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "rule, world, decides, carried",
+    CARRIED_LABEL_RULES,
+    ids=[case[0] for case in CARRIED_LABEL_RULES],
+)
+def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides, carried):
+    """One case per rule that builds a `Transition`, each in a world that
+    disagrees with itself: the issue wears `swarm:done` because a human typed
+    it there, and the cycle believes something else because the world says so.
+
+    `from_state` names the label the write has to **remove**, so every one of
+    these must be the internal state of the label the issue is wearing. Taking
+    the
+    believed label off instead leaves the issue with two state labels, and §3's
+    precedence then reads the furthest-along of them and stops the task; it
+    also feeds `fold`, which rebuilds the entry's label set from this field, so
+    the cycle's own ledger would disagree with GitHub for long enough to
+    dispatch a container against it. Both failures are silent.
+    """
+    for label in carried:
+        transition = world(label).transitions[0]
+
+        assert transition.to_state == decides, f"{rule}: the rule stopped firing"
+        assert transition.from_state == internal_state(label), (
+            f"{rule} carrying {label}: removed the believed label"
+        )

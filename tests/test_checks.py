@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Callable, Iterable, Mapping, cast
 
 import pytest
 from fixtures import failures
@@ -70,9 +70,12 @@ from swarm.orchestrator.checks import (
 )
 from swarm.nodes.judge import mentioned_paths
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
+from swarm.orchestrator.lifecycle import internal_state
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
 from swarm.taskref import TaskRef
-from swarm.orchestrator.derived import ELIGIBLE, NEEDS_HUMAN
+from swarm.orchestrator.authority import Belief
+from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
+from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
 NOW = dt.datetime(2026, 8, 14, 14, 25, 30, tzinfo=dt.timezone.utc)
 
@@ -150,6 +153,17 @@ def failing(*paths: str, name: str = "ci") -> CheckSet:
     """A red check set whose output names `paths` the way pytest would."""
     lines = [f"FAILED {path}::test_thing - AssertionError" for path in paths]
     return summarise_checks([run(name, "failure", text="\n".join(lines))])
+
+
+#: The world every #243 case shares: #23 in review by belief, wearing the label
+#: a human typed onto it instead.
+REVIEWED = Belief(states={"task-23": "review"})
+
+
+def relabelled(label: str, attempt: int = 0) -> Ledger:
+    """#23 as the gate sees it, wearing `swarm:done` because somebody typed it."""
+    return ledger(entry(23, "src/mod23.py", "tests/test_mod23.py",
+                        label=label, attempt=attempt))
 
 
 def body(task_id: str, *, attempt: int = 0) -> str:
@@ -1336,3 +1350,97 @@ def test_the_ci_output_is_fenced_because_it_is_foreign_text():
     apply_checks(client, plan)
 
     assert "```" in client.comments[0][1]
+
+
+#: Every rule in this module that builds a `Transition`, each in a world where
+#: the carried label and the believed state disagree (#243). `swarm:done` is
+#: what a human typed onto #23 while its pull request was in flight; the belief
+#: still says `review`, because the resolver reads that off the open pull
+#: request rather than off the label.
+#: Two labels per rule, never one - see `tests/test_reconcile.py`.
+CARRIED = (DONE, "swarm:blocked")
+
+CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = (
+    (
+        "CI failed outside this issue's files",
+        lambda label: plan_checks(
+            relabelled(label),
+            pulls=pulls(pull(101, issue=23)),
+            checks={task_ref(23): failing("tests/test_other.py")},
+            believed=REVIEWED,
+            now=NOW,
+        ),
+        NEEDS_HUMAN,
+    ),
+    (
+        "no check run was ever created",
+        lambda label: plan_checks(
+            relabelled(label),
+            pulls=pulls(pull(101, issue=23, age_s=3600)),
+            checks={task_ref(23): CheckSet()},
+            policy=MergePolicy(zero_check_grace_s=300),
+            believed=REVIEWED,
+            now=NOW,
+        ),
+        NEEDS_HUMAN,
+    ),
+    (
+        "the checks passed and it merges",
+        lambda label: plan_checks(
+            relabelled(label),
+            pulls=pulls(pull(101, issue=23)),
+            checks={task_ref(23): summarise_checks([run("test", "success")])},
+            believed=REVIEWED,
+            now=NOW,
+        ),
+        LANDED,
+    ),
+    (
+        "CI failed and the budget holds",
+        lambda label: plan_checks(
+            relabelled(label),
+            pulls=pulls(pull(101, issue=23)),
+            checks={task_ref(23): failing("tests/test_mod23.py")},
+            max_attempts=3,
+            believed=REVIEWED,
+            now=NOW,
+        ),
+        ELIGIBLE,
+    ),
+    (
+        "CI failed and the attempts are spent",
+        lambda label: plan_checks(
+            relabelled(label, attempt=2),
+            pulls=pulls(pull(101, issue=23, attempt=2)),
+            checks={task_ref(23): failing("tests/test_mod23.py")},
+            max_attempts=3,
+            believed=REVIEWED,
+            now=NOW,
+        ),
+        NEEDS_HUMAN,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "rule, world, decides", CARRIED_LABEL_RULES, ids=[case[0] for case in CARRIED_LABEL_RULES]
+)
+def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides):
+    """#243. Every transition here named `review` as a constant, on the
+    reasoning that this gate only fires on a task in review - which is true of
+    what the gate *believes* and not of what the issue is *wearing*.
+
+    A human relabelled #23 while its pull request was in flight. The belief
+    still says review, so the gate decides as it always would - and the write
+    has to take `swarm:done` off, because that is the label that is there.
+    Naming `review` removes nothing, so the issue ends up carrying two state
+    labels and §3's precedence then reads the furthest-along of them.
+    """
+    for label in CARRIED:
+        transition = world(label).transitions[0]
+
+        assert transition.to_state == decides, f"{rule}: the rule stopped firing"
+        assert transition.from_state == internal_state(label), (
+            f"{rule} carrying {label}: removed the believed label"
+        )
+        assert transition.from_state != REVIEW_STATE
