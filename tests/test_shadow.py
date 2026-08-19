@@ -571,7 +571,7 @@ def test_the_infrastructure_ceiling_is_expected_and_says_why():
     """ADR 0001's first non-derivable state. `infrastructure_streaks` counts
     transitions because exit 2 does not bump the attempt and the observation
     carries one record per task, so N mechanical failures displace one another
-    there and the artifacts cannot tell one from three."""
+    there and no count of them survives to be read."""
     found, seen = shadow(
         report(entry(4, label=FAILED)),
         infrastructure={ref(4): 3},
