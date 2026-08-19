@@ -511,6 +511,20 @@ def test_a_late_sites_response_cannot_steal_the_selected_tab():
     assert "current = current || sites[0]" in asset("app.js")
 
 
+def test_the_page_is_served_with_a_query_string_on_it():
+    """`?debug=1` is the *only* way to reach the planner tab, which is the only
+    place Start building exists - and `do_GET` hands `render` the whole request
+    target, so matching the path against "/" answered "no route for GET
+    /?debug=1". The button #129 and #130 are about was unreachable in a browser.
+    """
+    console = Console()
+
+    assert console.render("GET", "/?debug=1", HOST).status == 200
+    assert console.render("GET", "/app.js?v=2", HOST).status == 200
+    assert console.render("GET", "/sites?x=1", HOST).status == 200
+    assert console.render("GET", "/nope?debug=1", HOST).status == 404
+
+
 def test_the_model_call_tabs_hide_unless_debug_is_asked_for():
     """The swarm tab is the product; the other tabs are its debugger, and a
     strip with one tab is clutter - so without ?debug=1 no strip renders at

@@ -385,7 +385,15 @@
         timer = setTimeout(function () { pollBuild(id); }, 1000);
         return;
       }
-      show([job.state === "error" ? errorCard(job.error) : buildCard(job.result)]);
+      if (job.state === "error") { show([errorCard(job.error)]); return; }
+      //: The build is over and the swarm is on the repository it made. The run
+      //: gets the swarm tab's own view rather than a second one written here:
+      //: same log, same summary strip, same Stop button - and therefore the
+      //: same SIGINT, which is what disposes the run's containers.
+      var runBox = el("div", "stack");
+      show([buildCard(job.result), runBox]);
+      var started = job.result && job.result.run;
+      if (started) pollSwarm(started.id, swarmView(started, runBox));
     });
   }
 
@@ -394,7 +402,8 @@
     body.appendChild(el("p", null, "creating the repository and writing the issues — "
                                   + job.elapsed_s + "s elapsed"));
     body.appendChild(el("p", "empty",
-      "The model is not being asked anything; this is GitHub's pace, one issue per task."));
+      "The model is not being asked anything; this is GitHub's pace, one issue per task. "
+      + "The swarm starts on it as soon as the last issue is written."));
     return card("building", body);
   }
 
@@ -428,6 +437,16 @@
     (r.warnings || []).forEach(function (w) {
       body.appendChild(el("p", "empty", w));
     });
+    //: The repository and its issues are real even when the loop would not
+    //: start, so this is a line on a finished build rather than an error card
+    //: replacing it - and it carries the command that picks the work up.
+    if (r.run_error) {
+      var failed = el("p", "fix");
+      failed.appendChild(el("strong", null, "the swarm did not start: "));
+      failed.appendChild(el("span", null, r.run_error.error));
+      body.appendChild(failed);
+      if (r.run_error.fix) body.appendChild(el("p", "fix", "Try: " + r.run_error.fix));
+    }
 
     var title = r.repo + " · " + (r.issues || []).length + " issue(s)";
     if ((r.rejected || []).length) title += ", " + r.rejected.length + " task(s) not written";
@@ -529,6 +548,17 @@
   //: about, recorded whatever the run's state - so followSelection can tell
   //: whether the card in the run area belongs to the project on the selector.
   var ownRepo = "";
+
+  //: How a finished run is named on the page, keyed by `progress.outcome`.
+  //: Four endings, and the ticket asks for the page to survive all four and
+  //: say which: `swarm run` exits 0 both when the objective was met and when
+  //: `--max-cycles` ran out, so "done" answers the question wrongly half the
+  //: time. Absent (an older backend, or a run still going) falls back to the
+  //: state, which is what the pill always said.
+  var OUTCOMES = {
+    met: "objective met", capped: "cycle cap reached",
+    stopped: "stopped", failed: "failed", done: "done"
+  };
 
   //: Lifecycle order, mirroring `console_board.COLUMNS` - the internal
   //: vocabulary, derived from the world rather than read off labels.
@@ -1013,7 +1043,11 @@
     if (err && err.fix) body.appendChild(el("p", "empty", "Try: " + err.fix));
   }
 
-  function swarmView(job) {
+  //: `into` is where the view is drawn, and it defaults to the swarm tab's run
+  //: area. #130 passes one: a run chained off Start building is followed from
+  //: the planner tab, and a second copy of this view written there would be a
+  //: second answer to "what is this run doing" - the one that goes stale.
+  function swarmView(job, into) {
     //: Built once and mutated by every poll, so the log node keeps its scroll
     //: position and the browser is not relaying out a growing <pre> per tick.
     var state = el("span", "pill", "running");
@@ -1045,7 +1079,7 @@
     body.appendChild(el("p", "blurb", "$ " + job.command));
     body.appendChild(log);
 
-    var box = panel().runBox;
+    var box = into || panel().runBox;
     box.textContent = "";
     extView = null;   // an own view owns the box now; the external card is gone
     box.appendChild(card("the run", head));
@@ -1054,13 +1088,19 @@
     var view = {
       next: 0,
       absorb: function (j) {
-        state.textContent = j.state + (j.state === "failed" && j.returncode !== null
-                                       ? " · exit " + j.returncode : "");
-        state.className = "pill " + (j.state === "done" ? "ok"
-                                     : j.state === "running" ? "" : "bad");
+        var p = j.progress || {};
+        //: `state` cannot say this on its own: a run that met its objective
+        //: and a run that ran out of cycles both end "done" with exit 0, and
+        //: the second has unfinished work sitting in the repository. An empty
+        //: `outcome` is a run still going, or a backend older than #130.
+        var ended = OUTCOMES[p.outcome] || j.state;
+        state.textContent = ended + (j.state === "failed" && j.returncode !== null
+                                     ? " · exit " + j.returncode : "");
+        state.className = "pill " + (j.state === "running" ? ""
+                                     : p.outcome === "capped" ? ""
+                                     : j.state === "done" ? "ok" : "bad");
         elapsed.textContent = j.elapsed_s + "s";
         elapsed.style.display = "";
-        var p = j.progress || {};
         if (p.run_id) ownRunIds[p.run_id] = 1;   // the external view must skip it
         //: While the run lives, the board follows its repository and the
         //: selector lands on it when it is a known project. A run that has

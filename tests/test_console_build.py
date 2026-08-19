@@ -32,15 +32,32 @@ import pytest
 
 from swarm.console import DEFAULT_HOST, DEFAULT_PORT, Console, Job
 from swarm.console_build import BUILD_SITE, BuildError, Builder, plan_from_result
+from swarm.console_runs import SwarmRuns
 from swarm.doctor import Check, Diagnosis
 from swarm.greenfield.provision import ProvisionReport
 from swarm.github.labels import LabelReport
+
+from fixtures.procs import FakeProc, settle, spawner
 
 HOST = {"Host": f"{DEFAULT_HOST}:{DEFAULT_PORT}"}
 
 #: Both keys present. The token preflight checks presence and nothing else -
 #: validity is GitHub's to judge - so a plausible pair is all a test needs.
 ENV = {"GITHUB_TOKEN": "ghp-work", "APIARY_PROVISION_TOKEN": "github_pat_boot"}
+
+
+@pytest.fixture(autouse=True)
+def tokens(monkeypatch):
+    """The *process* environment, which is a different one from `ENV`.
+
+    `Builder` reads the mapping it was handed; the run a finished build starts
+    reads `os.environ`, because that is what its child will inherit. Autouse
+    so that the chain is exercised by every test in this file rather than by
+    the handful written for it - a build whose run silently refused to start
+    everywhere would leave `report["run"]` unasserted and unnoticed.
+    """
+    for name, value in ENV.items():
+        monkeypatch.setenv(name, value)
 
 FORM = {"owner": "shahrestani-me", "name": "expense-tracker", "stack": "python",
         "public": "1", "objective": "a CLI that tracks expenses"}
@@ -132,7 +149,16 @@ def healthy(_stacks) -> Diagnosis:
                       Check.passed("image.python", "present"),))
 
 
-def console_with(**overrides) -> tuple[Console, FakeProvisioner, FakeIssues]:
+def console_with(*, runs: SwarmRuns | None = None, **overrides):
+    """A console whose every edge is a double, including the one #130 added.
+
+    The `runs` seam is not optional in spirit: since a finished build starts
+    the swarm on the repository it made, a console left with a real `SwarmRuns`
+    would exec `python -m swarm.cli run` out of the test suite the moment the
+    developer running it happened to have `GITHUB_TOKEN` exported. Every caller
+    gets a `SwarmRuns` driven through its `spawn` seam by a scripted process,
+    which is also what lets the argv the build produces be asserted.
+    """
     provisioner, issues = FakeProvisioner(), FakeIssues()
     seams: dict[str, Any] = {
         "provisioner": provisioner,
@@ -142,7 +168,26 @@ def console_with(**overrides) -> tuple[Console, FakeProvisioner, FakeIssues]:
         "out": lambda line: None,
     }
     seams.update(overrides)
-    return Console(builder=Builder(**seams)), provisioner, issues
+    return (
+        Console(builder=Builder(**seams), runs=runs if runs is not None else swarm_runs(FakeProc())),
+        provisioner,
+        issues,
+    )
+
+
+def swarm_runs(proc: FakeProc) -> SwarmRuns:
+    """`SwarmRuns` with a scripted child and no question asked of GitHub.
+
+    `exists` raises rather than answering, which is an assertion in every test
+    that uses this: the build tells `start` the repository is there, and a
+    probe for a repository this process created seconds ago is the round trip
+    #130 removed - the one whose 404 would send the chained run down the
+    greenfield branch and provision a second repository over the first.
+    """
+    def never(repo: str) -> bool:
+        raise AssertionError(f"the chained run asked GitHub whether {repo} exists")
+
+    return SwarmRuns(spawn=spawner(proc), exists=never)
 
 
 def planned(console: Console, result: Any = None) -> str:
@@ -877,3 +922,143 @@ def test_the_checkbox_says_what_it_writes_and_what_it_changes():
     assert "blocked on it" in field["label"]           # what it changes
     assert "empty repository" in field["label"]        # why it is on
     assert "project scaffold" in BUILD_SITE["blurb"]   # and the blurb agrees
+
+
+# --------------------------------------------------------------------------
+# ...and then the swarm runs on it (#130)
+# --------------------------------------------------------------------------
+
+
+def test_a_finished_build_starts_the_swarm_on_the_repository_it_made():
+    """#130's first criterion: one press, and cycles start.
+
+    The command is asserted rather than the fact that something was spawned,
+    because *which* command it is carries the whole ticket. `swarm run --repo`
+    attaches to the repository that now exists and dispatches its backlog;
+    `swarm run --new` would provision a second repository and ask the model to
+    plan the objective again, which is the path #129 exists to have escaped.
+    """
+    proc = FakeProc()
+    runs = swarm_runs(proc)
+    console, _, _ = console_with(runs=runs)
+
+    _, job = build(console, planned(console))
+
+    assert job["state"] == "done", job.get("error")
+    assert runs.spawn.argv[2:] == [                     # type: ignore[attr-defined]
+        "-m", "swarm.cli", "run",
+        "--repo", "shahrestani-me/expense-tracker",
+        "--objective", "a CLI that tracks expenses",
+        # The placeholder gate the provisioner committed, because the form left
+        # the field blank - the same command every `## Verify` was written with.
+        "--verify", "test -f README.md",
+        "--stack", "python",
+    ]
+    # And the page is handed the run to follow, with the id `/swarm/status`
+    # and `/swarm/stop` both take.
+    assert job["result"]["run"]["id"] in console.runs.jobs
+    assert job["result"]["run"]["state"] == "running"
+
+
+def test_the_run_verifies_with_the_command_in_the_commit_not_the_form():
+    """`Builder` already writes `report.verify_command` into every `## Verify`
+    - the gate in the commit that now exists, which is not always the form's.
+    A run told a different one would dispatch tasks that were red before a
+    worker touched them."""
+    proc = FakeProc()
+    runs = swarm_runs(proc)
+    console, provisioner, _ = console_with(runs=runs)
+    provisioner.calls = []
+
+    _, job = build(console, planned(console), dict(FORM, verify="pytest -x"))
+
+    argv = runs.spawn.argv                              # type: ignore[attr-defined]
+    assert argv[argv.index("--verify") + 1] == job["result"]["verify_command"] == "pytest -x"
+
+
+def test_the_cap_and_the_merge_policy_travel_from_the_form_to_the_run():
+    """The two fields that belong to the loop rather than to the repository.
+    Without the cap there is no ending but "met" and "stopped", and the
+    ticket's second ending is the cap."""
+    proc = FakeProc()
+    runs = swarm_runs(proc)
+    console, _, _ = console_with(runs=runs)
+
+    build(console, planned(console), dict(FORM, max_cycles="3", auto_merge=""))
+
+    argv = runs.spawn.argv                              # type: ignore[attr-defined]
+    assert argv[argv.index("--max-cycles") + 1] == "3"
+    assert runs.spawn.env["APIARY_MERGE_ADMIN_OVERRIDE"] == "0"   # type: ignore[attr-defined]
+    names = [f["name"] for f in BUILD_SITE["fields"]]
+    assert "max_cycles" in names and "auto_merge" in names
+
+
+def test_a_second_build_is_refused_while_the_swarm_it_started_is_live():
+    """The refusal that has to arrive *before* a repository exists.
+
+    `SwarmRuns.start` refuses a second run on its own - but only after this
+    build has provisioned a repository and written a backlog into it, leaving
+    both for a human to go and delete. So the gate is asked before anything is
+    created, and it names the repository being built rather than saying that
+    something, somewhere, is busy.
+    """
+    proc = FakeProc()
+    console, provisioner, _ = console_with(runs=swarm_runs(proc))
+
+    _, first = build(console, planned(console))
+    assert first["state"] == "done", first.get("error")
+
+    refused, _ = build(console, planned(console))       # the run is still live
+
+    assert refused.status == 409
+    body = json.loads(refused.body)
+    assert "shahrestani-me/expense-tracker" in body["error"]
+    assert "shahrestani-me/expense-tracker" in body["fix"]
+    assert len(provisioner.calls) == 1                  # nothing was created twice
+
+    # ...and once the run ends, the button works again.
+    proc.finish(0)
+    settle(console.runs.jobs[first["result"]["run"]["id"]])
+    again, second = build(console, planned(console))
+    assert again.status == 202 and second["state"] == "done", second.get("error")
+
+
+def test_a_run_that_will_not_start_does_not_turn_a_finished_build_into_a_failure():
+    """The repository and its issues are real by the time the loop is asked for.
+
+    A build that reported itself failed because Docker was down would be
+    describing the wrong thing, and would send the operator looking for a
+    repository that is sitting there with its backlog written. So the report
+    stands, and the refusal rides on it with the command that picks the work up.
+    """
+    def refuses(argv, **kwargs):
+        raise OSError("no such file or directory: python")
+
+    console, _, issues = console_with(runs=SwarmRuns(spawn=refuses, exists=lambda r: True))
+
+    _, job = build(console, planned(console))
+
+    assert job["state"] == "done"
+    assert len(job["result"]["issues"]) == 3           # scaffold + the two tasks
+    assert "run" not in job["result"]
+    assert "could not start the run" in job["result"]["run_error"]["error"]
+    assert "swarm run --repo shahrestani-me/expense-tracker" in job["result"]["run_error"]["fix"]
+
+
+def test_a_build_that_refuses_starts_no_run_at_all():
+    """Nothing created, nothing dispatched. The `_start_run` call sits after
+    `Builder.run`, and a refusal from it must not reach the swarm."""
+    console, provisioner, _ = console_with(
+        runs=SwarmRuns(spawn=_never_spawn, exists=lambda r: True),
+        preflight=lambda stacks: Diagnosis((
+            Check.failed("image.python", "not built", fix="`swarm images build`"),)),
+    )
+
+    _, job = build(console, planned(console))
+
+    assert job["state"] == "error"
+    assert provisioner.calls == []
+
+
+def _never_spawn(argv, **kwargs):
+    raise AssertionError(f"a refused build spawned a run: {argv}")

@@ -91,6 +91,10 @@ _REPO_LINE = re.compile(r"\brepo ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
 #: without it the external-run view would show every console run twice.
 _RUN_ID_LINE = re.compile(r"»\s*run\s+([a-z0-9][a-z0-9-]*)\s")
 _CYCLE_LINE = re.compile(r"\bcycle (\d+):")
+#: `_report_outcome`'s cap verdict, and the *only* line that tells a run which
+#: ran out of cycles apart from one that finished its work: both exit 0, and a
+#: page calling them the same thing reports an unfinished project as a done one.
+_CAPPED_LINE = re.compile(r"stopped after \d+ cycle\(s\)")
 _PR_REF = re.compile(r"\bPR #(\d+)")
 _ISSUE_LINE = re.compile(r"^\s*#(\d+): ")
 
@@ -306,7 +310,12 @@ class RunJob:
     lines: list[str] = field(default_factory=list)
     progress: dict[str, Any] = field(default_factory=lambda: {
         "repo": "", "repo_url": "", "run_id": "", "cycle": None,
-        "issues": [], "prs": [], "note": "", "met": False,
+        "issues": [], "prs": [], "note": "", "met": False, "capped": False,
+        # Empty while the run lives, and one of `met`/`capped`/`stopped`/
+        # `failed`/`done` after. `state` alone cannot answer this: a run that
+        # met its objective and one that ran out of cycles both end `done` with
+        # exit 0, and #130 asks the console to say *which*.
+        "outcome": "",
     })
     stop_requested: bool = False
 
@@ -340,6 +349,32 @@ class RunJob:
             p["note"] = stripped.lstrip("»! ").strip()
         if "objective met" in line:
             p["met"] = True
+        if _CAPPED_LINE.search(line):
+            p["capped"] = True
+
+    def conclude(self, returncode: int) -> None:
+        """The ending, in both the words the page needs.
+
+        `state` is what the pill is coloured by and `progress["outcome"]` is
+        what it *says*, and they are two questions rather than one. A run that
+        met its objective and a run that hit `--max-cycles` both leave `state`
+        at "done" with exit 0 - the second has unfinished work sitting in the
+        repository, and a console that rendered the two identically would be
+        telling the operator a project is finished when it is not.
+
+        Requested stops win over the exit code, because a `SIGINT`ed run exits
+        130 and calling the operator's own Stop a failure is the one reading
+        that is never true.
+        """
+        self.returncode = returncode
+        p = self.progress
+        if self.stop_requested:
+            self.state, p["outcome"] = "stopped", "stopped"
+        elif returncode == 0:
+            self.state = "done"
+            p["outcome"] = "met" if p["met"] else ("capped" if p["capped"] else "done")
+        else:
+            self.state, p["outcome"] = "failed", "failed"
 
     def to_dict(self, *, since: int = 0, now: float | None = None) -> dict[str, Any]:
         return {
@@ -395,7 +430,17 @@ class SwarmRuns:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _running: str = ""
 
-    def start(self, values: Mapping[str, str]) -> RunJob:
+    def start(self, values: Mapping[str, str], *, exists: bool | None = None) -> RunJob:
+        """Start one run. `exists` is the caller's answer about the repository.
+
+        Passing it skips the GitHub probe, and #130 is the reason it exists.
+        A build has *just* created the repository, so probing would be a wasted
+        round trip at best - and at worst a wrong one: GitHub answers 404 for a
+        repository it created seconds ago often enough that the run chained off
+        a build would take the greenfield branch and provision a **second**
+        repository over the first. The caller that made the thing is the
+        authority on whether it is there.
+        """
         local = values.get("local") == "1"
         if local:
             # No GitHub: no tokens to check, no existence to probe. The child
@@ -406,7 +451,7 @@ class SwarmRuns:
             # The one read this module does before exec'ing the real thing: is
             # the repository there? The answer picks the mode, so the operator
             # only ever says *where*, never *which command*.
-            found = self.exists(target(values))
+            found = self.exists(target(values)) if exists is None else exists
             argv = build_argv(values, exists=found)
             env = child_env(values, greenfield=not found)
 
@@ -425,6 +470,16 @@ class SwarmRuns:
                 started=time.monotonic(),
                 local=local,
             )
+            if not local:
+                # Known now, rather than parsed out of the child's first lines.
+                # `absorb` only fills this when it is empty, so the log parse
+                # stays where it is for runs adopted from elsewhere - but a run
+                # that has printed nothing yet is no longer a run the page can
+                # only call by its job id, which is what a refusal naming the
+                # live run had to say before #130. The links appear with the
+                # first tick for the same reason.
+                job.progress["repo"] = repo = target(values)
+                job.progress["repo_url"] = f"https://github.com/{repo}"
             self.jobs[job.id] = job
             self._running = job.id
 
@@ -440,6 +495,7 @@ class SwarmRuns:
         except Exception as exc:
             with self._lock:
                 job.state = "failed"
+                job.progress["outcome"] = "failed"
                 job.absorb(f"! could not start the run: {type(exc).__name__}: {exc}")
                 self._running = ""
             raise SwarmRunError(f"could not start the run: {exc}",
@@ -460,13 +516,7 @@ class SwarmRuns:
         finally:
             returncode = proc.wait()
             with self._lock:
-                job.returncode = returncode
-                if job.stop_requested:
-                    job.state = "stopped"
-                elif returncode == 0:
-                    job.state = "done"
-                else:
-                    job.state = "failed"
+                job.conclude(returncode)
                 self._running = ""
             self._procs.pop(job.id, None)
 
@@ -488,6 +538,20 @@ class SwarmRuns:
         except (ProcessLookupError, OSError):
             pass
         return job
+
+    def live(self) -> RunJob | None:
+        """The run in flight, or None. The gate a *second* build has to pass.
+
+        `start` already refuses a second run, but that refusal arrives after a
+        build has created a repository and written a backlog - which is the one
+        place in this console where being told "no" too late costs something a
+        human has to go and delete. So the build path asks this first, and the
+        answer carries the live run rather than a boolean, because "one is
+        already running" without saying which one is not a refusal an operator
+        can act on.
+        """
+        with self._lock:
+            return self.jobs.get(self._running) if self._running else None
 
     def status(self, job_id: str, *, since: int = 0) -> dict[str, Any]:
         job = self.jobs.get(job_id)

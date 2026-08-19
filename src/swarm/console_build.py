@@ -74,8 +74,15 @@ because there is nothing to ask.
 
 ## What this module does not do
 
-It does not run anything. Epic #128 step 1 is a plan becoming work. Turning
-work into workers is the next button, and `SwarmRuns` already knows how.
+It does not run anything, and after #130 that is a statement about this module
+rather than about the button. Provisioning ends at a repository with a backlog;
+`Console._build` then hands that repository to `SwarmRuns`, which supervises the
+reconcile loop exactly as the swarm tab does - a child process running the real
+`swarm run`, stopped with the `SIGINT` that lets `cli._loop` dispose its
+containers. Keeping the two apart is what lets a run that will not start be
+reported *on a build that succeeded*: the repository and its issues are real
+either way, and a build that called itself failed because the loop could not
+begin would be describing the wrong thing.
 """
 
 from __future__ import annotations
@@ -216,14 +223,16 @@ class BuildReport:
 BUILD_SITE: dict[str, Any] = {
     "key": "build",
     "kind": "build",
-    "label": "Start building — this plan, as a repository",
+    "label": "Start building — this plan, as a repository, and then a running swarm",
     "blurb": (
-        "Creates a new GitHub repository and writes the plan above into it as issues — "
-        "the tasks on this screen, with these ids, these goals and these files. The model "
-        "is not asked again. Nothing is created until the token and image checks pass, and "
-        "any task that cannot become an issue is listed here rather than dropped. The only "
-        "issue written that is not on this screen is the project scaffold, and only while "
-        "the box below is ticked."
+        "Creates a new GitHub repository, writes the plan above into it as issues — "
+        "the tasks on this screen, with these ids, these goals and these files — and then "
+        "starts the swarm on it: one worker per ready issue, a pull request per task, "
+        "cycle after cycle until the objective is met, the cap below is hit, or you press "
+        "Stop. The model is not asked to plan again. Nothing is created until the token and "
+        "image checks pass, and any task that cannot become an issue is listed here rather "
+        "than dropped. The only issue written that is not on this screen is the project "
+        "scaffold, and only while the box below is ticked."
     ),
     "fields": [
         {"name": "owner", "label": "Owner — the GitHub account or organisation to create it under",
@@ -238,6 +247,16 @@ BUILD_SITE: dict[str, Any] = {
          "kind": "check", "value": "1"},
         {"name": "verify", "label": "Verify command (optional; default: the placeholder gate, which the first pull request replaces)",
          "kind": "text", "placeholder": "python -m pytest -q", "value": ""},
+        # The two fields that belong to the *run*, not to the repository, and
+        # they are here rather than on a second form because #130 made this one
+        # button do both. They are the swarm tab's own two, verbatim: a build
+        # that offered a different cap or a different merge policy from the one
+        # `swarm run` offers would be a second set of defaults, which is the
+        # thing the ticket says not to grow.
+        {"name": "max_cycles", "label": "Stop after this many cycles (optional; default: until the objective is met)",
+         "kind": "text", "placeholder": "", "value": ""},
+        {"name": "auto_merge", "label": "Merge green pull requests automatically (admin override) — unchecked, every PR waits for a human",
+         "kind": "check", "value": "1"},
     ],
 }
 

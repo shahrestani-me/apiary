@@ -11,11 +11,9 @@ containers on the way out.
 
 from __future__ import annotations
 
-import queue
 import signal
 import sys
-import threading
-import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,80 +29,9 @@ from swarm.console_runs import (
     build_argv,
     child_env,
 )
+from fixtures.procs import FakeProc, settle, spawner
 
 HOST = {"Host": "127.0.0.1:8117"}
-
-
-# --------------------------------------------------------------------------
-# A process the test scripts
-# --------------------------------------------------------------------------
-
-
-class Script:
-    """A stdout whose lines arrive when the test says so."""
-
-    def __init__(self) -> None:
-        self._lines: queue.Queue[str] = queue.Queue()
-
-    def feed(self, *lines: str) -> None:
-        for line in lines:
-            self._lines.put(line + "\n")
-
-    def close(self) -> None:
-        self._lines.put("")
-
-    def readline(self) -> str:
-        return self._lines.get()
-
-
-class FakeProc:
-    def __init__(self, returncode: int = 0) -> None:
-        self.stdout = Script()
-        self.returncode = returncode
-        self.signals: list[int] = []
-        self._done = threading.Event()
-
-    def feed(self, *lines: str) -> None:
-        self.stdout.feed(*lines)
-
-    def finish(self, returncode: int | None = None) -> None:
-        if returncode is not None:
-            self.returncode = returncode
-        self.stdout.close()
-        self._done.set()
-
-    def wait(self) -> int:
-        self._done.wait(timeout=5)
-        return self.returncode
-
-    def send_signal(self, sig: int) -> None:
-        self.signals.append(sig)
-        self.finish(130)
-
-
-def spawner(proc: FakeProc):
-    """A `spawn` that records the argv and env it was invoked with."""
-
-    def spawn(argv, **kwargs):
-        spawn.argv = argv
-        spawn.env = kwargs.get("env")
-        return proc
-
-    spawn.argv = None
-    spawn.env = None
-    return spawn
-
-
-def settle(job, *, state: str | None = None) -> None:
-    """Wait for the watcher thread to publish, bounded rather than flaky."""
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if state is None and job.state != "running":
-            return
-        if state is not None and job.state == state:
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"run never settled: state={job.state!r}")
 
 
 @pytest.fixture
@@ -534,3 +461,160 @@ def test_the_plan_exhausted_checkbox_reaches_the_command():
 
     assert "--no-goal-check" in on
     assert "--no-goal-check" not in off
+
+
+# --------------------------------------------------------------------------
+# How a run ends, and whether the page can tell (#130)
+# --------------------------------------------------------------------------
+
+
+def ended(lines: tuple[str, ...], returncode: int, *, stop: bool = False) -> dict:
+    """One run, fed a scripted ending, settled, and read back as the page reads it."""
+    proc = FakeProc()
+    runs = SwarmRuns(spawn=spawner(proc), exists=lambda r: True)
+    job = runs.start({"objective": "x", "repo": "a/b"})
+    for line in lines:
+        proc.feed(line)
+    if stop:
+        runs.stop(job.id)          # sends SIGINT, which ends this fake at 130
+    else:
+        proc.finish(returncode)
+    settle(job)
+    return runs.status(job.id)
+
+
+@pytest.mark.usefixtures("tokens")
+def test_a_run_that_met_its_objective_says_so_rather_than_done():
+    status = ended(("» objective met: every task is verified and merged",), 0)
+
+    assert status["state"] == "done"
+    assert status["progress"]["outcome"] == "met"
+
+
+@pytest.mark.usefixtures("tokens")
+def test_a_run_that_ran_out_of_cycles_is_not_reported_as_a_finished_project():
+    """The ending `state` cannot express, and the reason `outcome` exists.
+
+    `_report_outcome` exits 0 for a cap as well as for a met objective - the
+    work is simply unfinished, which is not a failure - so a page reading the
+    exit code alone tells the operator a half-built project is done.
+    """
+    status = ended(("» cycle 3: 2 live, 1 ready",
+                    "» stopped after 3 cycle(s) with 2 live issue(s)"), 0)
+
+    assert status["state"] == "done"
+    assert status["progress"]["outcome"] == "capped"
+    assert status["progress"]["met"] is False
+
+
+@pytest.mark.usefixtures("tokens")
+def test_a_run_that_stopped_short_is_a_failure_with_its_exit_code():
+    status = ended(("» the objective is not met: the CLI has no `add` command",), 1)
+
+    assert (status["state"], status["progress"]["outcome"]) == ("failed", "failed")
+    assert status["returncode"] == 1
+
+
+@pytest.mark.usefixtures("tokens")
+def test_a_stopped_run_is_stopped_and_not_a_failure_whatever_it_exits():
+    """130 is what a `SIGINT`ed run exits, and calling the operator's own Stop
+    a failure is the one reading of that exit code that is never true."""
+    status = ended((), 0, stop=True)
+
+    assert (status["state"], status["progress"]["outcome"]) == ("stopped", "stopped")
+    assert status["returncode"] == 130
+
+
+def test_a_run_that_could_not_be_started_at_all_still_ends(tokens):
+    """The console has to survive this ending too: no child, so no watcher
+    thread will ever publish a verdict for this job."""
+    def refuses(argv, **kwargs):
+        raise OSError("no such file or directory: python")
+
+    runs = SwarmRuns(spawn=refuses, exists=lambda r: True)
+    with pytest.raises(SwarmRunError):
+        runs.start({"objective": "x", "repo": "a/b"})
+
+    job = next(iter(runs.jobs.values()))
+    assert (job.state, job.progress["outcome"]) == ("failed", "failed")
+    assert runs.live() is None
+
+
+# --------------------------------------------------------------------------
+# Stop, and what it is for
+# --------------------------------------------------------------------------
+
+
+def test_stop_disposes_every_container_the_run_spawned(monkeypatch):
+    """The half of Stop that happens in the child, proven rather than assumed.
+
+    `test_stop_is_sigint_so_the_run_disposes_its_containers` pins the signal;
+    this pins what the signal is *worth*. `cli._loop` runs the reconcile loop
+    inside `Reaper.guard()`, so the `KeyboardInterrupt` a `SIGINT` becomes
+    unwinds out of `Reconciler.loop` and the guard's exit sweep removes this
+    run's containers on the way past. A Stop that killed the process instead -
+    `SIGKILL`, or an in-process thread abandoned - would leave every worker
+    holding a clone, a disk and a token, and nothing here would notice.
+
+    Driven through the real `Reaper` against `fixtures.docker.Daemon`, which
+    parses the `--filter` arguments for real. That is what makes the second
+    assertion mean something: the sweep removes the run's own containers and
+    leaves the machine's alone.
+    """
+    import swarm.cli as cli
+    from swarm.containers.manager import DockerCLI
+    from swarm.run import Run
+
+    from fixtures.docker import Container, Daemon
+
+    monkeypatch.delenv("APIARY_CAPTURE", raising=False)
+    run = Run.start("shahrestani-me/expense-tracker", "a CLI that tracks expenses")
+    daemon = Daemon([
+        Container("worker-one", run_id=run.id, issue=1, state="running"),
+        Container("worker-two", run_id=run.id, issue=2),
+        # Somebody's database, wearing no run label. Never this sweep's to touch.
+        Container("postgres", name="db", image="postgres"),
+    ])
+
+    class Interrupted:
+        """The loop, ended the way Stop ends it."""
+
+        def loop(self, *, cycles=None):
+            raise KeyboardInterrupt
+
+    class Nothing:
+        """Every collaborator `_loop` opens and closes around the loop."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def summary(self) -> str:
+            return "store: hermetic"
+
+    monkeypatch.setattr("swarm.orchestrator.reconcile.Reconciler",
+                        lambda **kwargs: Interrupted())
+    monkeypatch.setattr("swarm.containers.manager.ContainerManager",
+                        lambda **kwargs: SimpleNamespace(docker=DockerCLI(runner=daemon)))
+    monkeypatch.setattr("swarm.store.SqliteTaskStore.open",
+                        classmethod(lambda cls, repo: Nothing()))
+    artifacts = Nothing()
+    artifacts.worker_env = lambda: {}
+    artifacts.mount_flags = lambda: []
+    artifacts.log_sink = lambda handle: None
+    artifacts.results_dir = "/var/apiary/results"
+    artifacts.event = lambda name, **fields: {}
+    artifacts.observed = lambda payload: {}
+    monkeypatch.setattr(cli.RunArtifacts, "open", classmethod(lambda cls, r, **_: artifacts))
+
+    code = cli._loop(
+        SimpleNamespace(base_commit="", no_merge=True, no_goal_check=True,
+                        dry_run=False, max_cycles=None),
+        SimpleNamespace(run=run),
+        source=SimpleNamespace(head_sha=lambda ref=None: "a" * 40),
+    )
+
+    assert code == 130                      # what `swarm run` exits on Ctrl-C
+    assert daemon.ids == ["postgres"]       # both workers gone, the machine's untouched
