@@ -96,6 +96,7 @@ from .checks import (
     PullState,
     read_pulls,
 )
+from ..store import StoreError, TaskStore, record_judgement
 from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
@@ -1022,6 +1023,7 @@ def apply_mergeability(
     plan: MergeabilityPlan,
     *,
     budget: UpdateBudget | None = None,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> MergeabilityReport:
     """Update, then relabel. Never raises for one issue; see `Failure`.
@@ -1033,10 +1035,15 @@ def apply_mergeability(
     outcome this ticket exists to remove.
 
     Within a transition the order is `docs/issue-contract.md` §5 and
-    `checks.apply_checks`': the counter and the conflict detail are one body
-    `PATCH` written first, then the new label, then the old one. One patch rather
-    than two because both are edits to the same body, and a second read between
-    them is a window for a human's edit to be lost.
+    `checks.apply_checks`': the judgment is recorded, then the counter and the
+    conflict detail go out as one body `PATCH`, then the new label, then the old
+    one. One patch rather than two because both are edits to the same body, and
+    a second read between them is a window for a human's edit to be lost.
+
+    `store` is where the judgment that goes with the counter is recorded (#159).
+    `None` records none - for a caller exercising the label half alone - and
+    `Reconciler` always passes one, because an attempt consumed without its
+    signature recorded is an attempt that renews somebody's budget for free.
     """
     updated: list[int] = []
     applied: list[Transition] = []
@@ -1073,6 +1080,15 @@ def apply_mergeability(
         if transition is None:
             continue
         try:
+            if transition.attempt is not None:
+                record_judgement(
+                    store,
+                    transition.ref,
+                    transition.attempt,
+                    blocker=transition.blocker,
+                    streak=transition.streak,
+                    renewals=transition.renewals,
+                )
             if transition.attempt is not None or decision.context:
                 _patch_body(client, transition, decision.context)
             # `Transition` is keyed on the task; these calls address the
@@ -1081,7 +1097,7 @@ def apply_mergeability(
             client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
                 client.remove_label(number, transition.from_label)
-        except GitHubError as exc:
+        except (GitHubError, StoreError) as exc:
             failures.append(Failure(decision.number, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
@@ -1110,7 +1126,9 @@ def _patch_body(client: Any, transition: Transition, context: str) -> None:
     is cheap because it happens only for an issue that just lost its pull
     request. `rewrite_marker` is #22's, imported rather than reimplemented: two
     modules with their own idea of where the counter lives is how a counter stops
-    bounding anything.
+    bounding anything. It carries the counter and nothing else - the failure
+    signature that used to ride with it is written to apiary's own store by the
+    caller, immediately before this (#159).
     """
     number = issue_number(transition.ref)
     issue = client.get_issue(number)
@@ -1136,6 +1154,7 @@ def run_mergeability(
     budget: UpdateBudget | None = None,
     policy: UpdatePolicy | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> MergeabilityReport:
     """Read, decide, write, and hand `report.plan.admitted` to `checks.apply_checks`.
@@ -1179,7 +1198,7 @@ def run_mergeability(
         files=files,
         max_attempts=max_attempts,
     )
-    return apply_mergeability(client, plan, budget=spent, dry_run=dry_run)
+    return apply_mergeability(client, plan, budget=spent, store=store, dry_run=dry_run)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docstring

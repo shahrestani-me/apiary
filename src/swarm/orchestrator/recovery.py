@@ -152,6 +152,7 @@ from ..github.refs import task_ref
 from ..run import Run, RunError, validate_run_id
 from ..taskref import TaskRef
 from .dispatcher import CLAIMED, REVIEW
+from ..store import TaskStore
 from .reconcile import FAILED, ReconcilePlan, ReconcileReport, Snapshot, Transition, apply_plan
 
 
@@ -511,6 +512,20 @@ class Recovery:
 
     max_attempts: int = SETTINGS.max_attempts_per_task
 
+    #: Where apiary's own judgments live (#159). A released claim consumes an
+    #: attempt through a channel that has no verify output to sign, so the
+    #: judgment written here carries no signature - which is the deliberate
+    #: "clear the record" direction §5 describes: a stale signature could renew
+    #: a budget the blocker never released, and the counter must over-bound
+    #: rather than under-bound. `None` leaves the store alone, and the outcome
+    #: is the same either way, because a judgment stamped at an attempt the
+    #: counter has since passed is read as stale and dropped
+    #: (`store.TaskJudgement.matches`). It is passed all the same, so the
+    #: store never sits holding a belief that has already been superseded -
+    #: a run somebody is debugging should not have to know the staleness rule
+    #: to read it.
+    store: TaskStore | None = None
+
     #: Plans and prints, writes nothing - including no marker adoption, which
     #: is a body `PATCH` a dry run promised not to make.
     dry_run: bool = False
@@ -574,7 +589,10 @@ class Recovery:
             ledger, containers=containers, states=states, open_branches=open_branches
         )
         result = apply_plan(
-            self.client, ReconcilePlan(transitions=plan.transitions), dry_run=self.dry_run
+            self.client,
+            ReconcilePlan(transitions=plan.transitions),
+            store=self.store,
+            dry_run=self.dry_run,
         )
         return RecoveryReport(plan=plan, result=result)
 
@@ -587,7 +605,11 @@ class Recovery:
         does inside a cycle.
         """
         snapshot = Snapshot(self.client)
-        ledger = load_ledger(snapshot, adopt=not self.dry_run)  # type: ignore[arg-type]
+        ledger = load_ledger(
+            snapshot,  # type: ignore[arg-type]
+            adopt=not self.dry_run,
+            store=self.store,
+        )
         return self.sweep(
             ledger,
             states=snapshot.states(),

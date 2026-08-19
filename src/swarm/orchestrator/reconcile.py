@@ -30,6 +30,20 @@ to what actually changed: a label move per finished worker, not per issue. A run
 of N cycles therefore costs O(N) requests, not O(N x issues), and
 `tests/test_reconcile.py` asserts exactly that by counting them.
 
+**Two facts a cycle reads, and only one of them is GitHub's.** Everything
+above is about the tracker winning, and it still does - for everything the
+tracker owns. It does not own the failure signature, the streak of it or the
+renewal count: those are apiary's judgments about its own execution, they
+cannot be derived from anything external, and #159 moved them out of the
+customer's issue body into apiary's own store
+(`docs/adr/0002-apiary-owns-a-thin-task-store.md`). So a cycle joins two
+sources - the issue listing for what each task *is*, `Reconciler.store` for
+what apiary decided about running it - and the join needs no reconciliation at
+all, because the store holds only fields the tracker never had. The attempt
+counter stays in the issue marker, because the worker reads it from there and
+cannot reach the store; the store keeps a *stamp* of which attempt each
+judgment belongs to, never a second copy of the counter.
+
 **Two things this module needs and cannot have.** `docs/issue-contract.md` §1.4
 requires the orchestrator to post a `ContractError` back as a comment on the
 offending issue, and the whole loop wants to read pull requests; `GitHubClient`
@@ -115,6 +129,7 @@ from ..github.readiness import (
 )
 from ..github.refs import issue_number, task_ref
 from ..run import TERMINAL_LABELS, Run, live_entries
+from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord, summarise_dir, tail
@@ -349,16 +364,32 @@ class Transition:
     task_id: str = ""
     attempt: int | None = None
     comment: str = ""
-    #: The failure-signature record that rides the same body `PATCH` as the
-    #: counter (§5). `blocker` is the signature of the failure this transition
-    #: is charging for and `streak` how many consecutive attempts have now
-    #: failed with it; both are only meaningful when `attempt` is written, and
-    #: a transition that consumes an attempt without setting them - a stale
-    #: claim, a failed check run, anything whose failure has no verify output
-    #: to sign - deliberately clears the record, which downstream reads as "no
-    #: previous blocker" and falls back to the pre-signature arithmetic.
+    #: The failure-signature record this transition is charging for. Written
+    #: to apiary's own store (#159), not to the issue body: a signature is
+    #: apiary's judgment about its own execution and
+    #: `docs/adr/0002-apiary-owns-a-thin-task-store.md` is where those live.
+    #: `blocker` is the signature of the failure and `streak` how many
+    #: consecutive attempts have now failed with it; both are only meaningful
+    #: when `attempt` is written, and a transition that consumes an attempt
+    #: without setting them - a stale claim, a failed check run, anything whose
+    #: failure has no verify output to sign - deliberately clears the record,
+    #: which downstream reads as "no previous blocker" and falls back to the
+    #: pre-signature arithmetic.
     blocker: str = ""
     streak: int | None = None
+    #: How many times this task's per-blocker budget has been renewed, this
+    #: transition included. Carried so the store can record it; nothing here
+    #: branches on it, and `store.TaskJudgement.renewals` says why adding a
+    #: third input to the give-up arithmetic would be a behaviour change.
+    #:
+    #: A transition with no signature to record leaves this at 0, and that is
+    #: the same "clears the record" direction the two fields above take: a
+    #: channel that consumed an attempt without seeing why (a stale claim, a
+    #: failed check run) has no basis for any part of the record, and the old
+    #: marker rewrite dropped the whole of it too. Nothing decides on the
+    #: count, so the cost is a number in a store somebody is reading rather
+    #: than a retry granted or refused.
+    renewals: int = 0
     #: This move was caused by an infrastructure verdict (exit 2), whether it
     #: re-readied the issue or escalated it at the cap. Carried as a flag
     #: rather than sniffed back out of `reason`, because `infrastructure_streaks`
@@ -745,6 +776,11 @@ def _retry_or_give_up(
     # pre-signature arithmetic exactly (the back-compat the tests pin).
     previous_streak = entry.attempt if entry.streak is None else entry.streak
     streak = 1 if renewed else previous_streak + 1
+    # Recorded, never read here. The give-up tests below run on `streak` and on
+    # `attempt`, exactly as #154-#156 left them; this is the transcript of how
+    # often the budget was renewed, which was previously written down only as
+    # prose in a comment nobody could count.
+    renewals = entry.renewals + 1 if renewed else entry.renewals
 
     if attempt >= total_cap:
         return Transition(
@@ -756,6 +792,7 @@ def _retry_or_give_up(
             attempt=attempt,
             blocker=sig,
             streak=streak,
+            renewals=renewals,
             comment=(
                 f"apiary: giving up after {attempt} attempt(s). {reason}\n\n"
                 f"The total retry budget is spent ({attempt} of {total_cap}, "
@@ -781,6 +818,7 @@ def _retry_or_give_up(
             attempt=attempt,
             blocker=sig,
             streak=streak,
+            renewals=renewals,
             comment=(
                 f"apiary: giving up after {attempt} attempt(s). {reason}\n\n"
                 f"The last {streak} attempt(s) failed the same way, so another retry "
@@ -805,6 +843,7 @@ def _retry_or_give_up(
         attempt=attempt,
         blocker=sig,
         streak=streak,
+        renewals=renewals,
         comment=retry_comment(attempt, reason, verify_output, renewal=renewal),
     )
 
@@ -1076,13 +1115,15 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
             entry,
             state_label=transition.to_label,
             attempt=entry.attempt if transition.attempt is None else transition.attempt,
-            # The signature record mirrors the marker write exactly: a
-            # transition that wrote the counter wrote (or cleared) the record
-            # in the same patch, and one that left the counter alone left the
-            # record alone too. Folding anything else would hand the rest of
-            # the cycle a ledger disagreeing with the body it just patched.
+            # The signature record mirrors the store write exactly: a
+            # transition that wrote the counter wrote (or cleared) the
+            # judgment in the same act, and one that left the counter alone
+            # left the judgment alone too. Folding anything else would hand
+            # the rest of the cycle a ledger disagreeing with what was just
+            # persisted.
             blocker=entry.blocker if transition.attempt is None else transition.blocker,
             streak=entry.streak if transition.attempt is None else transition.streak,
+            renewals=entry.renewals if transition.attempt is None else transition.renewals,
             labels=frozenset(entry.labels - {transition.from_label} | {transition.to_label}),
         )
     return replace(ledger, entries=entries)
@@ -1093,9 +1134,7 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
 # --------------------------------------------------------------------------
 
 
-def rewrite_marker(
-    body: str, task_id: str, attempt: int, *, blocker: str = "", streak: int | None = None
-) -> str:
+def rewrite_marker(body: str, task_id: str, attempt: int) -> str:
     """Set the counter in the identity marker, preserving every other byte.
 
     §5's write rule, and the reason it is a body `PATCH` rather than a label: it
@@ -1109,16 +1148,16 @@ def rewrite_marker(
     fresh marker prepended, which is where the loader's own adoption puts it and
     which the parser reads first either way.
 
-    `blocker` and `streak` are the failure-signature record; the marker is
-    rewritten *from the arguments*, not merged with what it carried, so a
-    caller that does not pass them (`checks`, `mergeability`, recovery -
-    channels whose consumed attempt has no verify output to sign) clears the
-    record and the next failure is judged by the pre-signature arithmetic.
-    That direction is deliberate: a stale signature could renew a budget the
-    blocker never released, and §5 says the counter must over-bound, never
-    under-bound.
+    **The counter and nothing else.** The marker used to carry the failure
+    signature too, and #159 moved that into apiary's own store
+    (`docs/adr/0002-apiary-owns-a-thin-task-store.md`) - so this rewrite drops
+    `blocker=` and `streak=` from any body that still has them, which is how a
+    repository upgraded mid-flight sheds them. The counter itself stays,
+    because the worker reads it: it is a container with no view of the host and
+    it derives its branch name and its result filename from that number
+    (`render_marker`).
     """
-    marker = render_marker(task_id, attempt, blocker=blocker, streak=streak)
+    marker = render_marker(task_id, attempt)
     lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     fenced = False
     for index, line in enumerate(lines):
@@ -1134,15 +1173,7 @@ def rewrite_marker(
     return f"{marker}\n\n{body}" if body else marker
 
 
-def bump_attempt(
-    client: Any,
-    number: int,
-    task_id: str,
-    attempt: int,
-    *,
-    blocker: str = "",
-    streak: int | None = None,
-) -> None:
+def bump_attempt(client: Any, number: int, task_id: str, attempt: int) -> None:
     """Persist the counter, re-reading the body immediately before the patch.
 
     Two API calls, and the re-read is the point: the body in the ledger was
@@ -1151,17 +1182,19 @@ def bump_attempt(
     fresh read, and it is cheap because it happens only for an issue that just
     finished an attempt.
 
-    The failure signature travels in the same patch as the counter, which is
-    what keeps §5's crash-ordering argument intact for it: the record lands
-    before the label goes back to `swarm:ready`, so a crash between the two
-    costs an attempt with its signature recorded, never grants a retry whose
-    streak forgot what it was retrying.
+    The failure signature no longer travels with it - it is written to
+    apiary's own store, immediately before this call, by the same `apply_plan`
+    loop (#159). §5's crash-ordering argument survives the split intact and
+    reads the same way: judgment, then counter, then the label that re-readies
+    the task, so a crash anywhere in the sequence costs an attempt with its
+    signature recorded rather than granting a retry whose streak forgot what it
+    was retrying. The two writes are not atomic together and never were - the
+    counter and the label were already two calls - and the order is what buys
+    the guarantee, not a transaction.
     """
     issue = client.get_issue(number)
     body = issue.get("body") or ""
-    client.update_issue(
-        number, body=rewrite_marker(body, task_id, attempt, blocker=blocker, streak=streak)
-    )
+    client.update_issue(number, body=rewrite_marker(body, task_id, attempt))
 
 
 # --------------------------------------------------------------------------
@@ -1246,16 +1279,25 @@ def apply_plan(
     *,
     fleet: Fleet | None = None,
     handles: Mapping[TaskRef, Handle] | None = None,
+    store: TaskStore | None = None,
     dry_run: bool = False,
 ) -> ReconcileReport:
     """Write the plan. Never raises for one issue; see `Failure`.
 
-    Per transition the order is counter, then add, then remove. Counter first is
-    §5 - the increment is persisted before the issue can be re-dispatched.
-    Add-before-remove is `readiness._relabel`'s rule and load-bearing for the
-    same reason: a crash between two label calls leaves either two state labels
-    or none, and two is repairable by §3's precedence while none puts the issue
-    outside the ledger where nothing looks at it again.
+    Per transition the order is judgment, then counter, then add, then remove.
+    Judgment and counter first is §5 - both are persisted before the issue can
+    be re-dispatched, so a crash costs an attempt rather than granting a free
+    one, and the judgment leads because a counter that moved without one would
+    be an attempt charged against a blocker nobody recorded. Add-before-remove
+    is `readiness._relabel`'s rule and load-bearing for the same reason: a
+    crash between two label calls leaves either two state labels or none, and
+    two is repairable by §3's precedence while none puts the issue outside the
+    ledger where nothing looks at it again.
+
+    `store` is where the judgment goes (#159). `None` writes none, which is for
+    a caller that is only exercising the label half; `Reconciler` requires a
+    store and always passes it, because a run that consumed attempts without
+    recording their signatures would let every task renew its budget forever.
     """
     handles = handles or {}
     applied: list[Transition] = []
@@ -1284,21 +1326,30 @@ def apply_plan(
         number = issue_number(transition.ref)
         try:
             if transition.attempt is not None and transition.task_id:
-                bump_attempt(
-                    client,
-                    number,
-                    transition.task_id,
+                # apiary's own judgment first, the tracker's counter second.
+                # A store write that fails raises out of this `try` like a
+                # GitHub error does and lands in `failures` for that one issue,
+                # which is the right blast radius: one task whose judgment
+                # could not be recorded must not cost the other nineteen their
+                # transition, and the un-bumped counter leaves that task
+                # exactly where it was for the next cycle to try again.
+                record_judgement(
+                    store,
+                    transition.ref,
                     transition.attempt,
                     blocker=transition.blocker,
                     streak=transition.streak,
+                    renewals=transition.renewals,
                 )
+                bump_attempt(client, number, transition.task_id, transition.attempt)
             client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
                 client.remove_label(number, transition.from_label)
-        except GitHubError as exc:
+        except (GitHubError, StoreError) as exc:
             # A human deleting or relabelling this issue between the read and
-            # the write lands here. It is a fact about one issue, not a reason
-            # to abandon the cycle - the next read sees whatever they did.
+            # the write lands here, and so does a store that will not take the
+            # judgment. Either is a fact about one issue, not a reason to
+            # abandon the cycle - the next read sees whatever they did.
             failures.append(Failure(transition.ref, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
@@ -1460,6 +1511,17 @@ class Reconciler:
 
     run: Run
     client: GitHubClient
+    #: Where apiary's own judgments live (#159): the failure signature, its
+    #: streak and the renewal count for every task this run touches.
+    #: **Required, and deliberately without a default.** Every other seam here
+    #: is optional because its absence disables a rule that is then plainly
+    #: not running; a missing store is the opposite - the retry arithmetic
+    #: still runs, still consumes attempts, and simply forgets what it decided,
+    #: which reads as a fresh budget for every task on the next cycle and lets
+    #: a failing task retry forever. That failure is silent, so it is made
+    #: impossible instead: there is no `Reconciler` without somewhere to write
+    #: its judgments, and mypy says so at every construction site.
+    store: TaskStore
     base_commit: str = ""
     fleet: Fleet | None = None
     #: Where the workers' result records land - `RunArtifacts.results_dir`, not
@@ -1578,7 +1640,11 @@ class Reconciler:
         snapshot = Snapshot(self.client)
         # `adopt` writes a marker onto every hand-written issue (§2), which a
         # dry run promised not to do.
-        ledger = load_ledger(snapshot, adopt=not self.dry_run)  # type: ignore[arg-type]
+        ledger = load_ledger(
+            snapshot,  # type: ignore[arg-type]
+            adopt=not self.dry_run,
+            store=self.store,
+        )
 
         handles = self._handles()
         # Read once and shared with step 5: the judge's observation carries each
@@ -1599,7 +1665,12 @@ class Reconciler:
             infrastructure_policy=self.infrastructure_policy,
         )
         result = apply_plan(
-            snapshot, plan, fleet=self.fleet, handles=handles, dry_run=self.dry_run
+            snapshot,
+            plan,
+            fleet=self.fleet,
+            handles=handles,
+            store=self.store,
+            dry_run=self.dry_run,
         )
         ledger = fold(ledger, result.applied)
         # Folded from what actually **landed**, not from what was planned: a
@@ -1674,9 +1745,15 @@ class Reconciler:
                 policy=self.update_policy,
                 budget=self.update_budget,
                 max_attempts=self.max_attempts,
+                # Both gates consume attempts of their own - a PR that will not
+                # rebase, a check run that failed - so both need somewhere to
+                # record the judgment that goes with the counter they bump.
+                store=self.store,
                 dry_run=self.dry_run,
             )
-            checks = apply_checks(snapshot, mergeability.plan.admitted, dry_run=self.dry_run)
+            checks = apply_checks(
+                snapshot, mergeability.plan.admitted, store=self.store, dry_run=self.dry_run
+            )
             ledger = fold(ledger, checks.applied)
 
         readiness: ReadinessPlan | None = None
@@ -1945,11 +2022,17 @@ class Reconciler:
 if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docstring
     import os
 
+    from ..store import SqliteTaskStore
+
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
     # Read-only on every path: no label, no comment, no adoption, no container.
     reconciler = Reconciler(
         run=Run.start(repo, "dry run", run_id="apiary-dry-run-000000-aaaaaa"),
         client=GitHubClient.from_env(repo),
+        # Opened read-only in effect: a dry run plans and writes nothing, but
+        # it still has to *read* the judgments, or every task would print as
+        # though it had never failed.
+        store=SqliteTaskStore.open(repo),
         dry_run=True,
     )
     dry = reconciler.cycle()

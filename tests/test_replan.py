@@ -37,6 +37,7 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
+from fixtures.markers import legacy_marker
 from swarm.github.client import GitHubError
 from swarm.github.ledger import Ledger, LedgerEntry, load_ledger, render_marker
 from swarm.github.refs import task_ref as ref
@@ -846,7 +847,7 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
     client, store = tracker()
     body = render_body("stuck", goal="Unblock the chain", files=["src/swarm/a.py"], verify=VERIFY, attempt=3)
     body = body.replace(
-        render_marker("stuck", 3), render_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
+        render_marker("stuck", 3), legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
     )
     number = store.add(body=body, labels=[FAILED])
     before = load_ledger(client, adopt=False)
@@ -866,7 +867,7 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
     labels = {label["name"] for label in store.issues[number]["labels"]}
     assert labels == {READY}
     # The marker survives verbatim: nothing is reset, the arithmetic guards.
-    assert render_marker("stuck", 3, blocker="ab12cd34ef", streak=3) in store.issues[number]["body"]
+    assert legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3) in store.issues[number]["body"]
     assert store.comments[0][0] == number
     assert store.comments[0][1].startswith("apiary: the replan retained this task")
     assert "revived" in report.summary()

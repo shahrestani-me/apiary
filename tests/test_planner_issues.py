@@ -28,6 +28,7 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
+from fixtures.markers import legacy_marker
 from swarm.config import SETTINGS
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubError
@@ -527,7 +528,7 @@ def failed_body(
     body = render_body(task_id, goal=goal, files=list(files), verify=VERIFY, attempt=attempt)
     return body.replace(
         render_marker(task_id, attempt),
-        render_marker(task_id, attempt, blocker=blocker, streak=streak),
+        legacy_marker(task_id, attempt, blocker=blocker, streak=streak),
     )
 
 
