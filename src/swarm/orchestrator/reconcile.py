@@ -133,7 +133,7 @@ from ..run import TERMINAL_LABELS, Run, live_entries
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
-from ..worker.result import ResultRecord, summarise_dir, tail
+from ..worker.result import ResultRecord, latest_named, load_named, summarise_dir, tail
 from .authority import (
     Belief,
     Grant,
@@ -2078,7 +2078,7 @@ class Reconciler:
         # task's latest failure text, and that text is what a replan is written
         # from (`replan.brief`). A second read here would be a second directory
         # listing for facts this cycle already has.
-        results = self._results()
+        results, result_names = self._results()
         # One fold over the cached issue listing, shared by the three readers in
         # this cycle. No API call either way - `Snapshot` caches the listing -
         # but three walks of it to build the same mapping is three walks.
@@ -2397,6 +2397,10 @@ class Reconciler:
             # would emit one manufactured divergence per task in review.
             pulls=pulls,
             results=results,
+            # The names those records were read from, so the recorder can write
+            # down which file this cycle saw rather than one rebuilt from the
+            # record's `attempt` - which since #177 need not be the same file.
+            result_names=result_names,
             states=states,
             infrastructure=self._infrastructure,
             infrastructure_cap=self.infrastructure_policy.cap,
@@ -2741,22 +2745,34 @@ class Reconciler:
                 found.setdefault(task_ref(int(handle.issue)), handle)
         return found
 
-    def _results(self) -> dict[TaskRef, ResultRecord]:
-        """The latest artifact record per issue, or nothing if there is no directory.
+    def _results(self) -> tuple[dict[TaskRef, ResultRecord], dict[TaskRef, str]]:
+        """The latest artifact record per issue, **and the file each was read from**.
 
         The worker writes its record last (`worker/result.py`), so a record is
         the only evidence this process has that a container finished and what it
         decided - and reading it costs a directory listing rather than an API
         call or a blocking `docker wait`.
+
+        The names come back from the same read as the records, which is the
+        whole reason they come back at all. `shadow.observed_line` has to write
+        down *which* file this cycle was handed, and since #177 that is not a
+        function of the record: several records can share an attempt and live
+        under different names. A recorder that listed the directory again to
+        find out would be reading the world a second time, at the end of a cycle
+        that has since dispatched containers - so it would record a file this
+        cycle never saw. Reading once and carrying both is what keeps the
+        recorded line a projection of what was resolved.
         """
         if self.artifacts is None:
-            return {}
-        # `summarise_dir` keys on the issue number the worker wrote into the
-        # record's filename; minted here for `_handles`' reason.
-        return {
-            task_ref(number): record
-            for number, record in summarise_dir(self.artifacts, run_id=self.run.id).latest.items()
-        }
+            return {}, {}
+        # Keyed on the issue number the worker wrote into the record; minted
+        # here for `_handles`' reason. `latest_named` is `summarise_dir(...)
+        # .latest` with the filename attached, and asserted to be so.
+        latest = latest_named(load_named(self.artifacts))
+        return (
+            {task_ref(number): record for number, (_, record) in latest.items()},
+            {task_ref(number): name for number, (name, _) in latest.items()},
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docstring
