@@ -85,6 +85,23 @@ services:
       APIARY_TRACKER_MCP_URL: ${APIARY_TRACKER_MCP_URL:-}
       APIARY_TRACKER_TOKEN: ${APIARY_TRACKER_TOKEN:-}
 
+      # Where the capability contract is (#150) - which tool on that server
+      # fulfils intake, comment and create. A path *inside this container*: the
+      # only host directory this service mounts is ./.swarm/runs, so a
+      # containerised orchestrator either keeps the block there or gets a mount
+      # added here. Unset means "no tracker configured", which is still a normal
+      # installation until the label control plane goes (#152), and `swarm
+      # doctor` reports it as a skip rather than as a failure.
+      APIARY_TRACKER_CONFIG: ${APIARY_TRACKER_CONFIG:-}
+
+      # The credential the shipped `linear` profile names. A default that names
+      # a variable nothing passes through is the APIARY_EGRESS_ALLOW mistake
+      # again - documented in several places and read by none - so it is here
+      # even though a customer on another tracker never sets it. The `github`
+      # profile reuses GITHUB_TOKEN above and needs nothing new, which is the
+      # whole point of #143's credential-overlap finding.
+      APIARY_LINEAR_TOKEN: ${APIARY_LINEAR_TOKEN:-}
+
       # Which image carries which stack's toolchain (#99). This block is an
       # explicit list, not a passthrough, so an override that is not named here
       # simply never reaches a containerised orchestrator - it would read the
