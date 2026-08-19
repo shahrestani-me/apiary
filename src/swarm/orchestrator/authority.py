@@ -474,6 +474,17 @@ def source_summary(source: str | None = None) -> str:
 # --------------------------------------------------------------------------
 
 
+def _about(held: Remembered, ref: TaskRef | None) -> bool:
+    """Is this remembered state about the work item now filed under its task id?
+
+    A task id absent from this cycle's ledger cannot be vouched for, so the
+    memory is dropped - the conservative direction, and the same one
+    `_still_landed` takes: an unverifiable memory falls back to the label seed
+    rather than deciding on a ref nobody confirmed.
+    """
+    return ref is not None and held.about(ref)
+
+
 def _unbelieved(state: str) -> str:
     """A state that decides this cycle but may not seed the ratchet.
 
@@ -489,6 +500,13 @@ def _unbelieved(state: str) -> str:
     one place that deliberately does not.
     """
     return str(state)
+
+
+def _remembered(
+    state: str, ref: TaskRef, stands: bool, announced: str | None
+) -> Remembered:
+    """`Remembered.__reduce__`'s rebuild. Module level so pickle can name it."""
+    return Remembered(state, ref, stands=stands, announced=announced)
 
 
 class Remembered(str):
@@ -562,12 +580,16 @@ class Remembered(str):
         self.announced = announced
         return self
 
-    def __getnewargs__(self) -> tuple[str, TaskRef]:
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
         # `str.__getnewargs__` returns `(value,)`, so `copy`, `deepcopy` and
         # `pickle` would all re-enter `__new__` without a ref and raise. Nothing
         # in `src/` copies a belief today; a `str` subclass that explodes on
         # `copy.copy` is a trap for whoever first does.
-        return str(self), self.ref
+        #
+        # `__reduce__` rather than `__getnewargs__` because the latter's return
+        # type is fixed at `tuple[str]` by the supertype, and widening it is the
+        # override mypy rejects.
+        return _remembered, (str(self), self.ref, self.stands, self.announced)
 
     def about(self, ref: TaskRef) -> bool:
         """Is this remembered state about `ref`? The id-reuse check, spelled once."""
@@ -897,7 +919,7 @@ def believe(
     seen = {
         task_id: state
         for task_id, state in (remembered or {}).items()
-        if not isinstance(state, Remembered) or state.about(refs.get(task_id))
+        if not isinstance(state, Remembered) or _about(state, refs.get(task_id))
     }
     previous = {**by_label, **seen}
 
