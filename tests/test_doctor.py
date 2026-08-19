@@ -58,10 +58,10 @@ from swarm.doctor import (
     CHECK_DOCKER_CLI,
     CHECK_DOCKER_DAEMON,
     CHECK_LABELS,
-    CHECK_OLLAMA_MODELS,
-    CHECK_OLLAMA_REACHABLE,
-    CHECK_OLLAMA_SCHEMA,
-    CHECK_OLLAMA_TARGET,
+    CHECK_MODEL_AVAILABLE,
+    CHECK_MODEL_REACHABLE,
+    CHECK_MODEL_SCHEMA,
+    CHECK_MODEL_TARGET,
     CHECK_BOOT_TOKEN,
     CHECK_REPO,
     CHECK_TIMEOUTS,
@@ -382,10 +382,10 @@ def test_a_healthy_environment_passes_every_check(doctor):
     diagnosis = subject.run()
 
     assert [check.name for check in diagnosis.checks] == [
-        CHECK_OLLAMA_TARGET,
-        CHECK_OLLAMA_REACHABLE,
-        CHECK_OLLAMA_MODELS,
-        CHECK_OLLAMA_SCHEMA,
+        CHECK_MODEL_TARGET,
+        CHECK_MODEL_REACHABLE,
+        CHECK_MODEL_AVAILABLE,
+        CHECK_MODEL_SCHEMA,
         CHECK_TOKEN,
         CHECK_BOOT_TOKEN,
         CHECK_REPO,
@@ -435,7 +435,7 @@ def test_the_report_is_readable(doctor):
     report = subject.run().report()
 
     assert "all 19 preconditions met" in report
-    for name in (CHECK_OLLAMA_SCHEMA, CHECK_TOKEN, stack_check("python")):
+    for name in (CHECK_MODEL_SCHEMA, CHECK_TOKEN, stack_check("python")):
         assert name in report
 
 
@@ -453,7 +453,7 @@ def test_a_bind_address_is_caught_before_the_connection_error(doctor):
     """
     subject, _, _, _ = doctor(settings=settings(ollama_base_url=BIND_URL))
     diagnosis = subject.run()
-    target = diagnosis.by_name(CHECK_OLLAMA_TARGET)
+    target = diagnosis.by_name(CHECK_MODEL_TARGET)
 
     assert target.status == FAIL
     assert "bind address" in target.detail
@@ -462,24 +462,24 @@ def test_a_bind_address_is_caught_before_the_connection_error(doctor):
 
     # And the connection error that would have followed is not reported at
     # all: `ollama serve` is what it advises, and it would fix nothing.
-    assert diagnosis.by_name(CHECK_OLLAMA_REACHABLE).status == SKIP
+    assert diagnosis.by_name(CHECK_MODEL_REACHABLE).status == SKIP
 
 
 @pytest.mark.parametrize("url", ["http://0.0.0.0:11434", "http://[::]:11434", "http://:11434"])
 def test_every_wildcard_spelling_is_a_bind_address(doctor, url):
     subject, _, _, _ = doctor(settings=settings(ollama_base_url=url))
-    assert subject.check_ollama_target().status == FAIL
+    assert subject.check_model_target().status == FAIL
 
 
 def test_loopback_is_only_wrong_inside_a_container(doctor):
     """`localhost` from a container is the container, and Ollama is on the host."""
     inside, _, _, _ = doctor(in_container=True)
-    verdict = inside.check_ollama_target()
+    verdict = inside.check_model_target()
     assert verdict.status == FAIL
     assert "host.docker.internal" in verdict.fix
 
     outside, _, _, _ = doctor(in_container=False)
-    assert outside.check_ollama_target().ok
+    assert outside.check_model_target().ok
 
 
 def test_an_unreachable_server_names_the_command_that_starts_it(doctor):
@@ -487,23 +487,23 @@ def test_an_unreachable_server_names_the_command_that_starts_it(doctor):
     subject, _, _, _ = doctor(inference=dead)
     diagnosis = subject.run()
 
-    reachable = diagnosis.by_name(CHECK_OLLAMA_REACHABLE)
+    reachable = diagnosis.by_name(CHECK_MODEL_REACHABLE)
     assert reachable.status == FAIL
     assert "ollama serve" in reachable.fix
 
     # And the two checks that need a server are not attempted, rather than
     # reporting an absent model. Each names the verdict directly above it, so
     # the chain leads back to the one thing that is actually wrong.
-    assert diagnosis.by_name(CHECK_OLLAMA_MODELS).status == SKIP
-    assert CHECK_OLLAMA_REACHABLE in diagnosis.by_name(CHECK_OLLAMA_MODELS).detail
-    assert diagnosis.by_name(CHECK_OLLAMA_SCHEMA).status == SKIP
-    assert CHECK_OLLAMA_MODELS in diagnosis.by_name(CHECK_OLLAMA_SCHEMA).detail
+    assert diagnosis.by_name(CHECK_MODEL_AVAILABLE).status == SKIP
+    assert CHECK_MODEL_REACHABLE in diagnosis.by_name(CHECK_MODEL_AVAILABLE).detail
+    assert diagnosis.by_name(CHECK_MODEL_SCHEMA).status == SKIP
+    assert CHECK_MODEL_AVAILABLE in diagnosis.by_name(CHECK_MODEL_SCHEMA).detail
 
 
 def test_a_missing_model_is_named_with_its_pull_command(doctor):
     """The failure that otherwise presents as "the planner is broken"."""
     subject, _, _, _ = doctor(inference=FakeInference(models=[WORKER_MODEL]))
-    verdict = subject.run().by_name(CHECK_OLLAMA_MODELS)
+    verdict = subject.run().by_name(CHECK_MODEL_AVAILABLE)
 
     assert verdict.status == FAIL
     assert ORCHESTRATOR_MODEL in verdict.detail
@@ -526,12 +526,12 @@ def test_the_implicit_latest_tag_is_not_a_missing_model(doctor, installed, wante
         inference=FakeInference(models=installed),
         settings=settings(orchestrator_model=wanted, worker_model=wanted),
     )
-    assert subject.check_models().ok is expected
+    assert subject.check_model_available().ok is expected
 
 
 def test_a_model_that_ignores_the_schema_is_a_failure_not_a_planning_bug(doctor):
     subject, _, _, _ = doctor(inference=FakeInference(schema_failures=("worker",)))
-    verdict = subject.run().by_name(CHECK_OLLAMA_SCHEMA)
+    verdict = subject.run().by_name(CHECK_MODEL_SCHEMA)
 
     assert verdict.status == FAIL
     assert WORKER_MODEL in verdict.detail
@@ -544,7 +544,7 @@ def test_the_schema_probe_can_be_turned_off(doctor):
     subject, _, _, probe = doctor(probe_schema=False)
     diagnosis = subject.run()
 
-    assert diagnosis.by_name(CHECK_OLLAMA_SCHEMA).status == SKIP
+    assert diagnosis.by_name(CHECK_MODEL_SCHEMA).status == SKIP
     assert probe.probed == []
     assert diagnosis.ok
 
@@ -579,7 +579,7 @@ def test_a_missing_token_stops_the_github_checks_rather_than_the_run(doctor):
     # The rest of the environment is still reported: an operator who has two
     # problems should learn about both on the first run.
     assert diagnosis.by_name(CHECK_DOCKER_DAEMON).ok
-    assert diagnosis.by_name(CHECK_OLLAMA_MODELS).ok
+    assert diagnosis.by_name(CHECK_MODEL_AVAILABLE).ok
 
 
 @pytest.mark.parametrize(
@@ -1035,10 +1035,10 @@ def provoked_failures(doctor) -> list[Check]:
     catastrophe that would fail everything.
     """
     cases: list[tuple[str, dict[str, Any]]] = [
-        (CHECK_OLLAMA_TARGET, {"settings": settings(ollama_base_url=BIND_URL)}),
-        (CHECK_OLLAMA_REACHABLE, {"inference": FakeInference(DoctorError("refused"))}),
-        (CHECK_OLLAMA_MODELS, {"inference": FakeInference(models=[])}),
-        (CHECK_OLLAMA_SCHEMA, {"inference": FakeInference(schema_failures=("orchestrator",))}),
+        (CHECK_MODEL_TARGET, {"settings": settings(ollama_base_url=BIND_URL)}),
+        (CHECK_MODEL_REACHABLE, {"inference": FakeInference(DoctorError("refused"))}),
+        (CHECK_MODEL_AVAILABLE, {"inference": FakeInference(models=[])}),
+        (CHECK_MODEL_SCHEMA, {"inference": FakeInference(schema_failures=("orchestrator",))}),
         (CHECK_TOKEN, {"env": {}}),
         (CHECK_REPO, {"script": github_script(issues=response(404, {"message": "Not Found"}))}),
         (CHECK_LABELS, {"script": github_script(labels=label_page(missing=["swarm:ready"]))}),
@@ -1124,11 +1124,11 @@ def test_live_models_honour_the_schema():
     question is whether *this* configuration works.
     """
     subject = Doctor(inference=HostInference())
-    reachable = subject.check_ollama_reachable()
+    reachable = subject.check_model_reachable()
     if not reachable.ok:
         pytest.skip(reachable.detail)
-    assert subject.check_models().ok, subject.check_models().detail
-    assert subject.check_schema().ok, subject.check_schema().detail
+    assert subject.check_model_available().ok, subject.check_model_available().detail
+    assert subject.check_model_schema().ok, subject.check_model_schema().detail
 
 
 @pytest.mark.network
@@ -1260,3 +1260,180 @@ def test_the_timeout_check_probes_nothing(doctor):
 
     assert verdict.status == FAIL
     assert (len(transport.calls), len(runner.calls)) == before
+
+
+# --------------------------------------------------------------------------
+# The four model checks, after ADR 0006
+# --------------------------------------------------------------------------
+#
+# The complaint this section answers is doctor's own docstring, turned on
+# itself: a check "that reports `ollama.models: failed` has moved the hour of
+# confusion rather than removing it", and a doctor reporting on Ollama while
+# the run will use Bedrock does exactly that.
+
+
+BEDROCK_ENV = {
+    "GITHUB_TOKEN": TOKEN,
+    PROVISION_TOKEN_ENV: BOOT_TOKEN,
+    "APIARY_LINEAR_TOKEN": LINEAR_TOKEN,
+    "SWARM_WORKER_MODEL": "bedrock:gpt-5.6-luna",
+    "SWARM_WORKER_MODEL_OPTIONS": "region=eu-west-1,profile=acme",
+}
+
+
+@dataclass
+class FakeRemote:
+    """The remote counterpart of `FakeInference`, breakable one field at a time."""
+
+    version_answer: str | Exception = "reachable as aws profile 'acme' in eu-west-1"
+    listing: list[str] | Exception | None = None
+    schema_failures: tuple[str, ...] = ()
+
+    def version(self) -> str:
+        if isinstance(self.version_answer, Exception):
+            raise self.version_answer
+        return self.version_answer
+
+    def installed(self) -> list[str]:
+        from swarm.doctor import Unlistable
+
+        if isinstance(self.listing, Exception):
+            raise self.listing
+        if self.listing is None:
+            raise Unlistable("listing is a separate permission")
+        return list(self.listing)
+
+    def schema_probe(self, role: str) -> str:
+        if role in self.schema_failures:
+            raise DoctorError("returned str, not the requested schema")
+        return "Ping parsed"
+
+
+def test_the_target_check_names_the_provider_and_the_rung_that_chose_it(doctor):
+    """The half an operator cannot otherwise discover. A model now comes from an
+    argument, a variable, a file a console session wrote last week, or a
+    built-in - and only two of those are visible from a shell."""
+    subject, _, _, _ = doctor(env=BEDROCK_ENV, remote=FakeRemote())
+
+    verdict = subject.check_model_target()
+
+    assert verdict.ok
+    assert "bedrock:gpt-5.6-luna" in verdict.detail
+    assert "bedrock-runtime.eu-west-1.amazonaws.com" in verdict.detail
+    assert "SWARM_WORKER_MODEL" in verdict.detail
+    # And the orchestrator, still local, in the same verdict.
+    assert "ollama:" in verdict.detail
+
+
+def test_ollamas_bind_address_trap_is_still_ollamas_alone(doctor):
+    """`model.target`'s whole subject on Ollama is the bind-address-versus-
+    client-target ambiguity, which no other provider has. It moved rather than
+    changed."""
+    subject, _, _, _ = doctor(settings=settings(ollama_base_url=BIND_URL))
+
+    verdict = subject.check_model_target()
+
+    assert verdict.status == FAIL
+    assert "the shape of a bind address" in verdict.detail
+
+
+def test_the_checks_report_on_the_provider_that_is_configured(doctor):
+    """The whole ticket in one assertion: with a Bedrock worker configured, the
+    Ollama probe is not what answers for it."""
+    remote = FakeRemote()
+    subject, _, _, _ = doctor(env=BEDROCK_ENV, remote=remote)
+
+    verdict = subject.check_model_reachable()
+
+    assert verdict.ok
+    assert "bedrock" in verdict.detail
+
+
+def test_no_credential_and_a_rejected_one_are_different_verdicts(doctor):
+    """Two of the three, and the pair that matters most: telling an operator to
+    export a variable they have already exported is exactly the moved hour of
+    confusion this module exists to end."""
+    from swarm.doctor import InvalidCredential, MissingCredential
+
+    missing, _, _, _ = doctor(
+        env=BEDROCK_ENV, remote=FakeRemote(version_answer=MissingCredential("nothing is set"))
+    )
+    rejected, _, _, _ = doctor(
+        env=BEDROCK_ENV, remote=FakeRemote(version_answer=InvalidCredential("expired"))
+    )
+
+    absent = missing.check_model_reachable()
+    refused = rejected.check_model_reachable()
+
+    assert absent.status == FAIL and refused.status == FAIL
+    assert absent.fix != refused.fix
+    assert "aws sso login" in absent.fix
+    assert "will not help" in refused.fix, "a rejected key must not be answered with 'set it'"
+
+
+def test_no_access_to_this_model_is_the_third_verdict_and_not_a_pull(doctor):
+    """On Ollama the remedy is a download. On Bedrock it is an entitlement
+    somebody grants in a console, and telling an operator to pull something
+    would be advice they cannot act on."""
+    subject, _, _, _ = doctor(env=BEDROCK_ENV, remote=FakeRemote(listing=["some-other-model"]))
+
+    verdict = subject.check_model_available()
+
+    assert verdict.status == FAIL
+    assert "not available to this bedrock account" in verdict.detail
+    assert "ollama pull" not in verdict.fix
+    assert "model access is granted per model and per region" in verdict.fix
+
+
+def test_a_provider_that_will_not_list_its_catalogue_is_not_a_failure(doctor):
+    """Listing is a different permission from calling on every remote provider,
+    and an account routinely holds the second without the first. The schema
+    probe answers "does *my* model work" with a real call anyway."""
+    subject, _, _, _ = doctor(env=BEDROCK_ENV, remote=FakeRemote(listing=None))
+
+    verdict = subject.check_model_available()
+
+    assert verdict.ok
+    assert "not listable" in verdict.detail
+
+
+def test_the_schema_probe_runs_against_whichever_provider_is_configured(doctor):
+    """The check that matters most, and the one ADR 0006 put the most weight on:
+    Ollama constrains decoding so a model cannot wander off-format, while a
+    remote strict schema is a different mechanism with a different failure
+    mode."""
+    subject, _, _, _ = doctor(env=BEDROCK_ENV, remote=FakeRemote(schema_failures=("worker",)))
+
+    verdict = subject.check_model_schema()
+
+    assert verdict.status == FAIL
+    assert "bedrock:gpt-5.6-luna (worker)" in verdict.detail
+    # And the remedy is Bedrock's, not `ollama show`.
+    assert "ollama show" not in verdict.fix
+    assert "method=function_calling" in verdict.fix
+
+
+def test_a_misconfigured_provider_is_a_verdict_rather_than_a_traceback(doctor):
+    """`config.py`'s rule - "declining rather than raising is deliberate" - held
+    here too. A `swarm doctor` that died of the thing it exists to report would
+    report nothing else at all, and `swarm --help` must keep working."""
+    broken = dict(BEDROCK_ENV, SWARM_WORKER_MODEL="bedrock:x", SWARM_WORKER_MODEL_OPTIONS="regoin=eu")
+    subject, _, _, _ = doctor(env=broken, remote=FakeRemote())
+
+    diagnosis = subject.run()
+
+    assert diagnosis.by_name(CHECK_MODEL_TARGET).status == FAIL
+    assert "regoin" in diagnosis.by_name(CHECK_MODEL_TARGET).detail
+    # And the run still reported on everything else.
+    assert diagnosis.by_name(CHECK_TOKEN).ok
+    assert diagnosis.by_name(CHECK_MODEL_REACHABLE).status == SKIP
+
+
+def test_a_local_installation_never_builds_a_remote_probe(doctor):
+    """A fully local clone must not construct an SDK client it has no need for,
+    and `remote` is built on first use precisely so that it does not."""
+    subject, _, _, _ = doctor()
+
+    subject.run()
+
+    assert subject.remote is None

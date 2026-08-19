@@ -63,6 +63,7 @@ from .config import (
     DEFAULT_WORKER_NUM_CTX,
     SETTINGS,
     ConfigError,
+    Settings,
 )
 from .llm import PROVIDERS, ModelSpec
 
@@ -310,20 +311,31 @@ class Resolution:
         return f"{self.spec.label} from {self.source}{where}"
 
 
-def _built_in(role: str) -> ModelSpec:
-    """Rung 4. Ollama, from the defaults `config.py` has always carried."""
+def _built_in(role: str, settings: Settings | None = None) -> ModelSpec:
+    """Rung 4. Ollama, out of `Settings` - which *is* the built-in answer.
+
+    Reading `Settings` rather than the `DEFAULT_*` constants directly is what
+    keeps this rung honest. `Settings` folds the environment into its own
+    fields, so on the only path that reaches rung 4 - no `SWARM_*_MODEL` set,
+    nothing saved - it holds exactly those constants. What it buys is that a
+    caller holding a *different* `Settings` gets that one: `swarm doctor` pins
+    its settings so a test can provoke a verdict without breaking the machine
+    it runs on, and a rung that ignored them would report on a model the doctor
+    was not asked about.
+    """
+    chosen = SETTINGS if settings is None else settings
     if role == "orchestrator":
         return ModelSpec(
             provider="ollama",
-            model=DEFAULT_ORCHESTRATOR_MODEL,
-            temperature=SETTINGS.orchestrator_temperature,
-            num_ctx=DEFAULT_ORCHESTRATOR_NUM_CTX,
+            model=chosen.orchestrator_model or DEFAULT_ORCHESTRATOR_MODEL,
+            temperature=chosen.orchestrator_temperature,
+            num_ctx=chosen.orchestrator_num_ctx or DEFAULT_ORCHESTRATOR_NUM_CTX,
         )
     return ModelSpec(
         provider="ollama",
-        model=DEFAULT_WORKER_MODEL,
-        temperature=SETTINGS.worker_temperature,
-        num_ctx=DEFAULT_WORKER_NUM_CTX,
+        model=chosen.worker_model or DEFAULT_WORKER_MODEL,
+        temperature=chosen.worker_temperature,
+        num_ctx=chosen.worker_num_ctx or DEFAULT_WORKER_NUM_CTX,
     )
 
 
@@ -346,7 +358,9 @@ def _num_ctx(role: str, env: Mapping[str, str], fallback: int) -> int:
         return fallback
 
 
-def _from_environment(role: str, env: Mapping[str, str]) -> Resolution | None:
+def _from_environment(
+    role: str, env: Mapping[str, str], settings: Settings | None = None
+) -> Resolution | None:
     """Rung 2, or `None` if this role's model variable is not set.
 
     Only the *model* variable decides whether this rung applies. An options
@@ -360,11 +374,12 @@ def _from_environment(role: str, env: Mapping[str, str]) -> Resolution | None:
     if not raw:
         return None
     provider, model = parse_model(raw)
+    defaults = _built_in(role, settings)
     spec = ModelSpec(
         provider=provider,
         model=model,
-        temperature=_built_in(role).temperature,
-        num_ctx=_num_ctx(role, env, _built_in(role).num_ctx),
+        temperature=defaults.temperature,
+        num_ctx=_num_ctx(role, env, defaults.num_ctx),
         options=parse_options(env.get(names["options"], "")),
     )
     return Resolution(spec=spec, source=ENVIRONMENT, detail=names["model"])
@@ -376,11 +391,12 @@ def resolve(
     *,
     env: Mapping[str, str] | None = None,
     sink: ModelStore | None = None,
+    settings: Settings | None = None,
 ) -> Resolution:
     """Which model `role` gets, and why. The four rungs, highest first.
 
-    `env` and `sink` are the test seams. Both default to the real thing, so
-    every production caller passes neither.
+    `env`, `sink` and `settings` are the test seams. All three default to the
+    real thing, so every production caller passes none of them.
     """
     if role not in ROLES:
         raise ConfigError(f"unknown role {role!r}; the roles are {', '.join(ROLES)}")
@@ -389,7 +405,7 @@ def resolve(
     if spec is not None:
         return Resolution(spec=spec, source=ARGUMENT)
 
-    from_env = _from_environment(role, environment)
+    from_env = _from_environment(role, environment, settings)
     if from_env is not None:
         return from_env
 
@@ -409,7 +425,7 @@ def resolve(
             detail=str((sink or store()).path),
         )
 
-    return Resolution(spec=_built_in(role), source=BUILT_IN)
+    return Resolution(spec=_built_in(role, settings), source=BUILT_IN)
 
 
 #: Roles already announced in this process. A set rather than a flag because
