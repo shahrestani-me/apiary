@@ -858,27 +858,35 @@ class ShadowReport:
 
 
 def observed_line(
-    observation: Observation, control: Mapping[str, str], *, results_dir: Any = None
+    observation: Observation,
+    control: Mapping[str, str],
+    *,
+    result_names: Mapping[TaskRef, str] | None = None,
 ) -> dict[str, Any]:
     """One `observed.jsonl` line, in the shape `tests/fixtures/corpus.py` loads.
 
     A projection of an `Observation` that has already been built, so nothing
     here reads anything and nothing here can disagree with what was resolved.
     The one asymmetry is `results`: the corpus records the *file names* a cycle
-    could see rather than the records themselves, so the name is rebuilt
-    through `worker.result.record_path` - the one spelling of that name in the
-    codebase.
+    could see rather than the records themselves. `result_names` is those
+    names, carried here from the read that produced `observation.results`
+    (`Reconciler._results`) rather than looked up again - this function still
+    reads nothing, which is what stops it disagreeing with what was resolved.
 
-    **The rebuilt name is not necessarily the file the record was read from.**
-    Since #177 `write_result` bumps the *filename* on a collision and leaves
-    the record's `attempt` alone, so several records for one issue can share an
-    attempt and live under different names, and this line names the first of
-    them. The loader (#230) matches the name against the directory and then
-    reduces to `RunSummary.latest`, so a task carries one `AttemptFact` on both
-    sides and the count is right. What does not survive is *which* of the
-    records sharing that attempt it was - visible only if two of them disagree
-    on their exit code, which needs an infrastructure failure and a task
-    failure at one attempt number.
+    **The name cannot be rebuilt from the record.** Since #177 `write_result`
+    bumps the *filename* on a collision and leaves the record's `attempt`
+    alone, so several records for one issue share an attempt and live under
+    different names; `record_path(issue, attempt)` names the first of them
+    whichever one this cycle actually read. That only changes a replayed fact
+    when two records at one attempt disagree on their exit code - an
+    infrastructure failure and a task failure at the same attempt number, where
+    the difference is `AttemptFact.spends_budget` - but it is a fact about the
+    run either way, and #230 is the loader half of the same seam.
+
+    The rebuilt name is still the fallback, for a caller that has an
+    `Observation` and no directory: a hand-written line and every test that
+    predates the argument. It is exactly right whenever no two records share an
+    attempt, which is every run that never hit infrastructure trouble.
 
     Labels rather than internal states in `control`, because that is the
     corpus's own decision and its reason is good: the day the labels go away it
@@ -928,7 +936,8 @@ def observed_line(
             for pull in observation.pulls
         ],
         "results": [
-            record_path("", _issue_of(record.ref), record.attempt).name
+            (result_names or {}).get(record.ref)
+            or record_path("", _issue_of(record.ref), record.attempt).name
             for record in observation.results
         ],
         "budget": {
@@ -1015,6 +1024,7 @@ class ShadowWindow:
         containers: Iterable[Handle] = (),
         pulls: Mapping[str, PullState] | None = None,
         results: Mapping[TaskRef, ResultRecord] | None = None,
+        result_names: Mapping[TaskRef, str] | None = None,
         states: Mapping[TaskRef, IssueState] | None = None,
         infrastructure: Mapping[TaskRef, int] | None = None,
         infrastructure_cap: int = 3,
@@ -1054,6 +1064,7 @@ class ShadowWindow:
                 containers=list(containers),
                 pulls=pulls,
                 results=results,
+                result_names=result_names,
                 states=states,
                 infrastructure=infrastructure,
                 infrastructure_cap=infrastructure_cap,
@@ -1083,6 +1094,7 @@ class ShadowWindow:
         containers: Sequence[Handle],
         pulls: Mapping[str, PullState] | None,
         results: Mapping[TaskRef, ResultRecord] | None,
+        result_names: Mapping[TaskRef, str] | None,
         states: Mapping[TaskRef, IssueState] | None,
         infrastructure: Mapping[TaskRef, int] | None,
         infrastructure_cap: int,
@@ -1136,7 +1148,7 @@ class ShadowWindow:
         )
 
         if record is not None:
-            record(observed_line(observation, labels))
+            record(observed_line(observation, labels, result_names=result_names))
         if emit is not None:
             self._announce(shadow, emit)
         if shadow.unexplained and not self.warned:

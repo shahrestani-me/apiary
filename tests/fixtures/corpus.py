@@ -76,7 +76,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 from swarm.artifacts import (
     CORPUS_MANIFEST_NAME,
@@ -100,7 +100,7 @@ from swarm.orchestrator.derived import (
     TaskFact,
 )
 from swarm.orchestrator.lifecycle import INTERNAL_STATE
-from swarm.worker.result import ResultRecord, RunSummary
+from swarm.worker.result import ResultRecord, latest_named
 
 #: Where the committed runs live. A directory rather than a roster, so a run
 #: added tomorrow is replayed because it exists - the same ratchet
@@ -376,7 +376,7 @@ def _cycle(
         AttemptFact(
             ref=task_ref(record.issue), attempt=record.attempt, exit_code=record.exit_code
         )
-        for _, record in sorted(_latest(results[name] for name in sorted(visible)).items())
+        for _, record in sorted(_latest({name: results[name] for name in visible}).items())
     )
 
     budget = line.get("budget") or {}
@@ -440,27 +440,21 @@ def _ref(value: Any) -> TaskRef:
     return task_ref(int(text[1:]))
 
 
-def _latest(records: Iterable[ResultRecord]) -> dict[int, ResultRecord]:
-    """Issue number -> its newest record. `RunSummary.latest`, not a copy of it.
+def _latest(named: Mapping[str, ResultRecord]) -> dict[int, ResultRecord]:
+    """Issue number -> its newest record. `worker.result.latest_named`, not a copy.
 
     **This is what makes the loader model a cycle rather than a directory.** A
-    live cycle never sees a list of records: `reconcile._results` hands it
+    live cycle never sees a list of records: `Reconciler._results` hands it
     `summarise_dir(...).latest`, one record per task, and the recorder
-    (`shadow.observed_line`) writes the names of exactly those. So the visible
-    set is reduced the same way here, by the same property, and a task carries
-    one `AttemptFact` on both sides of the recording.
+    (`shadow.observed_line`) writes the names of exactly those. The reduction
+    here is the same function the recorder's side of the seam uses, so the two
+    cannot drift - which is the property the old `_result_name` claimed and
+    stopped having when #177 unpinned the filename from the `attempt` field.
 
-    Asked of `RunSummary` rather than reimplemented because the reduction is
-    subtle enough to have been wrong twice: `latest` keeps the newest on the
-    whole of `record_order` - `(issue, attempt, finished_at)` - after #218 found
-    that comparing the attempt alone left eleven records for one issue tied and
-    the answer to whichever a sorted glob put last. A second spelling here would
-    be a second thing to fix the next time that ordering moves.
-
-    `run_id` is unused by `latest` and is left empty on purpose: this is a
-    reduction over records the corpus already holds, not a summary of a run.
+    The name `latest_named` returns is what the loader matched on rather than
+    something it needs again, so only the record comes back.
     """
-    return RunSummary(run_id="", records=tuple(records)).latest
+    return {issue: record for issue, (_, record) in latest_named(named).items()}
 
 
 def _load_results(directory: Path) -> dict[str, ResultRecord]:
