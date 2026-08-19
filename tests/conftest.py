@@ -7,6 +7,16 @@ and `fixtures/repo.py` as pytest fixtures. Anything that talks to the GitHub
 API or to a git remote should reach for one of those rather than growing a
 sixth private version of it.
 
+**The roots.** `hermetic_roots` is autouse: every test runs with the three
+`.swarm/` roots - runs, console sessions and the task store - pointed at its
+own `tmp_path`. Passing explicit paths remains the right thing for a test that
+cares (see `ProjectStore`'s docstring on its seams); this is the floor beneath
+that, for the default-constructed store nobody remembered to seam. Without it
+`Console()` carries a `ProjectStore` addressed at the developer's real
+`.swarm/projects.sqlite`, and the console tests read *and write* it - which is
+how three fixture repositories ended up in one developer's database while CI,
+having no `.swarm/` at all, stayed green.
+
 **The gate.** Three markers - `docker`, `network` and `ollama` - name the three
 things a laptop may have and CI does not. They are deselected by default, so
 `pytest -q` is the hermetic suite everywhere, and enabled per-marker with
@@ -146,6 +156,37 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
+
+
+#: The three roots a test must never write to on a developer's machine. Each
+#: is its own setting on purpose - see `test_store.py` on why the store root is
+#: not derived from the artifacts root - so each is redirected by name.
+HERMETIC_ROOT_ENV_VARS = {
+    "APIARY_ARTIFACTS_DIR": "runs",
+    "APIARY_CONSOLE_DIR": "console",
+    "APIARY_STORE_DIR": "store",
+}
+
+
+@pytest.fixture(autouse=True)
+def hermetic_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point every `.swarm/` root at this test's `tmp_path`.
+
+    The defaults are relative (`.swarm/runs`), so "the developer's real state"
+    is whatever sits under the directory pytest happens to be run from - the
+    repository itself, usually, holding real runs and a real projects
+    database. A test that constructs its own paths never noticed; a test that
+    let a default through wrote into that database and passed anyway.
+
+    A test that wants the default back deletes the variable itself
+    (`monkeypatch.delenv(..., raising=False)`), which is what the two tests
+    asserting the defaults already do - this fixture runs first, and theirs
+    wins.
+    """
+    root = tmp_path / ".swarm"
+    for var, leaf in HERMETIC_ROOT_ENV_VARS.items():
+        monkeypatch.setenv(var, str(root / leaf))
+    return root
 
 
 @pytest.fixture()
