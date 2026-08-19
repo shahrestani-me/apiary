@@ -59,6 +59,7 @@ __all__ = [
     "SwarmRunError",
     "SwarmRuns",
     "RunJob",
+    "assert_tokens",
     "build_argv",
     "child_env",
 ]
@@ -237,6 +238,33 @@ def _cycles_flag(values: Mapping[str, str], flag: str) -> list[str]:
     return [flag, cycles]
 
 
+def assert_tokens(env: Mapping[str, str], *, greenfield: bool) -> None:
+    """Refuse before anything is started if the credentials are not there.
+
+    Split out of `child_env` because the console grew a second way to reach
+    GitHub that spawns no child at all (`console_build`): a build provisions a
+    repository and writes issues in this process, and it needs exactly these
+    two variables for exactly these two reasons. One statement of a missing
+    variable, in one place, is the point - two descriptions of one problem is
+    how the fix for it goes stale on the copy nobody edited.
+
+    Presence only. Validity is GitHub's to judge, and the caller's own error
+    will name anything subtler.
+    """
+    if not env.get(WORK_TOKEN_ENV):
+        raise SwarmRunError(
+            f"{WORK_TOKEN_ENV} is not set in the console's environment",
+            fix="start the console from a shell with the credentials loaded: "
+                "`set -a; source ~/.config/apiary/env; set +a; swarm console`",
+        )
+    if greenfield and not env.get(PROVISION_TOKEN_ENV):
+        raise SwarmRunError(
+            f"creating a repository needs {PROVISION_TOKEN_ENV}, which is not set",
+            fix=f"mint the boot key (administration, contents, workflows, issues, metadata), "
+                f"export it as {PROVISION_TOKEN_ENV}, and restart the console",
+        )
+
+
 def child_env(
     values: Mapping[str, str],
     *,
@@ -250,18 +278,7 @@ def child_env(
     error will name anything subtler.
     """
     env = dict(os.environ if base is None else base)
-    if not env.get(WORK_TOKEN_ENV):
-        raise SwarmRunError(
-            f"{WORK_TOKEN_ENV} is not set in the console's environment",
-            fix="start the console from a shell with the credentials loaded: "
-                "`set -a; source ~/.config/apiary/env; set +a; swarm console`",
-        )
-    if greenfield and not env.get(PROVISION_TOKEN_ENV):
-        raise SwarmRunError(
-            f"creating a repository needs {PROVISION_TOKEN_ENV}, which is not set",
-            fix=f"mint the boot key (administration, contents, workflows, issues, metadata), "
-                f"export it as {PROVISION_TOKEN_ENV}, and restart the console",
-        )
+    assert_tokens(env, greenfield=greenfield)
     # The checkbox is authoritative per run, whatever the shell said: a policy
     # the page shows and the child inherits differently would be the lie.
     env[MERGE_OVERRIDE_ENV] = "1" if values.get("auto_merge") == "1" else "0"

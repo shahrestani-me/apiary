@@ -61,6 +61,7 @@ from .artifacts import console_root
 from .capture import CAPTURE_ENV, Capture, Recorder
 from .config import ConfigError, SETTINGS
 from .console_board import BoardError, BoardReader
+from .console_build import BUILD_SITE, BUILD_SITE_KEY, BuildError, Builder
 from .console_intake import QUESTIONS as INTAKE_QUESTIONS
 from .console_projects import ProjectError, ProjectStore
 from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns
@@ -103,6 +104,19 @@ CAPTURE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 class ConsoleError(ValueError):
     """A refusal an operator can fix. Rendered by `cli.main` as one `!` line."""
+
+
+class ConsoleBusy(ConsoleError):
+    """Single flight, refused. Carries the fix, and is always a 409.
+
+    Its own type because two routes raise it now - a model call and a build -
+    and the alternative was each of them re-deriving "is something running,
+    and what do I say if it is" from `_running`. See `Console._claim`.
+    """
+
+    def __init__(self, message: str, *, fix: str = "") -> None:
+        super().__init__(message)
+        self.fix = fix
 
 
 def validate_capture_id(value: str) -> str:
@@ -211,6 +225,11 @@ def _plan_run(payload: Mapping[str, str]) -> Any:
                 "goal": task.goal,
                 "files": list(task.files),
                 "depends_on": list(task.depends_on),
+                # Rendered nowhere, and carried anyway: #129 rebuilds the plan
+                # it writes out of this payload, and a task whose stack was
+                # dropped on the way to the screen would be written back with a
+                # different one than the model chose.
+                "stack": task.stack,
             }
             for task in plan.tasks
         ],
@@ -338,7 +357,10 @@ class Job:
     state: str = "running"
     result: Any = None
     capture: dict[str, Any] | None = None
-    error: dict[str, str] | None = None
+    #: `Any` rather than `str` because a build's failure carries doctor's
+    #: failing checks alongside the message and the fix (#129), and a check is
+    #: an object rather than a line. Everything in here is still JSON.
+    error: dict[str, Any] | None = None
 
     def to_dict(self, *, now: float | None = None) -> dict[str, Any]:
         return {
@@ -367,6 +389,7 @@ class Console:
     sink: Recorder | None = None
     jobs: dict[str, Job] = field(default_factory=dict)
     runs: SwarmRuns = field(default_factory=SwarmRuns)
+    builder: Builder = field(default_factory=Builder)
     board: BoardReader = field(default_factory=BoardReader)
     projects: ProjectStore = field(default_factory=ProjectStore)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -414,6 +437,10 @@ class Console:
                                   # nothing that iterates model-call sites may
                                   # pick up a form with no prompt behind it.
                                   "swarm": SWARM_SITE,
+                                  # Its own key for the same reason `swarm` is:
+                                  # it is a form, not a call site, and nothing
+                                  # that iterates `sites` may fire it at a model.
+                                  "build": BUILD_SITE,
                                   "models": {"orchestrator": SETTINGS.orchestrator_model,
                                              "worker": SETTINGS.worker_model,
                                              "base_url": SETTINGS.ollama_base_url}})
@@ -423,6 +450,8 @@ class Console:
             return self._run(body)
         if method == "GET" and path.startswith("/status"):
             return self._status(path)
+        if method == "POST" and path == "/swarm/build":
+            return self._swarm_build(body)
         if method == "POST" and path == "/swarm/start":
             return self._swarm_start(body)
         if method == "POST" and path == "/swarm/stop":
@@ -462,23 +491,46 @@ class Console:
         return Response.json({"system": system, "human": human,
                               "chars": len(system) + len(human)})
 
-    def _run(self, body: bytes) -> Response:
-        try:
-            site, values = self._payload(body)
-        except ConsoleError as exc:
-            return Response.error(str(exc), 400)
+    def _claim(self, site: str) -> Job:
+        """One thing at a time, on one latch, for every kind of work there is.
 
+        #129 asked for a second Start building to be refused "the same way a
+        second inference is refused". The same way means the same latch, not a
+        second one that agrees with it most of the time: a build provisions a
+        repository and writes a backlog, and two of those racing would create
+        two repositories from one plan. So a build takes a `Job` and claims
+        `_running` exactly as a model call does, and each kind explains itself
+        in terms of what is *already* running rather than what was asked for -
+        Ollama loading one model at a time is the reason for the first and has
+        nothing to do with the second.
+        """
         with self._lock:
             if self._running:
                 running = self.jobs.get(self._running)
-                return Response.error(
+                kind = getattr(running, "site", "") or "it"
+                if kind == BUILD_SITE_KEY:
+                    raise ConsoleBusy(
+                        "a build is already in flight, and a second one would create "
+                        "a second repository from the same plan",
+                        fix="wait for it to finish, or reload the page",
+                    )
+                raise ConsoleBusy(
                     "a call is already in flight, and Ollama loads one model at a time",
-                    409,
-                    fix=f"wait for {running.site if running else 'it'} to finish, or reload the page",
+                    fix=f"wait for {kind} to finish, or reload the page",
                 )
-            job = Job(id=uuid.uuid4().hex[:16], site=site.key, started=time.monotonic())
+            job = Job(id=uuid.uuid4().hex[:16], site=site, started=time.monotonic())
             self.jobs[job.id] = job
             self._running = job.id
+            return job
+
+    def _run(self, body: bytes) -> Response:
+        try:
+            site, values = self._payload(body)
+            job = self._claim(site.key)
+        except ConsoleBusy as exc:
+            return Response.error(str(exc), 409, fix=exc.fix)
+        except ConsoleError as exc:
+            return Response.error(str(exc), 400)
 
         threading.Thread(target=self._work, args=(site, values, job), daemon=True).start()
         return Response.json(job.to_dict(), 202)
@@ -559,6 +611,112 @@ class Console:
                 print(f"! projects: could not record {values.get('repo')!r}: {exc}",
                       file=sys.stderr)
         return Response.json(job.to_dict(), 202)
+
+    # -- Start building ---------------------------------------------------
+
+    def _swarm_build(self, body: bytes) -> Response:
+        """The plan on the screen, as a repository and a backlog.
+
+        The plan travels as the **id of the call that produced it**, not as
+        tasks posted back up from the browser. That is the whole point of the
+        ticket made structural: the console writes the decomposition it
+        returned, and no round trip through a page - or through anything
+        pretending to be one - can substitute a different set of tasks between
+        the operator reading them and GitHub receiving them. `job.result` is
+        the exact payload `/status` served, so "the plan shown is the plan
+        written" is a property of the code rather than a promise in a docstring.
+
+        On a thread, and polled at `/status` like every other job, for the
+        reason the module docstring gives about blocking POSTs: provisioning is
+        a repository creation, a commit, a label sweep and a ruleset, and then
+        one issue per task. That is minutes on a slow morning, and a browser
+        showing nothing for minutes is a browser that gets reloaded.
+        """
+        try:
+            data = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            return Response.error(f"bad request body: {exc}", 400)
+
+        values = {k: str(v) for k, v in (data.get("values") or {}).items()}
+        try:
+            source = self.jobs.get(validate_capture_id(str(data.get("plan", ""))))
+        except ConsoleError as exc:
+            return Response.error(str(exc), 400)
+        if source is None:
+            return Response.error(
+                "no such call, so there is no plan to build", 404,
+                fix="run the planner and press Start building on its answer",
+            )
+        if source.site != "planner" or source.state != "done":
+            return Response.error(
+                f"call {source.id} is a {source.site} call in state {source.state!r}, "
+                "which is not a plan", 400,
+                fix="press Start building on a finished planner call",
+            )
+
+        try:
+            job = self._claim(BUILD_SITE_KEY)
+        except ConsoleBusy as exc:
+            return Response.error(str(exc), 409, fix=exc.fix)
+
+        threading.Thread(
+            target=self._build, args=(source.result, values, job), daemon=True
+        ).start()
+        return Response.json(job.to_dict(), 202)
+
+    def _build(self, result: Any, values: Mapping[str, str], job: Job) -> None:
+        """`_work`, minus the capture - and the omission is deliberate.
+
+        `_work` attaches `sink.last` to every job it finishes, which is right
+        when the job *was* a model call. This one is not, and the recorder's
+        last record is therefore the planner call that produced the plan
+        several minutes ago. Attaching it would draw a "the call" card with
+        timings and a raw response under a build that never spoke to a model,
+        which is the single most misleading thing this page could render given
+        what the ticket is about.
+        """
+        state, report, error = "error", None, None
+        try:
+            report = self.builder.run(result, values).to_dict()
+            self._record(report, values)
+            state = "done"
+        except BuildError as exc:
+            error = {"type": "BuildError", "message": str(exc), "fix": exc.fix,
+                     "traceback": "", "checks": exc.checks}
+        except Exception as exc:  # noqa: BLE001 - every failure belongs on the page
+            error = {"type": type(exc).__name__, "message": str(exc),
+                     "fix": _fix_for(exc), "traceback": traceback.format_exc()[-2000:]}
+        finally:
+            job.result = report
+            job.error = error
+            job.state = state
+            with self._lock:
+                self._running = ""
+
+    def _record(self, report: Mapping[str, Any], values: Mapping[str, str]) -> None:
+        """File the new repository as a project, before the verdict is published.
+
+        Here rather than in `Builder` for the reason `_swarm_start` files a
+        started run here: this is the layer that owns the store, and
+        provisioning should not learn bookkeeping.
+
+        Before, not after, and that ordering is the same one `_work` writes
+        down: the page renders the report the instant `state` becomes "done",
+        and a selector still missing the repository at that moment is a
+        repository the operator has to retype the name of. Best-effort and out
+        loud - the repository and its issues are already real, so a store
+        hiccup must not turn a finished build into a failed one.
+        """
+        try:
+            self.projects.record_run(
+                report["repo"],
+                objective=(values.get("objective") or "").strip(),
+                stack=report["stack"],
+                verify=report["verify_command"],
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not mask the build
+            print(f"! projects: could not record {report['repo']!r}: {exc}",
+                  file=sys.stderr)
 
     def _swarm_stop(self, body: bytes) -> Response:
         try:
