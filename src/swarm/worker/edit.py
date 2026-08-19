@@ -56,7 +56,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ..llm import structured, worker_llm
+from ..config import SETTINGS
+from ..llm import parse_failure, structured, worker_llm
 from ..state import FileEdit, WorkerOutput
 
 SYSTEM = """You are a careful software engineer working alone on ONE task.
@@ -339,6 +340,140 @@ def prompt_for(
     return SYSTEM, build_prompt(goal, writable, readable)
 
 
+# --------------------------------------------------------------------------
+# Fitting the prompt to the context window
+# --------------------------------------------------------------------------
+#
+# `CONTEXT_BUDGET_CHARS` bounds the readable set against a *typical* task, and
+# a size-L task walked straight past it: twelve writable files, eighteen
+# context files and a folded-in failure report add up to a prompt far larger
+# than `worker_num_ctx`, and Ollama does not refuse an over-long prompt - it
+# silently truncates the FRONT of it, which is where the system instructions
+# are. The model then answers without ever having been told to emit the
+# schema, langchain's parser rejects the junk, and the failure is classified
+# as infrastructure - three of those trip the escalation, for a task whose
+# real problem was arithmetic this module could have done up front.
+
+#: The crude rule for turning characters into tokens: four characters per
+#: token. Crude on purpose - the real tokenizer lives in the model and varies
+#: by model, and shipping one here would pin this module to a vocabulary. Code
+#: tokenises denser than prose, so /4 overestimates tokens slightly, which is
+#: the safe direction for a budget check.
+CHARS_PER_TOKEN = 4
+
+#: The share of the context window reserved for the model's ANSWER. A quarter:
+#: the reply replays the full contents of every file it *changes*, so the
+#: honest worst case is a mirror of the whole writable set - but reserving
+#: that would halve the usable window for every task to protect the rare one
+#: that rewrites everything, and a task large enough to hit this reserve is a
+#: task the pinned failure below already tells the planner to split.
+RESPONSE_RESERVE_DIVISOR = 4
+
+#: Tokens the chat template and the structured-output scaffolding spend around
+#: the two turns this module builds: role markers, message framing, and the
+#: JSON-schema grammar constraint. Small and flat, so a constant.
+TEMPLATE_OVERHEAD_TOKENS = 64
+
+
+def estimate_tokens(text: str) -> int:
+    """~How many tokens `text` costs, by the chars/4 rule. See `CHARS_PER_TOKEN`."""
+    return len(text) // CHARS_PER_TOKEN + 1
+
+
+def prompt_budget(num_ctx: int) -> int:
+    """The tokens the prompt may spend: the window minus the answer's reserve."""
+    return num_ctx - num_ctx // RESPONSE_RESERVE_DIVISOR - TEMPLATE_OVERHEAD_TOKENS
+
+
+def _prompt_tokens(
+    goal: str, writable: Sequence[SourceFile], readable: Sequence[SourceFile]
+) -> int:
+    """The estimated cost of the exact `(system, human)` pair `propose_edits` sends."""
+    system, human = prompt_for(goal, writable, readable)
+    return estimate_tokens(system) + estimate_tokens(human)
+
+
+def fit_context(
+    goal: str,
+    writable: Sequence[SourceFile],
+    readable: Sequence[SourceFile],
+    *,
+    num_ctx: int | None = None,
+) -> tuple[tuple[SourceFile, ...], str | None]:
+    """Make the prompt fit `num_ctx`, or say honestly that it cannot.
+
+    Returns `(readable, None)` when the prompt fits as offered, a trimmed
+    readable set when dropping context files makes it fit, and `((), failure)`
+    when the goal and the writable set alone overflow the window - the one
+    case no amount of trimming can fix, because a task must be shown the files
+    it is told to edit (`read_writable`'s rule).
+
+    The failure is a returned string, not an exception, in this module's usual
+    shape (`syntax_failure`, `install_dependencies`): it is an *outcome* - the
+    task as planned does not fit this worker - and its first line is pinned
+    because `orchestrator.reconcile.diagnose` matches it, turning "three
+    parse errors that looked like infrastructure" into "split the task".
+
+    Context files are dropped whole, least useful first. The keep order is:
+    files sharing a directory with a writable file first (they are the
+    conventions the edit must match - the reason `gather_context` collects
+    siblings at all), then shorter files first (a short neighbour teaches the
+    house style at a fraction of the cost of a long one), path as the
+    deterministic tie-break. Survivors keep `gather_context`'s original
+    presentation order. Every trim is printed to stdout, so the container log
+    tells the operator what the model was *not* shown.
+
+    `num_ctx` defaults to `SETTINGS.worker_num_ctx` - the same value
+    `worker_llm()` passes to Ollama, so the budget and the window cannot
+    drift apart. One divergence, stated: `swarm console` renders `prompt_for`
+    without this fitting pass, so on an over-budget task the console shows
+    the prompt as built, not as trimmed.
+    """
+    num_ctx = SETTINGS.worker_num_ctx if num_ctx is None else num_ctx
+    budget = prompt_budget(num_ctx)
+
+    base = _prompt_tokens(goal, writable, ())
+    if base > budget:
+        return (), (
+            f"the task is too large for the worker's context window (~{base} tokens "
+            f"against a budget of {budget}; SWARM_WORKER_CTX={num_ctx}), and the plan "
+            "should split it into tasks with smaller file sets. The goal and the "
+            "declared files alone overflow the window before any read-only context "
+            "is added, so a retry with the same file set will overflow identically."
+        )
+
+    total = _prompt_tokens(goal, writable, readable)
+    if total <= budget:
+        return tuple(readable), None
+
+    directories = {Path(_normalise(source.path)).parent for source in writable}
+
+    def keep_rank(source: SourceFile) -> tuple[int, int, str]:
+        sibling = Path(_normalise(source.path)).parent in directories
+        return (0 if sibling else 1, len(source.text or ""), source.path)
+
+    ranked = sorted(readable, key=keep_rank)
+    dropped = 0
+    # Token cost is order-independent (the rendered blocks are joined, not
+    # nested), so counting against `ranked` answers for the prompt that will
+    # actually be sent in the original order.
+    while ranked and _prompt_tokens(goal, writable, ranked) > budget:
+        ranked.pop()
+        dropped += 1
+    kept_paths = {source.path for source in ranked}
+    print(f"  · context trimmed: dropped {dropped} file(s) (~{total - budget} tokens over budget)")
+    return tuple(source for source in readable if source.path in kept_paths), None
+
+
+#: The one line appended for the parse retry. A statement of the constraint,
+#: not a paraphrase of the schema - the schema is already enforced by Ollama's
+#: grammar-constrained decoding; what the retry buys is a second decode.
+RETRY_INSTRUCTION = (
+    "your previous reply was not valid JSON for the schema; "
+    "reply with ONLY the JSON object"
+)
+
+
 def propose_edits(
     goal: str,
     writable: Sequence[SourceFile],
@@ -351,16 +486,35 @@ def propose_edits(
     `llm` is the test seam - anything with `.invoke(messages)` returning a
     `WorkerOutput`. The default reaches the host's Ollama, which is why every
     test that uses it carries the `ollama` marker.
+
+    A reply the parser rejects is retried ONCE, with `RETRY_INSTRUCTION`
+    appended as a further human turn, before it escapes as `EditError`. Once
+    and never a loop: the schema is grammar-enforced at the decoder, so a
+    parse failure means the model is emitting junk under a format constraint -
+    a truncated prompt, a broken runner - and a model that does it twice is
+    broken in a way more turns will not fix, while each extra turn costs a
+    whole-file generation of wall-clock time. Only the parse failure is
+    retried; a refused socket or a missing model fails the same on any number
+    of tries and escapes immediately, as before.
     """
     model = structured(worker_llm(), WorkerOutput) if llm is None else llm
     system, human = prompt_for(goal, writable, readable)
+    messages = [("system", system), ("human", human)]
     try:
-        return model.invoke([("system", system), ("human", human)])
+        return model.invoke(messages)
     except Exception as exc:  # noqa: BLE001 - local model failures are varied
-        # The type as well as the message. `str(exc)` alone turns a refused
-        # socket, a missing model and a schema the server rejected into three
-        # sentences that read the same in a result file.
-        raise EditError(f"model call failed: {type(exc).__name__}: {exc}") from exc
+        if not parse_failure(exc):
+            # The type as well as the message. `str(exc)` alone turns a refused
+            # socket, a missing model and a schema the server rejected into
+            # three sentences that read the same in a result file.
+            raise EditError(f"model call failed: {type(exc).__name__}: {exc}") from exc
+        print(f"  · the reply was not valid JSON ({type(exc).__name__}); retrying once")
+        try:
+            return model.invoke([*messages, ("human", RETRY_INSTRUCTION)])
+        except Exception as retry_exc:  # noqa: BLE001 - same varied failures
+            raise EditError(
+                f"model call failed: {type(retry_exc).__name__}: {retry_exc}"
+            ) from retry_exc
 
 
 # --------------------------------------------------------------------------

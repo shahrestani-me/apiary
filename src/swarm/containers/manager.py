@@ -627,7 +627,15 @@ DEFAULT_LIMITS = Limits()
 #: redactor at all; `OLLAMA_HOST` is inherited rather than defaulted because
 #: `Dockerfile.worker` already sets a sane one and overriding it blindly would
 #: undo that.
-INHERITED_ENV = ("GITHUB_TOKEN", "OLLAMA_HOST")
+#:
+#: The two `SWARM_WORKER_*` knobs are here because the worker reads `Settings`
+#: *inside* the container: an operator's `export SWARM_WORKER_CTX=32768` that
+#: silently stopped at the container boundary would leave the tuning tables in
+#: README/SETUP.md describing a knob that turns nothing - the worker would run
+#: at the baked-in default while the host believed otherwise (observed live:
+#: an over-long prompt truncated at 16K on a host tuned past it). Both values
+#: are non-secret, so either `--env` form `_env_flags` emits is fine.
+INHERITED_ENV = ("GITHUB_TOKEN", "OLLAMA_HOST", "SWARM_WORKER_CTX", "SWARM_WORKER_MODEL")
 
 
 # --------------------------------------------------------------------------

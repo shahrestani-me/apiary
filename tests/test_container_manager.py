@@ -307,6 +307,28 @@ def test_a_token_already_in_the_environment_is_passed_by_name_not_by_value(monke
     assert TOKEN not in " ".join(runner.argv_for("create"))
 
 
+def test_the_worker_tuning_knobs_cross_the_container_boundary(monkeypatch):
+    """`SWARM_WORKER_CTX`/`SWARM_WORKER_MODEL` are read by `Settings` INSIDE
+    the container, so an operator's export that stopped at the boundary would
+    tune nothing while the docs said otherwise - the observed shape of that
+    lie is a 16K truncation on a host tuned past it."""
+    assert "SWARM_WORKER_CTX" in manager_module.INHERITED_ENV
+    assert "SWARM_WORKER_MODEL" in manager_module.INHERITED_ENV
+
+    monkeypatch.setenv("SWARM_WORKER_CTX", "32768")
+    monkeypatch.setenv("SWARM_WORKER_MODEL", "gemma4:26b")
+    manager, runner = make_manager(env=None)
+
+    spawned(manager)
+
+    # Bare `--env NAME`: the values are already this process's own, so the CLI
+    # reads them from here - same form the token takes, harmless for these
+    # since neither is a secret.
+    flags = runner.flags("create", "--env")
+    assert "SWARM_WORKER_CTX" in flags
+    assert "SWARM_WORKER_MODEL" in flags
+
+
 def test_the_worker_reaches_the_hosts_ollama_rather_than_its_own():
     manager, runner = make_manager()
 
