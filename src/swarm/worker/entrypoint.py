@@ -82,6 +82,7 @@ from .edit import (
     Applied,
     EditError,
     apply_edits,
+    fit_context,
     gather_context,
     propose_edits,
     read_writable,
@@ -919,7 +920,27 @@ def run_worker(
 
         writable = read_writable(root, contract.files)
         readable = gather_context(root, contract.files)
+        # The prompt must fit the context window BEFORE the model sees it: Ollama
+        # silently truncates the front of an over-long prompt - the system
+        # instructions - and the disoriented model then emits junk the parser
+        # rejects, which reads as infrastructure and burns free retries on a task
+        # whose real problem is that it is too big. Trimming drops context files;
+        # a writable set that alone overflows is a failed *task*, reported with
+        # the numbers, so the retry comment and the replan can split it.
+        readable, oversized = fit_context(goal, writable, readable)
         print(f"  · {len(writable)} file(s) to edit, {len(readable)} for context")
+        if oversized is not None:
+            return WorkerResult(
+                issue=issue,
+                repo=repo,
+                task_id=task_id,
+                branch=branch,
+                root=root,
+                verify_command=contract.verify,
+                verify_output=oversized,
+                passed=False,
+                attempt=contract.attempt,
+            )
 
         output = propose_edits(goal, writable, readable, llm=editor)
         # The declared set plus the dependency manifests: a worker may always

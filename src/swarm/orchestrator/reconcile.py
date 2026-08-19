@@ -568,6 +568,18 @@ _IMPORT_NAME_RE = re.compile(r"ImportError: cannot import name '[^']+' from '([^
 #: not budget-renewing progress.
 _SYNTAX_FAILURE_RE = re.compile(r"python syntax error in ([^\s,:]+)")
 
+#: The worker's own pinned overflow sentence, exactly as `worker.edit.
+#: fit_context` writes it when the goal and the writable set alone exceed the
+#: context window. Same honesty rule as the syntax line: the worker authored
+#: the sentence, so recognising it is certain. The token counts are matched
+#: but deliberately left out of the diagnosis - `signature` uses the diagnosis
+#: as the failure's identity, and a retry whose folded-in feedback nudges the
+#: estimate is the same blocker, not budget-renewing progress.
+_TOO_LARGE_RE = re.compile(
+    r"too large for the worker's context window "
+    r"\(~\d+ tokens against a budget of \d+; SWARM_WORKER_CTX=\d+\)"
+)
+
 
 def diagnose(verify_output: str) -> str:
     """Classify a failed verify output into one actionable sentence, or say nothing.
@@ -576,9 +588,10 @@ def diagnose(verify_output: str) -> str:
     that tells the next attempt what to *do* about it. Only failures whose fix
     is mechanical and certain are recognised - a missing Python module, the
     failure observed to burn three identical attempts on one issue, and the
-    worker's own pinned syntax-failure line, whose shape is certain because
-    the worker wrote it - and anything else returns the empty string, because
-    a guessed diagnosis would be repeated to the model as truth.
+    worker's own two pinned lines (the syntax-failure line and the
+    context-overflow sentence), whose shapes are certain because the worker
+    wrote them - and anything else returns the empty string, because a
+    guessed diagnosis would be repeated to the model as truth.
 
     Pure, like the rest of the planning half of this module, so every
     classification is testable as a string in and a string out.
@@ -594,6 +607,13 @@ def diagnose(verify_output: str) -> str:
                 "(installed before the verify runs), or use the standard library "
                 "instead"
             )
+    if _TOO_LARGE_RE.search(verify_output or ""):
+        return (
+            "the task is too large for the worker's context window: no retry with "
+            "the same file set can fit, so split it into tasks with smaller "
+            "`## Files` sets - or narrow this one's - and keep each task's files "
+            "to what one focused change needs"
+        )
     broken = _SYNTAX_FAILURE_RE.findall(verify_output or "")
     if broken:
         # `dict.fromkeys` deduplicates while keeping the worker's order; one

@@ -65,3 +65,17 @@ def structured(llm: ChatOllama, schema: type[T]):
     orchestration - they cannot wander off-format even if they want to.
     """
     return llm.with_structured_output(schema)
+
+
+def parse_failure(exc: BaseException) -> bool:
+    """Did the structured boundary reject the model's reply as unparseable?
+
+    Answered here rather than at the call site because the answer is a
+    framework exception type, and ADR 0003 keeps every framework import inside
+    this module: a caller that wants to retry a rejected reply (the worker
+    does - an over-long prompt truncated by Ollama produces exactly this) asks
+    the question without learning which framework did the rejecting.
+    """
+    from langchain_core.exceptions import OutputParserException  # noqa: PLC0415 - lazy, like `_callbacks`
+
+    return isinstance(exc, OutputParserException)

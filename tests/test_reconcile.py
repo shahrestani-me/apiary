@@ -662,6 +662,49 @@ def test_a_raw_cpython_syntax_traceback_is_still_not_diagnosed():
     assert diagnose(SYNTAX_ERROR_OUTPUT) == ""
 
 
+#: The worker's pinned context-overflow sentence, exactly as
+#: `worker.edit.fit_context` writes it when the goal and the writable set
+#: alone exceed the window - the other worker-authored line `diagnose` may
+#: recognise, for the same honesty reason as the syntax one.
+TOO_LARGE_OUTPUT = (
+    "the task is too large for the worker's context window (~9210 tokens "
+    "against a budget of 12224; SWARM_WORKER_CTX=16384), and the plan should "
+    "split it into tasks with smaller file sets. The goal and the declared "
+    "files alone overflow the window before any read-only context is added, "
+    "so a retry with the same file set will overflow identically."
+)
+
+
+def test_the_workers_pinned_overflow_sentence_is_diagnosed_as_split_advice():
+    finding = diagnose(TOO_LARGE_OUTPUT)
+
+    assert "too large for the worker's context window" in finding
+    assert "split" in finding
+    assert "## Files" in finding
+    # The numbers stay out of the diagnosis: `signature` uses it as the
+    # failure's identity, and a retry whose folded-in feedback nudges the
+    # token estimate is the same blocker, not budget-renewing progress.
+    assert "9210" not in finding
+    assert "12224" not in finding
+
+
+def test_the_overflow_diagnosis_matches_the_workers_real_sentence():
+    """Cross-module pin: the sentence `fit_context` writes today is the one
+    this regex recognises, so neither side can be reworded alone."""
+    from swarm.worker.edit import SourceFile, fit_context
+
+    _, failure = fit_context("goal", (SourceFile("src/big.py", "x" * 60_000),), (), num_ctx=4096)
+
+    assert failure is not None
+    assert diagnose(failure) != ""
+
+
+def test_two_overflows_with_different_numbers_sign_identically():
+    moved = TOO_LARGE_OUTPUT.replace("~9210", "~9944")
+
+    assert signature(TOO_LARGE_OUTPUT) == signature(moved)
+
+
 def test_a_moved_syntax_error_in_the_same_file_signs_identically():
     moved = WORKER_SYNTAX_FAILURE.replace("line 7", "line 12")
 

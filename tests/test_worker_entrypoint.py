@@ -1331,6 +1331,196 @@ def test_the_context_reaches_the_prompt_marked_read_only(fake_github, scratch_re
 
 
 # --------------------------------------------------------------------------
+# Fitting the prompt to the context window
+# --------------------------------------------------------------------------
+#
+# The failure these tests pin was observed live: a size-L task's prompt
+# overflowed `worker_num_ctx`, Ollama silently truncated the FRONT of it - the
+# system instructions - and the disoriented model emitted junk that read as
+# infrastructure, three times, through an Ollama restart.
+
+
+def _ctx_fitting(tokens: int) -> int:
+    """The smallest `num_ctx` whose prompt budget covers `tokens`.
+
+    Computed rather than hand-picked so these tests position the budget at the
+    exact boundary they mean to test; the assertions on *which files survive*
+    are the pins, not the arithmetic.
+    """
+    num_ctx = tokens
+    while edit_module.prompt_budget(num_ctx) < tokens:
+        num_ctx += 1
+    return num_ctx
+
+
+FIT_GOAL = "make it so"
+FIT_WRITABLE = (edit_module.SourceFile("src/app.py", "a" * 400),)
+
+
+def test_a_prompt_that_fits_keeps_its_context_untouched(capsys):
+    readable = (edit_module.SourceFile("README.md", "r" * 100),)
+
+    kept, failure = edit_module.fit_context(FIT_GOAL, FIT_WRITABLE, readable)
+
+    assert failure is None
+    assert kept == readable
+    # No trim, no log line: the operator only hears about what changed.
+    assert capsys.readouterr().out == ""
+
+
+def test_an_over_budget_context_drops_whole_files_and_logs_the_trim(capsys):
+    readme = edit_module.SourceFile("README.md", "r" * 20_000)
+    sibling = edit_module.SourceFile("src/sibling.py", "s" * 2_000)
+    guide = edit_module.SourceFile("docs/guide.md", "d" * 1_000)
+    readable = (readme, sibling, guide)
+    # A budget that covers everything except the README.
+    num_ctx = _ctx_fitting(edit_module._prompt_tokens(FIT_GOAL, FIT_WRITABLE, (sibling, guide)))
+
+    kept, failure = edit_module.fit_context(FIT_GOAL, FIT_WRITABLE, readable, num_ctx=num_ctx)
+
+    assert failure is None
+    # Whole files, survivors in their original presentation order.
+    assert [source.path for source in kept] == ["src/sibling.py", "docs/guide.md"]
+    over = edit_module._prompt_tokens(FIT_GOAL, FIT_WRITABLE, readable) - edit_module.prompt_budget(num_ctx)
+    assert (
+        f"· context trimmed: dropped 1 file(s) (~{over} tokens over budget)"
+        in capsys.readouterr().out
+    )
+
+
+def test_the_trim_keeps_siblings_before_shorter_strangers(capsys):
+    """The keep order pinned: writable-adjacent first, then shortest first.
+
+    The sibling here is ten times the README's size and still survives, which
+    is what proves the tiering; the guide surviving proves the longest
+    stranger is dropped first - a shortest-first drop would have taken the
+    guide and then the README, and left only the sibling.
+    """
+    readme = edit_module.SourceFile("README.md", "r" * 2_000)
+    sibling = edit_module.SourceFile("src/sibling.py", "s" * 20_000)
+    guide = edit_module.SourceFile("docs/guide.md", "d" * 1_000)
+    readable = (readme, sibling, guide)
+    num_ctx = _ctx_fitting(edit_module._prompt_tokens(FIT_GOAL, FIT_WRITABLE, (sibling, guide)))
+
+    kept, failure = edit_module.fit_context(FIT_GOAL, FIT_WRITABLE, readable, num_ctx=num_ctx)
+
+    assert failure is None
+    assert [source.path for source in kept] == ["src/sibling.py", "docs/guide.md"]
+    assert "dropped 1 file(s)" in capsys.readouterr().out
+
+
+def test_a_writable_set_that_overflows_alone_is_an_honest_failure(capsys):
+    writable = (edit_module.SourceFile("src/big.py", "x" * 60_000),)
+    readable = (edit_module.SourceFile("README.md", "r" * 100),)
+
+    kept, failure = edit_module.fit_context("goal", writable, readable, num_ctx=4096)
+
+    assert kept == ()
+    assert failure is not None
+    # The pinned sentence, numbers and knob included - it is the retry
+    # comment's raw material and `reconcile.diagnose` matches it.
+    assert "the task is too large for the worker's context window (~" in failure
+    assert f"against a budget of {edit_module.prompt_budget(4096)}" in failure
+    assert "SWARM_WORKER_CTX=4096" in failure
+    assert "split it into tasks with smaller file sets" in failure
+    # No trim line: nothing was trimmed, the task failed whole.
+    assert "context trimmed" not in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_an_oversized_task_fails_before_any_model_call(
+    fake_github, scratch_repo, workspace, monkeypatch
+):
+    """Task failure, never a model call: the overflow is arithmetic this side
+    of the wire, and sending the prompt anyway is how the junk-JSON
+    infrastructure misdiagnosis happened live."""
+    from dataclasses import replace as dc_replace
+
+    monkeypatch.setattr(
+        edit_module, "SETTINGS", dc_replace(edit_module.SETTINGS, worker_num_ctx=256)
+    )
+    gh, _, _ = fake_github(issue())
+    editor = FakeEditor(AssertionError("the model must not be called"))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert editor.prompts == []
+    assert not result.passed
+    assert result.exit_code == EXIT_TASK_FAILED
+    assert "the task is too large for the worker's context window" in result.verify_output
+    assert "SWARM_WORKER_CTX=256" in result.verify_output
+
+
+# --------------------------------------------------------------------------
+# The parse retry
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class SequenceEditor:
+    """A model double that answers each call from a script, in order."""
+
+    replies: list
+    calls: list = field(default_factory=list)
+
+    def invoke(self, messages: Sequence[tuple[str, str]]) -> WorkerOutput:
+        self.calls.append(list(messages))
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _parse_failure() -> Exception:
+    from langchain_core.exceptions import OutputParserException
+
+    return OutputParserException('Invalid json output: --- { "')
+
+
+def test_a_rejected_reply_is_retried_once_with_the_format_restated(capsys):
+    good = edits({"calc.py": GOOD_CALC})
+    editor = SequenceEditor([_parse_failure(), good])
+
+    output = edit_module.propose_edits("goal", FIT_WRITABLE, (), llm=editor)
+
+    assert output is good
+    assert len(editor.calls) == 2
+    # The retry is the same call plus exactly one appended human turn.
+    assert editor.calls[1][:-1] == editor.calls[0]
+    assert editor.calls[1][-1] == ("human", edit_module.RETRY_INSTRUCTION)
+    assert "retrying once" in capsys.readouterr().out
+
+
+def test_a_second_rejected_reply_escapes_after_exactly_one_retry():
+    editor = SequenceEditor([_parse_failure(), _parse_failure()])
+
+    with pytest.raises(edit_module.EditError):
+        edit_module.propose_edits("goal", FIT_WRITABLE, (), llm=editor)
+
+    # One retry, never a loop: a model that fails twice under a
+    # grammar-enforced format is broken in a way more turns will not fix.
+    assert len(editor.calls) == 2
+
+
+def test_a_non_parse_failure_is_never_retried():
+    editor = SequenceEditor([RuntimeError("connection refused")])
+
+    with pytest.raises(edit_module.EditError):
+        edit_module.propose_edits("goal", FIT_WRITABLE, (), llm=editor)
+
+    # A refused socket fails the same on any number of tries.
+    assert len(editor.calls) == 1
+
+
+# --------------------------------------------------------------------------
 # Exit codes
 # --------------------------------------------------------------------------
 

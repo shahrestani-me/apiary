@@ -300,7 +300,7 @@ All via environment variables — see `src/swarm/config.py`.
 | `SWARM_MAX_STALLS` | 2 | Consecutive no-progress rounds before **replanning** instead of retrying. |
 | `SWARM_MAX_ATTEMPTS` | 3 | Per-task retries before abandoning it. |
 | `SWARM_VERIFY` | `python -m pytest -q` | Your quality gate. Add lint/typecheck: `ruff check . && mypy . && pytest -q` |
-| `SWARM_WORKER_CTX` | 16384 | Worker context window. **Never set this to gemma4's advertised 256K** — the KV cache at that size costs more memory than the 20 GB of weights. Lower to 8192 if you're memory-constrained. |
+| `SWARM_WORKER_CTX` | 16384 | Worker context window. **Never set this to gemma4's advertised 256K** — the KV cache at that size costs more memory than the 20 GB of weights. Lower to 8192 if you're memory-constrained. Exported on the host, it reaches the worker containers too — the orchestrator passes it through. |
 | `SWARM_WORKER_TIMEOUT` | 1200 | Wall clock for a whole worker container: clone, one inference call, the verify run, the commit, the push, the PR. |
 | `SWARM_VERIFY_TIMEOUT` | 300 | Wall clock for `SWARM_VERIFY` alone, **inside** the above. |
 | `APIARY_CAPTURE` | unset (off) | Record every model call: prompt, raw response, Ollama's load/total durations, and the real exception. Off by default — a worker prompt carries whole file bodies from the repo under test. |
