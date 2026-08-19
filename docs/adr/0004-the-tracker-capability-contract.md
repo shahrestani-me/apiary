@@ -6,9 +6,10 @@ Amends: `docs/adr/0001-task-systems-are-integrations.md`, "Configuration, not co
 
 ## The one-line summary
 
-**A capability needs three things, not one: which tool, which arguments, and
-what the server calls apiary's fields.** ADR 0001 specified only the first two,
-and with them no real call can be made against either priority tracker.
+**A capability needs four things, not one: which tool, which arguments, what
+the server calls apiary's fields — and that the task ref is one of those
+fields.** ADR 0001 specified only the first two, and with them no real call can
+be made against either priority tracker.
 
 ## Context
 
@@ -40,6 +41,17 @@ as an argument, and cannot write an issue body to a server that calls the field
 
 - a **field map**, from apiary's canonical field names to this server's
 - a **`ref` rule**, naming which response field is the durable, branch-safe task ref
+
+**And a third thing, which the spike missed and #150 found while implementing
+it.** The spike treated the ref purely as a *response* field. It is also a
+*request argument whose name diverges*: GitHub's comment tool takes
+`issue_number`, Linear's takes `issueId`, Jira's takes `issueIdOrKey`. So the
+spike's own Linear example — `comment: { tool: create_comment }` — cannot make
+the call either. It convicted ADR 0001 of exactly the defect it then repeated.
+
+The fix is not a fifth field but a wider vocabulary: **`ref` is one of apiary's
+canonical field names**, so the existing field map covers it —
+`fields: { ref: issue_number }`.
 
 The scope constants — `owner`+`repo`, `teamId` — need no new machinery. They
 belong in the existing `args`, which is already a static dict.
@@ -87,13 +99,20 @@ Two trackers, and this is the entire list of what differs:
 
 | | GitHub | Linear |
 |---|---|---|
-| create | `method: "create"` pinned | — |
+| create tool | `issue_write`, `method: "create"` pinned | `create_issue` |
 | body field | `body` | `description` |
+| comment's ref argument | `issue_number` | `issueId` |
 | scope | `owner` + `repo` | `teamId` |
-| ref rule | issue number | issue identifier |
+| ref rule | `number` | `identifier` |
 
-Four rows. That is what the contract has to absorb, and it is why the contract
-is still config rather than code.
+**Five rows, not the four an earlier draft of this ADR claimed.** The comment
+row is the one that was missing, and it is missing from the spike for the same
+reason: a ref reads naturally as something a server *returns*, so nobody checks
+whether it is also something the call *takes*.
+
+Five rows is still config rather than code, which is the point. But the
+correction is worth keeping visible, because both the ADR it amends and the
+spike that corrected that ADR made the same omission independently.
 
 ## Consequences
 
@@ -102,11 +121,20 @@ is still config rather than code.
   is unchanged.
 - #150 implements this shape. The spike (`docs/plans/spike-143-mcp-tool-shapes.md`)
   carries the per-tracker detail and the seven-row Jira constraint table.
-- **Comment bodies are the trap.** GitHub and Linear both call the field `body`,
-  so a two-tracker implementation is tempted to hard-code it. Jira calls it
-  `commentBody`. A hard-coded `body` is a design that fits exactly the two
-  trackers in front of it — which is the failure ADR 0003 named in a different
-  context and this one inherits.
+- **The comment-body trap closes itself.** GitHub and Linear both call the
+  comment field `body`, so a two-tracker implementation was expected to
+  hard-code it and lock out Jira's `commentBody`. Because comment now needs a
+  field map on *both* priority trackers for its ref argument, the map exists
+  before anyone is tempted — the divergence that was going to be missed forces
+  the machinery that prevents it. Worth noting as luck rather than design.
+- **GitHub's credential goes in the server's environment, not a header.** The
+  spike contradicted itself here: its example block passes `Authorization:
+  bearer`, while its own recommendation selects the local stdio server, which
+  takes its credential from its own environment and never sees a header.
+  Resolved in favour of the recommendation, as `auth.server_env`.
+- **`ref` belongs under `intake`**, with other capabilities inheriting it. It is
+  a fact about the server rather than about a call — GitHub's create returns
+  `number` in the same field intake lists.
 
 ## What this does not change
 
