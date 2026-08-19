@@ -719,12 +719,156 @@
       extView.log.scrollTop = extView.log.scrollHeight;
     }
     extView.next = b.next;
+    //: A finished run has an ending recorded, and this is where it is read
+    //: (#134). Only when finished: `active` and `quiet` mean the summary is
+    //: not on disk, which is a run to keep watching rather than one to draw a
+    //: terminal state for.
+    if (b.state === "finished") drawOutcome(extView, b.run_id, box);
     //: Only a run that is still going speaks for the page: a finished run's
     //: card stays as an account of what happened, but it must not pick the
     //: board's repo - or, through boot, the project - for an operator who has
     //: chosen nothing yet. And never once a project is selected; from then on
     //: the selection owns the board.
     if (b.repo && !selectedProject && b.state !== "finished") runRepo = b.repo;
+  }
+
+  // ---- how the run ended, read from its own summary ------------------------
+  //
+  //: Step 6 of the epic (#134). A build that stops without saying so reads as
+  //: a build that hung, and "finished" has four meanings here - the objective
+  //: was met, the round cap was hit, every task reached a terminal state, or a
+  //: human is needed. This panel says which, quotes the sentence the *run*
+  //: recorded for it, and names the tasks that need a person.
+  //:
+  //: Drawn from `/swarm/outcome`, which reads `summary.json`, rather than from
+  //: the job in the console's memory: an ending read off a child process's
+  //: stdout dies with the console, and this one has to survive a reload. It is
+  //: also the only account available for a run this console did not start.
+
+  //: Wall clock as a human reads it. A run is minutes to hours long, and
+  //: seconds alone stop being legible somewhere around the four-minute mark.
+  function hms(s) {
+    if (s === null || s === undefined) return "";
+    var m = Math.floor(s / 60), h = Math.floor(m / 60);
+    if (h) return h + "h " + (m % 60) + "m";
+    if (m) return m + "m " + Math.round(s % 60) + "s";
+    return Math.round(s) + "s";
+  }
+
+  //: Which pill an ending wears. A cap is neutral on purpose - work left open
+  //: is neither a success nor a failure - and `exhausted` reads ok because the
+  //: goal gate was off, so the run did exactly the work that was planned.
+  //: `stopped` is neutral too: the operator pressed Stop, and calling their
+  //: own decision a failure is the one reading that is never true.
+  function outcomeClass(kind) {
+    return kind === "met" || kind === "exhausted" ? " ok" : kind === "failed" ? " bad" : "";
+  }
+
+  function fact(list, term, text) {
+    list.appendChild(el("dt", null, term));
+    list.appendChild(el("dd", null, text));
+  }
+
+  //: An issue as a link when the repository is known, and as plain text when
+  //: it is not - the same rule every other href on this page follows, because
+  //: `repo_url` is built by the server from a validated slug or not at all.
+  function issueRef(o, number) {
+    if (!o.repo_url) return el("span", null, "#" + number);
+    var a = el("a", null, "#" + number);
+    a.href = o.repo_url + "/issues/" + number;
+    a.target = "_blank";
+    a.rel = "noopener";
+    return a;
+  }
+
+  function outcomeCard(o) {
+    var body = el("div");
+    var strip = el("div", "pills");
+    strip.appendChild(el("span", "pill" + outcomeClass(o.outcome),
+                         OUTCOMES[o.outcome] || "ended"));
+    strip.appendChild(el("span", "pill",
+                         o.cap ? o.cycles + "/" + o.cap + " cycles"
+                               : o.cycles + (o.cycles === 1 ? " cycle" : " cycles")));
+    if (o.wall_s !== null && o.wall_s !== undefined) {
+      strip.appendChild(el("span", "pill", hms(o.wall_s)));
+    }
+    body.appendChild(strip);
+
+    //: The run's own words, quoted. `close_the_loop` and the goal gate compose
+    //: these sentences and the run records the one it ended on, so the page
+    //: has no second vocabulary for an ending - which is how "objective met"
+    //: and "stopped after 40 cycles" came to read identically as "done".
+    body.appendChild(el("p", "proposal", o.reason || "this run recorded no ending"));
+    if (o.note) body.appendChild(el("p", "why", o.note));
+
+    var tasks = o.tasks || {}, prs = o.prs || {};
+    var merged = (tasks.merged || []).length;
+    var human = (tasks.needs_human || []).length;
+    var abandoned = (tasks.abandoned || []).length;
+    var facts = el("dl", "facts");
+    fact(facts, "tasks", merged + " merged · " + human + " needing a human · "
+                         + abandoned + " abandoned");
+    fact(facts, "pull requests", prs.opened + " opened, " + prs.merged + " merged");
+    fact(facts, "cycles", o.cap ? o.cycles + " of " + o.cap
+                                : o.cycles + " (no cap was set)");
+    //: Reported only when it was measured. Nothing increments the inference
+    //: clock yet, and printing "0% inference" off an unmeasured field would be
+    //: a claim about the model rather than about the recording.
+    fact(facts, "wall clock", hms(o.wall_s) + (
+      o.inference_share === null || o.inference_share === undefined
+        ? " · inference not recorded"
+        : " · " + Math.round(o.inference_share * 100) + "% inference"));
+    body.appendChild(facts);
+
+    //: Separate from the counts and never folded into them: a task waiting for
+    //: a person is the one thing on this panel that must not scroll past, and
+    //: "8 tasks" hides it behind the ones that merged.
+    if (human) {
+      var stripe = el("div", "failedstrip");
+      stripe.appendChild(el("h3", null, "needs a human"));
+      var row = el("p", "links");
+      (tasks.needs_human || []).forEach(function (n) { row.appendChild(issueRef(o, n)); });
+      stripe.appendChild(row);
+      body.appendChild(stripe);
+    }
+
+    var links = el("p", "links");
+    if (o.repo_url) {
+      var a = el("a", null, o.repo || "repository");
+      a.href = o.repo_url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      links.appendChild(a);
+    }
+    body.appendChild(links);
+    //: Text, not a link: a browser will not follow a `file:` href out of an
+    //: `http:` document, so the useful form is the path to paste beside
+    //: `swarm show` - which is where the events are.
+    body.appendChild(el("p", "runpath", "events: " + o.path));
+    return card("how it ended — from the run's own summary", body, "outcome");
+  }
+
+  //: One fetch per view, inserted above the log so it is the first thing read
+  //: when a run stops. A 404 means the summary is not on disk yet - the child
+  //: writes it on its way out - so exactly one retry follows, and then the
+  //: page stops asking rather than polling a run that never wrote one.
+  function drawOutcome(view, runId, box) {
+    if (!runId || view.outcomeAsked) return;
+    view.outcomeAsked = true;
+    var ask = function (retry) {
+      api("/swarm/outcome?run=" + encodeURIComponent(runId)).then(function (res) {
+        if (view.generation !== undefined && view.generation !== runGeneration) return;
+        if (!box.childNodes.length) return;            // the view was replaced
+        if (!res.ok) {
+          if (res.status === 404 && retry) setTimeout(function () { ask(false); }, 1500);
+          return;
+        }
+        var old = box.querySelector(".outcome");
+        if (old) box.removeChild(old);
+        box.insertBefore(outcomeCard(res.body), box.childNodes[1] || null);
+      });
+    };
+    ask(true);
   }
 
   function extTick() {
@@ -1198,6 +1342,11 @@
           //: The run just wrote (or failed to write) its summary: refetch so
           //: the newest history entry's pill reads finished truthfully.
           refreshHistory(selectedProject);
+          //: ...and the same summary carries the ending (#134). Drawn from the
+          //: artifacts rather than from `p` beside it, because that is the
+          //: account that is still there after a reload - and the one a run
+          //: this console did not start has too.
+          drawOutcome(this, p.run_id, box);
         }
       }
     };

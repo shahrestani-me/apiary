@@ -489,6 +489,8 @@ class Console:
             return self._swarm_board(path)
         if method == "GET" and path.startswith("/swarm/external"):
             return self._swarm_external(path)
+        if method == "GET" and path.startswith("/swarm/outcome"):
+            return self._swarm_outcome(path)
         if method == "GET" and route == "/projects":
             return self._projects_list()
         if method == "POST" and route == "/projects":
@@ -909,6 +911,33 @@ class Console:
         if latest is None:
             return Response.error("no recorded runs", 404)
         return Response.json(latest)
+
+    def _swarm_outcome(self, path: str) -> Response:
+        """How a run ended, once it has (#134). 404 until then.
+
+        Keyed by run id rather than "the latest", because both views that ask
+        hold one: the external card names the run it drew, and the console's
+        own job carries the id it parsed out of its child's first line. A panel
+        answered with a *different* run's ending is the wrong answer this
+        route must never give, so `run_outcome` refuses an id it cannot find
+        rather than falling back to the newest.
+
+        404 is the ordinary case, not an error: a run that is still going has
+        no ending to render, and the page treats "not yet" as nothing to draw.
+        """
+        import urllib.parse
+
+        from .console_external import run_outcome
+
+        _, _, query = path.partition("?")
+        wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        try:
+            ended = run_outcome(urllib.parse.unquote(wanted.get("run", "")))
+        except Exception as exc:  # noqa: BLE001 - an unreadable artifacts root belongs on the page
+            return Response.error(f"{type(exc).__name__}: {exc}", 502)
+        if ended is None:
+            return Response.error("this run has not ended yet", 404)
+        return Response.json(ended)
 
     def _swarm_board(self, path: str) -> Response:
         """One repository's tickets in lifecycle columns, read from GitHub.

@@ -991,6 +991,76 @@ def test_a_run_that_stopped_short_exits_non_zero_and_says_what_is_missing(capsys
     assert "still missing: there is no CLI" in out
 
 
+def test_the_four_endings_are_named_in_the_run_s_own_words(capsys):
+    """#134. `swarm run` exits 0 for a met objective *and* for an exhausted
+    cycle cap, so the exit code has never been able to answer "did this project
+    finish". `_outcome` is where the run answers it, and every `reason` here is
+    the sentence `_report_outcome` prints - lifted, never reworded, so the
+    terminal, `summary.json` and the console cannot disagree about an ending.
+    """
+    met = cli._outcome([_cycle(_goal(True, summary="objective met: all merged"))], cap=40)
+    assert met.kind == "met"
+    assert met.reason == "objective met: all merged"
+
+    # A human is needed: the gate resigned rather than met the objective.
+    resigned = _goal(False, missing=("there is no CLI",), summary="stopping without meeting it")
+    assert cli._outcome([_cycle(resigned)]).kind == "failed"
+
+    # The ledger did not decide it. Work still open is a cap; nothing open is a
+    # plan that finished - `live` tells them apart, exactly as the console's
+    # own `_no_verdict` reads it off the same sentence.
+    capped = cli._outcome([_cycle(None, live=2)], cap=40)
+    assert capped.kind == "capped"
+    assert capped.reason == "stopped after 1 cycle(s) with 2 live issue(s)"
+    assert cli._outcome([_cycle(None, live=0)]).kind == "exhausted"
+
+    # And the ending is the line the terminal showed, character for character.
+    assert cli._report_outcome([_cycle(None, live=2)], capped) == 0
+    assert capped.reason in capsys.readouterr().out
+
+
+def test_the_recorded_ending_carries_the_counts_the_run_alone_knows(capsys):
+    """A run that merged four tasks and one that merged none both end
+    `met=False`, and the difference is the whole story. The merge gate and the
+    goal gate are the only things that ever saw either number."""
+    merged = SimpleNamespace(merged=(7, 9))
+    reports = [
+        _cycle(None, index=0),
+        SimpleNamespace(index=1, live=1, goal=_goal(False, summary="stopped short"),
+                        checks=merged),
+    ]
+    reports[1].goal.assessment = SimpleNamespace(missing=(), abandoned=("add-retry",))
+
+    outcome = cli._outcome(reports, cap=40)
+
+    assert outcome.merged == (7, 9)           # issue numbers, from the merge gate
+    assert outcome.abandoned == ("add-retry",)
+    assert outcome.cycles == 2 and outcome.cap == 40 and outcome.live == 1
+
+
+def test_an_interrupted_run_records_that_it_was_stopped():
+    """A `KeyboardInterrupt` leaves `Reconciler.loop` with the reports still
+    inside it, so `_loop` keeps its own list of the cycles that finished.
+    Called anything
+    else, a stopped run reads on the page as a cap - and an operator goes
+    looking for a cap nobody set."""
+    stopped = cli._outcome([_cycle(None), _cycle(None, live=2, index=1)],
+                           cap=40, interrupted=True)
+
+    assert stopped.kind == "stopped"
+    assert stopped.reason == cli.INTERRUPTED
+    assert stopped.cycles == 2 and stopped.live == 2   # how far it did get
+
+
+def test_an_empty_run_records_no_ending_at_all(capsys):
+    """`--max-cycles 0` is neither met nor failed. An empty `kind` is what
+    every reader already treats as "this run recorded no ending", and the
+    command still prints nothing."""
+    assert cli._outcome([], cap=0).kind == ""
+    assert cli._report_outcome([]) == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_a_run_the_cap_ended_is_not_a_failure(capsys):
     """`--max-cycles` stopping a healthy run says nothing about the objective,
     and the next invocation attaches to whatever is still open."""

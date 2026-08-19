@@ -88,6 +88,7 @@ from .security import EgressPolicy, worker_create_flags
 from .artifacts import (
     ArtifactsError,
     RunArtifacts,
+    RunOutcome,
     list_runs,
     load_run,
     runs_text,
@@ -781,6 +782,17 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     if args.no_goal_check:
         print("» goal gate: off; the run stops when the plan is exhausted")
 
+    # Every cycle that finished, kept here as well as printed. A
+    # `KeyboardInterrupt` escapes `Reconciler.loop` with the loop's own list
+    # still inside it, and a stopped run that reported zero cycles would be
+    # describing a run that never started rather than one somebody stopped.
+    observed: list[Any] = []
+    record_cycle = _report_cycle(artifacts)
+
+    def on_cycle(cycle: Any) -> None:
+        observed.append(cycle)
+        record_cycle(cycle)
+
     reconciler = Reconciler(
         run=run,
         client=github,
@@ -809,7 +821,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         objective=run.objective,
         verify=verify,
         goal_gate=not args.no_goal_check,
-        on_cycle=_report_cycle(artifacts),
+        on_cycle=on_cycle,
         # The per-task lifecycle (#141), straight onto `events.jsonl` and
         # therefore through the same redactor as everything else in the run
         # directory. `_report_cycle` still writes `cycle.reconciled`, unchanged:
@@ -834,12 +846,25 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         try:
             reports = reconciler.loop(cycles=args.max_cycles)
         except KeyboardInterrupt:
-            print("\n! interrupted; containers are being disposed", file=sys.stderr)
+            print(f"\n! {INTERRUPTED}", file=sys.stderr)
+            # Recorded inside the `with`, because the summary is written by
+            # `artifacts.__exit__` on the way out of it. A stopped run that
+            # said nothing about having been stopped is the reading this
+            # record exists to prevent: the page would otherwise call it a
+            # cap, and an operator would go looking for a cap nobody set.
+            artifacts.outcome = _outcome(
+                observed, cap=args.max_cycles or 0, interrupted=True
+            )
             return 130
+        # The ending, written where the loop knows it and *before* the
+        # directory closes - `_report_outcome` below then prints the same
+        # object rather than a second phrasing of it.
+        outcome = _outcome(reports, cap=args.max_cycles or 0)
+        artifacts.outcome = outcome
 
     print()
     print(f"» artifacts in {artifacts.path}")
-    return _report_outcome(reports)
+    return _report_outcome(reports, outcome)
 
 
 def _report_cycle(artifacts: RunArtifacts):
@@ -887,27 +912,110 @@ def _report_cycle(artifacts: RunArtifacts):
     return report
 
 
-def _report_outcome(reports) -> int:
+#: What a `SIGINT` ends a run with, in one place because two things say it: the
+#: line `_loop` prints, and the ending it records. An operator who stopped a run
+#: and a page that says why must not be reading two different sentences.
+INTERRUPTED = "interrupted; containers are being disposed"
+
+
+def _outcome(reports, *, cap: int = 0, interrupted: bool = False) -> RunOutcome:
+    """Which of the endings this was, and the run's own sentence for it (#134).
+
+    Four endings, and `swarm run`'s exit code separates only two of them: a met
+    objective and an exhausted `--max-cycles` both exit 0, so "did this project
+    finish?" has never been answerable from the outside. This is where the run
+    answers it, and `RunArtifacts.finish` writes the answer down.
+
+    **The words are lifted, not written.** `reason` is `GoalReport.summary()`
+    where a gate decided the run and the exact line `_report_outcome` prints
+    where none did - so what the terminal showed, what `summary.json` records
+    and what the console renders are one sentence with one author. The
+    alternative is what the console does today for its own child process:
+    `console_runs` recovers the ending by matching three regular expressions
+    against stdout, and its own comment says what that costs - all three
+    endings exit 0, so a miss reports an unfinished project as a finished one.
+
+    `live` is what separates the two endings the ledger did not decide, exactly
+    as `console_runs._no_verdict` reads it: nothing left open is a plan that
+    finished, anything left open is a run that was cut short. Reading the count
+    beats reading the *mode*, because `--no-goal-check` and `--max-cycles` can
+    both be set on one run.
+
+    Defensive about `checks` and `goal` on purpose: a report is built by the
+    reconciler, but this is also called with the loop's own partial history
+    when a `KeyboardInterrupt` arrives mid-cycle.
+    """
+    if interrupted:
+        # A stop is an ending like any other, and it still gets the counts:
+        # what merged before the operator pressed Stop merged. Only the
+        # sentence is fixed, because there is no gate verdict to quote.
+        return RunOutcome(
+            kind="stopped", reason=INTERRUPTED, cycles=len(reports), cap=cap,
+            live=int(getattr(reports[-1], "live", 0)) if reports else 0,
+            merged=_merged(reports),
+        )
+    if not reports:
+        # `--max-cycles 0`. Neither met nor failed, and nothing to record: an
+        # empty `kind` is how a reader spells "this run recorded no ending".
+        return RunOutcome(cap=cap)
+    last = reports[-1]
+    live = int(getattr(last, "live", 0))
+    goal = getattr(last, "goal", None)
+    if goal is None:
+        return RunOutcome(
+            kind="exhausted" if live == 0 else "capped",
+            reason=f"stopped after {len(reports)} cycle(s) with {live} live issue(s)",
+            cycles=len(reports), cap=cap, live=live, merged=_merged(reports),
+        )
+    return RunOutcome(
+        kind="met" if goal.met else "failed",
+        reason=goal.summary(),
+        cycles=len(reports), cap=cap, live=live, merged=_merged(reports),
+        abandoned=tuple(str(ref) for ref in getattr(goal.assessment, "abandoned", ())),
+    )
+
+
+def _merged(reports) -> tuple[int, ...]:
+    """Every issue whose pull request the merge gate landed, over the whole run.
+
+    Issue numbers, because `ChecksReport.merged` is issue-numbered and keeping
+    the two numberings apart is the point of #174 and #181 - a set of pull
+    request numbers rendered under "tasks merged" would be the same category
+    error one layer up. Deduplicated because a cycle reports what *it* merged
+    and a task merges once; sorted so the record does not depend on the order
+    the gate happened to run in.
+    """
+    merged: set[int] = set()
+    for report in reports:
+        checks = getattr(report, "checks", None)
+        if checks is not None:
+            merged.update(int(number) for number in checks.merged)
+    return tuple(sorted(merged))
+
+
+def _report_outcome(reports, outcome: RunOutcome | None = None) -> int:
     """The last word: was the objective met, and what is left if it was not.
 
     Non-zero when the run stopped short, because a swarm that gave up is a
     failed command - a shell script chaining `swarm run` must not read "I
     planned three things, abandoned one and stopped" as success. An empty run
     (`--max-cycles 0`) is neither met nor failed and reports nothing.
+
+    Prints `outcome.reason` rather than recomposing the sentence, so the line
+    on the terminal is the one in `summary.json` by construction rather than by
+    two authors agreeing. `outcome` is passed in by `_loop`, which recorded it
+    before its `with` closed; anything else - the tests, a caller with only the
+    reports - gets it derived here.
     """
     if not reports:
         return 0
-    last = reports[-1]
-    goal = last.goal
-    if goal is None:
+    ending = outcome if outcome is not None else _outcome(reports)
+    print(f"» {ending.reason}")
+    if ending.kind != "failed":
         # The cap or `until` ended this, not the ledger. Whatever is still open
         # is still open, and the next invocation attaches to it.
-        print(f"» stopped after {len(reports)} cycle(s) with {last.live} live issue(s)")
         return 0
-    print(f"» {goal.summary()}")
-    if goal.met:
-        return 0
-    for line in goal.assessment.missing:
+    for line in reports[-1].goal.assessment.missing:
         print(f"  · still missing: {line}")
     return 1
 

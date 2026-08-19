@@ -202,6 +202,23 @@ LOG_GLOB = "*.log"
 #: reads once beats a ratio they have to divide in their head.
 SWAP_SHARE_NOTE = 0.2
 
+#: Every word a run may record as its ending, and the *only* vocabulary for it.
+#:
+#: "Finished" has several meanings here and that is the whole reason this exists:
+#: `swarm run` exits 0 both when the objective was met and when `--max-cycles`
+#: ran out, so an exit code cannot tell an operator whether a project is done.
+#: `cli._outcome` assigns one of these, the run records it in `summary.json`, and
+#: `console_external.run_outcome` reads it back - so the answer survives the
+#: process that knew it, which is what makes it readable after a page reload or
+#: a console restart.
+#:
+#: Declared here rather than in `console_runs.py` (which imports it) because the
+#: *run* is what ends, not the page: a second tuple in the console would be a
+#: second vocabulary to keep in step, and the failure mode is silent - an ending
+#: the page has no word for renders as "done", which is the wrong answer this
+#: field exists to remove.
+OUTCOMES = ("met", "capped", "exhausted", "stopped", "failed", "done")
+
 
 class ArtifactsError(RuntimeError):
     """A run directory could not be written, found, or made sense of."""
@@ -725,6 +742,87 @@ class RunMetrics:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class RunOutcome:
+    """How a run ended, in the run's own words. Written into `summary.json`.
+
+    **The sentence is quoted, never composed here.** `reason` is whatever
+    `GoalReport.summary()` said, or the one line `cli._report_outcome` prints
+    when the ledger did not decide the run - the same string the terminal
+    showed. A second phrasing of an ending is a second thing that can disagree
+    with the run, and the console had one already: `console_runs` reads the
+    ending off the child's *stdout* with three regular expressions, which works
+    only for a run this console process spawned and only while it is in memory.
+    This record is the durable half of that answer.
+
+    **Counts, because "finished" without them is not an account.** A run that
+    merged four tasks and one that merged none both end `met=False`; the
+    difference is the whole story. `merged` is issue numbers because that is
+    what the merge gate reports (`checks.ChecksReport.merged`), and `abandoned`
+    is task refs because that is what the goal gate assesses - the two
+    numberings are kept apart deliberately (#174, #185), so they are not folded
+    into one list here either.
+
+    Everything is defaulted: a run recorded before this existed reads back as
+    `RunOutcome()`, and `kind == ""` is how every reader spells "this run
+    recorded no ending" without a second flag to forget.
+    """
+
+    #: One of `OUTCOMES`, or empty for a run that recorded none.
+    kind: str = ""
+    reason: str = ""
+    #: Cycles used, against the cap that bounded them. `cap` is 0 when the run
+    #: was uncapped, which is a different fact from "the cap was never reached"
+    #: and the one an operator needs to read "7 cycles" correctly.
+    cycles: int = 0
+    cap: int = 0
+    #: Tasks still open when the loop stopped. What tells a cap apart from a
+    #: plan that simply finished - `cli._outcome` reads exactly this.
+    live: int = 0
+    merged: tuple[int, ...] = ()
+    abandoned: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "reason": self.reason,
+            "cycles": self.cycles,
+            "cap": self.cap,
+            "live": self.live,
+            "merged": list(self.merged),
+            "abandoned": list(self.abandoned),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> RunOutcome:
+        """Tolerant on purpose: this is read back off disk, where a hand-edited
+        summary and a run from a future version are both ordinary."""
+        kind = str(payload.get("kind") or "")
+        return cls(
+            kind=kind if kind in OUTCOMES else "",
+            reason=str(payload.get("reason") or ""),
+            cycles=_int(payload.get("cycles")),
+            cap=_int(payload.get("cap")),
+            live=_int(payload.get("live")),
+            merged=tuple(_int(n) for n in payload.get("merged") or () if _is_number(n)),
+            abandoned=tuple(str(ref) for ref in payload.get("abandoned") or ()),
+        )
+
+    def line(self) -> str:
+        """The ending as one line, for `swarm show`."""
+        cap = f"/{self.cap}" if self.cap else ""
+        return f"{self.kind or '(unrecorded)'} after {self.cycles}{cap} cycle(s): {self.reason}"
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _int(value: Any) -> int:
+    """An integer from JSON, or 0. A summary is a file, and files get edited."""
+    return int(value) if _is_number(value) else 0
+
+
 # --------------------------------------------------------------------------
 # Event names
 # --------------------------------------------------------------------------
@@ -806,6 +904,12 @@ class RunArtifacts:
     #: `summary.json` without re-reading the file it just wrote.
     stack: str = ""
     verify: str = ""
+    #: How the run ended, set by the loop that ended it (`cli._loop`) before
+    #: this object is closed. A field rather than an argument to `finish`
+    #: because `finish` is called from `__exit__`, and the two paths that need
+    #: to record an ending - the loop returning, and a `KeyboardInterrupt`
+    #: leaving through the `with` - both go through it without passing anything.
+    outcome: RunOutcome | None = None
     _cycles: list[CycleMetrics] = field(default_factory=list, repr=False)
     _loaded_model: str = field(default="", repr=False)
 
@@ -1091,6 +1195,12 @@ class RunArtifacts:
                 "stack": self.stack,
                 "verify": self.verify,
                 "note": note,
+                # The ending, in the run's own words (#134). Written even when
+                # nothing set it - as `{}` - because "this run recorded no
+                # ending" and "this key did not exist yet" are the same thing
+                # to every reader below, and a key that is sometimes absent is
+                # one every reader has to remember to `.get`.
+                "outcome": (self.outcome or RunOutcome()).to_dict(),
                 "metrics": self.metrics().to_dict(),
                 # Derived from `results/` and never read back - the files are the
                 # source of truth and re-reading this block would let a
@@ -1400,6 +1510,10 @@ class RunView:
     #: prints "(unrecorded)" rather than an empty column.
     stack: str = ""
     verify: str = ""
+    #: How the run said it ended (#134). `RunOutcome()` - `kind == ""` - for
+    #: every run recorded before that was written down, which is why the
+    #: console asks `kind` rather than testing for the key.
+    outcome: RunOutcome = RunOutcome()
     metrics: RunMetrics = RunMetrics()
     results: RunSummary = RunSummary(run_id="", records=())
     container_logs: tuple[Path, ...] = ()
@@ -1477,6 +1591,9 @@ def read_run(path: str | Path) -> RunView:
         started_at=_parse(summary.get("started_at") or identity.get("started_at")),
         finished_at=_parse(summary.get("finished_at")),
         note=str(summary.get("note") or ""),
+        outcome=RunOutcome.from_dict(
+            summary["outcome"] if isinstance(summary.get("outcome"), Mapping) else {}
+        ),
         stack=str(summary.get("stack") or identity.get("stack") or ""),
         verify=str(summary.get("verify") or identity.get("verify") or ""),
         metrics=metrics,
@@ -1597,6 +1714,12 @@ def show_text(view: RunView) -> str:
         f"  started    {_iso(view.started_at) or '(unrecorded)'}",
         f"  finished   {_iso(view.finished_at) or '(never - this run did not reach its end)'}",
     ]
+    # Beside `finished`, because "it reached its end" and "which end it
+    # reached" are one question asked twice, and the second one is the one
+    # `finished` cannot answer: a met objective and an exhausted cycle cap
+    # both write a `finished_at`.
+    if view.outcome.kind:
+        lines.append(f"  ending     {view.outcome.line()}")
     if view.note:
         lines.append(f"  note       {view.note}")
     lines += ["", view.results.text(), "", view.metrics.text(), ""]

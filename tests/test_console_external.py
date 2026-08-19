@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from swarm.console import Console
-from swarm.console_external import ACTIVE_WITHIN_S, latest_external
+from swarm.console_external import ACTIVE_WITHIN_S, latest_external, run_outcome
 
 HOST = {"Host": "127.0.0.1:8117"}
 
@@ -136,3 +136,161 @@ def test_a_console_job_records_its_swarm_run_id_for_deduplication(monkeypatch):
 
     assert job.progress["run_id"] == "wallet-20260818-090333-aeek6b"
     assert job.progress["repo"] == "me/thing"
+
+
+# --------------------------------------------------------------------------
+# How the run ended (#134)
+# --------------------------------------------------------------------------
+
+
+def finished_run(
+    root: Path,
+    run_id: str = "demo-20260818-100000-aaaaaa",
+    *,
+    repo: str = "me/thing",
+    outcome: dict | None = None,
+    results: tuple[tuple[int, int], ...] = ((7, 0), (8, 1)),
+    inference_calls: int = 0,
+) -> Path:
+    """A run directory with a summary, written the way a real run writes one.
+
+    `results` is `(issue, exit code)` per task: exit 0 is a worker that opened a
+    pull request, anything else is a task that stopped needing a person.
+    """
+    from swarm.worker.result import ResultRecord, write_result
+
+    d = write_run(root, run_id, repo=repo, finished=True)
+    for issue, exit_code in results:
+        write_result(
+            ResultRecord(run_id=run_id, issue=issue, attempt=1, exit_code=exit_code,
+                         reason="the verify command failed" if exit_code else "opened",
+                         repo=repo),
+            d / "results",
+        )
+    summary = json.loads((d / "summary.json").read_text())
+    summary["outcome"] = {
+        "kind": "met", "reason": "objective met: every task is verified and merged",
+        "cycles": 6, "cap": 40, "live": 0, "merged": [7], "abandoned": [],
+        **(outcome or {}),
+    }
+    summary["metrics"] = {"cycles": [
+        {"cycle": i, "inference_calls": inference_calls, "inference_s": 90.0}
+        for i in range(summary["outcome"]["cycles"])
+    ]}
+    (d / "summary.json").write_text(json.dumps(summary))
+    return d
+
+
+def test_the_ending_is_the_sentence_the_run_recorded(tmp_path):
+    """Not a rewording of it. `close_the_loop` and the goal gate compose these
+    sentences, the run records the one it ended on, and the page quotes it -
+    which is what stops "objective met" and "stopped after 40 cycles" from
+    both rendering as "done"."""
+    finished_run(tmp_path)
+
+    ended = run_outcome(root=tmp_path)
+
+    assert ended["outcome"] == "met"
+    assert ended["reason"] == "objective met: every task is verified and merged"
+    assert ended["cycles"] == 6 and ended["cap"] == 40
+
+
+@pytest.mark.parametrize(
+    "kind, reason",
+    [
+        ("met", "objective met: every task is verified and merged"),
+        ("capped", "stopped after 40 cycle(s) with 2 live issue(s)"),
+        ("exhausted", "stopped after 4 cycle(s) with 0 live issue(s)"),
+        ("failed", "stopping without meeting the objective: #8 was abandoned"),
+    ],
+)
+def test_each_of_the_four_endings_arrives_distinctly(tmp_path, kind, reason):
+    """The criterion, one ending at a time: the page has to be able to tell
+    them apart, and the two that exit 0 - met and capped - are the pair the
+    exit code never could."""
+    finished_run(tmp_path, outcome={"kind": kind, "reason": reason})
+
+    ended = run_outcome(root=tmp_path)
+
+    assert ended["outcome"] == kind
+    assert ended["reason"] == reason
+
+
+def test_the_counts_match_the_summary_and_keep_merged_apart_from_needs_human(tmp_path):
+    """Both halves of the criterion. Every number is read back off
+    `summary.json` rather than recomputed, and the task waiting for a person is
+    listed separately from the ones that merged - folded into one total, it is
+    the first thing to disappear."""
+    directory = finished_run(
+        tmp_path,
+        outcome={"kind": "failed", "reason": "stopping without meeting the objective",
+                 "merged": [7], "abandoned": ["add-retry"]},
+        results=((7, 0), (8, 1)),
+    )
+    summary = json.loads((directory / "summary.json").read_text())
+
+    ended = run_outcome(root=tmp_path)
+
+    assert ended["tasks"]["merged"] == summary["outcome"]["merged"] == [7]
+    assert ended["tasks"]["needs_human"] == [8]        # exit 1: no pull request open
+    assert ended["tasks"]["abandoned"] == ["add-retry"]
+    # One pull request per task: #7's is open and merged, #8 never opened one.
+    assert ended["prs"] == {"opened": 1, "merged": 1}
+
+
+def test_the_wall_clock_is_reported_and_the_inference_share_only_when_measured(tmp_path):
+    """Nothing increments `CycleMetrics.inference_s` yet. A page dividing an
+    unmeasured field by the wall clock to print "0% inference" would be making
+    a claim about the model instead of about the recording."""
+    finished_run(tmp_path)
+
+    ended = run_outcome(root=tmp_path)
+
+    assert ended["wall_s"] == 1800.0                   # 10:00 -> 10:30
+    assert ended["inference_share"] is None
+    assert ended["inference_s"] is None
+
+    finished_run(tmp_path, "demo-20260818-110000-bbbbbb", inference_calls=3)
+
+    measured = run_outcome(root=tmp_path)
+
+    assert measured["inference_share"] == round(6 * 90.0 / 1800.0, 3)
+
+
+def test_a_run_that_has_not_ended_has_no_ending_to_draw(tmp_path):
+    """404 on the route, and `None` here. A run still going is
+    `latest_external`'s `active`/`quiet` to report - drawing a terminal state
+    for it is the "the build hung" reading, backwards."""
+    write_run(tmp_path, "demo-20260818-100000-aaaaaa")     # no summary.json
+
+    assert run_outcome(root=tmp_path) is None
+
+
+def test_a_named_run_is_never_answered_with_a_different_run_s_ending(tmp_path):
+    """Both callers hold one run's card. A miss is `None` rather than a
+    fallback to the newest, which would put the wrong ending under the right
+    run id at exactly the moment a second run starts."""
+    finished_run(tmp_path, "demo-20260818-100000-aaaaaa")
+    finished_run(tmp_path, "demo-20260818-110000-bbbbbb",
+                 outcome={"kind": "capped", "reason": "stopped after 40 cycle(s)"})
+
+    assert run_outcome("demo-20260818-100000-aaaaaa", root=tmp_path)["outcome"] == "met"
+    assert run_outcome("demo-20260818-110000-bbbbbb", root=tmp_path)["outcome"] == "capped"
+    assert run_outcome("demo-20260818-999999-zzzzzz", root=tmp_path) is None
+
+
+def test_the_route_serves_the_ending_and_404s_until_there_is_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("APIARY_ARTIFACTS_DIR", str(tmp_path))
+    console = Console()
+
+    write_run(tmp_path, "demo-20260818-100000-aaaaaa")
+    assert console.render("GET", "/swarm/outcome?run=demo-20260818-100000-aaaaaa",
+                          HOST).status == 404
+
+    finished_run(tmp_path, "demo-20260818-110000-bbbbbb")
+    body = json.loads(console.render(
+        "GET", "/swarm/outcome?run=demo-20260818-110000-bbbbbb", HOST).body)
+
+    assert body["outcome"] == "met"
+    assert body["repo_url"] == "https://github.com/me/thing"
+    assert body["path"].endswith("demo-20260818-110000-bbbbbb")
