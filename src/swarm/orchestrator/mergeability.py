@@ -41,10 +41,15 @@ computes wrong:
   re-dispatches it from a fresh base commit: the dispatcher (#21) spawns a worker
   against the current base head, so "start from a fresh base" falls out of
   returning the issue to the queue rather than needing a mechanism of its own.
-  What the next attempt needs and would not otherwise have is *why* - so the base
-  it conflicted with, and the files involved, are written onto the issue body
-  before the label moves (`write_conflict`), exactly as `checks.write_feedback`
-  persists a CI failure.
+  What the next attempt needs and would not otherwise have is *why*, and since
+  #248 it gets it - as a comment whose first line is the one
+  `worker/entrypoint.fetch_feedback` greps for. The base and the conflicting
+  files used to be written onto the issue *body* before the label moved; **#152
+  removed that write** for `checks`' reason, which is that nothing read it. The
+  text was never wrong, it was written where nothing looked. `checks`' module
+  docstring carries the ADR 0001 argument for the comment being a write apiary
+  may make; in one line, `comment` is one of the three capabilities that ADR
+  defines and it appends rather than overwriting.
 - **Merges are serialised.** Merging N green pull requests in one cycle under a
   strict policy means N-1 immediately go stale; merge one, let the rest update,
   repeat. It costs a cycle per merge and buys a queue that drains.
@@ -140,8 +145,9 @@ from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
     Transition,
+    bump_attempt,
     post_comment,
-    rewrite_marker,
+    retry_comment,
     write_labels,
 )
 
@@ -788,6 +794,10 @@ def _decide_conflicted(
             context=context,
         )
 
+    reason = (
+        f"the branch conflicts with {facts.base_name}; re-dispatching from a fresh "
+        f"base commit rather than retrying the same diff"
+    )
     return Decision(
         number=entry.number,
         pull=pull,
@@ -797,12 +807,15 @@ def _decide_conflicted(
             ref=entry.ref,
             from_state=REVIEW_STATE,
             to_state=ELIGIBLE,
-            reason=(
-                f"the branch conflicts with {facts.base_name}; re-dispatching from a fresh "
-                f"base commit rather than retrying the same diff"
-            ),
+            reason=reason,
             task_id=entry.task_id,
             attempt=attempt,
+            # #248. The context travels as `detail`, not as `verify_output`:
+            # `conflict_context` is prose this repository wrote, so it carries
+            # none of the `## Verify`-at-column-0 hazard a foreign log does, and
+            # fencing it would render its own file list as literal text to the
+            # human reading the issue.
+            comment=retry_comment(attempt, reason, detail=context),
         ),
         held=held,
         context=context,
@@ -1014,67 +1027,6 @@ def conflict_context(
     return tail("\n".join(lines), CONTEXT_CHARS)
 
 
-def write_conflict(body: str, text: str, *, attempt: int) -> str:
-    """Put the conflict in the issue body, replacing any block already there.
-
-    The sibling of `checks.write_feedback`, and the same three rules: replace
-    rather than append, so the next attempt reads one conflict and not three;
-    keep every byte outside the block, so a human editing prose while the
-    orchestrator records a conflict does not lose their edit; indent the content,
-    so nothing in it can become a contract section.
-    """
-    block = "\n".join(
-        [
-            CONFLICT_OPEN,
-            f"**apiary: attempt {int(attempt)} starts from a fresh base.** The previous "
-            f"branch could not be merged:",
-            "",
-            quote(tail(text, CONTEXT_CHARS)),
-            CONFLICT_CLOSE,
-        ]
-    )
-    stripped = strip_conflict(body)
-    return f"{stripped}\n\n{block}\n" if stripped else f"{block}\n"
-
-
-def read_conflict(body: str) -> str:
-    """The quoted conflict detail of the last attempt, undented, or `""`.
-
-    Exported for the call site this ticket cannot write, exactly as
-    `checks.read_feedback` is: the worker builds its prompt from `## Goal` plus
-    the declared files (`worker/entrypoint.run_worker`), so a re-dispatched
-    attempt sees this only once that call site passes it in, and
-    `worker/entrypoint.py` is outside this ticket's file set. Until it does, the
-    block is what a human reads to find out why an issue went round again.
-    """
-    text = body or ""
-    start = text.find(CONFLICT_OPEN)
-    end = text.find(CONFLICT_CLOSE, start + 1)
-    if start < 0 or end < 0:
-        return ""
-    inner = text[start + len(CONFLICT_OPEN) : end]
-    # Only the indented lines are the detail; the sentence above them is this
-    # module's framing, and a consumer wants the facts rather than the framing.
-    lines = [
-        line[len(QUOTE_INDENT) :] for line in inner.split("\n") if line.startswith(QUOTE_INDENT)
-    ]
-    return "\n".join(lines).strip("\n")
-
-
-def strip_conflict(body: str) -> str:
-    """The body without its block, so `write_conflict` can put a fresh one back."""
-    text = body or ""
-    start = text.find(CONFLICT_OPEN)
-    if start < 0:
-        return text.rstrip("\n")
-    end = text.find(CONFLICT_CLOSE, start)
-    if end < 0:
-        # An opener with no closer is a body somebody edited by hand mid-block.
-        # Truncating from the opener is the reading that cannot leave a stray
-        # closer behind to swallow the next block's content.
-        return text[:start].rstrip("\n")
-    return (text[:start] + text[end + len(CONFLICT_CLOSE) :]).rstrip("\n")
-
 
 # --------------------------------------------------------------------------
 # Writing
@@ -1232,8 +1184,13 @@ def apply_mergeability(
                     streak=transition.streak,
                     renewals=transition.renewals,
                 )
-            if transition.attempt is not None or decision.context:
-                _patch_body(client, transition, decision.context)
+            if transition.attempt is not None and transition.task_id:
+                # The counter, and nothing else - `checks._apply`'s reasoning
+                # and the same removal (#152). The conflict is on the pull
+                # request, which is where a human looking for it will be.
+                bump_attempt(
+                    client, issue_number(transition.ref), transition.task_id, transition.attempt
+                )
             # One writer for the whole transition path (#152): the label names
             # are `reconcile.write_labels`'s business and not this module's, and
             # three copies of add-before-remove were three places to find when
@@ -1259,27 +1216,6 @@ def apply_mergeability(
         unupdatable=tuple(dict.fromkeys(unupdatable)),
         uncommented=tuple(dict.fromkeys(uncommented)),
     )
-
-
-def _patch_body(client: Any, transition: Transition, context: str) -> None:
-    """One `PATCH`, carrying the counter and the conflict the next attempt needs.
-
-    The body is re-read immediately before the write, which §5 requires and which
-    is cheap because it happens only for an issue that just lost its pull
-    request. `rewrite_marker` is #22's, imported rather than reimplemented: two
-    modules with their own idea of where the counter lives is how a counter stops
-    bounding anything. It carries the counter and nothing else - the failure
-    signature that used to ride with it is written to apiary's own store by the
-    caller, immediately before this (#159).
-    """
-    number = issue_number(transition.ref)
-    issue = client.get_issue(number)
-    body = issue.get("body") or ""
-    if transition.attempt is not None and transition.task_id:
-        body = rewrite_marker(body, transition.task_id, transition.attempt)
-    if context:
-        body = write_conflict(body, context, attempt=transition.attempt or 0)
-    client.update_issue(number, body=body)
 
 
 # --------------------------------------------------------------------------

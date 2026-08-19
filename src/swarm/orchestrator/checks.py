@@ -34,16 +34,32 @@ here is the narrower case of a PR nothing was configured to run against.
 **A retry is only worth an attempt if the failure reaches the next one.** A
 re-dispatch with identical context reproduces the identical result - that is the
 loop #24's stall detector exists to catch, and it is cheaper not to create it.
-The failure output is therefore persisted onto the issue *before* the label goes
-back to `swarm:ready`, in a delimited block at the end of the body
-(`write_feedback`), because the body is the only channel that survives the
-container, the orchestrator process and the machine. `read_feedback` is the
-other half and is exported for a caller this ticket cannot write: the worker
-builds its prompt from `## Goal` plus the declared files
-(`worker/entrypoint.run_worker`), so a retry sees the block only once that call
-site passes it in, and `worker/entrypoint.py` is outside this ticket's file set.
-Until it does, the block is still what a human reads to find out why an issue is
-on its third attempt.
+The failure output used to be persisted onto the issue body in a delimited block
+before the label went back to `swarm:ready`. **#152 removed that write**, and
+what it removed is worth stating because the block looked load-bearing and was
+not: `read_feedback` was exported for a worker call site that was never written,
+and the worker ended up reading *comments* instead
+(`worker/entrypoint.fetch_feedback`), so nothing ever read the block. The failing
+check itself is on the pull request, which is where a human looking for it goes.
+
+**A retry after a red check now carries its reason as a comment** (#248). It did
+not before, and the gap was older and larger than the block: the retry transition
+carried no `comment`, and `fetch_feedback` matches only the
+`apiary: attempt N failed` line that `reconcile._retry_or_give_up` posts on the
+*worker-result* path. So a worker re-dispatched by this module had never had the
+CI output, block or no block - charged an attempt and told nothing, which is the
+exact case the paragraph above says is not worth creating.
+
+**And a comment is a write ADR 0001 sanctions, which is the question #248 asked
+to be answered rather than assumed.** ADR 0001 forbids apiary writing its own
+*vocabulary and workflow* into a customer's tracker - the `swarm:*` labels, the
+state machine, the counter in the body. A comment is not that: `comment` is one
+of the three capabilities the ADR defines ("post the PR link or flag
+needs-human", `mcp/contract.CAPABILITIES`), it goes over the MCP path like every
+other tracker write since #151, and it *appends* rather than overwriting, which
+was the specific sin of the body `PATCH` #152 removed - a comment cannot lose a
+human's edit. The give-up branch has always commented and nobody thought that
+needed an argument; the retry branch differs only in who reads it next.
 
 **Some failures are not the worker's to fix.** A PR can pass its own
 `## Verify` and still break CI, because another ticket's tests assert behaviour
@@ -98,13 +114,14 @@ from ..worker.result import tail
 from .authority import Belief, in_review
 from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from .derived import REVIEW as REVIEW_STATE
-from .dispatcher import REVIEW, normalise
+from .dispatcher import normalise
 from .reconcile import (
     COMMENT_METHOD,
     PULLS_METHOD,
     Transition,
     post_comment,
-    rewrite_marker,
+    retry_comment,
+    bump_attempt,
     write_labels,
 )
 
@@ -1020,6 +1037,16 @@ def _retry_or_give_up(
     increment rides on the transition so it is persisted *before* the label goes
     back to `swarm:ready` (`docs/issue-contract.md` §5), and a crash between the
     two costs an attempt rather than granting a free one.
+
+    **Both branches comment, and the retry's is the one #248 was about.** The
+    give-up branch has always said why, because a human is about to read it. The
+    retry branch said nothing to anybody: the CI output went into a delimited
+    block in the issue body that nothing ever read, and the worker looks for its
+    feedback in the *comments* - so a task re-dispatched because CI went red was
+    charged an attempt and told nothing. `reconcile.retry_comment` is the
+    formatter, not a second one, because its first line is the string
+    `worker.entrypoint.fetch_feedback` greps for and a second speller of that
+    line is how the contract drifts.
     """
     attempt = entry.attempt + 1
     cap = max(int(max_attempts), 1)
@@ -1043,6 +1070,7 @@ def _retry_or_give_up(
             ),
             feedback=feedback,
         )
+    reason = f"{named} failed on the pull request"
     return Outcome(
         number=entry.number,
         verdict=FAILING,
@@ -1051,9 +1079,13 @@ def _retry_or_give_up(
             ref=entry.ref,
             from_state=REVIEW_STATE,
             to_state=ELIGIBLE,
-            reason=f"{named} failed on the pull request",
+            reason=reason,
             task_id=entry.task_id,
             attempt=attempt,
+            # The CI output travels as `verify_output`, which is fenced and
+            # clipped: it is a foreign log, and a line of it reading `## Verify`
+            # at column 0 would corrupt the contract while reporting a failure.
+            comment=retry_comment(attempt, reason, feedback),
         ),
         feedback=feedback,
     )
@@ -1078,71 +1110,6 @@ def _quote(text: str) -> str:
         return f"{QUOTE_INDENT}(no output)"
     return "\n".join(f"{QUOTE_INDENT}{line}".rstrip() for line in body.split("\n"))
 
-
-def write_feedback(body: str, text: str, *, attempt: int) -> str:
-    """Put the failure in the issue body, replacing any block already there.
-
-    Replacing rather than appending: three attempts would otherwise leave three
-    logs in one body, and the only one that helps the next attempt is the last.
-    The previous attempt's output is not lost - `worker/result.py` keeps one
-    record per attempt in the run's artifacts, which is where the history
-    belongs.
-
-    Every byte outside the block is returned untouched, which is
-    `reconcile.rewrite_marker`'s rule and load-bearing for the same reason: a
-    human editing prose while the orchestrator records a CI failure must not
-    lose their edit.
-    """
-    block = "\n".join(
-        [
-            FEEDBACK_OPEN,
-            f"**apiary: CI failed on attempt {int(attempt)}.** The next attempt should fix this:",
-            "",
-            _quote(tail(text, FEEDBACK_CHARS)),
-            FEEDBACK_CLOSE,
-        ]
-    )
-    stripped = _strip_feedback(body)
-    return f"{stripped}\n\n{block}\n" if stripped else f"{block}\n"
-
-
-def read_feedback(body: str) -> str:
-    """The quoted CI output of the last attempt, undented, or `""`.
-
-    The half of this channel this ticket cannot call: the worker builds its
-    prompt from `## Goal` and the declared files
-    (`worker/entrypoint.run_worker`), so until that call site passes this in, a
-    retry does not see it. Exported, named and tested so that wiring it is one
-    line in a file this ticket's `## Files` does not include.
-    """
-    text = body or ""
-    start = text.find(FEEDBACK_OPEN)
-    end = text.find(FEEDBACK_CLOSE, start + 1)
-    if start < 0 or end < 0:
-        return ""
-    inner = text[start + len(FEEDBACK_OPEN) : end]
-    # Only the indented lines are the log. The sentence above them is this
-    # module's framing, and a consumer wants what CI said, not what apiary said
-    # about it.
-    lines = [
-        line[len(QUOTE_INDENT) :] for line in inner.split("\n") if line.startswith(QUOTE_INDENT)
-    ]
-    return "\n".join(lines).strip("\n")
-
-
-def _strip_feedback(body: str) -> str:
-    """The body without its block, so `write_feedback` can put a fresh one back."""
-    text = body or ""
-    start = text.find(FEEDBACK_OPEN)
-    if start < 0:
-        return text.rstrip("\n")
-    end = text.find(FEEDBACK_CLOSE, start)
-    if end < 0:
-        # An opener with no closer is a body somebody edited by hand mid-block.
-        # Truncating from the opener is the reading that cannot leave a stray
-        # closer behind to swallow the next block's content.
-        return text[:start].rstrip("\n")
-    return (text[:start] + text[end + len(FEEDBACK_CLOSE) :]).rstrip("\n")
 
 
 # --------------------------------------------------------------------------
@@ -1374,8 +1341,16 @@ def apply_checks(
                     streak=transition.streak,
                     renewals=transition.renewals,
                 )
-            if transition.attempt is not None or outcome.feedback:
-                _patch_body(client, transition, outcome.feedback)
+            if transition.attempt is not None and transition.task_id:
+                # The counter, and nothing else. The failure text used to ride
+                # along in a delimited block; #152 removed it - nothing read it
+                # (`read_feedback` was exported for a worker call site never
+                # written, and the worker reads comments). It travels as the
+                # transition's `comment` since #248, posted below, which is where
+                # `fetch_feedback` looks.
+                bump_attempt(
+                    client, issue_number(transition.ref), transition.task_id, transition.attempt
+                )
             # One writer for the whole transition path (#152): the label names
             # are `reconcile.write_labels`'s business and not this module's, and
             # three copies of add-before-remove were three places to find when
@@ -1398,31 +1373,6 @@ def apply_checks(
         uncommented=tuple(dict.fromkeys(uncommented)),
         merge_commits=tuple(merge_commits.items()),
     )
-
-
-def _patch_body(client: Any, transition: Transition, feedback: str) -> None:
-    """One `PATCH`, carrying the counter and the failure the next attempt needs.
-
-    The body is re-read immediately before the write, which §5 requires and
-    which is cheap because it happens only for an issue that just finished an
-    attempt: the copy in the ledger was fetched at the top of the cycle, and a
-    human editing in between would have their edit overwritten by a patch built
-    from the stale one.
-
-    `rewrite_marker` is #22's, imported rather than reimplemented: two modules
-    with their own idea of where the counter lives is how a counter stops
-    bounding anything. It carries the counter and nothing else - the failure
-    signature that used to ride with it is written to apiary's own store by the
-    caller, immediately before this (#159).
-    """
-    number = issue_number(transition.ref)
-    issue = client.get_issue(number)
-    body = issue.get("body") or ""
-    if transition.attempt is not None and transition.task_id:
-        body = rewrite_marker(body, transition.task_id, transition.attempt)
-    if feedback:
-        body = write_feedback(body, feedback, attempt=transition.attempt or 0)
-    client.update_issue(number, body=body)
 
 
 # --------------------------------------------------------------------------

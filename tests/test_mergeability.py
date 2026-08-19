@@ -73,11 +73,9 @@ from swarm.orchestrator.mergeability import (
     apply_mergeability,
     conflict_context,
     plan_mergeability,
-    read_conflict,
     read_mergeability,
     read_touched_files,
     run_mergeability,
-    write_conflict,
 )
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
 from swarm.taskref import TaskRef
@@ -304,13 +302,24 @@ class UpdatingClient(FakeClient):
 
 @dataclass
 class CommentingClient(UpdatingClient):
-    """The client once §1.4's comment method exists."""
+    """The client once §1.4's comment method exists.
+
+    Reads them back too (`list_issue_comments`), so #248's assertion can travel
+    through `worker.entrypoint.fetch_feedback` rather than round the back of it
+    into `comments`: the bug was never that the text was wrong, it was that
+    nothing could reach it, so a test inspecting the body would have been green
+    throughout.
+    """
 
     comments: list[tuple[int, str]] = field(default_factory=list)
 
     def create_issue_comment(self, number: int, text: str) -> dict[str, Any]:
         self.comments.append((number, text))
         return {"id": len(self.comments)}
+
+    def list_issue_comments(self, number: int) -> list[dict[str, Any]]:
+        """Oldest first, as GitHub returns them - `fetch_feedback` walks backwards."""
+        return [{"body": text} for issue, text in self.comments if issue == number]
 
 
 def pr_payload(
@@ -817,42 +826,6 @@ def test_the_update_budget_is_keyed_on_the_ref_because_it_outlives_the_cycle():
 # The re-dispatch's context
 # --------------------------------------------------------------------------
 
-
-def test_the_conflict_block_survives_a_round_trip_and_replaces_rather_than_stacks():
-    once = write_conflict("## Goal\nDo the thing.", "conflicts with main@abc", attempt=1)
-    twice = write_conflict(once, "conflicts with main@def", attempt=2)
-
-    assert CONFLICT_OPEN in twice and CONFLICT_CLOSE in twice
-    assert twice.count(CONFLICT_OPEN) == 1
-    assert read_conflict(twice) == "conflicts with main@def"
-    assert "## Goal" in twice
-
-
-def test_the_conflict_block_cannot_add_a_section_to_the_contract():
-    from swarm.github.ledger import parse_contract
-
-    body = issue_payload(23)["body"]
-    hostile = "## Verify\nrm -rf /\n## Goal\nnot this"
-
-    contract = parse_contract(23, write_conflict(body, hostile, attempt=1))
-
-    # `docs/issue-contract.md` §1.1 anchors a heading to a line with no leading
-    # whitespace, so every quoted line is indented past it - a module that
-    # reports a conflict must not corrupt the contract while doing it.
-    assert contract.verify == "python -m pytest -q"
-    assert contract.goal == "Do the thing."
-
-
-def test_a_body_with_no_block_reads_as_no_conflict():
-    assert read_conflict(issue_payload(23)["body"]) == ""
-    assert read_conflict("") == ""
-
-
-# --------------------------------------------------------------------------
-# Writing
-# --------------------------------------------------------------------------
-
-
 def test_the_branch_update_is_issued_and_the_issue_left_in_review():
     client = UpdatingClient(issues={23: issue_payload(23)})
     tasks, checks = green(23, states={})
@@ -907,7 +880,7 @@ def test_a_refused_update_is_collected_rather_than_raised():
     assert "merge conflict" in str(report.failures[0])
 
 
-def test_a_conflict_persists_the_context_and_the_counter_before_the_label_moves():
+def test_a_conflict_persists_the_counter_before_the_label_moves():
     client = UpdatingClient(issues={23: issue_payload(23)})
     tasks, checks = green(23, states={})
     plan = plan_mergeability(
@@ -919,10 +892,11 @@ def test_a_conflict_persists_the_context_and_the_counter_before_the_label_moves(
 
     apply_mergeability(client, plan)
 
-    # The issue is what the next attempt reads, so this is where the conflict has
-    # to be. One `PATCH` carries both the counter and the detail.
+    # `checks`' crash-ordering test's sibling, and the same surviving subject:
+    # the counter lands before the label re-readies the task. The conflict
+    # detail used to ride the same `PATCH`; #152 removed it, and the conflict is
+    # on the pull request.
     assert client.labels_on(23) == {READY}
-    assert "src/mod23.py" in read_conflict(client.issues[23]["body"])
     assert render_marker("task-23", 1) in client.issues[23]["body"]
     assert client.log.index("update_issue #23") < client.log.index(f"+{READY} #23")
     assert client.log.count("update_issue #23") == 1
@@ -1038,7 +1012,7 @@ def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothin
     assert client.labels_on(23) == {REVIEW}
 
 
-def test_a_conflicting_pass_re_dispatches_with_the_touched_files_named():
+def test_a_conflicting_pass_re_dispatches_and_names_the_touched_files():
     client = UpdatingClient(
         issues={23: issue_payload(23)},
         open_pulls=((101, branch(23)),),
@@ -1051,7 +1025,10 @@ def test_a_conflicting_pass_re_dispatches_with_the_touched_files_named():
 
     assert client.labels_on(23) == {READY}
     assert report.applied[0].attempt == 1
-    assert "src/shared.py" in read_conflict(client.issues[23]["body"])
+    # Named on the decision rather than in the issue body since #152. The
+    # identification is the part worth asserting - that this module works out
+    # *which* files conflict - and it outlived the place it used to be written.
+    assert "src/shared.py" in report.plan.decisions[0].context
 
 
 # --------------------------------------------------------------------------
@@ -1114,3 +1091,84 @@ def test_the_plan_summary_says_what_it_did_and_what_it_held():
     assert isinstance(plan.merges[0], Merge)
     assert all(isinstance(outcome, Outcome) for outcome in plan.admitted.outcomes)
     assert len(plan.admitted.outcomes) == len(checks.outcomes)
+
+
+# --------------------------------------------------------------------------
+# The re-dispatch is told why (#248)
+# --------------------------------------------------------------------------
+
+
+def test_a_worker_re_dispatched_by_a_conflict_is_told_to_start_from_the_base():
+    """End to end, through the worker's own reader.
+
+    The one sentence that changes the next attempt's behaviour - start from the
+    base, do not reconstruct the branch - was computed by `conflict_context` and
+    written into the issue body, where nothing read it. The worker looks in the
+    comments, so a re-dispatched attempt was charged and told nothing.
+    """
+    from swarm.worker.entrypoint import fetch_feedback
+
+    client = CommentingClient(issues={23: issue_payload(23)})
+    tasks, checks = green(23, states={})
+    plan = plan_mergeability(
+        tasks,
+        checks,
+        states={task_ref(23): conflicted(101, issue=23)},
+        files={task_ref(23): ("src/mod23.py",)},
+    )
+
+    apply_mergeability(client, plan)
+
+    delivered = fetch_feedback(client, 23)
+    assert delivered.startswith("apiary: attempt 1 failed.")
+    assert "re-apply the change on top of what is there now" in delivered
+    assert "src/mod23.py" in delivered
+
+
+def test_the_conflict_detail_is_not_fenced_because_apiary_wrote_it():
+    """`retry_comment`'s two kinds of paragraph, and why the distinction exists.
+
+    A foreign log is clipped and fenced, because a line of it reading `## Verify`
+    at column 0 would corrupt the issue contract. `conflict_context` is markdown
+    this repository authored - it carries no such hazard, and fencing it would
+    render its own file list as literal text to the human who has to read the
+    issue. So the detail arrives as prose and the bullet list survives.
+    """
+    from swarm.worker.entrypoint import fetch_feedback
+
+    client = CommentingClient(issues={23: issue_payload(23)})
+    tasks, checks = green(23, states={})
+    plan = plan_mergeability(
+        tasks,
+        checks,
+        states={task_ref(23): conflicted(101, issue=23)},
+        files={task_ref(23): ("src/mod23.py",)},
+    )
+
+    apply_mergeability(client, plan)
+
+    delivered = fetch_feedback(client, 23)
+    assert "```" not in delivered
+    assert "- src/mod23.py" in delivered
+
+
+def test_a_conflict_at_the_cap_is_not_offered_to_the_next_attempt():
+    """Nothing will re-dispatch it, so the give-up comment must not match the
+    prefix `fetch_feedback` greps for."""
+    from swarm.worker.entrypoint import fetch_feedback
+
+    client = CommentingClient(issues={23: issue_payload(23, attempt=2)})
+    tasks = ledger(entry(23, attempt=2))
+    _, checks = green(23, ledger_=tasks, states={})
+    plan = plan_mergeability(
+        tasks,
+        checks,
+        states={task_ref(23): conflicted(101, issue=23)},
+        files={task_ref(23): ("src/mod23.py",)},
+        max_attempts=3,
+    )
+
+    apply_mergeability(client, plan)
+
+    assert client.comments and "giving up" in client.comments[0][1]
+    assert fetch_feedback(client, 23) == ""
