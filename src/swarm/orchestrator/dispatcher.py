@@ -288,8 +288,9 @@ class Spawner(Protocol):
     ) -> Handle: ...
 
     #: The safe-release probe. A spawn that raised may still have left a
-    #: container running - `docker start` can fail this process's read after
-    #: the daemon acted - and releasing a claim on that reading buys the issue
+    #: container behind - `docker start` can fail this process's read after
+    #: the daemon acted, and that container may have exited having already
+    #: pushed - and releasing a claim on that reading buys the issue
     #: a second worker next cycle. So the claim is only given back when the
     #: daemon says there is nothing there. This is the same question #35's
     #: recovery asks before it releases anything, asked one cycle earlier.
@@ -560,8 +561,10 @@ def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
     only about liveness. An issue put back to `swarm:ready` on that reading
     gets a second container next cycle - two workers, one file set, one of the
     two pushes lost. "Any container blocks the release" is the only reading
-    that cannot produce that, which is why #187 narrowed the callers that
-    genuinely mean liveness and deliberately left this one alone. That risk is
+    that cannot produce that, which is why #187 gave the callers that genuinely
+    mean liveness a way to say so and deliberately left this one alone. No
+    caller in `src/` asks for `running=True` today: the reaper documents never
+    doing so, and the derived resolver reads `Handle.running` instead. That risk is
     what kept the claim in the first place; `find` is what removes it, by
     asking the question #35's recovery already asks instead of assuming the
     answer.
