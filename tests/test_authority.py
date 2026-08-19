@@ -51,6 +51,7 @@ from swarm.github.ledger import load_ledger
 from swarm.github.readiness import BLOCKED, READY, compute_readiness
 from swarm.github.refs import pull_ref, task_ref as ref
 from swarm.orchestrator.authority import (
+    in_review,
     BUDGET_RENEWED,
     BUDGET_SPENT,
     DERIVED,
@@ -72,6 +73,7 @@ from swarm.orchestrator.derived import (
     ELIGIBLE,
     LANDED,
     NEEDS_HUMAN,
+    Budget,
     ContainerFact,
     PullFact,
     observe,
@@ -83,7 +85,17 @@ from swarm.orchestrator.derived import PullFact
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity, plan_dispatch
 from swarm.orchestrator.goal import FAILED as GAVE_UP
 from swarm.orchestrator.goal import IN_FLIGHT, abandoned, assess, live, shipped
-from swarm.orchestrator.reconcile import DONE, FAILED, Transition, plan_reconcile
+from swarm.orchestrator.reconcile import (
+    DONE,
+    FAILED,
+    InfrastructurePolicy,
+    Transition,
+    apply_plan,
+    plan_reconcile,
+    signature,
+)
+from swarm.orchestrator.checks import plan_checks, summarise_checks
+from swarm.orchestrator.mergeability import plan_mergeability
 from swarm.orchestrator.recovery import plan_recovery
 from swarm.orchestrator.replan import brief
 from swarm.store import STORE_DIR_ENV
@@ -91,15 +103,24 @@ from swarm.worker.result import write_result
 
 from test_goal import Says, met  # the goal gate's scripted oracle
 from test_reconcile import (  # the doubles that drive a real cycle
+    CommentingClient,
     OTHER_ISSUE,
     OTHER_PULL,
     TASK_ISSUE,
     TASK_PULL,
     a_lifecycle_run,
     entry,
+    issue_payload,
     ledger,
     record,
+    task_store,
 )
+from test_checks import NOW as CHECKS_NOW
+from test_checks import failing
+from test_checks import run as check_run
+from test_checks import pull as check_pull
+from test_checks import pulls as check_pulls
+from test_mergeability import behind, conflicted
 from test_replan import stalled  # a verdict that has already refused to be one
 
 
@@ -1708,3 +1729,426 @@ def test_the_first_sight_seed_is_the_label_and_the_contract_says_so():
     prose = " ".join(section.split())
     assert "reopening the issue does not take it back" in prose
     assert "stays pinned until the process restarts" in prose
+
+
+# --------------------------------------------------------------------------
+# 8. A transition removes the label the issue is wearing (#243)
+# --------------------------------------------------------------------------
+#
+# `reconcile.Transition`'s docstring states the property this section pins:
+# `from_state` is derived from **the label the issue carries**, never from what
+# the cycle believes. Get it wrong and two things break silently - `write_labels`
+# takes the wrong label off, so the issue wears two and §3's precedence has to
+# sort it out; and `fold` rebuilds the entry's in-memory label set from the same
+# field, so the cycle's ledger disagrees with GitHub for, in `fold`'s own words,
+# "long enough to dispatch a container against it".
+#
+# **Why the existing tests could not see it.** Every one of them builds a world
+# where the carried label and the believed state *agree* - they pass
+# `believed=None`, which makes `_was` read the label, so `from_state` and the
+# believed state are the same value by construction and each construction site is
+# indistinguishable from every wrong version of itself. Mutating five sites to a
+# fixed wrong state left the whole suite green: `_retry_or_give_up`'s two give-up
+# branches, `_verdict`'s two infrastructure branches, and `recovery._release`'s
+# escalation. #243 has the per-site measurement.
+#
+# The tests belong in this file rather than in `test_reconcile`, because what they
+# need is a *disagreement* and this file's whole subject is who is believed when
+# the label says otherwise.
+
+
+#: The hand edit. A human relabels a running task back to `swarm:ready` - the
+#: gesture somebody makes at a task they think is stuck - while its container is
+#: still going.
+#:
+#: **`swarm:done` looked like the sharper choice and is unusable**, which is worth
+#: recording because it cost an hour. The landed ratchet (#214) never takes
+#: `landed` back, so a belief built over an issue wearing `swarm:done` *agrees*
+#: with the label and the disagreement evaporates. `swarm:ready` carries no
+#: ratchet and is not terminal, so the rules under test still fire.
+EDITED = READY
+EDITED_STATE = ELIGIBLE
+
+
+def a_running_container(ref_: Any) -> ContainerFact:
+    return ContainerFact(id="c" * 64, run_id="apiary-test-run", ref=ref_, running=True)
+
+
+def carried(**facts: Any) -> tuple[Any, Belief]:
+    """A task wearing `EDITED` whose container is still running, and the belief.
+
+    The belief comes from the resolver over an observation holding that container,
+    so it says `claimed` while the issue says `swarm:ready`. That is the whole
+    fixture: every assertion below is that the transition's `from_state` follows
+    the *issue*.
+
+    The observation carries a deliberately unreachable budget. `believe` applies
+    ADR 0002's give-up arithmetic, so an entry sitting at the cap - which three of
+    these five rules need - resolves to `needs-human` before the rule under test
+    is reached, and the cycle never gets there. The caps the *planner* is given are
+    the tight ones, which is the pair of numbers each rule actually reads.
+    """
+    task = entry(4, label=EDITED, **facts)
+    book = ledger(task)
+    seen = world(
+        task,
+        containers=(a_running_container(task.ref),),
+        budget=Budget(max_attempts=99, max_total_attempts=99),
+    )
+    return book, believe(book, seen)
+
+
+#: What `_was` has to say for the result-driven rules to fire at all: the task was
+#: claimed last cycle and its worker has since finished.
+WAS_CLAIMED = {"task-4": CLAIMED_STATE}
+
+
+def test_the_give_up_at_the_total_cap_removes_the_carried_label():
+    """`reconcile._retry_or_give_up`, hard-total-cap branch."""
+    book, believed = carried(attempt=8)
+
+    plan = plan_reconcile(
+        book,
+        results={ref(4): record(4, 1, attempt=8)},
+        believed=believed,
+        previous=WAS_CLAIMED,
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+    # The belief disagrees, which is what makes the assertion above mean anything.
+    assert believed.state("task-4") == CLAIMED_STATE
+
+
+def test_the_give_up_at_the_streak_cap_removes_the_carried_label():
+    """`reconcile._retry_or_give_up`, per-blocker branch."""
+    output = "ModuleNotFoundError: No module named 'attrs'"
+    book, believed = carried(attempt=2, blocker=signature(output), streak=2)
+
+    plan = plan_reconcile(
+        book,
+        results={ref(4): record(4, 1, attempt=2, verify_output=output)},
+        believed=believed,
+        previous=WAS_CLAIMED,
+        max_attempts=3,
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+    assert believed.state("task-4") == CLAIMED_STATE
+
+
+def test_the_infrastructure_ceiling_removes_the_carried_label():
+    """`reconcile._verdict`, ceiling branch. Exit 2 at the streak cap."""
+    book, believed = carried(attempt=1)
+
+    plan = plan_reconcile(
+        book,
+        results={ref(4): record(4, 2, attempt=1, reason="docker: no such image")},
+        believed=believed,
+        previous=WAS_CLAIMED,
+        infrastructure={ref(4): 2},
+        infrastructure_policy=InfrastructurePolicy(cap=3),
+        max_attempts=3,
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+
+
+def test_an_infrastructure_retry_removes_the_carried_label():
+    """`reconcile._verdict`, below-the-cap branch.
+
+    The one case where the correct answer is to remove *nothing*: `from_state` and
+    `to_state` are both the carried state, so `write_labels` issues no removal. A
+    belief-sourced `from_state` would take `swarm:claimed` off an issue that is not
+    wearing it, which is why this case is worth a test rather than being skipped
+    for having no visible write.
+    """
+    book, believed = carried(attempt=1)
+
+    plan = plan_reconcile(
+        book,
+        results={ref(4): record(4, 2, attempt=1, reason="docker: no such image")},
+        believed=believed,
+        previous=WAS_CLAIMED,
+        infrastructure={ref(4): 0},
+        infrastructure_policy=InfrastructurePolicy(cap=3),
+        max_attempts=3,
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, EDITED_STATE)
+
+
+def test_the_stale_claim_escalation_removes_the_carried_label():
+    """`recovery._release` at the attempt cap.
+
+    The container is in the *observation* and gone from the sweep's own listing,
+    which is the real shape of a stale claim: it died between the read and the
+    sweep. The belief therefore says `claimed` - without which the sweep does not
+    speak about this task at all - while the issue says `swarm:ready`.
+    """
+    book, believed = carried(attempt=3)
+
+    swept = plan_recovery(book, containers=(), believed=believed, max_attempts=3)
+
+    transition = swept.transitions[0]
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+
+
+def test_the_stale_claim_release_removes_the_carried_label():
+    """`recovery._release` below the cap. The sibling site, for completeness."""
+    book, believed = carried(attempt=0)
+
+    swept = plan_recovery(book, containers=(), believed=believed, max_attempts=3)
+
+    transition = swept.transitions[0]
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, EDITED_STATE)
+
+
+def test_the_write_takes_off_the_label_the_issue_wears_end_to_end():
+    """The consequence, through `apply_plan` and a client rather than the field.
+
+    Asserting `from_state` pins the value; this pins what it *does*. Both are
+    wanted - the field is what `fold` reads, the label call is what GitHub sees,
+    and #243's failure mode is an issue left wearing two state labels.
+    """
+    book, believed = carried(attempt=8)
+    client = CommentingClient(issues={4: issue_payload(4, label=EDITED)})
+    plan = plan_reconcile(
+        book,
+        results={ref(4): record(4, 1, attempt=8)},
+        believed=believed,
+        previous=WAS_CLAIMED,
+        max_attempts=3,
+        max_total_attempts=9,
+    )
+
+    apply_plan(client, plan, store=task_store())
+
+    # `swarm:ready` off, `swarm:failed` on, and no `swarm:claimed` removal - which
+    # is what a belief-sourced `from_state` would have issued against an issue
+    # that never wore it.
+    assert [line for line in client.log if line.startswith("-")] == [f"-{EDITED} #4"]
+    assert client.labels_on(4) == {FAILED}
+
+
+# --- the merge gate's own construction sites -------------------------------
+#
+# `checks` and `mergeability` used to pass `from_state=REVIEW_STATE` as a
+# **constant** rather than reading the carried label, on the reasoning that the
+# gate only fires on a task in review. #243 asked for that to be brought under
+# the rule or for the difference to be written down; it turned out to be the same
+# defect, so it is under the rule now and these are what hold it there.
+#
+# The reasoning was wrong because since #147 the gate selects on `in_review(entry,
+# believed)` - the *belief*, not the label. A human who moves a reviewing task's
+# label back to `swarm:ready` leaves the gate firing on a task whose issue says
+# something else, and a constant `swarm:review` removal then takes a label off
+# that the issue is not wearing, leaving `swarm:ready` in place beside whatever
+# the gate just added.
+
+
+def reviewing(**facts: Any) -> tuple[Any, Belief, Any]:
+    """A task the resolver reads as `review`, wearing `EDITED`, and its pull request.
+
+    The pull request is open on the task's attempt branch, which is what makes the
+    resolver say `review` - `carried`'s container does the same job for `claimed`.
+    """
+    # The failing path has to be inside the declared files, or `checks` routes it
+    # to a human as "not the worker's to fix" and never reaches the retry branch.
+    task = entry(23, "src/mod23.py", "tests/test_mod23.py", label=EDITED, **facts)
+    book = ledger(task)
+    pull = PullFact(
+        number=pull_ref(101),
+        ref=task.ref,
+        attempt=task.attempt,
+        merged=False,
+        closed=False,
+        draft=False,
+        head_sha="a" * 40,
+    )
+    seen = world(task, pulls=(pull,), budget=Budget(max_attempts=99, max_total_attempts=99))
+    return book, believe(book, seen), task
+
+
+def test_the_merge_gate_fires_on_a_task_whose_label_was_moved():
+    """The premise the constant rested on, and it does not hold.
+
+    Asserted separately from the consequence, because if this ever stops being
+    true the tests below stop measuring anything and should be deleted rather
+    than quietly passing.
+    """
+    _, believed, task = reviewing()
+
+    assert believed.state("task-23") == REVIEW_STATE
+    assert task.state_label == EDITED
+    assert in_review(task, believed) is True
+
+
+def test_a_red_check_removes_the_label_the_issue_wears():
+    """`checks._retry_or_give_up`, under the rule since #243."""
+    book, believed, task = reviewing()
+
+    plan = plan_checks(
+        book,
+        pulls=check_pulls(check_pull(101, issue=23)),
+        checks={task.ref: failing("tests/test_mod23.py")},
+        believed=believed,
+        max_attempts=3,
+    )
+
+    transition = plan.outcomes[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, ELIGIBLE)
+
+
+def test_a_red_check_at_the_cap_removes_the_label_the_issue_wears():
+    """`checks._retry_or_give_up`'s give-up branch, same rule."""
+    book, believed, task = reviewing(attempt=2)
+
+    plan = plan_checks(
+        book,
+        # The pull request has to be on *this* attempt's branch, or the gate finds
+        # none for the task and decides nothing.
+        pulls=check_pulls(check_pull(101, issue=23, attempt=2)),
+        checks={task.ref: failing("tests/test_mod23.py")},
+        believed=believed,
+        max_attempts=3,
+    )
+
+    transition = plan.outcomes[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+
+
+def test_a_failure_outside_the_declared_files_removes_the_label_the_issue_wears():
+    """`checks._decide`, the not-the-worker's-to-fix branch."""
+    book, believed, task = reviewing()
+
+    plan = plan_checks(
+        book,
+        pulls=check_pulls(check_pull(101, issue=23)),
+        # A path the issue never declared: nothing a retry could do about it.
+        checks={task.ref: failing("src/unrelated.py")},
+        believed=believed,
+        max_attempts=3,
+    )
+
+    transition = plan.outcomes[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+
+
+def test_an_empty_check_set_removes_the_label_the_issue_wears():
+    """`checks._decide_empty`, past the grace period."""
+    from swarm.orchestrator.checks import CheckSet, MergePolicy
+
+    book, believed, task = reviewing()
+
+    plan = plan_checks(
+        book,
+        pulls=check_pulls(check_pull(101, issue=23, age_s=3600)),
+        checks={task.ref: CheckSet()},
+        policy=MergePolicy(zero_check_grace_s=300),
+        now=CHECKS_NOW,
+        believed=believed,
+        max_attempts=3,
+    )
+
+    transition = plan.outcomes[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+
+
+def test_a_green_merge_removes_the_label_the_issue_wears():
+    """`checks._decide_passed`. The one that lands rather than escalates."""
+    book, believed, task = reviewing()
+
+    plan = plan_checks(
+        book,
+        pulls=check_pulls(check_pull(101, issue=23)),
+        checks={task.ref: summarise_checks([check_run("test", "success")])},
+        believed=believed,
+        max_attempts=3,
+    )
+
+    transition = plan.outcomes[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, LANDED)
+
+
+
+def a_green_gate(book: Any, believed: Belief, task: Any) -> Any:
+    """The check gate's plan for a task whose checks passed, built *with* the belief.
+
+    `test_mergeability.green` builds the same thing with `believed=None`, which
+    reads the label - and the label here is the hand edit, so `plan_checks` would
+    not select the task at all and `plan_mergeability` would decide nothing. The
+    belief is the whole fixture, so it has to reach the gate that admits the task.
+    """
+    return plan_checks(
+        book,
+        pulls=check_pulls(check_pull(101, issue=23, attempt=task.attempt)),
+        checks={task.ref: summarise_checks([check_run("test", "success")])},
+        believed=believed,
+        max_attempts=3,
+    )
+
+
+def test_a_conflict_removes_the_label_the_issue_wears():
+    """`mergeability._decide_conflicted`, re-dispatch branch."""
+    book, believed, task = reviewing()
+
+    plan = plan_mergeability(
+        book,
+        a_green_gate(book, believed, task),
+        states={task.ref: conflicted(101, issue=23)},
+        files={task.ref: ("src/mod23.py",)},
+        max_attempts=3,
+    )
+
+    transition = plan.decisions[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, ELIGIBLE)
+
+
+def test_a_conflict_at_the_cap_removes_the_label_the_issue_wears():
+    """`mergeability._decide_conflicted`, give-up branch."""
+    book, believed, task = reviewing(attempt=2)
+
+    plan = plan_mergeability(
+        book,
+        a_green_gate(book, believed, task),
+        states={task.ref: conflicted(101, issue=23)},
+        files={task.ref: ("src/mod23.py",)},
+        max_attempts=3,
+    )
+
+    transition = plan.decisions[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)
+
+
+def test_a_starved_branch_removes_the_label_the_issue_wears():
+    """`mergeability._decide_behind`, the update-round cap."""
+    from swarm.orchestrator.mergeability import UpdateBudget
+
+    book, believed, task = reviewing()
+
+    plan = plan_mergeability(
+        book,
+        a_green_gate(book, believed, task),
+        states={task.ref: behind(101, issue=23)},
+        # The rounds are already spent, which is what starvation is: the branch
+        # keeps passing and keeps being overtaken.
+        budget=UpdateBudget(cap=2, rounds={task.ref: 2}),
+        max_attempts=3,
+    )
+
+    transition = plan.decisions[0].transition
+    assert transition is not None
+    assert (transition.from_state, transition.to_state) == (EDITED_STATE, NEEDS_HUMAN)

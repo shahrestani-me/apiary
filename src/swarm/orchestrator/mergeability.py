@@ -138,9 +138,8 @@ from .checks import (
     render_keys,
 )
 from ..store import StoreError, TaskStore, record_judgement
-from .authority import Belief, in_review
+from .authority import Belief, in_review, label_state
 from .derived import ELIGIBLE, NEEDS_HUMAN
-from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
@@ -773,7 +772,7 @@ def _decide_conflicted(
             ),
             transition=Transition(
                 ref=entry.ref,
-                from_state=REVIEW_STATE,
+                from_state=label_state(entry.state_label),
                 to_state=NEEDS_HUMAN,
                 reason=(
                     f"the branch conflicts with {facts.base_name} and {attempt} attempt(s) "
@@ -802,7 +801,7 @@ def _decide_conflicted(
         detail=f"conflicts with {facts.base_name}; re-dispatching as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_state=REVIEW_STATE,
+            from_state=label_state(entry.state_label),
             to_state=ELIGIBLE,
             reason=reason,
             task_id=entry.task_id,
@@ -848,7 +847,7 @@ def _decide_behind(
             detail=reason,
             transition=Transition(
                 ref=entry.ref,
-                from_state=REVIEW_STATE,
+                from_state=label_state(entry.state_label),
                 to_state=NEEDS_HUMAN,
                 reason=reason,
                 task_id=entry.task_id,
