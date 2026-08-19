@@ -1918,12 +1918,25 @@ class Reconciler:
     #: and the next one read it off a label. `APIARY_STATE_SOURCE=labels` is the
     #: escape hatch and `authority.state_source` is loud on anything else.
     _source: str = field(default_factory=state_source, repr=False)
-    #: What this process believed at the end of the previous cycle, by task id.
-    #: `plan_reconcile` is incremental and the resolver is absolute; this is the
-    #: "was" the label used to carry. Run-scoped, like `_infrastructure` and
-    #: `update_budget`, and seeded from the labels for a task never seen - see
-    #: `authority.Belief.previous`.
-    _believed: dict[str, str] = field(default_factory=dict, repr=False)
+    #: What this process believed at the end of the previous cycle, by **work
+    #: item**. `plan_reconcile` is incremental and the resolver is absolute;
+    #: this is the "was" the label used to carry. Run-scoped, like
+    #: `_infrastructure` and `update_budget`, and seeded from the labels for a
+    #: task never seen - see `authority.Belief.previous`. Keyed by `TaskRef`
+    #: rather than by task id because an id is only *leased* to an issue
+    #: (`ledger._adopted_id`), and a memory looked up by a re-minted slug is a
+    #: memory about somebody else's issue - see `authority.Belief.carried`.
+    _believed: dict[TaskRef, str] = field(default_factory=dict, repr=False)
+    #: The work items this run has believed landed (#214): the ratchet's whole
+    #: memory, carried apart from `_believed` so that no state a *label* reached
+    #: can enter it. `authority.Belief.landed` names the only two places that
+    #: write to it. Run-scoped like everything else here, and a restart falls
+    #: back on the first-sight label seed `believe` documents.
+    _landed: frozenset[TaskRef] = field(default_factory=frozenset, repr=False)
+    #: Which standing ratchets have already announced themselves, and against
+    #: which label. Log state rather than decision state - see
+    #: `authority.Belief.announced`.
+    _announced: dict[TaskRef, str] = field(default_factory=dict, repr=False)
     #: Every revival this run has granted, as `authority.Grant`s: the attempt
     #: counter each was made at, and whether the one attempt it bought has been
     #: spent. Without it the resolver re-escalates a revived task on the same
@@ -2021,6 +2034,8 @@ class Reconciler:
             infrastructure_cap=self.infrastructure_policy.cap,
             revived=self._revived,
             remembered=self._believed,
+            landed=self._landed,
+            announced=self._announced,
             max_attempts=self.max_attempts,
             max_total_attempts=self.max_total_attempts,
         )
@@ -2326,7 +2341,7 @@ class Reconciler:
                 why=one.why,
             )
 
-    def _carry_forward(self, belief: Belief, report: CycleReport) -> dict[str, str]:
+    def _carry_forward(self, belief: Belief, report: CycleReport) -> dict[TaskRef, str]:
         """What this cycle ended believing, for the next cycle's `previous`.
 
         The same enumeration `shadow.control_labels` walks, from the other side
@@ -2342,8 +2357,15 @@ class Reconciler:
         overwrite a claim), then the dispatcher's claims - including the claim a
         failed spawn leaves standing, which is a claim the control plane is
         holding whether or not the spawn worked.
+
+        The ratchet leaves by the same door and is set on `self` here rather
+        than returned, because it is not a belief *about a task id*: `landed` is
+        keyed by work item and carries the one fact in a cycle that nothing
+        later may take back (#214). `hold` is where the taking-back would
+        happen - the revival overlay above it is unconditional - and the guard
+        is in `authority`.
         """
-        carried = belief.fold(getattr(report.mergeability, "applied", ()) or ())
+        folded = belief.fold(getattr(report.mergeability, "applied", ()) or ())
         overlay: dict[str, str] = {task: ELIGIBLE for task in revived_tasks(report)}
         if report.readiness is not None:
             for verdict in report.readiness.verdicts:
@@ -2358,7 +2380,10 @@ class Reconciler:
                 task = slugs.get(task_ref(int(failure.number)), "")
                 if failure.claimed and task:
                     overlay[task] = CLAIMED_STATE
-        return dict(carried.hold(overlay).states)
+        final = folded.hold(overlay)
+        self._landed = final.landed
+        self._announced = dict(final.announced)
+        return final.carried()
 
     def _spend_revivals(self, report: CycleReport) -> None:
         """Mark the grants this cycle put on the fleet. #200's whole fix.
