@@ -1005,18 +1005,25 @@ def test_a_named_block_that_is_not_there_is_a_refusal_and_not_a_silent_fallback(
 #: The payload fields a mint may read, keyed to the site, with what a non-GitHub
 #: tracker does to it. Written out rather than counted: #260's own evidence listed
 #: three of these four, and the missing one is the earliest of them in a cycle.
-PAYLOAD_MINTS: dict[tuple[str, str], str] = {
+#: `(file, field) -> (how many sites, what a non-GitHub payload does to them)`.
+#: The count is here rather than in a second structure so the inventory cannot
+#: disagree with itself - #253 is the cautionary tale for two hand-maintained
+#: tables of the same thing.
+PAYLOAD_MINTS: dict[tuple[str, str], tuple[int, str]] = {
     ("github/ledger.py", "number"): (
+        1,
         "a `## Blocked by` reference. The contract has no capability for "
         "resolving one, so a non-GitHub ref here is unresolvable rather than "
         "merely mis-minted"
     ),
     ("github/readiness.py", "number"): (
+        2,
         "`IssueState.from_payload` and `resolve_states`' listing. The first of "
         "the four a payload reaches in a cycle, and the one #260's evidence "
         "omits"
     ),
     ("orchestrator/reconcile.py", "number"): (
+        1,
         "`Snapshot.labels`, which is **core** rather than adapter - the one site "
         "that breaks ADR 0001's rule that nothing above the adapter takes a ref "
         "apart, and so the first one #260 should move"
@@ -1024,14 +1031,22 @@ PAYLOAD_MINTS: dict[tuple[str, str], str] = {
 }
 
 
-def _payload_mints() -> set[tuple[str, str]]:
-    """Every `task_ref(...)` whose argument reads a field by name, as (file, field).
+def _payload_mints() -> dict[tuple[str, str], int]:
+    """Every `task_ref(...)` whose argument reads a field by name: (file, field) -> count.
 
     A `Subscript` with a string-constant slice anywhere inside the call's
     arguments. `handle.issue` and `failure.number` are attribute reads and do not
     match, which is the whole point - see the note above.
+
+    **Counted rather than collected, and the count is the ratchet.** A set keyed
+    on (file, field) cannot see a *fifth* mint added to a file already on the
+    list - `readiness.py` holds two, so its second one is invisible to a set that
+    already contains its first. That is the likelier direction: a new payload
+    mint is most plausibly written into the file that already handles payloads.
+    Verified by adding one to `readiness.py` under the set version and watching
+    the suite stay green.
     """
-    found: set[tuple[str, str]] = set()
+    found: dict[tuple[str, str], int] = {}
     for path in sorted(SOURCE.rglob("*.py")):
         rel = str(path.relative_to(SOURCE))
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -1046,7 +1061,9 @@ def _payload_mints() -> set[tuple[str, str]]:
                     and isinstance(inner.slice, ast.Constant)
                     and isinstance(inner.slice.value, str)
                 ):
-                    found.add((rel, inner.slice.value))
+                    key = (rel, inner.slice.value)
+                    found[key] = found.get(key, 0) + 1
+                    break
     return found
 
 
@@ -1057,15 +1074,19 @@ def test_only_the_known_sites_mint_a_ref_out_of_a_payload():
     settles on instead - or one was removed, in which case delete its entry and
     enjoy the shorter list.
     """
-    assert _payload_mints() == set(PAYLOAD_MINTS), (
-        "the set of payload-sourced ref mints changed; see PAYLOAD_MINTS above"
+    assert _payload_mints() == {site: n for site, (n, _) in PAYLOAD_MINTS.items()}, (
+        "the payload-sourced ref mints changed; see PAYLOAD_MINTS above. A count "
+        "that rose means a new mint in a file already on the list - the case a "
+        "set could not see; one that fell means #260 moved one, which is what "
+        "this ratchet exists to make you notice"
     )
 
 
 def test_every_known_mint_says_what_a_non_github_payload_does_to_it():
     """An inventory with a blank entry is a list, and #260 needs the reasons."""
-    for site, why in PAYLOAD_MINTS.items():
+    for site, (count, why) in PAYLOAD_MINTS.items():
         assert why.strip(), f"{site} is inventoried with no consequence written down"
+        assert count >= 1, f"{site} is inventoried with no sites"
 
 
 def test_the_scan_ignores_a_ref_minted_from_apiary_s_own_records():
