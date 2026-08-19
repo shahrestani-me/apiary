@@ -550,13 +550,21 @@ def claim(client: Labeller, entry: LedgerEntry) -> None:
 def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
     """Undo one claim, `claimed -> ready`, and say whether it was undone.
 
-    **Only when the daemon says nothing is running under that issue.** A
+    **Only when the daemon says no container *exists* under that issue.**
+    Exists, not "is running": `find` here is `docker ps --all`, so a container
+    that has already exited still blocks the release, and that width is
+    deliberate rather than left over. This runs after a failed spawn, and a
     `docker start` that failed *this process's* read may still have started a
-    container, and an issue put back to `swarm:ready` on that reading gets a
-    second container next cycle - two workers, one file set, one of the two
-    pushes lost. That risk is what kept the claim in the first place; `find` is
-    what removes it, by asking the question #35's recovery already asks instead
-    of assuming the answer.
+    container - one that ran, pushed and exited in the same breath is
+    indistinguishable from one that never started at all to a probe that asks
+    only about liveness. An issue put back to `swarm:ready` on that reading
+    gets a second container next cycle - two workers, one file set, one of the
+    two pushes lost. "Any container blocks the release" is the only reading
+    that cannot produce that, which is why #187 narrowed the callers that
+    genuinely mean liveness and deliberately left this one alone. That risk is
+    what kept the claim in the first place; `find` is what removes it, by
+    asking the question #35's recovery already asks instead of assuming the
+    answer.
 
     Label order is `claim`'s, inverted, and load-bearing for the same reason:
     §3's precedence ranks `claimed` above `ready`, so a crash between the two
