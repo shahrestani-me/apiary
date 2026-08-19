@@ -261,13 +261,25 @@ class DeletingClient(FakeClient):
 
 @dataclass
 class CommentingClient(FakeClient):
-    """The client once §1.4's comment method exists."""
+    """The client once §1.4's comment method exists.
+
+    It reads comments back as well as writing them (`list_issue_comments`),
+    which is not decoration: #248's assertion has to travel through
+    `worker.entrypoint.fetch_feedback` - the thing that actually looks for the
+    feedback - rather than round the back of it into `comments`. A test that
+    inspected the comment body would have passed for the whole life of the bug,
+    because the text was always correct and always written where nothing read.
+    """
 
     comments: list[tuple[int, str]] = field(default_factory=list)
 
     def create_issue_comment(self, number: int, text: str) -> dict[str, Any]:
         self.comments.append((number, text))
         return {"id": len(self.comments)}
+
+    def list_issue_comments(self, number: int) -> list[dict[str, Any]]:
+        """Oldest first, as GitHub returns them - `fetch_feedback` walks backwards."""
+        return [{"body": text} for issue, text in self.comments if issue == number]
 
 
 @dataclass
@@ -1224,3 +1236,105 @@ def test_the_report_stays_hashable():
     `dict` field makes the generated `__hash__` raise, and a frozen dataclass
     that cannot be hashed is frozen in name only."""
     assert hash(ChecksReport(plan=ChecksPlan())) == hash(ChecksReport(plan=ChecksPlan()))
+
+
+# --------------------------------------------------------------------------
+# The retry is told why (#248)
+# --------------------------------------------------------------------------
+#
+# The failure text was always computed and always written - into a delimited
+# block in the issue body, which nothing ever read. The worker looks in the
+# comments. So a task re-dispatched because CI went red was charged an attempt
+# and handed nothing, which is the one case this module's own docstring says is
+# not worth creating: "a re-dispatch with identical context reproduces the
+# identical result".
+
+
+def test_a_worker_re_dispatched_by_a_red_check_is_told_what_failed():
+    """End to end, through the reader rather than past it.
+
+    `fetch_feedback` is the worker's own function, unmodified, run against the
+    comments this cycle actually posted. That is the assertion #248 asks for: the
+    bug was never that the text was wrong, it was that nothing could reach it, so
+    a test reading `client.comments` would have been green throughout.
+    """
+    from swarm.worker.entrypoint import fetch_feedback
+
+    client = CommentingClient(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
+        pulls=pulls(pull(101, issue=23)),
+        checks={task_ref(23): failing("tests/test_mod23.py")},
+        now=NOW,
+    )
+
+    apply_checks(client, plan)
+
+    delivered = fetch_feedback(client, 23)
+    assert delivered.startswith("apiary: attempt 1 failed.")
+    assert "failed on the pull request" in delivered
+    assert "tests/test_mod23.py" in delivered
+
+
+def test_the_retrys_comment_is_the_one_the_worker_greps_for():
+    """The first line is a contract, and this pins it against the worker's own
+    constant rather than against a copy of it here."""
+    from swarm.worker.entrypoint import FEEDBACK_PREFIX
+
+    client = CommentingClient(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
+        pulls=pulls(pull(101, issue=23)),
+        checks={task_ref(23): failing("tests/test_mod23.py")},
+        now=NOW,
+    )
+
+    apply_checks(client, plan)
+
+    assert [number for number, _ in client.comments] == [23]
+    assert client.comments[0][1].startswith(FEEDBACK_PREFIX)
+
+
+def test_a_give_up_is_not_offered_to_the_next_attempt():
+    """The give-up comment must **not** match the prefix, and it does not.
+
+    Nothing will re-dispatch this task, so a comment `fetch_feedback` would pick
+    up is a comment that reaches a worker only if a human re-readies the issue -
+    at which point "giving up after 3 attempt(s)" is the wrong thing to hand it.
+    The two comments are deliberately different sentences.
+    """
+    from swarm.worker.entrypoint import fetch_feedback
+
+    client = CommentingClient(issues={23: issue_payload(23, attempt=2)})
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py", "tests/test_mod23.py", attempt=2)),
+        pulls=pulls(pull(101, issue=23, attempt=2)),
+        checks={task_ref(23): failing("tests/test_mod23.py")},
+        max_attempts=3,
+        now=NOW,
+    )
+
+    apply_checks(client, plan)
+
+    assert client.comments and "giving up" in client.comments[0][1]
+    assert fetch_feedback(client, 23) == ""
+
+
+def test_the_ci_output_is_fenced_because_it_is_foreign_text():
+    """A CI log line reading `## Verify` at column 0 would corrupt the contract.
+
+    The module went to lengths about this for the body block it used to write;
+    the comment carries the same text and inherits the same hazard, so the fence
+    is asserted rather than assumed.
+    """
+    client = CommentingClient(issues={23: issue_payload(23)})
+    plan = plan_checks(
+        ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
+        pulls=pulls(pull(101, issue=23)),
+        checks={task_ref(23): failing("tests/test_mod23.py")},
+        now=NOW,
+    )
+
+    apply_checks(client, plan)
+
+    assert "```" in client.comments[0][1]
