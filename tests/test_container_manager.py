@@ -578,6 +578,58 @@ def test_containers_of_every_run_are_findable_without_a_run_object():
 
 
 # --------------------------------------------------------------------------
+# Parsing the listing (#190)
+#
+# The listing is text, and the guard against short rows is the one place where
+# a parse that went wrong turns into "no containers found" rather than into an
+# error. Silence there is expensive in every direction it travels: the reaper
+# sweeps nothing and orphaned containers keep their clones and their disk,
+# `recovery.holders` finds no holder and releases a claim somebody is still
+# honouring, and #146's shadow window sees every task diverge at once. The
+# guard is right - a row the daemon truncated is not a container anyone should
+# guess at - but until now nothing failed if it were deleted, and nothing
+# failed if a seventh column were added without `_PS_FIELDS` following it.
+# --------------------------------------------------------------------------
+
+
+def test_a_row_with_a_missing_column_is_skipped_rather_than_guessed_at():
+    """A short row is dropped, and the rows around it still arrive.
+
+    Skipping is deliberate: a five-column row came from a daemon that answered
+    something other than what was asked, and the fields cannot be assigned to
+    columns without guessing which one went missing. What must not happen is
+    the *whole listing* being lost with it - the reaper and `recovery.holders`
+    both act on what a listing returns, so one malformed row taking its
+    neighbours with it is the same silence by another route.
+    """
+    manager, runner = make_manager()
+    runner.replies["ps"] = Reply(
+        stdout=(
+            # Five columns: the state the daemon was asked for is absent.
+            f"{'a' * 64}\tapiary-short\tapiary-worker\t{manager.run.id}\t7\n"
+            f"{CONTAINER_ID}\tapiary-whole\tapiary-worker\t{manager.run.id}\t9\trunning\n"
+        )
+    )
+
+    handles = manager.find()
+
+    assert [handle.name for handle in handles] == ["apiary-whole"]
+    assert handles[0].running is True
+
+
+def test_the_column_count_cannot_drift_from_the_format_string():
+    """`_PS_FIELDS` is asserted against `_PS_FORMAT`, not maintained beside it.
+
+    Adding a column to the format without bumping the count would not raise
+    anywhere: the parse slices `fields[:_PS_FIELDS]`, so the new column would
+    be read and silently dropped, and every reader of it would see the empty
+    string. `{{.State}}` arrived that way in #187 and the next column will
+    arrive the same way. This fails at that commit instead of at the incident.
+    """
+    assert manager_module._PS_FORMAT.count("\t") + 1 == manager_module._PS_FIELDS
+
+
+# --------------------------------------------------------------------------
 # Liveness (#187)
 #
 # `docker ps --all` lists a container that has exited, so a listing without the
