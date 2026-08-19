@@ -19,6 +19,17 @@ no better than one that reports it on neither. If somebody relaxes the settings
 far enough that this stops failing, the gate is decorative and this test says so
 rather than the next refactor saying so six months later.
 
+**One and a half: the checker catches a *mis-sourcing*, not only a retype.**
+#185. `Merge` carries `number` (the issue) beside `pull` (the pull request), and
+while both were `int` a `Merge` built from the pull request's number twice was
+well-typed: it minted a perfectly valid `TaskRef`, just one addressing a pull
+request, so the refusal was filed under an identity no outcome answered to and
+`swarm:done` went out for a merge that never happened. Nothing above caught that
+- the assertion in the first group is about a *key type*, and both halves of
+this one were `int`. `test_a_pull_requests_number_in_the_issues_place_is_an_error`
+is that defect in miniature, and its control is the same construction sourced
+correctly.
+
 **Two: the exclusions cannot quietly become a blanket.** The backlog is excluded
 two ways and no others - per-module `disable_error_code` lists in
 `pyproject.toml`, and `# type: ignore[code]` at the site in the modules where a
@@ -133,6 +144,115 @@ def test_the_same_read_with_a_ref_is_clean(reproduction_findings: str) -> None:
     assert not [line for line in reproduction_findings.splitlines() if ":8: error:" in line], (
         "the corrected lookup was also flagged, so the finding above is not "
         "evidence of anything:\n" + reproduction_findings
+    )
+
+
+# --------------------------------------------------------------------------
+# One and a half: a pull request's number is not an issue's
+# --------------------------------------------------------------------------
+
+
+#: The #185 defect and its control, in the records that carry both numberings.
+#: Each construction is tagged, and the tags - not hard-coded line numbers - are
+#: what the assertions below look up, so inserting a case cannot silently point
+#: an assertion at its neighbour.
+#:
+#: Every `WRONG` line is sourced the way the bug was: the pull request's number
+#: read into the field that holds the issue's. Every `RIGHT` line is the same
+#: call with the issue's number in it. A checker that flags both is worth
+#: nothing, which is why the pairs are here rather than the errors alone.
+MIS_SOURCING = """\
+from swarm.orchestrator.checks import Merge, PullState
+from swarm.orchestrator.mergeability import Decision, Mergeability
+
+
+def build(issue: int, pull: PullState, facts: Mergeability) -> None:
+    Merge(number=pull.number, pull=pull.number, branch=pull.branch)  # WRONG
+    Merge(number=issue, pull=pull.number, branch=pull.branch)  # RIGHT
+
+    Decision(number=facts.number, pull=facts.number, verdict="fresh")  # WRONG
+    Decision(number=issue, pull=facts.number, verdict="fresh")  # RIGHT
+
+    Mergeability(number=issue)  # WRONG
+    Mergeability(number=pull.number)  # RIGHT
+"""
+
+
+def _tagged(tag: str) -> list[int]:
+    """The 1-based line numbers of every construction carrying `tag`."""
+    return [
+        number
+        for number, line in enumerate(MIS_SOURCING.splitlines(), start=1)
+        if line.rstrip().endswith(f"# {tag}")
+    ]
+
+
+@pytest.fixture(scope="module")
+def mis_sourcing_findings(tmp_path_factory: pytest.TempPathFactory) -> str:
+    scratch = tmp_path_factory.mktemp("two-numberings")
+    module = scratch / "numberings.py"
+    module.write_text(MIS_SOURCING)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--no-pretty",
+            "--no-error-summary",
+            "--no-incremental",
+            "--config-file",
+            str(ROOT / "pyproject.toml"),
+            "--follow-imports",
+            "silent",
+            str(module),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=scratch,
+        env={**os.environ, "MYPYPATH": str(SRC)},
+    )
+    assert result.returncode in (0, 1), result.stderr or result.stdout
+    return result.stdout
+
+
+def _lines_with_errors(findings: str) -> set[int]:
+    return {
+        int(match.group(1))
+        for match in re.finditer(r"^[^:]+:(\d+): error:", findings, flags=re.MULTILINE)
+    }
+
+
+def test_a_pull_requests_number_in_the_issues_place_is_an_error(
+    mis_sourcing_findings: str,
+) -> None:
+    """The shape that shipped green before #185, on all three records.
+
+    Not "a guard raises later": the construction itself is rejected, which is
+    the difference between a bug that is *caught* and one that cannot be
+    written. #184's `UnresolvedJoin` still catches the version of this a type
+    cannot - two records that genuinely disagree about which task a merge is
+    for, because a human fetched the wrong number - and that is a different
+    failure with a different fix.
+    """
+    wrong = _tagged("WRONG")
+    assert wrong, "the reproduction lost its tags"
+    flagged = _lines_with_errors(mis_sourcing_findings)
+    missed = [number for number in wrong if number not in flagged]
+    assert not missed, (
+        "a pull request's number was accepted where an issue's belongs, on line(s) "
+        f"{missed} of the reproduction - the two numberings are interchangeable "
+        "to the checker again:\n" + (mis_sourcing_findings or "(mypy reported nothing)")
+    )
+
+
+def test_the_same_records_built_correctly_are_clean(mis_sourcing_findings: str) -> None:
+    """The control. Errors on both spellings would make the finding above noise."""
+    flagged = _lines_with_errors(mis_sourcing_findings)
+    wrongly_flagged = [number for number in _tagged("RIGHT") if number in flagged]
+    assert not wrongly_flagged, (
+        f"the correctly-sourced construction was also flagged, on line(s) "
+        f"{wrongly_flagged}, so the finding above is not evidence of anything:\n"
+        + mis_sourcing_findings
     )
 
 

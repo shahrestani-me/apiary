@@ -69,25 +69,35 @@ Wiring this in front of `checks.apply_checks` - one call, taking the plan #23
 computed and returning the subset that may actually land - is a change to
 `orchestrator/reconcile.py`, which is outside this ticket's file set too.
 
-**Where the `TaskRef` line falls in this module, and why there (#174).** Every
-collection here that names *tasks* is ref-typed: `MergeabilityPlan.held`,
+**Where the `TaskRef` line falls in this module, and why there (#174, #185).**
+Every collection here that names *tasks* is ref-typed: `MergeabilityPlan.held`,
 `MergeabilityReport.updated` and `.uncommented`, `Failure.ref`,
 `BranchUpdate.ref`, `UpdateBudget.rounds`, and the `states`/`files` maps
-`plan_mergeability` takes. Two ints remain and neither is a task identity in
-disguise: `Decision.number`, which exists to address the GitHub API and is the
-code-host half ADR 0001 says stays GitHub-shaped, and `Mergeability.number`,
-which is a *pull request's* number read off `GET /pulls/{n}`.
+`plan_mergeability` takes.
 
-The rule is therefore "a task is a ref; an API address is a number", not "plans
-are refs and reports are numbers" - `recovery.RecoveryPlan.held` and
-`reconcile.Failure` were already on that side of it, and this module now agrees
-with them. `checks.py`'s own report surface - `Failure.number`,
-`ChecksReport.merged`, `.uncommented`, `ChecksPlan.escalated` - has *not* been
-moved, and that is the one place the line is drawn by scope rather than by the
-rule: those feed `ChecksReport.merge_commits` and `lifecycle.py`'s
-issue-numbered index, which #174 explicitly left to the follow-up. Anyone
-finishing that migration should expect this paragraph to lose its last
-sentence.
+The rule was "a task is a ref; an API address is a number", and #185 is what an
+API address now *is*. Two of them were pull requests - `Mergeability.number`,
+read off `GET /pulls/{n}`, and `Decision.pull` - and while those were `int` they
+sat beside an issue's number with nothing but the field name keeping them apart.
+`Decision(number=..., pull=...)` filled the wrong way round type-checked, minted
+a ref addressing a pull request, and the row then joined against nothing. So a
+pull request's number is a `PullRef` now (`swarm/taskref.py`, minted in
+`github/refs.py`): nominally distinct from `TaskRef` *and* from the `int` beside
+it, so mypy rejects the swap in both directions.
+
+**The rule is therefore "a task is a `TaskRef`; a pull request is a `PullRef`;
+an API address that is neither is a number".** Exactly one int of the third kind
+is left in this module - `Decision.number`, the issue number
+`apply_mergeability` posts this cycle's comment with. It is not a second
+numbering in disguise: it is the *task's* own address, ADR 0001's code-host half
+of the identity `Decision.ref` mints from it, and the field it used to be
+confusable with is now a different type. Retyping it to a `TaskRef` outright is
+#174's unfinished migration rather than this one - `checks.py`'s report surface
+(`Failure.number`, `ChecksReport.merged`, `.uncommented`, `ChecksPlan.escalated`)
+feeds `ChecksReport.merge_commits` and `lifecycle.py`'s issue-numbered index,
+and moving one end of that join without the other is precisely the defect #142
+shipped. Anyone finishing it should expect this paragraph to lose its last two
+sentences.
 
 Manual dry run against a real repo - reads only, updates nothing, merges
 nothing, writes nothing:
@@ -106,8 +116,8 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
-from ..github.refs import issue_number, task_ref
-from ..taskref import TaskRef
+from ..github.refs import issue_number, pull_number, pull_ref, task_ref
+from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
 from .checks import (
     QUOTE_INDENT,
@@ -314,14 +324,19 @@ class Mergeability:
     """
 
     #: **The pull request's number, not the issue's** - `from_payload` reads it
-    #: straight off `GET /pulls/{n}`. Documented rather than moved to a
-    #: `TaskRef` (#174 lists it beside three issue-numbered fields): a pull
-    #: request is not a task, has no ref, and giving it one would invent an
-    #: identity `github/refs.py` never minted. The task these facts are about is
-    #: the key this record is stored under, never a field on it - which is why
-    #: `_decide` takes `entry` and `state` as two arguments rather than reading
-    #: the issue out of here.
-    number: int
+    #: straight off `GET /pulls/{n}`. Still not a `TaskRef` and for #174's
+    #: reason, which #185 did not overturn: a pull request is not a task, has no
+    #: identity in the internal model, and giving it one would invent something
+    #: `github/refs.py` never minted. The task these facts are about is the key
+    #: this record is stored under, never a field on it - which is why `_decide`
+    #: takes `entry` and `state` as two arguments rather than reading the issue
+    #: out of here.
+    #:
+    #: What #185 changed is that it is no longer an `int` either. Documenting
+    #: the distinction was the whole of #174's answer here, and a comment does
+    #: not fail a build: this field feeds `Decision.pull`, one field along from
+    #: an issue number, and the two were interchangeable to the checker.
+    number: PullRef
     branch: str = ""
     mergeable: bool | None = None
     #: GitHub's `mergeable_state`, lowercased and otherwise verbatim. Kept raw
@@ -375,7 +390,7 @@ class Mergeability:
         base = payload.get("base") if isinstance(payload.get("base"), Mapping) else {}
         raw = payload.get("mergeable")
         return cls(
-            number=int(payload.get("number") or 0),
+            number=pull_ref(int(payload.get("number") or 0)),
             branch=str(head.get("ref") or ""),  # type: ignore[union-attr]
             mergeable=raw if isinstance(raw, bool) else None,
             state=str(payload.get("mergeable_state") or "").lower(),
@@ -393,9 +408,9 @@ def read_mergeability(client: Any, pull: PullState) -> Mergeability:
     always is.
     """
     try:
-        return Mergeability.from_payload(client.get_pull_request(pull.number))
+        return Mergeability.from_payload(client.get_pull_request(pull_number(pull.number)))
     except GitHubError as exc:
-        print(f"! PR #{pull.number} could not be read: {exc}", file=sys.stderr)
+        print(f"! PR {pull.number} could not be read: {exc}", file=sys.stderr)
         return Mergeability(number=pull.number, branch=pull.branch, unreadable=True)
 
 
@@ -412,9 +427,9 @@ def read_touched_files(client: Any, pull: PullState) -> tuple[str, ...]:
         if lister is None:
             continue
         try:
-            payloads = lister(pull.number) or ()
+            payloads = lister(pull_number(pull.number)) or ()
         except GitHubError as exc:
-            print(f"! files for PR #{pull.number}: {exc}", file=sys.stderr)
+            print(f"! files for PR {pull.number}: {exc}", file=sys.stderr)
             return ()
         return tuple(
             str(item.get("filename") or "")
@@ -443,8 +458,11 @@ class BranchUpdate:
     #: with it - `UpdateBudget.rounds` is keyed on refs and outlives the cycle,
     #: and a record carrying the other vocabulary is how the two would drift.
     ref: TaskRef
-    #: The pull request to update. A *different* numbering from `ref`'s issue.
-    pull: int
+    #: The pull request to update. A *different* numbering from `ref`'s issue,
+    #: and since #185 a *different type* too - so "different numbering" is
+    #: something the checker enforces rather than something this comment asks
+    #: the next reader to remember.
+    pull: PullRef
     branch: str
     base: str = ""
     round: int = 1
@@ -452,7 +470,7 @@ class BranchUpdate:
 
     def __str__(self) -> str:
         return (
-            f"{self.ref}: update PR #{self.pull} ({self.branch}) from "
+            f"{self.ref}: update PR {self.pull} ({self.branch}) from "
             f"{self.base or 'the base branch'}, round {self.round} of {self.cap}"
         )
 
@@ -477,8 +495,11 @@ class Decision:
     #: took its hold with it, and the merge went ahead uninspected.
     number: int
     #: The pull request this row is about. A *different* numbering from
-    #: `number`, kept visibly apart for `docs/issue-contract.md` §2's reason.
-    pull: int
+    #: `number`, kept visibly apart for `docs/issue-contract.md` §2's reason -
+    #: and since #185 kept apart by the type system rather than by the two field
+    #: names being read carefully. `Decision(number=<a pull>, pull=<an issue>)`
+    #: does not compile.
+    pull: PullRef
     verdict: str
     detail: str = ""
     update: BranchUpdate | None = None
@@ -680,7 +701,11 @@ def _decide(
     blind: bool,
 ) -> Decision:
     """One pull request's standing. The order of the branches is the priority."""
-    facts = state or Mergeability(number=0, branch=entry.branch, unreadable=blind)
+    # `pull_ref(0)` is the same placeholder the `int` 0 was: this branch is
+    # reached only when mergeability was not read at all, and the field is then
+    # carried onto a `COMPUTING` decision that prints its verdict, never its
+    # pull request.
+    facts = state or Mergeability(number=pull_ref(0), branch=entry.branch, unreadable=blind)
     verdict = COMPUTING if blind else facts.verdict
     pull = outcome.merge.pull if outcome.merge is not None else facts.number
 
@@ -710,7 +735,7 @@ def _decide(
 
 def _decide_conflicted(
     entry: LedgerEntry,
-    pull: int,
+    pull: PullRef,
     facts: Mergeability,
     files: tuple[str, ...],
     max_attempts: int,
@@ -780,7 +805,7 @@ def _decide_conflicted(
 
 def _decide_behind(
     entry: LedgerEntry,
-    pull: int,
+    pull: PullRef,
     facts: Mergeability,
     budget: UpdateBudget,
 ) -> Decision:
@@ -815,7 +840,7 @@ def _decide_behind(
                 # wrong, and charging it would take the retry away from whatever
                 # goes wrong next.
                 comment=(
-                    f"apiary: {reason}. The branch itself is fine - PR #{pull} passed its "
+                    f"apiary: {reason}. The branch itself is fine - PR {pull} passed its "
                     f"checks every time - so the useful next step is a human merging it by "
                     f"hand, or running fewer workers at once so the base stops moving."
                 ),
@@ -1125,7 +1150,7 @@ def update_branch(client: Any, update: BranchUpdate) -> bool:
         updater = getattr(client, name, None)
         if updater is None:
             continue
-        updater(update.pull)
+        updater(pull_number(update.pull))
         return True
     return False
 
@@ -1183,7 +1208,7 @@ def apply_mergeability(
             # A 422 (the branch is not behind after all, or is already updating)
             # or a 403. The issue keeps `swarm:review` and the next cycle re-reads
             # the pull request; the round is charged either way.
-            failures.append(Failure(update.ref, f"updating PR #{update.pull}: {exc}"))
+            failures.append(Failure(update.ref, f"updating PR {update.pull}: {exc}"))
             continue
         updated.append(update.ref)
 

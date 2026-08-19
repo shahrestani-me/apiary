@@ -45,7 +45,7 @@ import pytest
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
-from swarm.github.refs import task_ref
+from swarm.github.refs import pull_ref, task_ref
 from swarm.orchestrator.checks import (
     CheckSet,
     Merge,
@@ -135,7 +135,9 @@ def pull(number: int, *, issue: int, attempt: int = 0) -> PullState:
     # the invariant, not a test detail - a task in `swarm:review` still carries
     # the attempt its open pull request was pushed from, because an exit 0
     # moves no counter (`reconcile._observe`).
-    return PullState(number=number, branch=branch(issue, attempt), sha=f"{issue:0>40x}")
+    return PullState(
+        number=pull_ref(number), branch=branch(issue, attempt), sha=f"{issue:0>40x}"
+    )
 
 
 def pulls(*states: PullState) -> dict[str, PullState]:
@@ -150,7 +152,7 @@ def state(
     mergeable_state: str = "clean",
 ) -> Mergeability:
     return Mergeability(
-        number=pull_number,
+        number=pull_ref(pull_number),
         branch=branch(issue),
         mergeable=mergeable,
         state=mergeable_state,
@@ -335,20 +337,20 @@ def test_a_mergeability_github_has_not_computed_yet_decides_nothing():
     # `mergeable` is null on the first read of a pull request while a background
     # job runs. Reading that as "not mergeable" would re-dispatch a healthy
     # branch every time GitHub was slow.
-    assert Mergeability(1, mergeable=None, state="unknown").verdict == COMPUTING
-    assert Mergeability(1, mergeable=None, state="clean").verdict == COMPUTING
-    assert Mergeability(1, unreadable=True).verdict == COMPUTING
+    assert Mergeability(pull_ref(1), mergeable=None, state="unknown").verdict == COMPUTING
+    assert Mergeability(pull_ref(1), mergeable=None, state="clean").verdict == COMPUTING
+    assert Mergeability(pull_ref(1), unreadable=True).verdict == COMPUTING
 
 
 def test_the_three_states_this_module_folds_and_the_ones_it_leaves_alone():
-    assert Mergeability(1, mergeable=True, state="behind").verdict == BEHIND
-    assert Mergeability(1, mergeable=False, state="dirty").verdict == CONFLICTED
-    assert Mergeability(1, mergeable=True, state="clean").verdict == FRESH
+    assert Mergeability(pull_ref(1), mergeable=True, state="behind").verdict == BEHIND
+    assert Mergeability(pull_ref(1), mergeable=False, state="dirty").verdict == CONFLICTED
+    assert Mergeability(pull_ref(1), mergeable=True, state="clean").verdict == FRESH
     # `blocked` is a required check or review that has not landed and `unstable`
     # is a non-required check that failed. Both are #23's question, and two
     # modules with an opinion about CI is how an issue is relabelled twice.
-    assert Mergeability(1, mergeable=True, state="blocked").verdict == FRESH
-    assert Mergeability(1, mergeable=True, state="unstable").verdict == FRESH
+    assert Mergeability(pull_ref(1), mergeable=True, state="blocked").verdict == FRESH
+    assert Mergeability(pull_ref(1), mergeable=True, state="unstable").verdict == FRESH
 
 
 def test_mergeability_comes_from_the_single_pull_request_read_not_the_listing():
@@ -421,7 +423,7 @@ def test_a_fresh_pull_request_is_handed_straight_back_to_the_check_gate():
 
     assert plan.updates == ()
     assert plan.held == ()
-    assert [m.pull for m in plan.merges] == [101]
+    assert [m.pull for m in plan.merges] == [pull_ref(101)]
     assert plan.admitted.transitions[0].to_label == DONE
 
 

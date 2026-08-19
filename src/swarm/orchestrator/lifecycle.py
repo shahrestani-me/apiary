@@ -63,6 +63,7 @@ from ..github.readiness import BLOCKED, READY
 from ..github.refs import issue_number
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord
+from ..github.refs import pull_number
 from .checks import CheckSet, PullState
 from .dispatcher import CLAIMED, REVIEW
 from .reconcile import DONE, FAILED, CycleReport, Transition
@@ -266,11 +267,15 @@ def lifecycle_events(
         task = slugs.get(ref, "")
         if pull is None or not task:
             continue
+        # Un-minted for the payload, not carried as a `PullRef` (#185). Every
+        # field here is written into a JSONL artifact through
+        # `json.dumps(default=str)`, which would silently turn `101` into
+        # `"#101"` and change the schema every reader of the run log parses.
         emit(
             PR_OPENED,
-            once=(task, pull.number),
+            once=(task, pull_number(pull.number)),
             task=task,
-            pull=pull.number,
+            pull=pull_number(pull.number),
             head_sha=pull.sha,
         )
 
@@ -299,9 +304,9 @@ def lifecycle_events(
             # `PullState.sha` can be empty - the listing is the source and a
             # payload without a head is a real answer - and the key then
             # degrades to the coarse form rather than failing.
-            once=(task, pull.number, pull.sha, state, deciding),
+            once=(task, pull_number(pull.number), pull.sha, state, deciding),
             task=task,
-            pull=pull.number,
+            pull=pull_number(pull.number),
             head_sha=pull.sha,
             state=state,
             check=deciding,
@@ -321,7 +326,7 @@ def lifecycle_events(
             emit(
                 PR_MERGED,
                 task=task,
-                pull=merge.pull,
+                pull=pull_number(merge.pull),
                 merge_commit=commits.get(merge.number, ""),
             )
         events += _landed_or_human(gate.applied, slugs, by_number, report.index)
