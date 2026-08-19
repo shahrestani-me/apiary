@@ -1649,6 +1649,44 @@ def test_the_merge_policy_reaches_the_check_gate(monkeypatch):
     assert seen["policy"] is policy
 
 
+def test_a_merge_gate_join_that_cannot_resolve_stops_the_cycle(monkeypatch):
+    """`UnresolvedJoin` has to *escape*, and that is a property of the cycle
+    rather than of the gate that raises it (#174).
+
+    The gate raising is asserted in `test_checks.py` and `test_mergeability.py`.
+    What those cannot see is whether anything between `Reconciler.cycle` and the
+    caller catches it - and the entire argument for raising instead of
+    defaulting is that the run stops rather than writing a `swarm:failed` nobody
+    can distinguish from a real one. A bare `except Exception` added around the
+    merge gate later would leave every one of those tests green while quietly
+    restoring the fail-open behaviour, so the escape is pinned here, once."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise UnresolvedJoin("no check set for #4")
+
+    monkeypatch.setattr("swarm.orchestrator.checks.plan_checks", refuse)
+
+    client = PullAwareClient(issues={4: issue_payload(4, label=REVIEW)})
+    with pytest.raises(UnresolvedJoin):
+        reconciler(client, FakeFleet()).cycle()
+
+
+def test_the_unresolved_join_is_not_a_lookup_error(monkeypatch):
+    """And it must not be catchable as one.
+
+    `UnresolvedJoin` reports a failed lookup, so `LookupError` is the base a
+    reader reaches for - which is the trap: `KeyError` is a `LookupError`, so
+    one `except LookupError` around a dict access anywhere upstream would
+    swallow this and silently restore the default it exists to remove. The base
+    class is therefore part of the fix, not an implementation detail, and this
+    is what says so."""
+    from swarm.orchestrator.checks import UnresolvedJoin
+
+    assert not issubclass(UnresolvedJoin, LookupError)
+    assert issubclass(UnresolvedJoin, RuntimeError)
+
+
 # --------------------------------------------------------------------------
 # A task that only ever fails as infrastructure (#91)
 # --------------------------------------------------------------------------

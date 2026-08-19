@@ -231,7 +231,7 @@ _GO_TEST_LINE = re.compile(r"(?m)^\s+(?P<path>[\w.+-]+_test\.go):\d+:")
 # --------------------------------------------------------------------------
 
 
-class UnresolvedJoin(LookupError):
+class UnresolvedJoin(RuntimeError):
     """A key this gate had to resolve was not in the map it was handed.
 
     Every join here and in `mergeability.py` is between two facts *one cycle
@@ -254,8 +254,32 @@ class UnresolvedJoin(LookupError):
     wiring bug deserves - where both fail-open alternatives write a label
     nobody afterwards can tell from a real one. #174 is the ticket; #142 is why
     the shape recurs, because a `dict.get` default is how a retype ships green.
+
+    **`RuntimeError`, deliberately not `LookupError`.** The failure it reports
+    *is* a failed lookup, so `LookupError` reads as the natural base - and that
+    is the trap: `KeyError` is a `LookupError`, so any caller that ever wraps a
+    dict access in `except LookupError` would swallow this one and silently
+    restore the fail-open behaviour it exists to remove. `store.StoreError`
+    picked `RuntimeError` over the same argument, and for the same reason: an
+    exception that must not be recovered from should not inherit from the one
+    people routinely recover from.
     """
 
+
+
+def render_keys(values: Iterable[str], limit: int = 20) -> str:
+    """The first `limit` of `values`, sorted, with the remainder counted.
+
+    An `UnresolvedJoin` names the keys it did hold, because that is what tells
+    an operator whether the map was empty, stale or keyed on the wrong thing.
+    A review queue is not bounded, though, and an exception message is not the
+    place to render one - so this caps what the message carries and says how
+    much it left out.
+    """
+    ordered = sorted(values)
+    if len(ordered) <= limit:
+        return repr(ordered)
+    return f"{ordered[:limit]!r} (+{len(ordered) - limit} more)"
 
 # --------------------------------------------------------------------------
 # Policy
@@ -614,11 +638,22 @@ class Merge:
 
     #: The issue this merge closes - a GitHub issue number, and the same one
     #: the `Outcome` carrying this record holds. Documented rather than retyped
-    #: (#174): every consumer of it is the reporting surface - it is the key of
-    #: `ChecksReport.merged` and `ChecksReport.merge_commits`, and `lifecycle.py`
-    #: joins it against the issue-numbered half of its own index - so moving it
-    #: is that surface's migration rather than this gate's. **Nothing keys a
-    #: `TaskRef` map on it**; the joins this gate makes go through `Outcome.ref`.
+    #: (#174) because moving it is the *reporting* surface's migration rather
+    #: than this gate's: it keys `ChecksReport.merged` and
+    #: `ChecksReport.merge_commits`, and `lifecycle.py` joins it against the
+    #: issue-numbered half of its own index.
+    #:
+    #: **One join in this module does read it, and it is on the decision path.**
+    #: `apply_checks` collects the merges GitHub refused into `refused` by this
+    #: number and tests `outcome.number` against it, to stop a `swarm:done`
+    #: being written for a merge that did not happen. That is int-against-int
+    #: and safe *by construction rather than by type*: both sides are the one
+    #: `entry.number` `_decide_passed` put on the pair, built and consumed
+    #: inside a single `apply_checks` call, with no map surviving it. What keeps
+    #: it that way is the type gate - retyping either half alone produces
+    #: `Non-overlapping container check [comparison-overlap]` on that line under
+    #: `strict_equality`, which is the ratchet #168 installed for exactly this.
+    #: Retyping it is a follow-up; asserting it is not a hazard would be wrong.
     number: int
     #: The pull request GitHub is asked to merge. A *different* numbering from
     #: `number`, which is why both are spelled out: `#23: merge PR #101`.
@@ -771,7 +806,7 @@ def plan_checks(
                 f"reviewable entry, so this is the two halves having drifted apart - and "
                 f"the miss cannot be defaulted: an absent check set reads as an empty one, "
                 f"which escalates this issue to swarm:failed. Keys held: "
-                f"{sorted(str(key) for key in checks)}"
+                f"{render_keys(str(key) for key in checks)}"
             ) from None
         outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment))
 

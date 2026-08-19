@@ -97,6 +97,7 @@ from .checks import (
     PullState,
     UnresolvedJoin,
     read_pulls,
+    render_keys,
 )
 from ..store import StoreError, TaskStore, record_judgement
 from .dispatcher import REVIEW
@@ -602,7 +603,7 @@ def plan_mergeability(
                 f"({outcome.verdict}). The outcome was built from this ledger one call ago, "
                 f"so the two have drifted apart - and the miss cannot be skipped: an issue "
                 f"this gate never decides is a merge it never inspected. Refs held: "
-                f"{sorted(str(ref) for ref in entries)}"
+                f"{render_keys(str(ref) for ref in entries)}"
             ) from None
         if outcome.transition is not None and outcome.merge is None:
             # #23 has already moved this issue this cycle - a retry, an
@@ -888,7 +889,7 @@ def _admit(checks: ChecksPlan, held: Mapping[TaskRef, str]) -> ChecksPlan:
             f"comes from a decision made about one of these outcomes, so this is the two "
             f"halves having drifted apart - and the miss cannot be ignored: an unapplied "
             f"hold is a stale pull request merged with a swarm:done nobody can tell from a "
-            f"real one. Outcomes: {sorted(str(ref) for ref in decided)}"
+            f"real one. Outcomes: {render_keys(str(ref) for ref in decided)}"
         )
     outcomes = tuple(
         replace(

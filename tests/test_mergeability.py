@@ -713,14 +713,18 @@ def test_an_outcome_the_ledger_cannot_resolve_raises_rather_than_dropping_it():
     assert decided.merges == ()
 
 
-def test_the_ledger_is_indexed_by_ref_rather_than_by_a_private_number_map():
-    """`Ledger.by_ref` is the ledger's own index, and this module used to build
-    a second one beside it keyed on `entry.number` (#174). Two indexes of one
-    mapping are two things to keep in step, and they are interchangeable only
-    while `ref == task_ref(number)` holds for every entry - which construction
-    does not enforce. So what is pinned here is that the lookup goes through
-    the ledger's index, and that an entry it does not carry is never quietly
-    served by one sitting next to it in `entries`."""
+def test_the_outcome_is_resolved_by_ref_and_never_by_a_neighbouring_entry():
+    """The lookup resolves on the ref, and an entry the ledger does not carry
+    is never quietly served by one sitting next to it.
+
+    Named for what it asserts rather than for the implementation change that
+    motivated it: this module used to build its own index keyed on
+    `entry.number` beside `Ledger.by_ref`, and swapping to `by_ref` is not
+    something a test can observe directly - an equivalent private ref-keyed
+    index would pass this too. What it *can* pin is the property that made two
+    indexes a liability: they are interchangeable only while
+    `ref == task_ref(number)` holds for every entry, which construction does
+    not enforce."""
     reviewed, checks = green(23, states={})
     other = ledger(entry(24))
 
