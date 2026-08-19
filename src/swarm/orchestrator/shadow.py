@@ -867,7 +867,18 @@ def observed_line(
     The one asymmetry is `results`: the corpus records the *file names* a cycle
     could see rather than the records themselves, so the name is rebuilt
     through `worker.result.record_path` - the one spelling of that name in the
-    codebase, which is what keeps the recorder and the loader from drifting.
+    codebase.
+
+    **The rebuilt name is not necessarily the file the record was read from.**
+    Since #177 `write_result` bumps the *filename* on a collision and leaves
+    the record's `attempt` alone, so several records for one issue can share an
+    attempt and live under different names, and this line names the first of
+    them. The loader (#230) matches the name against the directory and then
+    reduces to `RunSummary.latest`, so a task carries one `AttemptFact` on both
+    sides and the count is right. What does not survive is *which* of the
+    records sharing that attempt it was - visible only if two of them disagree
+    on their exit code, which needs an infrastructure failure and a task
+    failure at one attempt number.
 
     Labels rather than internal states in `control`, because that is the
     corpus's own decision and its reason is good: the day the labels go away it

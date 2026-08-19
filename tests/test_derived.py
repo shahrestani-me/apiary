@@ -36,6 +36,7 @@ most interesting things the exercise found.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import shutil
 from pathlib import Path
@@ -72,6 +73,7 @@ from swarm.orchestrator.derived import (
     resolve,
 )
 from swarm.orchestrator.lifecycle import INTERNAL_STATE, internal_state
+from swarm.worker.result import ResultRecord
 
 RUNS = corpus_runs()
 
@@ -251,7 +253,7 @@ def test_a_pull_request_apiary_did_not_mint_is_never_joined_to_a_task() -> None:
             "pulls": [{"number": 9, "head": "fix/typo"}],
             "control": {"solo": "swarm:ready"},
         },
-        results=(),
+        results={},
         default_run_id="run-1",
         where="inline",
     )
@@ -617,6 +619,76 @@ def test_every_corpus_cycle_resolves_a_state_for_every_task_it_carries(run: Corp
         for verdict in resolution.verdicts:
             assert verdict.state in STATES
             assert verdict.because
+
+
+@pytest.mark.parametrize("run", RUNS, ids=lambda run: run.name)
+def test_a_replayed_cycle_carries_one_result_per_task(run: CorpusRun) -> None:
+    """#230. The loader models `latest`, not the contents of `results/`.
+
+    `reconcile._results` hands a live cycle `summarise_dir(...).latest` - one
+    record per issue - and `shadow.observed_line` records the names of exactly
+    those. A loader that admitted every record sharing an attempt handed the
+    replay more facts than the run it was recorded from.
+
+    `05-infrastructure-exit-2` is where that was measured: three exit 2s share
+    attempt 0 because none of them consumes one, `write_result` has filed them
+    under three names since #177, and rebuilding the name from the record's
+    `attempt` mapped all three back onto the single name the line carries.
+    Every cycle of that run replayed with three facts where a live cycle has
+    one.
+
+    Nothing observable moved on it, and the reason is the point of this test:
+    `_attempts_spent` skips records that spend no budget and takes a maximum
+    over the rest, which is idempotent under duplication. That is a property of
+    one consumer, not of the format. A consumer that *counted* facts - "how
+    many mechanical failures did this cycle see", which is the question the
+    infrastructure ceiling is about - would read the replay differently from
+    the live run it was recorded from.
+    """
+    for cycle in run.cycles:
+        refs = [str(fact.ref) for fact in cycle.observation.results]
+        assert len(refs) == len(set(refs)), (
+            f"{run.name} cycle {cycle.index} carries {len(refs)} result(s) for "
+            f"{len(set(refs))} task(s) - a live cycle is handed one per task: {refs}"
+        )
+
+
+def test_the_result_a_cycle_carries_is_the_newest_the_line_names() -> None:
+    """Reduced by `RunSummary.latest`, so the reduction is the whole sort key.
+
+    The visible set here names two records for one issue at one attempt - what
+    an infrastructure failure followed by a task failure leaves behind, since
+    exit 2 does not move the counter - and they disagree on the exit code,
+    which is the case where picking the wrong one would change
+    `spends_budget` and so the attempt count. `finished_at` is the tie-break
+    `record_order` reaches for when the attempt cannot decide (#218).
+    """
+    from fixtures.corpus import _cycle  # noqa: PLC0415 - the private half is the subject
+
+    def record(name: str, exit_code: int, minute: int) -> ResultRecord:
+        return ResultRecord(
+            run_id="run-1",
+            issue=1,
+            attempt=0,
+            exit_code=exit_code,
+            finished_at=dt.datetime(2026, 1, 1, 12, minute, tzinfo=dt.timezone.utc),
+        )
+
+    cycle = _cycle(
+        {
+            "cycle": 1,
+            "tasks": [{"ref": "#1", "task_id": "solo"}],
+            "results": ["issue-1-attempt-0.json", "issue-1-attempt-1.json"],
+            "control": {"solo": "swarm:ready"},
+        },
+        results={
+            "issue-1-attempt-0.json": record("issue-1-attempt-0.json", 2, 0),
+            "issue-1-attempt-1.json": record("issue-1-attempt-1.json", 1, 5),
+        },
+        default_run_id="run-1",
+        where="inline",
+    )
+    assert [(one.attempt, one.exit_code) for one in cycle.observation.results] == [(0, 1)]
 
 
 @pytest.mark.parametrize("run", RUNS, ids=lambda run: run.name)

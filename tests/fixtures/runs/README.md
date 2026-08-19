@@ -97,7 +97,7 @@ lowers the bound rather than corrupting it.
 | `branches` | the raw names a remote listing returned | parsed by `parse_task_branch`; anything apiary did not mint is dropped |
 | `containers` | one `docker ps --all` row, reduced | `running` is the field `Handle` does not carry today |
 | `pulls` | open and merged pull requests, by **head branch** | joined to a task through the branch name (#144), never through `Closes #n`; `number` is a JSON number on disk and a `PullRef` once loaded (#208) |
-| `results` | which result files this cycle could see | names must exist under `results/`, or the load fails; the name is rebuilt from each record's `attempt`, so records that share one — three exit 2s, none of which bumps it — are visible to a cycle together or not at all |
+| `results` | the result files this cycle was handed | names are matched against the filenames **on disk**, and one that is not there fails the load; the visible set is then reduced to the newest record per issue (`RunSummary.latest`), which is the one-record-per-task view `reconcile._results` hands a live cycle — so a task carries one `AttemptFact`, whatever the directory holds |
 | `budget` | the caps the run was configured with | operator setting, not a fact about the world |
 | `live_run_ids` | which runs' containers hold claims | defaults to this run's id; `recovery.py`'s rule |
 | `control` | the `swarm:*` label each task wore | **the thing being diffed against** |
