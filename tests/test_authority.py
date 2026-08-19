@@ -154,6 +154,12 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
     run's - the other three already speak for every task, and the label a
     second task ends on is asserted where it is edited rather than folded in
     here, where it would read as `TASK_ISSUE`'s.
+
+    Making them live is necessary and was not sufficient (#228). Two of the
+    arms that go red under a `plan_reconcile` regression only reach a disposal
+    rule at all because the second task also carries the *result record* its
+    worker wrote, so what this compares is `a_run(alongside=True,
+    artifacts=...)`'s world rather than any two-task one.
     """
     return (
         sorted(client.labels_on(TASK_ISSUE)),
@@ -169,6 +175,7 @@ def a_run(
     monkeypatch: pytest.MonkeyPatch,
     *,
     alongside: bool = False,
+    artifacts: Path | None = None,
 ) -> tuple[Any, Any, Any]:
     """One cycle the orchestrator has already seen, then a human edits a label.
 
@@ -184,21 +191,37 @@ def a_run(
     - this run's own task is dispatched later in the same cycle - so it is the
     only issue whose hand-edited label a disposal rule has to read.
 
-    **What the loop buys, measured rather than argued.** With `plan_reconcile`
-    reverted to `entry.state_label`, the `outcome()` equality below catches the
-    regression on `swarm:done` and `swarm:failed` only. Relabel `TASK_ISSUE`
-    alone and that equality is blind on all five, which is the state #202 found
-    this in - so this loop is the whole of the *equality's* sensitivity, and
-    that is a narrower claim than the whole of the pair's. The other three arms
-    go red on the liveness assertions instead, and those do not depend on this
-    loop at all: under the regression the baseline disposes nothing, so
-    `fleet.disposed == [OTHER_ISSUE]` fails whatever was relabelled. See #228 -
-    an equality that is still blind on three of five arms is not yet the
-    argument #202 wanted it to be. Under the resolver the edit must still change
-    nothing.
+    `artifacts` is passed straight through to `a_lifecycle_run`, where it is
+    the directory the second task's result record is written into. Only the
+    two-task callers need it, and it is what makes `swarm:claimed` and
+    `swarm:review` reachable rules rather than dead ones - see there.
+
+    **What the loop buys, measured rather than argued.** Two variants, each run
+    with `plan_reconcile` reverted to `entry.state_label` and only
+    `outcome(*edited) == outcome(*baseline)` evaluated, so that no liveness
+    assertion can supply the failure:
+
+        arm            relabel TASK_ISSUE only    relabel every issue
+        swarm:blocked  equal                      equal
+        swarm:claimed  equal                      differs
+        swarm:review   equal                      differs
+        swarm:done     equal                      differs
+        swarm:failed   equal                      differs
+
+    So the loop is load-bearing on four arms and nothing else is: relabelling
+    `TASK_ISSUE` alone leaves the disposal rules reading the same label in both
+    runs, which is the blindness #202 found. It cannot help `swarm:blocked`,
+    and neither can any other fixture - `plan_reconcile` does not branch on
+    that state at all, which
+    `test_reconcile.test_plan_reconcile_cannot_tell_blocked_from_ready` pins.
+    That arm still goes red under the regression, but on the liveness
+    assertion, and it is worth knowing which. Under the resolver the edit must
+    change nothing in every arm.
     """
     monkeypatch.setenv(STATE_SOURCE_ENV, source)
-    client, fleet, loop, seen = a_lifecycle_run(label=READY, alongside=alongside)
+    client, fleet, loop, seen = a_lifecycle_run(
+        label=READY, alongside=alongside, artifacts=artifacts
+    )
     # No fleet for the first cycle, so it settles the task without dispatching
     # it and the comparison below is between two second cycles.
     loop.fleet = None
@@ -288,7 +311,9 @@ def test_a_hand_edited_label_is_reported_even_when_the_cycle_repairs_it(monkeypa
 
 
 @pytest.mark.parametrize("label", WRONG_LABELS)
-def test_no_wrong_label_changes_a_decision_under_the_resolver(label, monkeypatch):
+def test_no_wrong_label_changes_a_decision_under_the_resolver(
+    label, monkeypatch, tmp_path
+):
     """The completeness test, and the one that fails if a path forgets.
 
     Five of the six labels, each written over a run whose world plainly
@@ -302,20 +327,43 @@ def test_no_wrong_label_changes_a_decision_under_the_resolver(label, monkeypatch
     and over a one-task run two of them - the containers disposed and the pull
     requests merged - are `[]` in every arm whatever was decided, so the
     equality was evidence about dispatch and readiness and nothing else. The
-    second task carries a container and an open pull request,
-    which puts both back in play. With `plan_reconcile` reverted to
-    `entry.state_label` the whole parametrization goes red: the equality on
-    `swarm:done` and `swarm:failed`, which read as terminal and dispose the
-    container the baseline keeps, and the liveness assertion on the other three,
-    because that baseline no longer disposes anything at all.
+    second task carries a container, an open pull request and the result record
+    its worker wrote on the way out, which puts both back in play.
 
-    Those two are not equally good evidence, and #228 is open about it: on three
-    of five arms the *equality* - the sentence that actually states #147's
-    criterion - still cannot fail, and a fixture guard is what turns them red.
-    Five red arms here are not yet five covered paths.
+    **How far the equality itself reaches, measured** (#228). With
+    `plan_reconcile` reverted to `entry.state_label` and the liveness
+    assertions below switched off, so that only `outcome()` can fail:
+
+        swarm:blocked  equal    <- blind
+        swarm:claimed  differs
+        swarm:review   differs
+        swarm:done     differs
+        swarm:failed   differs
+
+    Four of five, where #202 left two. `swarm:claimed` and `swarm:review` were
+    a gap in the fixture rather than in the argument: the second task's worker
+    had published a pull request but left no result record, and both of §4's
+    label-readable rows are gated on one. `a_lifecycle_run(artifacts=...)`
+    writes it, and those two arms now fail on the comparison that states #147's
+    criterion rather than on a fixture guard.
+
+    `swarm:blocked` is not a gap and cannot be closed here.
+    `plan_reconcile` branches on a closed issue, on terminal, on `claimed` and
+    on `review`, and on nothing else - so `blocked` and `eligible` take the
+    same path through every rule at every combination of the facts, which
+    `test_reconcile.test_plan_reconcile_cannot_tell_blocked_from_ready` asserts
+    over all 72 of them. No fixture makes an arm sensitive to a distinction the
+    function does not draw. What that costs the completeness claim is exact and
+    small: this arm is evidence about readiness and dispatch and none about
+    reconcile, and it stays in `WRONG_LABELS` because those two paths are real
+    and readiness is where `swarm:blocked` was always decided.
     """
-    baseline = a_run(READY, DERIVED, monkeypatch, alongside=True)
-    edited = a_run(label, DERIVED, monkeypatch, alongside=True)
+    baseline = a_run(
+        READY, DERIVED, monkeypatch, alongside=True, artifacts=tmp_path / "baseline"
+    )
+    edited = a_run(
+        label, DERIVED, monkeypatch, alongside=True, artifacts=tmp_path / "edited"
+    )
 
     assert outcome(*edited[:2]) == outcome(*baseline[:2])
     # And the three things that equality needed to mean anything, because each
@@ -325,6 +373,11 @@ def test_no_wrong_label_changes_a_decision_under_the_resolver(label, monkeypatch
     # components rather than two. And the edit reached the task carrying that
     # container - relabelling `TASK_ISSUE` alone leaves the disposal rule
     # reading the same label in both arms, which is what made this blind.
+    #
+    # A fixture guard, deliberately kept as one: on `swarm:blocked` it is still
+    # the only assertion here a `plan_reconcile` regression can fail, and on the
+    # other four it is what says the equality ran over a world with something
+    # in it rather than over four empty slots.
     client, fleet, _ = baseline
     assert fleet.disposed == [OTHER_ISSUE]
     assert client.merges == [OTHER_PULL]
@@ -337,7 +390,7 @@ def test_no_wrong_label_changes_a_decision_under_the_resolver(label, monkeypatch
 
 
 @pytest.mark.parametrize("label", OBEYED_LABELS)
-def test_the_flag_puts_every_one_of_those_decisions_back(label, monkeypatch):
+def test_the_flag_puts_every_one_of_those_decisions_back(label, monkeypatch, tmp_path):
     """The inverse of the test above, and the criterion #147 calls load-bearing.
 
     apiary develops itself on this control plane, so a cutover with no way back
@@ -355,21 +408,30 @@ def test_the_flag_puts_every_one_of_those_decisions_back(label, monkeypatch):
     Two tasks, for the reason its inverse above is run over two - the two
     baselines have to be the same world or the inequality is a statement about
     the fixtures. It buys a second thing here: the old behaviour reaches the
-    container as well as the dispatcher, and the last assertion below says
-    which arms that is true of.
+    container as well as the dispatcher, in all three arms, and the last two
+    assertions below say so against a baseline that disposes nothing.
     """
-    baseline = a_run(READY, LABELS, monkeypatch, alongside=True)
-    edited = a_run(label, LABELS, monkeypatch, alongside=True)
+    baseline = a_run(
+        READY, LABELS, monkeypatch, alongside=True, artifacts=tmp_path / "baseline"
+    )
+    edited = a_run(
+        label, LABELS, monkeypatch, alongside=True, artifacts=tmp_path / "edited"
+    )
 
     assert outcome(*edited[:2]) != outcome(*baseline[:2])
     # And the specific old behaviour, not merely "something differs": the label
     # says this task is in flight or finished, so nothing spawns.
     assert edited[1].spawned == []
     assert edited[0].labels_on(TASK_ISSUE) == {label}
-    # And the label decides the container too: `swarm:done` and `swarm:failed`
-    # are terminal to a label reader, so the second task's container goes with
-    # them, while `swarm:claimed` reads as a worker still holding it.
-    assert edited[1].disposed == ([] if label == CLAIMED else [OTHER_ISSUE])
+    # And the label decides the container too, by a different rule in each arm:
+    # `swarm:done` and `swarm:failed` are terminal to a label reader and rule 2
+    # disposes what a terminal task is still holding, while `swarm:claimed`
+    # reaches rule 3 - it was claimed, the second task's worker left a result
+    # record, so the verdict is observed and the container goes with it. The
+    # baseline disposes nothing at all under the labels, which is what the
+    # inequality above is made of.
+    assert edited[1].disposed == [OTHER_ISSUE]
+    assert baseline[1].disposed == []
 
 
 def test_under_labels_a_review_label_with_no_pull_request_is_charged(monkeypatch):
