@@ -3009,7 +3009,7 @@ def test_a_revived_attempt_that_leaves_no_result_lapses_instead_of_looping(
     # quietly skipped: `needs-human` is what the dispatcher refuses to start.
     from swarm.orchestrator.derived import NEEDS_HUMAN
 
-    assert loop._believed[TASK_REF] == NEEDS_HUMAN
+    assert loop._believed[ref(TASK_ISSUE)] == NEEDS_HUMAN
 
 
 def test_a_revival_whose_spawn_never_ran_lapses_too(tmp_path, monkeypatch):
@@ -3045,7 +3045,7 @@ def test_a_revival_whose_spawn_never_ran_lapses_too(tmp_path, monkeypatch):
     from swarm.orchestrator.derived import NEEDS_HUMAN
 
     assert fleet.spawned == [TASK_ISSUE], "one refused spawn spent the grant"
-    assert loop._believed[TASK_REF] == NEEDS_HUMAN
+    assert loop._believed[ref(TASK_ISSUE)] == NEEDS_HUMAN
 
 
 def test_a_revived_attempt_that_does_leave_a_result_is_unchanged(tmp_path, monkeypatch):
@@ -3075,4 +3075,4 @@ def test_a_revived_attempt_that_does_leave_a_result_is_unchanged(tmp_path, monke
     from swarm.orchestrator.derived import NEEDS_HUMAN
 
     assert fleet.spawned == [TASK_ISSUE], "still exactly one attempt"
-    assert loop._believed[TASK_REF] == NEEDS_HUMAN
+    assert loop._believed[ref(TASK_ISSUE)] == NEEDS_HUMAN
