@@ -104,6 +104,57 @@ than a generalist. Gemma's headline coding number (80% LiveCodeBench) measures
 competitive-programming puzzles, which is not the same skill as "modify these four
 files without breaking the tests."
 
+### Naming a model that is not on this machine
+
+Since ADR 0006 the two variables above take an optional provider prefix. A bare
+name still means Ollama — nothing below changes if you are staying local — and a
+registered provider name before the first colon qualifies it:
+
+```bash
+export SWARM_WORKER_MODEL=gemma4:26b                 # ollama, as always
+export SWARM_WORKER_MODEL=bedrock:gpt-5.6-luna       # AWS Bedrock
+export SWARM_WORKER_MODEL=openai:gpt-5.6-terra       # the OpenAI API
+```
+
+The prefix is *looked up*, not guessed, which is why `gemma4:26b` is still an
+Ollama tag rather than a provider called `gemma4`.
+
+Whatever the provider needs beyond a model name goes in the matching options
+variable, `name=value` and comma separated:
+
+```bash
+export SWARM_WORKER_MODEL_OPTIONS="region=eu-west-1,profile=acme"
+```
+
+Bedrock also falls through to `AWS_REGION` / `AWS_PROFILE`, so a machine already
+configured for AWS needs neither option set. An option the provider does not
+declare is refused **by name** — a typo'd `regoin` would otherwise leave a model
+served from somewhere you did not choose, with nothing in the log to say so.
+
+Remote providers are optional installs, because the default path needs no remote
+SDK at all:
+
+```bash
+pip install -e ".[bedrock]"     # or ".[openai]", or both
+```
+
+Finally, the four places a model can be chosen from, highest wins:
+
+| | Where | Who sets it |
+|---|---|---|
+| 1 | An explicit argument | `swarm console` firing one call at a chosen model |
+| 2 | `SWARM_*` environment | CI, `swarm run`, and every worker container |
+| 3 | The console-saved default | `models.json`, beside the artifacts root |
+| 4 | Built-in Ollama defaults | nobody — this is what a fresh clone gets |
+
+**The environment beats the saved default deliberately.** A container run or a
+CI job must not silently inherit whatever someone clicked in the console last
+week. Every run prints which rung it used, once per role:
+
+```
+· worker model: bedrock:gpt-5.6-luna from environment (SWARM_WORKER_MODEL)
+```
+
 ---
 
 ## 1. Ollama setup

@@ -355,15 +355,25 @@ def test_the_tracker_credential_never_reaches_a_worker() -> None:
     """
     assert TRACKER_TOKEN_ENV not in INHERITED_ENV
     assert TRACKER_ENDPOINT_ENV not in INHERITED_ENV
-    # The full list, pinned so growing it is a decision made here. The two
+    # The full list, pinned so growing it is a decision made here. The three
     # `SWARM_WORKER_*` knobs are tuning values, not credentials - they exist
     # in the list so an operator's export reaches the `Settings` the worker
-    # reads inside the container - and neither names a host or a secret.
+    # reads inside the container - and none names a secret.
+    #
+    # `SWARM_WORKER_MODEL_OPTIONS` is the newest and the only one that could
+    # name a host, through a provider's `base_url` option. It still opens no
+    # egress: tinyproxy allows `EGRESS_ALLOWLIST` and nothing else, so a worker
+    # pointed at an endpoint that is not on the list is refused by the proxy
+    # rather than reaching it. What the option carries is where to dial and
+    # which variable or profile holds the credential - never the credential.
+    # **Whether a worker may hold a model-provider credential at all is #269**,
+    # and this list deliberately does not answer it.
     assert set(INHERITED_ENV) == {
         "GITHUB_TOKEN",
         "OLLAMA_HOST",
         "SWARM_WORKER_CTX",
         "SWARM_WORKER_MODEL",
+        "SWARM_WORKER_MODEL_OPTIONS",
     }
 
 

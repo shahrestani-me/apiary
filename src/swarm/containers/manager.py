@@ -795,7 +795,23 @@ DEFAULT_LIMITS = Limits()
 #: at the baked-in default while the host believed otherwise (observed live:
 #: an over-long prompt truncated at 16K on a host tuned past it). Both values
 #: are non-secret, so either `--env` form `_env_flags` emits is fine.
-INHERITED_ENV = ("GITHUB_TOKEN", "OLLAMA_HOST", "SWARM_WORKER_CTX", "SWARM_WORKER_MODEL")
+#:
+#: `SWARM_WORKER_MODEL_OPTIONS` joined them for the same reason and is the same
+#: kind of value. Since ADR 0006 a model is a provider *and* a model name *and*
+#: whatever that provider needs to dial - a region, a profile - so carrying the
+#: name without the options would put a container on the right provider and the
+#: wrong endpoint, which is a worse failure than not carrying either. It is
+#: non-secret by construction: an option may name an environment variable or an
+#: AWS profile, never a credential. **The credential itself is deliberately not
+#: here** - whether a worker container may hold a model-provider credential at
+#: all is #269, and nothing in this tuple grants it.
+INHERITED_ENV = (
+    "GITHUB_TOKEN",
+    "OLLAMA_HOST",
+    "SWARM_WORKER_CTX",
+    "SWARM_WORKER_MODEL",
+    "SWARM_WORKER_MODEL_OPTIONS",
+)
 
 
 # --------------------------------------------------------------------------
