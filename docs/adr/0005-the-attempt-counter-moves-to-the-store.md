@@ -147,18 +147,37 @@ decision 1 or before it, never after.
 (`docs/recording-runs.md`), and the reason is stronger than caution.
 
 `_attempts_spent` under-reading the budget is not a hypothetical to be reasoned
-about — it is the exact shape of thing the derived-state shadow window exists to
-detect. A task whose counter the resolver reads lower than the control plane does
-is a `state.divergence` on the run where it happens, on precisely the tasks that
-matter. The runs would tell us whether decision 2's floor is sufficient in
-practice or whether branch deletion makes it leakier than the argument above
-predicts, and they can only tell us that while the labels are still written.
+about — it is the exact shape of thing the derived-state comparison detects. A
+task whose counter the resolver reads lower than the control plane does shows up
+as a divergence on the run where it happens, on precisely the tasks that matter.
+The runs would tell us whether decision 2's floor is sufficient in practice or
+whether branch deletion makes it leakier than the argument above predicts, and
+they can only tell us that while the labels are still written.
+
+**The instrument is the recorder, not the window** — which is a correction to this
+section rather than a change to its conclusion. This ADR was written while the
+shadow window still resolved beside each live cycle and emitted
+`state.divergence`; #244 deleted it. The comparison survives because a line of
+`observed.jsonl` carries both sides — the derived world and the `control` labels
+— so divergences are computed from the recording afterwards, which is what
+`docs/recording-runs.md` now instructs. Two consequences worth having in writing:
+
+- The runs no longer have to be measured *as they happen*. A recording made today
+  can be replayed against a resolver written next month, which is strictly better
+  than a live window for an amendment that changes what `_attempts_spent` reads.
+- What is genuinely lost is the *independence* count, which came from the
+  `CycleReport` and is not in the recording. So "the floor is sufficient in
+  practice" is a judgement over the recorded divergences rather than a ratio
+  somebody can quote.
 
 So the sequencing is not a preference:
 
-1. The ten runs, with the window still on.
+1. The ten runs. The labels must still be written when they are *recorded*; the
+   window no longer has to exist.
 2. This amendment implemented, decision 2 first.
-3. #152 c3 — the label writes, `APIARY_STATE_SOURCE`, and the window, together.
+3. #152 c3 — the label writes and `APIARY_STATE_SOURCE`, together. (The window
+   was the third item here and is already gone, merged as #244; that changed the
+   deadline from "before the window goes" to "before c3 goes", and nothing else.)
 
 An implementation that lands before step 1 forecloses the only measurement that
 would have checked it.
