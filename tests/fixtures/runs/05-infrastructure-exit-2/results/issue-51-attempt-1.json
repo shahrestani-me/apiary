@@ -16,8 +16,8 @@
   "deleted": [],
   "image": "apiary-worker:latest",
   "commit": null,
-  "started_at": "2026-08-19T09:00:19.000Z",
-  "finished_at": "2026-08-19T09:00:27.000Z",
+  "started_at": "2026-08-19T09:00:40.000Z",
+  "finished_at": "2026-08-19T09:00:48.000Z",
   "duration_s": 8.0,
   "synthesised": false
 }

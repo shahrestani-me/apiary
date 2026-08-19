@@ -97,7 +97,7 @@ lowers the bound rather than corrupting it.
 | `branches` | the raw names a remote listing returned | parsed by `parse_task_branch`; anything apiary did not mint is dropped |
 | `containers` | one `docker ps --all` row, reduced | `running` is the field `Handle` does not carry today |
 | `pulls` | open and merged pull requests, by **head branch** | joined to a task through the branch name (#144), never through `Closes #n`; `number` is a JSON number on disk and a `PullRef` once loaded (#208) |
-| `results` | which result files this cycle could see | names must exist under `results/`, or the load fails |
+| `results` | which result files this cycle could see | names must exist under `results/`, or the load fails; the name is rebuilt from each record's `attempt`, so records that share one — three exit 2s, none of which bumps it — are visible to a cycle together or not at all |
 | `budget` | the caps the run was configured with | operator setting, not a fact about the world |
 | `live_run_ids` | which runs' containers hold claims | defaults to this run's id; `recovery.py`'s rule |
 | `control` | the `swarm:*` label each task wore | **the thing being diffed against** |
@@ -155,7 +155,7 @@ than a sentence, because an empty one is a disagreement somebody silenced.
 | `02-verify-failure-retry` | exit 1, an attempt consumed, a retry that lands | none |
 | `03-interrupted-orchestrator` | a claim written, the process killed before the spawn | 1 — the stale claim |
 | `04-container-died-mid-flight` | a container that vanished, leaving no testimony | 1 — the stale claim |
-| `05-infrastructure-exit-2` | three exit 2s onto one filename, into the infra ceiling | 1 — the ceiling is not derivable |
+| `05-infrastructure-exit-2` | three exit 2s, three records for one attempt, into the infra ceiling | 1 — the ceiling is not derivable |
 | `06-goal-gate-revival` | the budget spent, then `planner.revive` | 3 — the revival is not derivable |
 | `07-renewed-retry-budget` | a blocker signature changing, renewing the budget | 3 — `streak` is not derivable |
 

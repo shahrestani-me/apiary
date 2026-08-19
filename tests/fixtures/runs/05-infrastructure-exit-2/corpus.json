@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "origin": "synthesised",
-  "describes": "Three consecutive exit 2s. None consumes an attempt (issue-contract.md \u00a74), so all three write the SAME result filename and the artifacts hold one record where three failures happened. The third trips InfrastructurePolicy.cap, which is counted from transitions and is therefore invisible to anything reading the directory.",
+  "describes": "Three consecutive exit 2s. None consumes an attempt (issue-contract.md §4), so all three records testify about attempt 0 - and write_result files them under three names (issue-51-attempt-0/1/2.json) rather than replacing one another, which it has not done since #177. What loses the count is the reading of the directory, not the directory: a cycle is handed summarise_dir(...).latest, one record per task, so each mechanical failure displaces the one before it in the map the reconciler reads. The third trips InfrastructurePolicy.cap, which is counted from transitions and is therefore invisible to anything reading that one-record-per-task view.",
   "exercises": [
     "exit 2 not consuming an attempt",
-    "three records collapsing onto one filename",
+    "three records for one attempt, under the three names write_result picks",
     "the infrastructure ceiling, which is not derivable"
   ],
   "expected_divergences": [
@@ -13,7 +13,7 @@
       "task": "bootstrap",
       "derived": "eligible",
       "control": "needs-human",
-      "why": "reconcile.infrastructure_streaks counts transitions, not results, and says why in its own docstring: an infrastructure verdict does not bump the attempt, so two mechanical failures in a row write the same filename and the artifacts cannot tell them apart. ADR 0001 lists 'the infrastructure cap hit' as a source of needs-human; this run is the demonstration that that half of the claim is false. Nothing in derived.py can close this without a durable counter, which is ADR 0002 territory."
+      "why": "reconcile.infrastructure_streaks counts transitions, not results, and says why in its own docstring: an infrastructure verdict does not bump the attempt, so consecutive mechanical failures displace one another in the one-record-per-task map (summarise_dir(...).latest) a cycle is handed. The files can be told apart - #177 made write_result bump the filename on collision instead of overwriting, and this run's results directory holds three of them - but nothing that survives the collapse to latest counts them, and the record's own attempt field reads 0 on all three. ADR 0001 lists 'the infrastructure cap hit' as a source of needs-human; this run is the demonstration that that half of the claim is false. Nothing in derived.py can close this without a durable counter, which is ADR 0002 territory."
     }
   ]
 }
