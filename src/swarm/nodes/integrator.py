@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..config import SETTINGS
 from ..state import SwarmState, TaskRecord
 from ..worktree import cleanup_all, ensure_repo, merge_branch
@@ -22,7 +24,7 @@ def _topo_order(tasks: dict[str, TaskRecord]) -> list[str]:
     return ordered
 
 
-def integrate_node(state: SwarmState) -> dict:
+def integrate_node(state: SwarmState) -> dict[str, Any]:
     repo = ensure_repo(SETTINGS.repo_path)
     tasks = state.get("tasks", {})
     verified = {tid: t for tid, t in tasks.items() if t.get("status") == "verified"}

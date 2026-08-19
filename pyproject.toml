@@ -43,7 +43,16 @@ Issues = "https://github.com/shahrestani-me/apiary/issues"
 swarm = "swarm.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = [
+    "pytest>=8.0",
+    # Pinned to a minor series on purpose: an unpinned checker turns
+    # "mypy shipped a release" into "every open pull request is red",
+    # which is how a ratchet gets switched off (#168).
+    "mypy~=2.3.1",
+    # `ignore_missing_imports` is false, so the one untyped dependency
+    # needs its stubs named rather than waved through.
+    "types-PyYAML>=6.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -51,3 +60,172 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/swarm"]
+
+# ---------------------------------------------------------------------------
+# Type checking (#168)
+# ---------------------------------------------------------------------------
+#
+# **Why this exists.** #142 (merged as #166) retyped the internal model from
+# issue numbers to an opaque `TaskRef` across 24 files, passed all 1480 tests,
+# and was broken: `Reconciler._results()` went ref-keyed while
+# `judge.Observation.of` still read `results.get(entry.number)`. A dict miss
+# returns rather than raises, so every signal read as "no evidence" - arithmetic
+# loop detection stopped working, `needs_human` could never fire and
+# `replan.brief` rendered empty. Nothing mechanical caught it, because CI ran
+# pytest and nothing else. This codebase annotates heavily; until now none of
+# those annotations was enforced.
+#
+# **Why mypy over pyright.** Three reasons, in order. Its per-module override
+# table is the exclusion mechanism this ticket needs - relaxations are named
+# module by module and code by code, so nothing is switched off wholesale and a
+# module that does not appear here is checked in full. It configures from
+# `pyproject.toml`, which is where the ticket asked the setting to live, rather
+# than from a second file with its own path-glob dialect. And it is a pip
+# install into the environment CI already builds; pyright would put a Node
+# toolchain in a workflow that has none. Catch rate did not break the tie: both
+# report the #142 defect on the seam, and on this tree pyright at `basic` finds
+# 53 where the settings below find 40, heavily overlapping.
+#
+# **The strictness is what passes today, not what we wish for.** A checker that
+# reports 400 pre-existing errors gets ignored, and an ignored checker is worse
+# than none. `strict = true` costs 85 findings on this tree; the settings below
+# cost 40, all of them named. Getting to strict is separate work (the ticket
+# says so); this buys the ratchet.
+#
+# **The ratchet.** `packages` names the package, never a file list, so a module
+# added tomorrow is checked the moment it exists - there is no roster to forget
+# to update. The backlog is excluded in exactly two ways and no others:
+#
+#   1. In `orchestrator/`, `github/`, `nodes/` and `taskref.py` - the modules
+#      where a type error is silent rather than loud, which is precisely where
+#      #142 bit - *nothing* is disabled at module level. Each legacy finding
+#      carries its own `# type: ignore[code]` at the site, so a *second* error
+#      of that same code in that same module still fails the build.
+#   2. Everywhere else, per-module `disable_error_code` lists below, one module
+#      per entry, each code named.
+#
+# **`warn_unused_ignores` is deliberately off.** Epic #140 has several typed
+# refactors in flight (#144, #159, #170). Any of them may fix a line that
+# carries a legacy ignore, and a stale ignore must be dead weight rather than a
+# build failure landing on whoever happened to fix it. Same reasoning for
+# `warn_unused_configs`: a module renamed out from under an override below is
+# not an emergency.
+#
+# **`ignore-without-code` is on.** A bare `# type: ignore` is a blanket
+# relaxation wearing a comment, and it is the one way the two mechanisms above
+# could be quietly bypassed.
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = ["src"]
+# The package, not a file list: a new module is checked because it exists.
+packages = ["swarm"]
+
+# No blanket import relaxation. Every third-party import in `src/swarm` either
+# ships types or has a stub package pinned in the `dev` extra, so a dependency
+# that arrives untyped is a decision somebody takes here rather than silence.
+ignore_missing_imports = false
+
+# Free on this tree - the codebase already annotates everything - and what
+# makes the annotations mean something inside a body rather than only at its
+# edges.
+check_untyped_defs = true
+
+# `strict_equality` is not decoration here. It is what produces
+# "Non-overlapping container check" on `entry.number in wanted` when `wanted`
+# has gone ref-keyed - the consumer half of #170's defect, which no argument
+# check sees because `in` accepts `object`.
+strict_equality = true
+no_implicit_optional = true
+warn_redundant_casts = true
+extra_checks = true
+
+enable_error_code = ["ignore-without-code"]
+warn_unused_ignores = false
+warn_unused_configs = false
+
+pretty = true
+show_error_codes = true
+
+# --- the priority tier -----------------------------------------------------
+#
+# Wildcards, so a module added under `orchestrator/`, `github/` or `nodes/`
+# tomorrow inherits the strict tier rather than the lax one. `disallow_any_-
+# generics` is the load-bearing one: a bare `dict` annotation is
+# `dict[Any, Any]`, and `Any`-keyed is exactly the shape that would have let
+# `results.get(entry.number)` through. `warn_return_any` is left off - it costs
+# 12 findings, mostly in `github/client.py` where the wire really is `Any`.
+[[tool.mypy.overrides]]
+module = ["swarm.orchestrator.*", "swarm.github.*", "swarm.nodes.*", "swarm.taskref"]
+disallow_any_generics = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_subclassing_any = true
+no_implicit_reexport = true
+
+# --- the excluded backlog --------------------------------------------------
+#
+# 14 findings, one entry per module, every code named. Nothing here is a
+# directory, a wildcard or an `ignore_errors`. The other 26 findings are in the
+# priority tier above and are excluded at their own line instead, so no code is
+# switched off there at all.
+#
+# To clear an entry: fix the finding, delete the code, watch the build stay
+# green. Entries are expected to shrink and never to grow - a new module needing
+# one is a review conversation, which is the point.
+
+[[tool.mypy.overrides]]
+module = "swarm.artifacts"
+# 1x a disposer returning the `Path` it removed where the seam says `None`.
+disable_error_code = ["return-value"]
+
+[[tool.mypy.overrides]]
+module = "swarm.capture"
+# 2x empty dicts built before their element type is known.
+disable_error_code = ["var-annotated"]
+
+[[tool.mypy.overrides]]
+module = "swarm.console"
+# 1x the recorder is optional and read without narrowing.
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = "swarm.console_intake"
+# 1x `Any | object` from an untyped LangChain runnable.
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = "swarm.console_projects"
+# 3x a method shadowing the name `list`, and the sort key that follows from it.
+disable_error_code = ["valid-type", "arg-type", "return-value"]
+
+[[tool.mypy.overrides]]
+module = "swarm.containers.manager"
+# 1x `subprocess.run` keyword set mypy cannot match to one overload.
+disable_error_code = ["call-overload"]
+
+[[tool.mypy.overrides]]
+module = "swarm.greenfield.bootstrap"
+# 1x `Any | object` from an untyped LangChain runnable.
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = "swarm.mcp.client"
+# 1x a JSON field assigned to a `str` without narrowing.
+disable_error_code = ["assignment"]
+
+[[tool.mypy.overrides]]
+module = "swarm.mcp.contract"
+# 1x a parsed YAML branch that is `dict | None` reaching a `Mapping` parameter.
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = "swarm.worker.entrypoint"
+# 1x an optional run id passed where a `str` is required.
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = "swarm.worker.pr"
+# 1x an optional API response assigned to a non-optional local.
+disable_error_code = ["assignment"]

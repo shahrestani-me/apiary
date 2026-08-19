@@ -337,12 +337,12 @@ class Mergeability:
         raw = payload.get("mergeable")
         return cls(
             number=int(payload.get("number") or 0),
-            branch=str(head.get("ref") or ""),
+            branch=str(head.get("ref") or ""),  # type: ignore[union-attr]
             mergeable=raw if isinstance(raw, bool) else None,
             state=str(payload.get("mergeable_state") or "").lower(),
-            base=str(base.get("ref") or ""),
-            base_sha=str(base.get("sha") or ""),
-            head_sha=str(head.get("sha") or ""),
+            base=str(base.get("ref") or ""),  # type: ignore[union-attr]
+            base_sha=str(base.get("sha") or ""),  # type: ignore[union-attr]
+            head_sha=str(head.get("sha") or ""),  # type: ignore[union-attr]
         )
 
 
