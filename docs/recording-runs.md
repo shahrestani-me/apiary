@@ -250,10 +250,31 @@ stronger evidence per cycle than a two-task one.
 
 ```bash
 swarm runs                 # newest first
-swarm show <run-id>
+swarm show <run-id>        # what the run did - not whether it counts
 ```
 
-Read the shadow block against §2. Then:
+**`swarm show` no longer answers the question this section is about.** It still
+prints what the run *did* - attempts, results, what needed a human - and that is
+worth reading. What it cannot print any more is the verdict: on a run recorded
+since #244 the shadow line reads
+
+    derived shadow: not run (a run after #152 removed the window, or one from
+    before #146 added it)
+
+which is correct and is not a problem with the run. The window that computed
+that block is deleted; §2's replay is what produces the verdict now. Runs
+recorded *before* #244 still print a real block, because the readers were kept
+so archived runs keep working - so the block appearing is a fact about when the
+run happened, not about whether it counts.
+
+So triage is two commands, and the second one is §2's:
+
+```bash
+swarm show <run-id>        # what happened
+# then §2's replay against .swarm/runs/<run-id>   -> origin, cycles, unexplained
+```
+
+Judge it on the replay. Then:
 
 - **Unexplained divergences?** That is a finding, and possibly the most valuable
   output of this whole exercise — it is the resolver being wrong about reality,
