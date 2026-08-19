@@ -94,6 +94,7 @@ from .artifacts import (
 )
 from .nodes.planner import plan_node
 from .run import Attachment, RunError, start_run
+from .runners import capability_table
 
 
 # `swarm local`'s help is the place a user chooses this runner, so it is the
@@ -113,14 +114,18 @@ worktree of code a model has just written, with this shell's environment and
 its network. None of docs/security.md applies to it.\
 """
 
-LOCAL_CAPABILITIES = """\
+# The rows are generated from `runners.py`, not written out here, and that is
+# `security.py`'s arrangement for `security.py`'s reason: the egress allowlist
+# is a predicate and a proxy config file and cannot disagree with itself
+# because one is rendered from the other. "Does the local runner have a
+# sandbox" is now answered in one place too. Every `yes` below is a claim
+# `tests/test_framework_boundary.py` has checked against the import graph, so
+# widening one means widening it where the code is - and failing there when
+# the code does not back it.
+LOCAL_CAPABILITIES = f"""\
 what this runner gives up, against `swarm run`:
 
-                          swarm run    swarm local
-    container sandbox     yes          no
-    egress policy         yes          no
-    pull request + CI     yes          no
-    merge queue           yes          no
+{capability_table("run", "local")}
 
 Run it only against a repository, and on a machine, you would let an untrusted
 script loose in - and pass --unsandboxed to say that you have. See
