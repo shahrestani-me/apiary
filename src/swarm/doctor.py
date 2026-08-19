@@ -1381,12 +1381,18 @@ class Doctor:
         return self._probe
 
     def _close_probe(self) -> None:
-        """End the session, and the subprocess if there was one. Best effort."""
-        probe, self.mcp, self._probe = self.mcp, None, None
-        if probe is None:
+        """End the session, and the subprocess if there was one. Best effort.
+
+        The client object is kept and only the handshake is forgotten. A second
+        `run()` then re-handshakes through the same one, which is what a caller
+        who injected a probe means; discarding it would quietly replace their
+        double with a live connection to somebody's tracker on the second call.
+        """
+        self._probe = None
+        if self.mcp is None:
             return
         try:
-            probe.close()
+            self.mcp.close()
         except Exception:  # noqa: BLE001 - a teardown must not become the verdict
             pass
 

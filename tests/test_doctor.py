@@ -857,6 +857,25 @@ def test_the_probe_is_closed_when_the_run_finishes(doctor):
     assert server.closed
 
 
+def test_a_second_run_reuses_the_injected_probe(doctor):
+    """Closing the session must not discard the client.
+
+    A caller who handed over a probe means it for the object's lifetime, and a
+    second `run()` that quietly built a live client instead would connect to
+    somebody's tracker from a test suite.
+    """
+    server = FakeMcpServer()
+    subject, _, _, _ = doctor(server=server)
+    # The tracker half twice rather than the whole run twice: the GitHub double
+    # is a script, and exhausting it would be a failure about the wrong thing.
+    assert all(check.ok for check in subject.tracker_checks())
+    assert all(check.ok for check in subject.tracker_checks())
+
+    assert server.methods.count("initialize") == 2
+    assert server.methods.count("tools/list") == 2
+    assert server.called_tools == []
+
+
 def test_one_handshake_serves_every_tracker_check(doctor):
     """Three checks read one `initialize`.
 
