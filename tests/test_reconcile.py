@@ -2642,9 +2642,10 @@ def test_a_retry_pushing_a_new_head_gets_its_own_check_announcements(tmp_path):
 
 def test_a_second_infrastructure_failure_at_the_same_attempt_is_announced(tmp_path):
     """Exit 2 does not consume an attempt (§4), so the re-dispatch runs as the
-    same attempt and overwrites the same result file. A host that is broken
-    three times over is exactly what an operator needs to see, and a key on the
-    attempt alone would report it once."""
+    *same* attempt - and since #177 it writes a **new** record file beside the
+    first rather than replacing it. A host that is broken three times over is
+    exactly what an operator needs to see, and a key on the attempt alone
+    reports it once because every failure of that attempt shares the number."""
     import datetime as dt
 
     client, fleet, loop, seen = a_lifecycle_run()

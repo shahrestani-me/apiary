@@ -987,7 +987,7 @@ def plan_reconcile(
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
-    observed_records: Mapping[TaskRef, str] | None = None,
+    observed: Mapping[TaskRef, str] | None = None,
 ) -> ReconcilePlan:
     """Compare desired state with actual state. Pure - no API call, no daemon.
 
@@ -1040,7 +1040,10 @@ def plan_reconcile(
     # for `infrastructure`'s reason - this function stays pure - and read only
     # by rule 3, which is the one rule that can be handed the same record
     # twice. `observed_records` folds it forward. See #203.
-    observed_records = observed_records or {}
+    # Named `observed` rather than `observed_records`: the module-level
+    # `observed_records` is a function, and a parameter shadowing it inside this
+    # body would make a later call to it read as "Mapping not callable".
+    seen_records = observed or {}
     live = set(running)
 
     transitions: list[Transition] = []
@@ -1091,7 +1094,7 @@ def plan_reconcile(
         #    (#203).
         record = results.get(entry.ref)
         finished = record is not None and record.attempt >= entry.attempt
-        fresh = record is not None and record.identity != observed_records.get(entry.ref)
+        fresh = record is not None and record.identity != seen_records.get(entry.ref)
         if was == CLAIMED_STATE and finished and fresh and record is not None:
             transition, disposal = _observe(
                 entry,
@@ -2035,7 +2038,7 @@ class Reconciler:
             max_total_attempts=self.max_total_attempts,
             infrastructure=self._infrastructure,
             infrastructure_policy=self.infrastructure_policy,
-            observed_records=self._observed_records,
+            observed=self._observed_records,
         )
         result = apply_plan(
             snapshot,
