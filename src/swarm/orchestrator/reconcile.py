@@ -143,10 +143,11 @@ from .authority import (
     state_of,
     state_source,
 )
-# **The `_STATE` suffix is ADR 0001's internal vocabulary.** `shadow.py`'s
-# convention, kept for its reason: the one time a state and the label storing it
-# were confused, every classification in that file stopped matching and nothing
-# failed. The suffix is now the *only* spelling this module decides on - the bare
+# **The `_STATE` suffix is ADR 0001's internal vocabulary.** The convention came
+# from the shadow window, and is kept for its reason: the one time a state and
+# the label storing it were confused, every classification in that file stopped
+# matching and nothing failed. The suffix is now the *only* spelling this module
+# decides on - the bare
 # labels it used to carry alongside them went with #152's `Transition` retype,
 # which is why `CLAIMED` and `REVIEW` are no longer imported here at all.
 from .derived import CLAIMED as CLAIMED_STATE
@@ -375,7 +376,7 @@ class Transition:
     the answer is *stored* - so this type says `eligible` and `needs-human`, and
     the one place a `swarm:*` name is needed looks it up at the moment it writes
     (`write_labels`). That is what lets the storage go without touching anything
-    that decides: `fold`, `lifecycle_events`, `shadow`, `recovery` and
+    that decides: `fold`, `lifecycle_events`, `observed`, `recovery` and
     `authority` all read these two fields, and none of them will notice.
 
     **Why `from_state` is derived from the label the issue carries, not from what
@@ -1810,24 +1811,6 @@ def _lifecycle_log() -> Any:
     return LifecycleLog()
 
 
-def _shadow_window() -> Any:
-    """`shadow.ShadowWindow`, imported at call time. `_lifecycle_log`'s reason.
-
-    `shadow` imports this module for `CycleReport` and imports `lifecycle` for
-    the label translation, so the dependency points the same way it does for the
-    announcement and for the same reason: this file is the body that *decides*,
-    and the modules that project a finished cycle sit downstream of it.
-
-    Constructed with the environment already read (`APIARY_DERIVED_SHADOW`), so
-    a `Reconciler` built in a test gets the shadow unless the test says
-    otherwise - which is the right default for an observer that must never be
-    the reason a cycle behaves differently.
-    """
-    from .shadow import ShadowWindow, shadow_enabled
-
-    return ShadowWindow(enabled=shadow_enabled())
-
-
 def _dispatch_attempted(report: CycleReport) -> set[TaskRef]:
     """Every task this cycle's dispatcher actually tried to run. #200's signal.
 
@@ -2005,11 +1988,11 @@ class Reconciler:
     #: built through a local import, for `merge_policy`'s reason: `lifecycle`
     #: imports this module.
     _lifecycle: Any = field(default_factory=_lifecycle_log, repr=False)
-    #: The derived-state shadow (#146), run-scoped so "have I warned about an
-    #: unexplained divergence yet" is asked once per run rather than once per
-    #: cycle. Typed loosely and built through a local import for `_lifecycle`'s
-    #: reason. It reads nothing the cycle decides and decides nothing itself.
-    _shadow: Any = field(default_factory=_shadow_window, repr=False)
+    #: Set once if the run recorder raised. Run-scoped for `_lifecycle`'s reason
+    #: and one of its own: a recorder that has broken will break again on the
+    #: next cycle for the same reason, and a traceback every fifteen seconds for
+    #: the rest of the run buries the one line that mattered.
+    _recorder_broken: bool = field(default=False, repr=False)
     #: Which control plane this run believes (#147), read once at construction
     #: so that a mid-run environment edit cannot make one cycle derive its state
     #: and the next one read it off a label. `APIARY_STATE_SOURCE=labels` is the
@@ -2069,7 +2052,7 @@ class Reconciler:
             store=self.store,
         )
 
-        # One `docker ps`, read twice: the raw listing for the shadow window,
+        # One `docker ps`, read twice: the raw listing for the run recorder,
         # which must be able to see two containers under one task, and the
         # collapsed map every rule in this cycle wants.
         containers = self._containers()
@@ -2084,13 +2067,13 @@ class Reconciler:
         # but three walks of it to build the same mapping is three walks.
         states = snapshot.states()
 
-        # Local, because `shadow` imports this module. `build_observation` is
+        # Local, because `observed` imports this module. `build_observation` is
         # #146's, and its docstring says why it takes raw inputs rather than a
         # finished report: "an observation can be built before the cycle decides
         # anything - which is the shape #147 needs when the derived state becomes
         # the thing decided *on*". This is that call.
         from .checks import read_pulls
-        from .shadow import build_observation
+        from .observed import build_observation
 
         # Read here rather than after `apply_plan`, which is where it used to
         # sit. It costs nothing extra - `open_branches()` has already forced
@@ -2369,46 +2352,31 @@ class Reconciler:
             pulls=pulls or {},
             checks=check_runs,
         )
-        # The shadow window (#146), last and on the same grown report, for the
-        # announcement's reason and one of its own: it diffs the derived state
-        # against the control plane **as this cycle left it**, so it has to run
-        # after every write this cycle made. Every fact it needs is one this
-        # cycle already read, which is why they are passed rather than fetched -
-        # shadowing adds no API call, and there is no client in `shadow.py` to
-        # add one with. It cannot raise; see `ShadowWindow.run`.
+        # The run recorder (#146), last and on the same grown report, for the
+        # announcement's reason and one of its own: it records the world **as
+        # this cycle left it**, so it has to run after every write this cycle
+        # made. Every fact it needs is one this cycle already read, which is why
+        # they are passed rather than fetched - recording adds no API call, and
+        # there is no client in `observed.py` to add one with.
         #
         # **Not on a dry run.** `apply_plan` returns before writing, so nothing
-        # is folded and `control_labels` would report *last* cycle's labels -
-        # exactly the lagging-cache comparison `shadow.py` argues against. The
-        # recorder is worse: `RunArtifacts.observed` stamps the directory
-        # `origin: "recorded"`, so a dry run would enter the replay corpus
-        # wearing the one label that means "this happened for real".
+        # is folded and `control_labels` would report *last* cycle's labels. The
+        # recorder makes that worse rather than merely wrong:
+        # `RunArtifacts.observed` stamps the directory `origin: "recorded"`, so a
+        # dry run would enter the replay corpus wearing the one label that means
+        # "this happened for real".
         if self.dry_run:
             return judged
-        self._shadow.run(
+        self._record_observed(
             judged,
-            # The raw listing, not `handles`: a resolver handed a first-wins map
-            # cannot see two containers under one task, which is one of the
-            # cases #146 gives as a reason to shadow.
             containers=containers,
-            # `pulls`, not `pulls or {}`. `None` means this cycle could not
-            # list pull requests, and `ShadowWindow.run` announces that as a
-            # blind cycle - `checks.read_pulls`' distinction, which conflating
-            # would emit one manufactured divergence per task in review.
             pulls=pulls,
             results=results,
-            # The names those records were read from, so the recorder can write
-            # down which file this cycle saw rather than one rebuilt from the
-            # record's `attempt` - which since #177 need not be the same file.
+            # The names those records were read from, so the recorder writes down
+            # which file this cycle saw rather than one rebuilt from the record's
+            # `attempt` - which since #177 need not be the same file (#230).
             result_names=result_names,
             states=states,
-            infrastructure=self._infrastructure,
-            infrastructure_cap=self.infrastructure_policy.cap,
-            max_attempts=self.max_attempts,
-            max_total_attempts=self.max_total_attempts,
-            live_run_ids=(self.run.id,),
-            emit=self.events,
-            record=self.record,
         )
         return judged
 
@@ -2417,10 +2385,10 @@ class Reconciler:
         label. **The observable proof the cutover happened.**
 
         Emitted at the *top* of the cycle, before anything is decided, which is
-        the opposite end from `shadow.ShadowWindow` and deliberately so: a label
-        a human edited and readiness then repaired leaves no `state.divergence`
-        line at all, and "the swarm carried on and said so" is exactly what
-        #147's acceptance criteria ask to be able to see.
+        the opposite end from the shadow window's classification and deliberately
+        so: a label a human edited and readiness then repaired left no
+        `state.divergence` line at all, and "the swarm carried on and said so" is
+        exactly what #147's acceptance criteria ask to be able to see.
 
         Keyed by task id and speaking ADR 0001's vocabulary on both sides -
         #141's rule for everything in `events.jsonl`, and the reason no
@@ -2445,7 +2413,7 @@ class Reconciler:
     def _carry_forward(self, belief: Belief, report: CycleReport) -> dict[TaskRef, str]:
         """What this cycle ended believing, for the next cycle's `previous`.
 
-        The same enumeration `shadow.control_labels` walks, from the other side
+        The same enumeration `observed.control_labels` walks, from the other side
         and for the same reason: three of a cycle's writers do not produce a
         `Transition` and are not folded back, so a belief advanced only by
         `fold` would forget them. It matters for exactly one of the three and
@@ -2520,6 +2488,64 @@ class Reconciler:
                 self._revived[entry.ref] = Grant(attempt=entry.attempt)
 
     # --- step 5 ----------------------------------------------------------
+
+    def _record_observed(
+        self,
+        report: CycleReport,
+        *,
+        containers: Any = (),
+        pulls: Any = None,
+        results: Any = None,
+        result_names: Any = None,
+        states: Any = None,
+    ) -> None:
+        """Put this cycle in the replay corpus. **Cannot fail the cycle.**
+
+        `ShadowWindow.run`'s guard, kept after the window it protected was
+        removed (#152), because the argument was never about the comparison:
+        `observed.py` reads a dozen attributes off objects five other modules
+        own, and the day one of them is renamed the right outcome is a recorder
+        that stops and says so rather than a run that dies holding containers.
+        The flag is here rather than there because "have I already given up" is a
+        question about *this run*, and a module-level flag would be state two
+        reconcilers shared.
+
+        The raw container listing is passed, not `handles`: a first-wins map
+        cannot express two containers under one task, and that is a fact a
+        recorded cycle has to keep. `pulls` is passed as it came - `None` means
+        this cycle could not list pull requests, and `record_cycle` writes
+        nothing rather than recording a world where nothing is in review.
+        `result_names` comes from the same read as `results` (#230), because
+        since #177 the file a record was read from is not a function of the
+        record - and a recorder that listed the directory again to find out would
+        record a file this cycle never saw.
+        """
+        if self.record is None or self._recorder_broken:
+            return
+        from .observed import record_cycle
+
+        try:
+            record_cycle(
+                report,
+                record=self.record,
+                containers=containers,
+                pulls=pulls,
+                results=results,
+                result_names=result_names,
+                states=states,
+                max_attempts=self.max_attempts,
+                max_total_attempts=self.max_total_attempts,
+                live_run_ids=(self.run.id,),
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self._recorder_broken = True
+            print(
+                f"! the run recorder failed and is off for the rest of this run: "
+                f"{exc!r}. The cycle is unaffected - nothing reads it back while a "
+                f"run is going - and the cost is that this run does not join the "
+                f"replay corpus.",
+                file=sys.stderr,
+            )
 
     def _judge(
         self,
@@ -2717,8 +2743,8 @@ class Reconciler:
         the collapse is lossy in a way that matters exactly once: two
         containers under one task is the double-spawn `dispatcher.release`'s
         docstring is written about, and it is one of the cases #146 gives as a
-        reason to shadow at all. A resolver handed the collapsed map could not
-        see it, so `orchestrator/shadow.py` takes this list.
+        reason to record a cycle at all. A resolver handed the collapsed map
+        could not see it, so `orchestrator/observed.py` takes this list.
 
         A container with no issue label is not this run's worker - the label is
         written at `docker create` - so it is left for the reaper (#20), which
