@@ -297,6 +297,8 @@ class FakeFleet:
     handles: dict[int, Handle] = field(default_factory=dict)
     log: list[str] = field(default_factory=list)
     dispose_error: Exception | None = None
+    #: issue -> the attempt it was spawned with. See `spawn`.
+    attempts: dict[int, int | None] = field(default_factory=dict)
 
     def find(self, *, ref: TaskRef | None = None) -> list[Handle]:
         # The fake keeps docker's int-keyed bookkeeping; only the seam changed.
@@ -319,9 +321,14 @@ class FakeFleet:
         *,
         issue: int | None = None,
         image: str | None = None,
+        attempt: int | None = None,
     ) -> Handle:
         assert issue is not None and task.label_value == str(issue)
         self.log.append(f"spawn #{issue}")
+        # Recorded, not asserted here: which attempt a container was told is
+        # `test_dispatcher`'s question. This fake only has to accept it, or every
+        # cycle test in this file fails on a keyword.
+        self.attempts[issue] = attempt
         handle = Handle(id=f"{issue:0>64x}", run_id=RUN_ID, issue=issue, image=image or "")
         self.handles[issue] = handle
         return handle

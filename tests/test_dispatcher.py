@@ -77,13 +77,13 @@ DAEMON_GB = 7.6
 # --------------------------------------------------------------------------
 
 
-def entry(number: int, *files: str, label: str = READY) -> LedgerEntry:
+def entry(number: int, *files: str, label: str = READY, attempt: int = 0) -> LedgerEntry:
     """One ledger entry. Files default to one nobody else touches."""
     return LedgerEntry(
         number=number,
         title=f"issue {number}",
         task_id=f"task-{number}",
-        attempt=0,
+        attempt=attempt,
         goal="do the thing",
         files=files or (f"src/mod{number}.py",),
         verify="python -m pytest -q",
@@ -123,6 +123,8 @@ class FakeSwarm:
     #: fleet-wide case and the two compose, this one winning.
     spawn_errors: dict[int, Exception] = field(default_factory=dict)
     handles: dict[int, Handle] = field(default_factory=dict)
+    #: issue -> the attempt the dispatcher told that container it is. See `spawn`.
+    attempts: dict[int, int | None] = field(default_factory=dict)
     #: What `find` reports, per issue. Empty means "the daemon says nothing is
     #: running under that issue", which is the only reading that releases a
     #: claim.
@@ -150,12 +152,17 @@ class FakeSwarm:
         *,
         issue: int | None = None,
         image: str | None = None,
+        attempt: int | None = None,
     ) -> Handle:
         # The fake keeps docker's int-keyed bookkeeping; only the seam changed.
         # `issue` is asserted rather than ignored: the dispatcher has to pass
         # both, and a caller that stopped would leave the worker without the
         # number it needs to open a pull request.
         assert issue is not None and task.label_value == str(issue)
+        # Kept per issue rather than logged, because the assertion about it is
+        # "which number did *this* task get" and a log line would make that a
+        # string-parsing exercise.
+        self.attempts[issue] = attempt
         # The image is in the log, because #99's whole question is which one a
         # task got and the ordering assertions read this log.
         self.log.append(f"spawn #{issue}" + (f" [{image}]" if image else ""))
@@ -444,6 +451,39 @@ def test_the_claim_is_written_before_the_container_is_spawned():
     # Both orders have a crash window; this one strands a label #35 can sweep,
     # and the other one dispatches the issue twice.
     assert swarm.log == [f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7 [apiary-worker]"]
+
+
+def test_a_spawned_worker_is_told_which_attempt_it_is():
+    """The counter reaches the container from the entry, not from the issue body.
+
+    The worker names its branch `apiary/<ref>-attempt-N`, and that name is what
+    derived state is read back from (#144, #145). Before this it learned N by
+    fetching the issue and parsing the marker - which made the customer's issue
+    body the transport for one of apiary's own numbers, and is the write #152
+    removes.
+    """
+    swarm = FakeSwarm()
+
+    dispatch(swarm, swarm, ledger(entry(7, attempt=2)), BASE_COMMIT, capacity=capacity(1))
+
+    assert swarm.attempts == {7: 2}
+
+
+def test_each_worker_is_told_its_own_attempt_and_not_the_fleets():
+    """Two tasks at different attempts in one cycle is the ordinary case.
+
+    A retry and a first attempt dispatch together all the time, and one number
+    for the whole cycle would name one of the two branches wrongly - silently,
+    because the push succeeds either way.
+    """
+    swarm = FakeSwarm()
+
+    dispatch(
+        swarm, swarm, ledger(entry(4, attempt=0), entry(5, attempt=3)),
+        BASE_COMMIT, capacity=capacity(2),
+    )
+
+    assert swarm.attempts == {4: 0, 5: 3}
 
 
 def test_the_new_label_is_added_before_the_old_one_is_removed():
