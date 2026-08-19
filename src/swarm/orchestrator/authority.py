@@ -513,8 +513,21 @@ def believe(
     previous = {**by_label, **(remembered or {})}
 
     if source != DERIVED or observation is None:
+        # `previous` is the labels alone here, deliberately, and not the
+        # `remembered` overlay the derived path uses.
+        #
+        # `APIARY_STATE_SOURCE=labels` has one job: restore what the
+        # orchestrator did before #147. Before #147 `plan_reconcile`'s rules 3
+        # and 4 read `entry.state_label` directly, every cycle. Carrying last
+        # cycle's belief over this cycle's label makes the remembered value win,
+        # and the one event that distinguishes them is a human editing a label
+        # mid-run - which is the single case the hatch exists for, and the
+        # action apiary's own give-up comment instructs ("move this back to
+        # `swarm:ready`"). Rule 4 would then fire on the remembered `review`,
+        # consume an attempt and post a failure for work a human had just
+        # rescheduled.
         return Belief(
-            source=LABELS, states=dict(by_label), stored=by_label, previous=previous
+            source=LABELS, states=dict(by_label), stored=by_label, previous=dict(by_label)
         )
 
     resolution = resolve(observation)
@@ -683,7 +696,26 @@ def _budget_spent(
     would open the hole it thought it had closed.
     """
     cap = max(int(max_attempts), 1)
-    if attempts_spent >= max(int(max_total_attempts), cap):
+    total_cap = max(int(max_total_attempts), cap)
+    # Two counters, because they are not the same number after a restart and
+    # only one of them survives one.
+    #
+    # `attempts_spent` is the **code host's** count, and this module's own
+    # docstring says why it resets: results are per-run and the observation
+    # takes branch names off *open* pull requests, so a task apiary gave up on
+    # resolves to `eligible` from scratch in the next process. `entry.attempt`
+    # is apiary's own monotonic counter, carried in the issue marker and the
+    # store, and it is the one `_retry_or_give_up` actually gives up on.
+    #
+    # Testing only the code-host count left one of that function's two branches
+    # uncovered, and precisely the branch a restart reaches. A *streak* give-up
+    # survives, because `entry.streak` is stored. A *total-cap* give-up did not:
+    # reaching `max_total_attempts` without the streak reaching `max_attempts`
+    # is exactly what renewals produce - every new failure signature resets the
+    # streak to 1 - so `streak >= cap` was False, nothing said the budget was
+    # spent, and the task was relabelled `swarm:ready` and dispatched with a
+    # fresh budget over work apiary had already abandoned.
+    if attempts_spent >= total_cap or int(entry.attempt) >= total_cap:
         return True
     if revived_at is not None and attempts_spent <= revived_at:
         return False
