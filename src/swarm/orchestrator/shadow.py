@@ -40,8 +40,10 @@ asserts the call count is unchanged, because a shadow that silently doubled the
 rate-limit spend would be switched off by the first person it throttled.
 
 **It diffs two answers to one observation, not two samples of one clock.** See
-below; this is the part a reader of the log has to understand and the part the
-log cannot tell them.
+"Which control plane, sampled when" below; this is the part a reader of the log
+has to understand and the part the log cannot tell them. "What a clean window is,
+and is not, evidence of" is the other part, and it is why every cycle reports how
+many of its comparisons were independent of the cycle's own writes.
 
 ## Which control plane, and sampled when
 
@@ -69,6 +71,38 @@ Neither is a disagreement about a fact; both are the cycle's own action
 outrunning its own read. They are classified and named rather than hidden,
 because the alternative - feeding "what this cycle wrote" back into the
 observation - is exactly the sourcing violation `derived.py` exists to prevent.
+
+## What a clean window is, and is not, evidence of
+
+This is the question #152 will be answered with, so it is written down rather
+than left for whoever reads the first clean run.
+
+`plan_reconcile` computes this cycle's label writes from `snapshot.states()`,
+`snapshot.open_branches()`, the results directory and the container listing.
+The resolver reads the same four. **So for a task this cycle relabelled, the two
+sides were fed the same observation**, and their agreeing shows that two
+reducers implement the same rules over one input. That is not nothing - it is
+exactly the statement "the label is a redundant cache", which is what #152 needs
+- but it is not the resolver tracking a world nobody told it about, and a reader
+who counted those as independent confirmations would be over-reading a clean
+window.
+
+The independent comparisons are the tasks the cycle did **not** write. There the
+label is the accumulation of every earlier cycle's decisions over earlier
+observations, and the derived state is one absolute reading of now; nothing
+shared produced them. `plan_reconcile` is incremental (current label plus facts
+-> a transition) and the resolver is absolute (facts -> a state), so agreement on
+an untouched task is the accumulated state matching a recomputation from
+scratch, which is the property that makes the cache deletable.
+
+The share is structural rather than a matter of luck: a cycle writes labels for
+at most the dispatch cap, plus `APIARY_MERGES_PER_CYCLE`, plus whatever
+reconcile and the gates moved - a small constant - out of a ledger of N tasks.
+So the independent share tends to `(N - O(1)) / N` and rises with plan size. It
+is not assumed, though: `ShadowReport.independent` counts it per cycle, every
+`state.shadow` event carries it, and `swarm show` prints the run's total beside
+the compared total. **A clean window whose independent count is small is a weak
+result and now says so on its own face.**
 
 ## Expected divergences, and why they are classified rather than suppressed
 
@@ -158,17 +192,30 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..containers.manager import CREATED_STATE, Handle
 from ..github.branches import parse_task_branch, task_branch
+from ..github.readiness import READY as READY_LABEL
 from ..github.readiness import SATISFYING_STATE_REASONS, IssueState
 from ..github.refs import issue_number, pull_number, task_ref
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord, record_path
 from .checks import PullState
+# **Bare `CLAIMED` and `REVIEW` in this module are ADR 0001's internal states**,
+# and the two `swarm:*` labels that store them are imported under names that say
+# so. Not decoration: the first version of the classifier tested
+# `divergence.control == CLAIMED` against the dispatcher's `"swarm:claimed"`,
+# which never matched, and every `dispatched-this-cycle` divergence silently
+# became unexplained. The suffix is what makes that a type of mistake a reader
+# sees rather than one the tests have to find.
 from .derived import (
+    BLOCKED,
+    CLAIMED,
+    ELIGIBLE,
+    LANDED,
     NEEDS_HUMAN,
+    REVIEW,
     AttemptFact,
     Budget,
     ContainerFact,
@@ -181,7 +228,7 @@ from .derived import (
     report as render,
     resolve,
 )
-from .dispatcher import CLAIMED
+from .dispatcher import CLAIMED as CLAIMED_LABEL
 from .lifecycle import INTERNAL_STATE, internal_state
 from .reconcile import CycleReport
 
@@ -196,13 +243,17 @@ __all__ = [
     "REVIVED",
     "SHADOW_ENV",
     "Explained",
+    "Judgment",
     "ShadowReport",
     "ShadowWindow",
+    "build_observation",
     "classify",
     "control_labels",
     "observation_for",
     "observed_line",
+    "revived_tasks",
     "shadow_enabled",
+    "written_this_cycle",
 ]
 
 #: The switch. **Defaulting on**, which is the ticket's word and the right
@@ -282,6 +333,14 @@ def control_labels(report: CycleReport) -> dict[str, str]:
        it", which is a claim the control plane is holding whether or not the
        spawn worked - and the case #35's recovery sweep exists for.
 
+    And a sixth that is not a label writer in `cycle` at all: `planner.revive`,
+    reached from step 5 through `replan` and from the goal gate, moves a task
+    `swarm:failed -> swarm:ready` on GitHub. `_judge` runs *before* this window
+    and nothing folds it either, so a map without it reports `needs-human` for a
+    task the cycle left `ready`. Overlaid before readiness, because that is
+    where it happens in the cycle and because a revived task is exactly the one
+    readiness may then move again.
+
     Labels rather than internal states, because that is what the replay corpus
     records (`tests/fixtures/runs/README.md`: "the corpus records what the
     control plane actually held, so the day epic #140 removes the labels it is
@@ -301,6 +360,8 @@ def control_labels(report: CycleReport) -> dict[str, str]:
         for transition in report.mergeability.applied:
             if transition.task_id and transition.task_id not in gated:
                 labels[transition.task_id] = transition.to_label
+    for task in revived_tasks(report):
+        labels[task] = READY_LABEL
     if report.readiness is not None:
         for verdict in report.readiness.verdicts:
             if verdict.task_id:
@@ -309,7 +370,7 @@ def control_labels(report: CycleReport) -> dict[str, str]:
         slugs = {entry.ref: entry.task_id for entry in report.ledger.entries.values()}
         for item in report.dispatched.dispatched:
             if item.entry.task_id:
-                labels[item.entry.task_id] = CLAIMED
+                labels[item.entry.task_id] = CLAIMED_LABEL
         for failure in report.dispatched.failed:
             # `DispatchFailure` carries the issue number rather than the entry,
             # so the ref is re-minted through the adapter and joined back to the
@@ -317,29 +378,42 @@ def control_labels(report: CycleReport) -> dict[str, str]:
             # and an API address is a number.
             task = slugs.get(task_ref(int(failure.number)), "")
             if failure.claimed and task:
-                labels[task] = CLAIMED
+                labels[task] = CLAIMED_LABEL
     return labels
 
 
-def observation_for(
-    report: CycleReport,
+def build_observation(
     *,
-    handles: Mapping[TaskRef, Handle] | None = None,
+    cycle: int,
+    entries: Iterable[Any],
+    containers: Iterable[Handle] = (),
     pulls: Mapping[str, PullState] | None = None,
     results: Mapping[TaskRef, ResultRecord] | None = None,
     states: Mapping[TaskRef, IssueState] | None = None,
     budget: Budget | None = None,
     live_run_ids: Iterable[str] = (),
 ) -> Observation:
-    """One `Observation` from facts the cycle already holds. **Reads nothing.**
+    """One `Observation` from raw cycle inputs. **Reads nothing.**
 
-    Every argument is something `Reconciler.cycle` computed for its own reasons
-    before this was called, which is what makes "shadowing adds no API call" a
-    structural claim rather than a promise: there is no client here to call one
-    with.
+    Every argument is something `Reconciler.cycle` computed for its own reasons,
+    which is what makes "shadowing adds no API call" a structural claim rather
+    than a promise: there is no client here to call one with.
 
-    Two of the inputs are narrower than `derived.py` would like, and saying so
-    is more useful than pretending otherwise:
+    **Raw inputs rather than a `CycleReport`**, with `observation_for` below as
+    the adapter. All of these are read at the *top* of a cycle, so an
+    observation can be built before the cycle decides anything - which is the
+    shape #147 needs when the derived state becomes the thing decided *on*, and
+    is a free property to keep now rather than a reshape later.
+
+    `containers` is the **raw listing, one entry per container**, not
+    `Reconciler._handles`' first-wins map. Two containers under one task is the
+    double-spawn `dispatcher.release` is written about and one of the cases #146
+    gives as a reason to shadow at all; a collapsed map cannot express it, and
+    an exited container listed ahead of a running one would additionally make
+    the resolver read not-claimed. `ContainerFact` is per-container by design.
+
+    Two inputs are narrower than `derived.py` would like, and saying so is more
+    useful than pretending otherwise:
 
     - **Branch names are the head refs of open pull requests, and nothing more.**
       A remote branch listing is not a call this cycle makes, and #146's
@@ -354,7 +428,6 @@ def observation_for(
       of the two paths `derived._landed` documents - and the reason
       `state_reason` is passed at all.
     """
-    handles = handles or {}
     pulls = pulls or {}
     results = results or {}
     states = states or {}
@@ -386,17 +459,18 @@ def observation_for(
         )
 
     return observe(
-        cycle=report.index,
-        entries=report.ledger.entries.values(),
+        cycle=cycle,
+        entries=entries,
         branch_names=[str(name) for name in pulls],
         containers=[
             ContainerFact(
                 id=handle.id,
                 run_id=handle.run_id,
-                ref=ref,
+                ref=task_ref(int(handle.issue)),
                 running=handle.running,
             )
-            for ref, handle in handles.items()
+            for handle in containers
+            if handle.issue is not None
         ],
         pulls=facts,
         results=[
@@ -406,6 +480,19 @@ def observation_for(
         budget=budget,
         live_run_ids=live_run_ids,
         state_reasons={ref: state.state_reason for ref, state in states.items()},
+    )
+
+
+def observation_for(report: CycleReport, **facts: Any) -> Observation:
+    """`build_observation` over a finished cycle. The two lines a report adds.
+
+    A thin adapter and nothing more, so that the builder above stays usable
+    before a cycle has decided anything: the ledger and the cycle index are the
+    only things a `CycleReport` contributes, and both are read at the top of the
+    cycle rather than produced by it.
+    """
+    return build_observation(
+        cycle=report.index, entries=report.ledger.entries.values(), **facts
     )
 
 
@@ -438,12 +525,83 @@ class Explained:
         return f"{head} [{self.kind}: {self.why}]" if self.kind else f"{head} [UNEXPLAINED]"
 
 
+#: What each account **predicts the derived side will say**, and the reason the
+#: sets exist at all.
+#:
+#: A rule that tested only `control` plus its external evidence would file a
+#: divergence as expected on the strength of half the pair - so a task the merge
+#: gate merged whose resolver had said `blocked` would be classified
+#: `merged-this-cycle`, drop out of `unexplained`, and #147's gate would read
+#: clean over a resolver that was simply wrong. That is the one failure this
+#: module exists to prevent, and it is silent. So every account below is
+#: two-sided: it names the states its own argument predicts, and a divergence
+#: outside them falls through to the next rule and, in the end, to unexplained.
+#: The failure direction becomes noise rather than silence, which is the
+#: direction this module takes everywhere else.
+
+#: A merge landed after the world was read, so the pre-merge reading is an open
+#: pull request - `review`, or `claimed` if a container of the merged attempt is
+#: still listed as running. Anything else (`blocked`, `eligible`, `needs-human`)
+#: means the resolver did not see the pull request this cycle merged, which is
+#: news about the resolver rather than about the sampling.
+_PRE_MERGE = frozenset({REVIEW, CLAIMED})
+
+#: A claim written after the container listing was taken. The pre-claim reading
+#: is whatever the task was before: `eligible` for a first dispatch, `review`
+#: for a retry (`worker/pr.py` reuses one pull request across attempts), and
+#: `blocked` only if readiness and this resolver disagree about an edge - which
+#: is itself a divergence worth keeping, so it is in the set for the claim
+#: classes and reported through them rather than hidden. **`needs-human` is
+#: deliberately out**: a spent counter outranks `claimed` in `derived._verdict`,
+#: so a container would not have changed the answer and the account is false.
+_PRE_CLAIM = frozenset({ELIGIBLE, BLOCKED, REVIEW})
+
+#: The infrastructure ceiling, whose own argument in `derived.py` is that an
+#: escalation raised on it "reads here as whatever the task would otherwise be -
+#: `eligible`, usually". `landed` is not one of those: a task whose work item
+#: reads closed-as-completed while the control plane escalated it is a genuine
+#: contradiction, not a ceiling. Nor is `claimed` - the escalation is raised on
+#: observing a result record, which means the worker exited.
+_PRE_CEILING = frozenset({ELIGIBLE, BLOCKED, REVIEW})
+
+#: A work item closed as not planned. The weakest of the four sets and
+#: deliberately so: a human can close an issue at any point in a task's life, so
+#: every non-terminal reading is plausible. What it still rules out is the one
+#: reading that would be a contradiction - `landed` - because
+#: `TaskFact.state_reason` is exactly what stops a not-planned closure reading
+#: as a completed one, and a regression that stopped passing it would otherwise
+#: be absorbed here as an expected divergence.
+_NOT_TERMINAL = frozenset({ELIGIBLE, BLOCKED, REVIEW, CLAIMED})
+
+
+@dataclass(frozen=True)
+class Judgment:
+    """The two numbers from apiary's own store that a classification reads.
+
+    **Not the `LedgerEntry` they came from**, and that is the point: an entry
+    carries `state_label`, and this is the module whose whole discipline is that
+    a label cannot reach a resolver. Holding an entry here would put one an
+    attribute access away from a classification rule, in the one function that
+    is allowed to look at both sides. Two ints cannot be misused that way.
+
+    `streak` is `None` for a task the store has never judged (`LedgerEntry`
+    says so), which is not the same as zero and is why it stays optional.
+    """
+
+    streak: int | None = None
+    renewals: int = 0
+
+    @classmethod
+    def of(cls, entry: Any) -> Judgment:
+        return cls(streak=getattr(entry, "streak", None), renewals=int(getattr(entry, "renewals", 0) or 0))
+
+
 def classify(
     divergences: Iterable[Divergence],
     *,
     resolution: Resolution,
-    entries: Mapping[str, Any] | None = None,
-    handles: Mapping[TaskRef, Handle] | None = None,
+    judgments: Mapping[str, Judgment] | None = None,
+    containers: Iterable[Handle] = (),
     states: Mapping[TaskRef, IssueState] | None = None,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_cap: int = 3,
@@ -453,71 +611,88 @@ def classify(
 ) -> tuple[Explained, ...]:
     """Attach an account to each divergence, or leave it unexplained.
 
-    Ordered most-specific first, and each rule is grounded in a fact this
-    function was handed rather than in a guess about which is likelier. A rule
-    that fired on a shape it did not actually recognise would hide a real
-    divergence inside an expected one, which is the single worst thing this
-    module could do - so every branch below tests for the *evidence* of its
-    account (the streak counter, the store's renewal count, the container's own
-    `created`, the merge this cycle performed) and not merely for the pair of
-    states that account would produce.
+    Ordered most-specific first. **Every rule is two-sided**: it tests the
+    control state, the derived state its own argument predicts, and the
+    evidence of its account - the streak counter, the store's renewal count, the
+    container's own `created`, the merge this cycle performed. Never the pair of
+    states alone, and never the control state alone.
+
+    That is not fastidiousness. A one-sided rule absorbs a *wrong derived
+    answer* into an expected divergence and removes it from `unexplained`, which
+    is the number #147's gate reads and #152 acts on. The sets above name what
+    each account predicts and the reasoning for each; a divergence outside them
+    falls through to the next rule and, in the end, to unexplained.
     """
-    entries = entries or {}
-    handles = handles or {}
+    judgments = judgments or {}
     states = states or {}
     infrastructure = infrastructure or {}
     merged_refs = frozenset(merged)
     dispatched_refs = frozenset(dispatched)
+    created: dict[TaskRef, Handle] = {}
+    for handle in containers:
+        if handle.issue is not None and handle.state == CREATED_STATE:
+            created.setdefault(task_ref(int(handle.issue)), handle)
     verdicts = resolution.by_task
 
     out: list[Explained] = []
     for one in divergences:
-        entry = entries.get(one.task_id)
+        judgment = judgments.get(one.task_id, Judgment())
         verdict = verdicts.get(one.task_id)
         spent = verdict.attempts_spent if verdict is not None else 0
-        handle = handles.get(one.ref)
+        streak = infrastructure.get(one.ref, 0)
         kind, why = "", ""
 
-        if one.control == "landed" and one.ref in merged_refs:
+        if one.control == LANDED and one.derived in _PRE_MERGE and one.ref in merged_refs:
             kind = MERGED_THIS_CYCLE
             why = (
                 "this cycle's merge gate merged the pull request after the world was "
                 "read, so the derived side is resolving a listing that predates the "
                 "merge. It converges on the next cycle, when the issue reads closed."
             )
-        elif one.control == "claimed" and one.ref in dispatched_refs:
+        elif (
+            one.control == CLAIMED
+            and one.derived in _PRE_CLAIM
+            and one.ref in dispatched_refs
+        ):
             kind = DISPATCHED_THIS_CYCLE
             why = (
                 "the dispatcher claimed and spawned for this task after the container "
-                "listing was taken, so no container could have been in the observation. "
-                "It converges on the next cycle, when the listing includes it."
+                "listing was taken, so no container could have been in the observation "
+                f"- and {one.derived} is what the task read before the claim. It "
+                "converges on the next cycle, when the listing includes it."
             )
         elif (
-            one.control == "claimed"
-            and handle is not None
-            and handle.state == CREATED_STATE
+            one.control == CLAIMED
+            and one.derived in _PRE_CLAIM
+            and one.ref in created
         ):
             kind = CONTAINER_CREATED
             why = (
-                "the container exists but the daemon reports it as created rather than "
-                "running, so `Handle.running` is false and the resolver reads liveness "
-                "rather than existence. See this module's docstring: the reading is "
-                "deliberate, and this window should be unreachable through `spawn`."
+                f"container {created[one.ref].short_id} exists but the daemon reports "
+                f"it as {CREATED_STATE!r} rather than running, so `Handle.running` is "
+                "false and the resolver reads liveness rather than existence. See this "
+                "module's docstring: the reading is deliberate, and this window should "
+                "be unreachable through `spawn`."
             )
         elif (
             one.control == NEEDS_HUMAN
-            and infrastructure.get(one.ref, 0) >= max(int(infrastructure_cap), 1)
+            and one.derived in _PRE_CEILING
+            and streak >= max(int(infrastructure_cap), 1)
         ):
             kind = INFRASTRUCTURE_CEILING
             why = (
-                f"this task has {infrastructure.get(one.ref, 0)} consecutive "
-                "infrastructure verdicts against a cap of "
-                f"{infrastructure_cap}. ADR 0001: the ceiling is counted from "
+                f"this task has {streak} consecutive infrastructure verdicts against a "
+                f"cap of {infrastructure_cap}. ADR 0001: the ceiling is counted from "
                 "transitions and exit 2 does not bump the attempt, so N mechanical "
                 "failures write one result filename and the artifacts cannot tell one "
-                "from three. Not derivable, at all."
+                f"from three. Not derivable at all, and {one.derived} is what the task "
+                "reads without it."
             )
-        elif one.control == NEEDS_HUMAN and _closed_not_planned(states.get(one.ref)):
+        elif (
+            one.control == NEEDS_HUMAN
+            and one.derived in _NOT_TERMINAL
+            and _closed_not_planned(states.get(one.ref))
+        ):
             kind = CLOSED_NOT_PLANNED
             why = (
                 "a human closed the work item as not planned, which "
@@ -526,16 +701,16 @@ def classify(
                 "one is a gap in the resolver rather than a limit of derivation, and "
                 "#147 can close it."
             )
-        elif one.derived == NEEDS_HUMAN and _renewed(entry, spent, max_attempts):
+        elif one.derived == NEEDS_HUMAN and _renewed(judgment, spent, max_attempts):
             kind = BUDGET_RENEWED
             why = (
                 f"the code host accounts for {spent} attempt(s) against a cap of "
                 f"{max_attempts}, but `_retry_or_give_up` gives up on the streak and "
-                f"the store records streak={getattr(entry, 'streak', None)}, "
-                f"renewals={getattr(entry, 'renewals', 0)}. The renewal is an ADR 0002 "
-                "store judgment and no branch, container or result can see it."
+                f"the store records streak={judgment.streak}, "
+                f"renewals={judgment.renewals}. The renewal is an ADR 0002 store "
+                "judgment and no branch, container or result can see it."
             )
-        elif one.derived == NEEDS_HUMAN and one.control in {"eligible", "blocked"}:
+        elif one.derived == NEEDS_HUMAN and one.control in {ELIGIBLE, BLOCKED}:
             kind = REVIVED
             why = (
                 f"the counter reads {spent} spent against a cap of {max_attempts} while "
@@ -552,27 +727,25 @@ def classify(
 def _closed_not_planned(state: IssueState | None) -> bool:
     """Closed, and closed in a way that discharges nothing.
 
-    `reconcile.SATISFYING_STATE_REASONS` rather than a literal, because the
-    question "does this closure count" is one judgement and three modules
+    `github.readiness.SATISFYING_STATE_REASONS` rather than a literal, because
+    the question "does this closure count" is one judgement and three modules
     already share it.
     """
     return state is not None and state.closed and state.state_reason not in SATISFYING_STATE_REASONS
 
 
-def _renewed(entry: Any, spent: int, max_attempts: int) -> bool:
+def _renewed(judgment: Judgment, spent: int, max_attempts: int) -> bool:
     """Did apiary's own store renew this task's per-blocker budget?
 
-    Two spellings of the same evidence, and both come from `LedgerEntry`'s
-    store-backed fields (#159). `renewals` is the count `TaskJudgement` keeps.
-    `streak` below the attempt bound is the same fact seen from the other side:
-    the counter moved and the streak did not, which is precisely what a changed
-    blocker signature does.
+    Two spellings of the same evidence, both from the store-backed fields
+    `LedgerEntry` carries since #159. `renewals` is the count `TaskJudgement`
+    keeps. A `streak` below the attempt bound is the same fact seen from the
+    other side: the counter moved and the streak did not, which is precisely
+    what a changed blocker signature does.
     """
-    if entry is None:
-        return False
-    if int(getattr(entry, "renewals", 0) or 0) > 0:
+    if judgment.renewals > 0:
         return True
-    streak = getattr(entry, "streak", None)
+    streak = judgment.streak
     return streak is not None and int(streak) < min(spent, max(int(max_attempts), 1))
 
 
@@ -589,6 +762,9 @@ class ShadowReport:
     resolution: Resolution
     control: Mapping[str, str]
     explained: tuple[Explained, ...] = ()
+    #: Task ids whose label **this cycle wrote**. See `independent` below; this
+    #: is the field that answers what a clean shadow window is evidence of.
+    written: frozenset[str] = frozenset()
 
     @property
     def divergences(self) -> tuple[Divergence, ...]:
@@ -610,6 +786,30 @@ class ShadowReport:
         is evidence.
         """
         return sum(1 for verdict in self.resolution.verdicts if verdict.task_id in self.control)
+
+    @property
+    def independent(self) -> int:
+        """Compared tasks whose label this cycle did **not** write.
+
+        The honest strength of the comparison, and the module docstring argues
+        it at length. For a task the cycle relabelled, `plan_reconcile` computed
+        that label from the same issue listing, the same results directory and
+        the same container listing this resolver read - so agreement shows the
+        two reducers implement the same rules over one input. That is worth
+        something (it is exactly "the cache is redundant"), but it is not the
+        resolver tracking a world nobody told it about.
+
+        For a task the cycle left alone, the label is the accumulation of every
+        earlier cycle's decisions over earlier observations, and the derived
+        state is one absolute reading of now. Those are the independent
+        comparisons, and this counts them so that a reader of a clean run can
+        tell how many there were.
+        """
+        return sum(
+            1
+            for verdict in self.resolution.verdicts
+            if verdict.task_id in self.control and verdict.task_id not in self.written
+        )
 
     def text(self) -> str:
         """`derived.report`, plus the account of each divergence."""
@@ -736,12 +936,34 @@ class ShadowWindow:
     #: stays quiet, rather than printing a traceback every fifteen seconds for
     #: the rest of the run.
     broken: bool = field(default=False, repr=False)
+    #: The last cycle this window actually resolved. Retained for one caller and
+    #: one reason: a test asserting that what the recorder wrote replays to what
+    #: the live cycle concluded has to compare against *that* cycle's report,
+    #: and re-running the window afterwards with different facts compares two
+    #: different observations while looking like it compares one.
+    last: ShadowReport | None = field(default=None, repr=False)
+
+    def _blind(self, report: CycleReport, emit: Callable[..., Any] | None) -> None:
+        """Announce a cycle that could not see. See `run`'s docstring."""
+        if emit is None:
+            return
+        from ..artifacts import STATE_SHADOW
+
+        emit(
+            STATE_SHADOW,
+            cycle=report.index,
+            tasks=0,
+            independent=0,
+            divergences=0,
+            unexplained=0,
+            blind=True,
+        )
 
     def run(
         self,
         report: CycleReport,
         *,
-        handles: Mapping[TaskRef, Handle] | None = None,
+        containers: Iterable[Handle] = (),
         pulls: Mapping[str, PullState] | None = None,
         results: Mapping[TaskRef, ResultRecord] | None = None,
         states: Mapping[TaskRef, IssueState] | None = None,
@@ -761,13 +983,26 @@ class ShadowWindow:
         renamed, the correct outcome is a shadow that stops reporting and says
         so, not a run that dies holding containers. `#146`'s own ticket puts it
         plainly: a shadow that raises is worse than no shadow.
+
+        **`pulls=None` is "this cycle could not look", and it is not `{}`.**
+        `checks.read_pulls` and `Snapshot.open_branches` both go to lengths to
+        keep the two apart because conflating them relabels the whole review
+        queue; here the cost is the same shape one level along. An empty
+        mapping read as the answer would resolve every task in review to
+        `eligible` and emit one manufactured unexplained divergence per review
+        task - straight into the number the epic's go/no-go reads. So the cycle
+        is announced as blind and nothing is compared: unmeasured, which is
+        true, rather than dirty, which is not.
         """
         if not self.enabled or self.broken:
             return None
         try:
-            return self._run(
+            if pulls is None:
+                self._blind(report, emit)
+                return None
+            self.last = self._run(
                 report,
-                handles=handles,
+                containers=list(containers),
                 pulls=pulls,
                 results=results,
                 states=states,
@@ -779,6 +1014,7 @@ class ShadowWindow:
                 emit=emit,
                 record=record,
             )
+            return self.last
         except Exception as exc:  # noqa: BLE001 - see the docstring
             self.broken = True
             print(
@@ -795,7 +1031,7 @@ class ShadowWindow:
         self,
         report: CycleReport,
         *,
-        handles: Mapping[TaskRef, Handle] | None,
+        containers: Sequence[Handle],
         pulls: Mapping[str, PullState] | None,
         results: Mapping[TaskRef, ResultRecord] | None,
         states: Mapping[TaskRef, IssueState] | None,
@@ -810,7 +1046,7 @@ class ShadowWindow:
         labels = control_labels(report)
         observation = observation_for(
             report,
-            handles=handles,
+            containers=containers,
             pulls=pulls,
             results=results,
             states=states,
@@ -826,10 +1062,15 @@ class ShadowWindow:
         explained = classify(
             diverge(resolution, control),
             resolution=resolution,
-            entries={
-                entry.task_id: entry for entry in report.ledger.entries.values() if entry.task_id
+            # Two numbers, never the `LedgerEntry` they came from: an entry
+            # carries `state_label`, and this is the one function allowed to
+            # look at both sides. See `Judgment`.
+            judgments={
+                entry.task_id: Judgment.of(entry)
+                for entry in report.ledger.entries.values()
+                if entry.task_id
             },
-            handles=handles,
+            containers=containers,
             states=states,
             infrastructure=infrastructure,
             infrastructure_cap=infrastructure_cap,
@@ -838,7 +1079,11 @@ class ShadowWindow:
             dispatched=_dispatched_refs(report),
         )
         shadow = ShadowReport(
-            cycle=report.index, resolution=resolution, control=control, explained=explained
+            cycle=report.index,
+            resolution=resolution,
+            control=control,
+            explained=explained,
+            written=written_this_cycle(report),
         )
 
         if record is not None:
@@ -876,8 +1121,14 @@ class ShadowWindow:
             STATE_SHADOW,
             cycle=shadow.cycle,
             tasks=shadow.tasks,
+            # The half of the coverage number that is evidence rather than
+            # arithmetic - see `ShadowReport.independent`. Carried per cycle
+            # because a run's total is the only way a reader of a clean window
+            # can tell how much of it the cycle's own writes accounted for.
+            independent=shadow.independent,
             divergences=len(shadow.explained),
             unexplained=len(shadow.unexplained),
+            blind=False,
         )
         for one in shadow.explained:
             emit(
@@ -891,6 +1142,58 @@ class ShadowWindow:
                 because=one.divergence.because,
                 why=one.why,
             )
+
+
+def revived_tasks(report: CycleReport) -> frozenset[str]:
+    """Tasks `planner.revive` returned to `swarm:ready` during this cycle.
+
+    Two callers reach it and both run before this window: `replan` through
+    `_judge`, and the goal gate. Neither result is folded into the ledger, so
+    without this the control map reports `needs-human` for a task the cycle left
+    `ready` - which under-reports rather than manufactures (the derived side
+    says `needs-human` too, so the divergence is simply not emitted until the
+    next cycle, where it lands as `revived`), but the enumeration in
+    `control_labels` claims to be exhaustive and this is the sixth.
+    """
+    found: set[str] = set()
+    for source in (getattr(report.replanned, "plan", None), report.goal):
+        for action in getattr(source, "revived", ()) or ():
+            task = getattr(action, "task_id", "")
+            if task:
+                found.add(str(task))
+    return frozenset(found)
+
+
+def written_this_cycle(report: CycleReport) -> frozenset[str]:
+    """Tasks whose label **this cycle wrote**. See `ShadowReport.independent`.
+
+    Every writer `control_labels` walks, narrowed to the ones that actually
+    moved something: readiness contributes `transitions` rather than every
+    verdict, because a verdict that agreed with the label wrote nothing and the
+    task is therefore still an independent comparison.
+    """
+    written: set[str] = set()
+    for transitions in (
+        report.result.applied,
+        getattr(getattr(report.recovered, "result", None), "applied", ()) or (),
+        getattr(report.mergeability, "applied", ()) or (),
+        getattr(report.checks, "applied", ()) or (),
+    ):
+        written.update(one.task_id for one in transitions if one.task_id)
+    if report.readiness is not None:
+        written.update(one.task_id for one in report.readiness.transitions if one.task_id)
+    if report.dispatched is not None:
+        written.update(
+            item.entry.task_id for item in report.dispatched.dispatched if item.entry.task_id
+        )
+        slugs = {entry.ref: entry.task_id for entry in report.ledger.entries.values()}
+        written.update(
+            slugs.get(task_ref(int(failure.number)), "")
+            for failure in report.dispatched.failed
+            if failure.claimed
+        )
+    written |= revived_tasks(report)
+    return frozenset(task for task in written if task)
 
 
 def _merged_refs(report: CycleReport) -> tuple[TaskRef, ...]:

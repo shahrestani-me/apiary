@@ -173,6 +173,24 @@ closed *as not planned* escalates to `needs-human` through
 `TaskFact.state_reason` carries the fact. Unlike the three above it is
 derivable, and #147 should derive it.
 
+### What a clean shadow window is evidence of
+
+Worth stating before #152 is decided on one. `reconcile.plan_reconcile` computes
+a cycle's label writes from the same issue listing, results directory and
+container listing the resolver reads, so **for a task the cycle relabelled the
+two sides were handed the same observation**: their agreeing shows two reducers
+implementing one set of rules, which is the claim "the label is a redundant
+cache" and is what this ADR needs — but it is not the resolver tracking a world
+nobody told it about.
+
+The independent comparisons are the tasks a cycle did *not* write, where the
+label is the accumulation of many earlier cycles over earlier observations and
+the derived state is one absolute reading of now. A cycle writes at most a small
+constant number of labels out of a ledger of N, so the independent share tends to
+`(N − O(1)) / N` — but it is counted rather than assumed:
+`orchestrator/shadow.py` reports it per cycle and `swarm show` totals it. A clean
+window with a small independent count is a weak result.
+
 ## Deterministic and model-driven MCP are different call sites
 
 MCP is a protocol, not a model. Plain code can call an MCP tool, and the

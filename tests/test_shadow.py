@@ -143,7 +143,14 @@ def report(
 def shadow(
     cycle: CycleReport, **facts: Any
 ) -> tuple[Any, list[tuple[str, dict[str, Any]]]]:
-    """Run the window over one report and hand back what it announced."""
+    """Run the window over one report and hand back what it announced.
+
+    `pulls={}` by default and never `None`: `None` is "this cycle could not
+    list pull requests" and makes the window announce a blind cycle, which is
+    the distinction `checks.read_pulls` exists to keep and which a test helper
+    must not smuggle past.
+    """
+    facts.setdefault("pulls", {})
     seen, emit = recorder()
     window = ShadowWindow()
     return window.run(cycle, emit=emit, **facts), seen
@@ -217,7 +224,19 @@ def test_a_clean_cycle_still_says_it_ran():
     found, seen = shadow(report(entry(4, label=READY)))
 
     assert found.explained == ()
-    assert seen == [(STATE_SHADOW, {"cycle": 0, "tasks": 1, "divergences": 0, "unexplained": 0})]
+    assert seen == [
+        (
+            STATE_SHADOW,
+            {
+                "cycle": 0,
+                "tasks": 1,
+                "independent": 1,
+                "divergences": 0,
+                "unexplained": 0,
+                "blind": False,
+            },
+        )
+    ]
 
 
 def test_a_task_the_resolver_never_saw_is_not_a_divergence():
@@ -257,19 +276,26 @@ def test_a_disagreeing_shadow_changes_no_decision(tmp_path):
     assert shadowed_log == plain_log
     assert shadowed_spawns == plain_spawns
     # …and the shadow really did have something to say about this cycle.
-    assert ShadowWindow().run(shadowed).explained
+    assert ShadowWindow().run(shadowed, pulls={}).explained
 
 
 def test_shadowing_adds_no_github_call():
     """#146's fourth criterion. `Snapshot` already forced every read the window
     uses, so the number of client calls must not move."""
-    def calls(*, enabled: bool) -> list[str]:
-        client, fleet, loop, _ = a_lifecycle_run()
+    def calls(*, enabled: bool) -> tuple[list[str], ShadowWindow, list]:
+        client, fleet, loop, seen = a_lifecycle_run()
         loop._shadow = ShadowWindow(enabled=enabled)
         loop.cycle()
-        return client.log
+        return client.log, loop._shadow, seen
 
-    assert calls(enabled=True) == calls(enabled=False)
+    on, window, seen = calls(enabled=True)
+    off, _, _ = calls(enabled=False)
+
+    assert on == off
+    # …and the window really ran, rather than having broken and done nothing,
+    # which would make the counts match for the wrong reason.
+    assert window.broken is False
+    assert [one for one in seen if one[0] == STATE_SHADOW]
 
 
 def test_the_window_cannot_fail_the_cycle(capsys):
@@ -283,12 +309,12 @@ def test_the_window_cannot_fail_the_cycle(capsys):
     window = ShadowWindow()
     broken = object()
 
-    assert window.run(broken) is None  # type: ignore[arg-type]
+    assert window.run(broken, pulls={}) is None  # type: ignore[arg-type]
     assert window.broken is True
     assert "derived-state shadow failed" in capsys.readouterr().err
 
     # And it stays off rather than printing a traceback every fifteen seconds.
-    assert window.run(report(entry(4, label=CLAIMED))) is None
+    assert window.run(report(entry(4, label=CLAIMED)), pulls={}) is None
     assert capsys.readouterr().err == ""
 
 
@@ -296,9 +322,9 @@ def test_the_warning_is_once_per_run(capsys):
     """A standing divergence repeats every cycle until something moves, and a
     warning per cycle trains an operator to ignore the one line that matters."""
     window = ShadowWindow()
-    window.run(report(entry(4, label=CLAIMED), index=0))
+    window.run(report(entry(4, label=CLAIMED), index=0), pulls={})
     first = capsys.readouterr().err
-    window.run(report(entry(4, label=CLAIMED), index=1))
+    window.run(report(entry(4, label=CLAIMED), index=1), pulls={})
 
     assert "derived state disagrees" in first
     assert capsys.readouterr().err == ""
@@ -322,7 +348,8 @@ def test_a_window_that_is_off_announces_nothing():
     assert found is not None and seen
 
     seen_off, emit = recorder()
-    assert ShadowWindow(enabled=False).run(report(entry(4, label=CLAIMED)), emit=emit) is None
+    off = ShadowWindow(enabled=False)
+    assert off.run(report(entry(4, label=CLAIMED)), pulls={}, emit=emit) is None
     assert seen_off == []
 
 
@@ -427,6 +454,103 @@ def test_a_dispatch_that_claimed_and_failed_to_spawn_still_counts_as_claimed():
     )
 
     assert control_labels(failed) == {"task-4": CLAIMED}
+
+
+def test_a_cycle_that_could_not_list_pull_requests_is_blind_not_clean(tmp_path):
+    """`None` is not `{}`, and the distinction decides a whole review queue.
+
+    An empty mapping read as the answer resolves every task in review to
+    `eligible` and emits one manufactured unexplained divergence per review
+    task, straight into the number the epic's go/no-go reads. Announced as
+    blind instead: unmeasured, which is true.
+    """
+    seen, emit = recorder()
+    window = ShadowWindow()
+
+    assert window.run(report(entry(4, label=REVIEW)), pulls=None, emit=emit) is None
+    assert [name for name, _ in seen] == [STATE_SHADOW]
+    assert seen[0][1]["blind"] is True
+    assert DivergenceTally.from_events(
+        [{"event": name, **fields} for name, fields in seen]
+    ).compared == 0
+
+
+def test_a_dry_run_neither_shadows_nor_records(tmp_path):
+    """Two reasons, and the second is the serious one.
+
+    `apply_plan` returns before writing on a dry run, so nothing is folded and
+    the control map would be *last* cycle's labels - the lagging-cache
+    comparison this module exists to avoid. And `RunArtifacts.observed` stamps
+    the directory `origin: "recorded"`, so a dry run would enter the replay
+    corpus wearing the one label that means "this happened for real".
+    """
+    run = Run.start(REPO, "a dry run", run_id=RUN_ID)
+    artifacts = RunArtifacts.open(run, root=tmp_path)
+
+    client, fleet, loop, seen = a_lifecycle_run(label=CLAIMED)
+    loop.dry_run = True
+    loop.record = artifacts.observed
+    loop.cycle()
+
+    assert [one for one in seen if one[0].startswith("state.")] == []
+    assert not (artifacts.path / OBSERVED_LOG_NAME).exists()
+    assert not (artifacts.path / CORPUS_MANIFEST_NAME).exists()
+
+
+def test_two_containers_under_one_task_reach_the_resolver(tmp_path):
+    """The collapse `Reconciler._handles` performs is first-wins, so an exited
+    container listed ahead of a running one made the resolver read not-claimed
+    - and a genuine double-spawn, which `dispatcher.release` is written about
+    and #146 names as a reason to shadow, was structurally invisible."""
+    found, _ = shadow(
+        report(entry(4, label=CLAIMED)),
+        containers=[handle(4, state="exited"), handle(4, state=RUNNING_STATE)],
+    )
+
+    assert found.explained == ()
+    assert len(found.resolution.verdicts) == 1
+
+
+def test_the_env_flag_reaches_a_reconciler(monkeypatch):
+    """`shadow_enabled` is unit-tested; this is the wiring that reads it - a
+    `default_factory` on the dataclass, which is the part that could silently
+    stop being called."""
+    monkeypatch.setenv(SHADOW_ENV, "0")
+    _, _, off, seen = a_lifecycle_run()
+    off.cycle()
+
+    assert off._shadow.enabled is False
+    assert [one for one in seen if one[0].startswith("state.")] == []
+
+    monkeypatch.setenv(SHADOW_ENV, "1")
+    _, _, on, seen_on = a_lifecycle_run()
+    on.cycle()
+
+    assert on._shadow.enabled is True
+    assert [one for one in seen_on if one[0] == STATE_SHADOW]
+
+
+def test_a_revival_is_in_the_control_map():
+    """The sixth writer, and the one that is not in `cycle` at all.
+
+    `planner.revive` runs from `_judge` - before this window - and moves a task
+    `swarm:failed -> swarm:ready` on GitHub with nothing folding it back.
+    """
+    from swarm.nodes.planner import IssueAction, PlanReport
+    from swarm.orchestrator.replan import ReplanReport
+
+    revived = replace(
+        report(entry(4, label=FAILED)),
+        replanned=ReplanReport(
+            repo=REPO,
+            replanned=True,
+            plan=PlanReport(
+                repo=REPO, actions=(IssueAction("revived", "task-4", 4, reason="streak 1 of 3"),)
+            ),
+        ),
+    )
+
+    assert control_labels(revived) == {"task-4": READY}
 
 
 # --------------------------------------------------------------------------
@@ -536,7 +660,7 @@ def test_a_container_between_create_and_start_is_expected_and_named():
     - and that reading is reported as a kind rather than hidden."""
     found, _ = shadow(
         report(entry(4, label=CLAIMED)),
-        handles={ref(4): handle(4, state=CREATED_STATE)},
+        containers=[handle(4, state=CREATED_STATE)],
     )
 
     assert [one.kind for one in found.explained] == [CONTAINER_CREATED]
@@ -550,10 +674,10 @@ def test_a_running_container_is_a_claim_and_an_exited_one_is_not():
     divergence on every task in every run.
     """
     live, _ = shadow(
-        report(entry(4, label=CLAIMED)), handles={ref(4): handle(4, state=RUNNING_STATE)}
+        report(entry(4, label=CLAIMED)), containers=[handle(4, state=RUNNING_STATE)]
     )
     dead, _ = shadow(
-        report(entry(4, label=CLAIMED)), handles={ref(4): handle(4, state="exited")}
+        report(entry(4, label=CLAIMED)), containers=[handle(4, state="exited")]
     )
 
     assert live.explained == ()
@@ -561,6 +685,88 @@ def test_a_running_container_is_a_claim_and_an_exited_one_is_not():
     # divergence: it is runs 03 and 04 of the corpus, where derived state is
     # right and the label is the stale one.
     assert [one.kind for one in dead.explained] == [""]
+
+
+# --- the negative shapes: an account must not absorb a wrong derived answer ---
+#
+# Each of these is a divergence whose *control* side and evidence match an
+# expected kind while its *derived* side contradicts that kind's own argument.
+# Before the classifier was two-sided every one of them was filed as expected
+# and dropped out of `unexplained` - the number #147's gate reads.
+
+
+def test_a_ceiling_over_a_derived_landed_is_not_the_ceiling():
+    """The worst of them. The resolver says the work item is closed as
+    completed while the control plane escalated it: a contradiction, not a
+    ceiling the resolver cannot see."""
+    done = replace(entry(4, label=FAILED), closed=True)
+    found, _ = shadow(
+        report(done),
+        states={ref(4): IssueState(ref=ref(4), state="closed", state_reason="completed")},
+        infrastructure={ref(4): 3},
+        infrastructure_cap=3,
+    )
+
+    assert [(one.divergence.derived, one.kind) for one in found.explained] == [("landed", "")]
+
+
+def test_a_dispatch_over_a_spent_counter_is_not_the_dispatch_window():
+    """`needs-human` outranks `claimed` in `derived._verdict`, so the container
+    the dispatcher spawned would not have changed the answer - the account is
+    false and the divergence does not converge next cycle."""
+    from swarm.orchestrator.dispatcher import DispatchPlan, DispatchReport, Dispatched
+
+    spent = report(
+        entry(4, label=READY),
+        dispatched=DispatchReport(
+            plan=DispatchPlan(),
+            dispatched=(Dispatched(entry=entry(4, label=CLAIMED), handle=handle(4)),),
+        ),
+    )
+    found, _ = shadow(
+        replace(spent, ledger=ledger(entry(4, label=CLAIMED))),
+        pulls={"apiary/%234-attempt-3": pull(11, "apiary/%234-attempt-3")},
+        max_attempts=3,
+    )
+
+    # Unexplained, because the store records no renewal either: the account
+    # for a spent counter against a live label is `budget-renewed` when the
+    # store says so and nothing at all when it does not.
+    assert [(one.divergence.derived, one.kind) for one in found.explained] == [
+        ("needs-human", "")
+    ]
+
+
+def test_a_created_container_over_a_spent_counter_is_not_the_create_window():
+    """Same shape, same reason: the container is irrelevant once the counter
+    outranks it, so `container-created` would be an account of nothing."""
+    found, _ = shadow(
+        report(entry(4, label=CLAIMED)),
+        containers=[handle(4, state=CREATED_STATE)],
+        pulls={"apiary/%234-attempt-3": pull(11, "apiary/%234-attempt-3")},
+        max_attempts=3,
+    )
+
+    assert [one.kind for one in found.explained] != [CONTAINER_CREATED]
+    assert found.explained[0].divergence.derived == "needs-human"
+
+
+def test_a_merge_over_a_derived_blocked_is_not_the_merge_window():
+    """A task the merge gate merged whose resolver said `blocked` did not see
+    the pull request that merged. That is news about the resolver."""
+    from swarm.orchestrator.checks import ChecksPlan, ChecksReport
+
+    merged = report(
+        replace(entry(4, label=DONE), blocked_by=(ref(9),)),
+        entry(9, label=READY),
+        checks=ChecksReport(plan=ChecksPlan(), merged=(4,)),
+    )
+    found, _ = shadow(merged)
+
+    kinds = {one.divergence.task_id: one.kind for one in found.explained}
+
+    assert kinds["task-4"] == ""
+    assert found.explained[0].divergence.derived == "blocked"
 
 
 def test_a_work_item_closed_as_not_planned_is_named_as_a_gap_not_a_law():
@@ -604,15 +810,25 @@ def test_a_closed_completed_item_reads_landed_rather_than_diverging():
 def test_show_reports_a_divergence_count_without_anybody_reading_the_jsonl(tmp_path):
     """#146's third criterion."""
     events = [
-        {"event": STATE_SHADOW, "cycle": 0, "tasks": 2, "divergences": 2, "unexplained": 1},
+        {
+            "event": STATE_SHADOW,
+            "cycle": 0,
+            "tasks": 2,
+            "independent": 1,
+            "divergences": 2,
+            "unexplained": 1,
+        },
         {"event": STATE_DIVERGENCE, "task": "a", "kind": INFRASTRUCTURE_CEILING},
         {"event": STATE_DIVERGENCE, "task": "b", "kind": ""},
     ]
     tally = DivergenceTally.from_events(events)
 
     assert (tally.ran, tally.cycles, tally.total, tally.unexplained) == (True, 1, 2, 1)
+    assert (tally.compared, tally.independent) == (2, 1)
     assert tally.by_kind == ((INFRASTRUCTURE_CEILING, 1),)
-    assert tally.tasks == ("b",)
+    assert tally.unexplained_tasks == ("b",)
+    assert "2 task-cycle(s) compared" in tally.text()
+    assert "1 of them independent" in tally.text()
     assert "1 unexplained" in tally.text()
     assert "unexplained on: b" in tally.text()
 
@@ -627,12 +843,15 @@ def test_show_says_not_run_rather_than_implying_a_clean_run():
 def test_show_prints_the_tally_for_a_real_run(tmp_path):
     run = Run.start(REPO, "shadow a run", run_id=RUN_ID)
     artifacts = RunArtifacts.open(run, root=tmp_path)
-    artifacts.event(STATE_SHADOW, cycle=0, tasks=1, divergences=1, unexplained=0)
+    artifacts.event(
+        STATE_SHADOW, cycle=0, tasks=1, independent=1, divergences=1, unexplained=0
+    )
     artifacts.event(STATE_DIVERGENCE, cycle=0, task="task-4", kind=INFRASTRUCTURE_CEILING)
 
     text = show_text(read_run(artifacts.path))
 
-    assert "derived shadow: 1 divergence(s) over 1 cycle(s), 0 unexplained" in text
+    assert "derived shadow: 1 task-cycle(s) compared over 1 cycle(s)" in text
+    assert "1 divergence(s), 0 unexplained" in text
     assert f"{INFRASTRUCTURE_CEILING} 1" in text
 
 
@@ -675,26 +894,46 @@ def test_a_shadowed_cycle_records_a_line_the_corpus_loader_accepts(tmp_path):
 
 def test_a_recorded_cycle_replays_to_the_same_divergences(tmp_path):
     """The round trip, and the only assertion that proves the recorder records
-    the observation the resolver actually saw rather than a plausible one."""
+    the observation the resolver actually saw rather than a plausible one.
+
+    Compared against `ShadowWindow.last` - the report from the cycle that did
+    the recording - rather than against a second `run()` afterwards. A second
+    run has to be handed the facts again, and a version of this test that
+    handed it none passed only because the fixture happened to have no
+    containers and no pull requests at that moment: it compared two different
+    observations while looking like it compared one. The fixture below now has
+    both, so an empty one would fail.
+    """
     from fixtures.corpus import load_corpus
+    from swarm.github.branches import task_branch
     from swarm.orchestrator.derived import diverge, resolve
 
     run = Run.start(REPO, "replay a cycle", run_id=RUN_ID)
     artifacts = RunArtifacts.open(run, root=tmp_path)
 
-    client, fleet, loop, _ = a_lifecycle_run(label=CLAIMED)
+    client, fleet, loop, _ = a_lifecycle_run()
     loop.artifacts = artifacts.results_dir
     loop.record = artifacts.observed
     live = ShadowWindow()
     loop._shadow = live
-    cycle = loop.cycle()
-    reported = live.run(cycle, record=None)
 
-    replayed = load_corpus(artifacts.path).cycles[0]
+    loop.cycle()  # dispatch: a running container for this task
+    # …and now a pull request and a result record, without clearing the
+    # container, so the recorded cycle carries all three.
+    client.open_pulls = ((TASK_PULL, task_branch(ref(TASK_ISSUE), 0)),)
+    client.check_runs = {client.head_of(TASK_PULL): pending()}
+    write_result(record(TASK_ISSUE, 0, attempt=0, reason="verified"), artifacts.results_dir)
+    loop.cycle()
+    reported = live.last
+
+    replayed = load_corpus(artifacts.path).cycles[-1]
     again = diverge(resolve(replayed.observation), replayed.control)
 
+    # The observation really did carry the three things a thin one would not.
+    assert replayed.observation.containers and replayed.observation.pulls
+    assert replayed.observation.results
+    assert reported is not None and reported.cycle == replayed.index
     assert {one.key for one in again} == {one.divergence.key for one in reported.explained}
-    assert again  # or the round trip is proving nothing
 
 
 def test_the_recorder_writes_a_line_per_cycle_and_the_manifest_once(tmp_path):
@@ -751,7 +990,7 @@ def test_the_recorder_never_raises_into_the_cycle(tmp_path, capsys):
         raise OSError("no space left on device")
 
     window = ShadowWindow()
-    assert window.run(report(entry(4, label=READY)), record=explode) is None
+    assert window.run(report(entry(4, label=READY)), pulls={}, record=explode) is None
     assert "derived-state shadow failed" in capsys.readouterr().err
 
 

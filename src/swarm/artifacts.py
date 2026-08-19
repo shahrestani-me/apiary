@@ -93,6 +93,7 @@ __all__ = [
     "CONSOLE_ROOT_ENV",
     "CONTAINER_LOGGED",
     "CORPUS_MANIFEST_NAME",
+    "CORPUS_SCHEMA",
     "CYCLE_FINISHED",
     "CYCLE_STARTED",
     "DEFAULT_ARTIFACTS_ROOT",
@@ -179,6 +180,13 @@ OBSERVED_LOG_NAME = "observed.jsonl"
 #: each one - `tests/fixtures/runs/README.md`'s rule, and the one part of
 #: recording a machine must not do on somebody's behalf.
 CORPUS_MANIFEST_NAME = "corpus.json"
+#: The corpus format's schema number, owned here because the recorder stamps it
+#: and `tests/fixtures/corpus.py` checks it. Two spellings would be worse than
+#: none: the loader only refuses a number *greater* than its own, so a bump made
+#: on one side alone would leave the recorder stamping the old number and the
+#: loader silently reading new-meaning fields as old ones. Bumped when a field
+#: in `observed.jsonl` changes meaning, never when one is added.
+CORPUS_SCHEMA = 1
 SUMMARY_FILE_NAME = "summary.json"
 RESULTS_DIR_NAME = "results"
 LOGS_DIR_NAME = "logs"
@@ -918,7 +926,7 @@ class RunArtifacts:
             self._write_json(
                 target,
                 {
-                    "schema": 1,
+                    "schema": CORPUS_SCHEMA,
                     "origin": "recorded",
                     "describes": self.run.objective or f"recorded run {self.run.id}",
                     "exercises": [],
@@ -1187,6 +1195,19 @@ class DivergenceTally:
 
     ran: bool = False
     cycles: int = 0
+    #: Cycles the window ran and could not see - `checks.read_pulls` answered
+    #: `None`. Counted apart from `cycles` because a blind cycle compared
+    #: nothing and must not be read as a cycle that agreed.
+    blind: int = 0
+    #: Task-cycles compared, and the subset whose label the cycle did **not**
+    #: write. Without the first, "0 divergences over 40 cycles" is printed for a
+    #: run that compared nothing - unmeasured reading as clean, which is the
+    #: failure this whole tally exists to prevent, one level up. Without the
+    #: second, a reader cannot tell how much of a clean window was the cycle
+    #: agreeing with its own arithmetic: see `orchestrator/shadow.py`'s
+    #: "What a clean window is, and is not, evidence of".
+    compared: int = 0
+    independent: int = 0
     total: int = 0
     unexplained: int = 0
     #: Kind -> count, expected kinds only, in descending order of count.
@@ -1195,11 +1216,14 @@ class DivergenceTally:
     #: Named rather than counted for `derived.Divergence`'s reason: a count is
     #: compatible with every disagreement being on the one state ADR 0001
     #: reports outbound.
-    tasks: tuple[str, ...] = ()
+    unexplained_tasks: tuple[str, ...] = ()
 
     @classmethod
     def from_events(cls, events: Iterable[Mapping[str, Any]]) -> DivergenceTally:
         cycles = 0
+        blind = 0
+        compared = 0
+        independent = 0
         total = 0
         unexplained = 0
         kinds: dict[str, int] = {}
@@ -1210,6 +1234,11 @@ class DivergenceTally:
             if name == STATE_SHADOW:
                 ran = True
                 cycles += 1
+                if payload.get("blind"):
+                    blind += 1
+                    continue
+                compared += int(payload.get("tasks") or 0)
+                independent += int(payload.get("independent") or 0)
                 continue
             if name != STATE_DIVERGENCE:
                 continue
@@ -1226,25 +1255,42 @@ class DivergenceTally:
         return cls(
             ran=ran,
             cycles=cycles,
+            blind=blind,
+            compared=compared,
+            independent=independent,
             total=total,
             unexplained=unexplained,
             by_kind=tuple(sorted(kinds.items(), key=lambda one: (-one[1], one[0]))),
-            tasks=tuple(tasks),
+            unexplained_tasks=tuple(tasks),
         )
 
     def text(self) -> str:
-        """The line `swarm show` prints. Says "not run" rather than implying clean."""
+        """The lines `swarm show` prints. Coverage first, because a divergence
+        count with no coverage beside it is a number that cannot be read."""
         if not self.ran:
             return "derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)"
-        head = (
-            f"derived shadow: {self.total} divergence(s) over {self.cycles} cycle(s), "
-            f"{self.unexplained} unexplained"
-        )
+        if not self.compared:
+            # Every other branch below would print "0 unexplained" for this,
+            # which is true and reads as a clean run. It is not one: the window
+            # ran and compared nothing.
+            return (
+                f"derived shadow: ran for {self.cycles} cycle(s) and compared no tasks"
+                + (f" ({self.blind} blind)" if self.blind else "")
+                + " - this run is unmeasured, not clean"
+            )
+        lines = [
+            f"derived shadow: {self.compared} task-cycle(s) compared over "
+            f"{self.cycles} cycle(s)"
+            + (f", {self.blind} blind" if self.blind else "")
+            + f"; {self.independent} of them independent of this cycle's own writes"
+        ]
+        head = f"  {self.total} divergence(s), {self.unexplained} unexplained"
         if self.by_kind:
             head += " (" + ", ".join(f"{kind} {count}" for kind, count in self.by_kind) + ")"
-        if self.tasks:
-            head += "\n  unexplained on: " + ", ".join(self.tasks)
-        return head
+        lines.append(head)
+        if self.unexplained_tasks:
+            lines.append("  unexplained on: " + ", ".join(self.unexplained_tasks))
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
