@@ -1,7 +1,8 @@
 # ADR 0001 implementation — replacing the label control plane
 
-Plan for `docs/adr/0001-task-systems-are-integrations.md` (PR #139).
-Status: **proposed, not published as issues.**
+Plan for `docs/adr/0001-task-systems-are-integrations.md`, amended by ADR 0002 and 0003.
+Status: **published as epic #140 with 16 tickets.**
+Revised 2026-08-19, after #135–#138 and #154–#156 landed.
 
 ## Problem
 
@@ -34,7 +35,7 @@ is what proves the seam is not GitHub-shaped.
 |---|---|---|---|
 | Relationship to epic #128 | Absorb #131 as the first ticket, retargeted | It is already "announcement only" and already writes to `events.jsonl` — the ADR's derived-state substrate, ticketed before the ADR existed | Yes |
 | Migration shape | Shadow, prove, then cut over | 988 tests pass today against label semantics; the only honest proof that derived state reproduces them is running both and diffing | Yes |
-| Self-hosting | Must hold at every step | apiary develops itself on this control plane; a broken step blocks its own repair | — |
+| ~~Self-hosting~~ | **Withdrawn** | apiary has never run against its own repository — zero swarm-minted branches or PRs, and the one recorded attempt (`docs/demo-run.md`) died before planning. Verification is against a scratch greenfield target, which is what the swarm actually does | — |
 | Proof bar | GitHub Issues through MCP, Linear later | Same code path with no special case proves the seam; a second tracker then costs config, not migration | Yes |
 
 ## Approach
@@ -59,39 +60,45 @@ Four movements, in order:
 | Risk | Likelihood | Impact | Mitigation / early warning |
 |---|---|---|---|
 | Derived state cannot reproduce label state in some case | Medium | Fatal to the ADR | T4/T5 are an explicit go/no-go before anything is deleted |
-| Cutover misbehaves in ways 988 tests don't catch | Medium | Blocks apiary's own development | `APIARY_STATE_SOURCE=labels` fallback flag, removed only in T11 |
-| Replay corpus is inadequate | High | T4 proves nothing | Corpus must be recorded *after* T1 — today's `events.jsonl` is cycle-level only |
-| MCP server absent or unauthorized in headless runs | Medium | Runs stall | S1 spike decides the headless auth story before T8 |
+| Cutover misbehaves in ways 988 tests don't catch | Medium | Blocks apiary's own development | `APIARY_STATE_SOURCE=labels` fallback flag, removed only in #152 |
+| Replay corpus is inadequate | High | #145 proves nothing | Corpus recorded *after* #141 — today's `events.jsonl` is cycle-level only — and from greenfield runs, since apiary does not run on itself |
+| Nothing dogfoods the control plane daily | High | A derived-state bug surfaces on a demo, not on our own work | Direct consequence of withdrawing self-hosting; #146's shadow window is ten runs rather than two |
+| MCP server absent or unauthorized in headless runs | Medium | Runs stall | S1 spike decides the headless auth story before #149 |
 | Worker containers gain a new egress destination | Low | Security regression | Tracker MCP is orchestrator-only; T7 removes the worker's tracker access entirely |
 
 ## Open questions
 
 | Question | Blocks | Owner |
 |---|---|---|
-| Do Linear/Jira MCP tool shapes fit one capability contract, or need per-server mapping? | T9 | S1 spike |
-| Headless/cron auth for interactively-authorized MCP servers | T8 | S1 spike |
-| Does `swarm show` print terminal labels anywhere that outlives T11? | T11 | T1 |
+| Do Linear/Jira MCP tool shapes fit one capability contract, or need per-server mapping? | #150 | S1 spike |
+| Headless/cron auth for interactively-authorized MCP servers | #149 | S1 spike |
+| Does `swarm show` print terminal labels anywhere that outlives T11? | #152 | #141 |
 
 ## Tickets
 
+Published as epic #140.
+
 | # | Title | Type | Size | Depends on |
 |---|---|---|---|---|
-| T1 | Per-task lifecycle events in the internal vocabulary (retargets #131) | feat | M | — |
-| T2 | `TaskRef` replaces issue numbers through the internal model | refactor | M | — |
-| S1 | Spike: MCP tool-shape survey and headless auth story | spike | S | — |
-| T3 | Branch names carry task ref and attempt | feat | S | T2 |
-| T4 | Derived-state resolver and offline replay equivalence suite | feat | M | T1, T3 |
-| T5 | Shadow the resolver in the live cycle; divergence is an event | feat | M | T4 |
-| T6 | Flip readiness, dispatcher and reconcile to derived state | feat | M | T5 |
-| T7 | The worker stops writing to the tracker | refactor | S | T6 |
-| T8 | MCP client in the orchestrator, with retry discipline and egress | feat | M | S1 |
-| T9 | Tracker capability-contract config, with a doctor check | feat | M | S1 |
-| T10 | GitHub Issues through the MCP path — the self-host proof | feat | M | T6, T8, T9 |
-| T11 | Remove the label control plane | refactor | M | T7, T10 |
-| T12 | Amend architecture-v2.md and issue-contract.md; mark ADR accepted | docs | S | T11 |
+| #141 | Per-task lifecycle events in the internal vocabulary (retargets #131) | feat | M | — |
+| #142 | `TaskRef` replaces issue numbers through the internal model | refactor | M | — |
+| #143 | Spike: MCP tool-shape survey and headless auth story | spike | S | — |
+| #144 | Branch names carry task ref and attempt | feat | S | #142 |
+| #145 | Derived-state resolver and offline replay equivalence suite | feat | M | #141, #144 |
+| #146 | Shadow the resolver in the live cycle; divergence is an event | feat | M | #145 |
+| #147 | Flip readiness, dispatcher and reconcile to derived state | feat | M | #146 |
+| #148 | The worker stops writing to the tracker | refactor | S | #147 |
+| #149 | MCP client in the orchestrator, with retry discipline and egress | feat | M | #143 |
+| #150 | Tracker capability-contract config, with a doctor check | feat | M | #143 |
+| #151 | GitHub Issues through the MCP path — the self-host proof | feat | M | #147, #149, #150 |
+| #152 | Remove the label control plane | refactor | M | #148, #151 |
+| #153 | Amend architecture-v2.md and issue-contract.md; mark ADR accepted | docs | S | #152 |
+| #158 | The console board reads derived state, not labels | feat | M | #147 |
+| #159 | apiary's own task store, holding the failure record (ADR 0002) | feat | M | #142 |
+| #160 | The working modules stay framework-free (ADR 0003) | test | S | — |
 
 **Critical path:** T1 → T4 → T5 → T6 → T7 → T11 → T12
-**Parallel at the start:** T1, T2, S1
+**Parallel at the start:** #141, #142, S1
 **Go/no-go gate:** T4 + T5. If derived state cannot reproduce label state, the
 ADR needs revisiting before anything is deleted.
 
