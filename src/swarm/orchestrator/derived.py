@@ -73,12 +73,15 @@ naming because they are findings about the ADR rather than gaps in this file.
 **The infrastructure ceiling is not in the artifacts.** ADR 0001 says
 `needs-human` is "attempts exhausted, **or the infrastructure cap hit**", and
 `reconcile.infrastructure_streaks` explains in its own docstring why the second
-half cannot be recomputed here: exit 2 does not bump the attempt, so two
-consecutive mechanical failures write the *same* result filename and the
-directory cannot tell one from two. The streak is counted from transitions,
-which are writes. So this module derives the attempt half of `needs-human` and
-nothing else, and an escalation raised on the infrastructure ceiling reads here
-as whatever the task would otherwise be - `eligible`, usually.
+half cannot be recomputed here: what reaches this module is one record per task
+(`summarise_dir(...).latest`), so the second of two consecutive mechanical
+failures displaces the first and the pair is not there to be counted. The
+*directory* can tell them apart - since #177 each failure writes its own file -
+but the observation this module is built from is the map, not the directory. The
+streak is counted from transitions, which are writes. So this module derives the
+attempt half of `needs-human` and nothing else, and an escalation raised on the
+infrastructure ceiling reads here as whatever the task would otherwise be -
+`eligible`, usually.
 
 **The retry budget renews, and the renewal is a stored judgment.**
 `docs/adr/0002-apiary-owns-a-thin-task-store.md` exists because `blocker` and

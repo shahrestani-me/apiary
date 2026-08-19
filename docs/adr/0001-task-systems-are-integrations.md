@@ -115,11 +115,21 @@ somebody has to know in advance which divergences are *expected*.
 
 **The infrastructure ceiling is not derivable at all.** `needs-human` is listed
 above as "attempts exhausted, or the infrastructure cap hit". The second half is
-false. `infrastructure_streaks` counts *transitions*, and exit 2 deliberately
-does not bump the attempt counter — so N consecutive mechanical failures write
-the *same* result filename, and the results directory cannot tell one from
-three. A run at the cap reads as `eligible` from the artifacts while the label
-says `swarm:failed`.
+false — though not for the reason given here until #217, which was that N
+consecutive mechanical failures write the *same* result filename. They do not,
+and have not since #177: `write_result` never replaces an existing record, it
+bumps the filename on collision, so two mechanical failures at one attempt write
+two files, and since #218 `latest` orders records by what they say rather than
+by how the directory lists them.
+
+What is not derivable is the *count*. `summarise_dir(...).latest` hands back
+**one record per task** — the newest — so the second mechanical failure displaces
+the first in that map rather than adding to it, and a streak is not a thing the
+map has room for. That is why `infrastructure_streaks` counts *transitions*: a
+transition fires once per verdict a cycle actually acted on, which is a fact
+about what the orchestrator did rather than one the results directory holds. A
+run at the cap reads as `eligible` from the artifacts while the label says
+`swarm:failed`.
 
 **A renewed per-blocker budget is not derivable from the code host.**
 `_retry_or_give_up` gives up on `streak`, not `attempt`, and the blocker

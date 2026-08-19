@@ -137,7 +137,7 @@ argument. `Explained.kind` is empty for the ones nobody has an account of, and
 
 | Kind | The account |
 |---|---|
-| `infrastructure-ceiling` | `infrastructure_streaks` counts transitions and exit 2 does not bump the attempt, so N mechanical failures write one result filename. Not in the artifacts at all. |
+| `infrastructure-ceiling` | `infrastructure_streaks` counts transitions, because the observation carries one record per task (`summarise_dir(...).latest`) and consecutive mechanical failures displace one another in it. Not in the artifacts at all. |
 | `budget-renewed` | `_retry_or_give_up` gives up on `streak`, not `attempt`, and a renewal is an ADR 0002 store judgment. |
 | `revived` | `planner.revive` "resets nothing", so the counter reads spent while the label reads ready. Converges on merge. |
 | `merged-this-cycle` | The merge gate landed it after the world was read. |
@@ -709,9 +709,10 @@ def classify(
             why = (
                 f"this task has {streak} consecutive infrastructure verdicts against a "
                 f"cap of {infrastructure_cap}. ADR 0001: the ceiling is counted from "
-                "transitions and exit 2 does not bump the attempt, so N mechanical "
-                "failures write one result filename and the artifacts cannot tell one "
-                f"from three. Not derivable at all, and {one.derived} is what the task "
+                "transitions, because exit 2 does not bump the attempt and the "
+                "observation carries one record per task - so N mechanical failures "
+                "displace one another there and the artifacts cannot tell one from "
+                f"three. Not derivable at all, and {one.derived} is what the task "
                 "reads without it."
             )
         elif (

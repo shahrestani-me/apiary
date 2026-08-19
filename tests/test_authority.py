@@ -496,11 +496,11 @@ def test_the_infrastructure_streak_counts_the_same_under_both_sources(
 def test_the_infrastructure_ceiling_still_escalates_though_nothing_can_see_it():
     """ADR 0001's first non-derivable state, and the resolver reads `eligible`.
 
-    Exit 2 does not bump the attempt, so N mechanical failures write one result
-    filename and the artifacts cannot tell one from three. The orchestrator
-    keeps believing its own counter; making the resolver authoritative did not
-    make this derivable, and a cutover that pretended otherwise would retry a
-    broken host forever.
+    The artifacts reach the cycle as one record per task, so N mechanical
+    failures displace one another there and nothing can count them. The
+    orchestrator keeps believing its own counter; making the resolver
+    authoritative did not make this derivable, and a cutover that pretended
+    otherwise would retry a broken host forever.
     """
     task = entry(4)
     held = belief(task, infrastructure={ref(4): 3}, infrastructure_cap=3)
