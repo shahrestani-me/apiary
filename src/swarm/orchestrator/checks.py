@@ -92,9 +92,9 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
-from ..github.refs import issue_number, task_ref
+from ..github.refs import issue_number, pull_number, pull_ref, task_ref
 from ..store import StoreError, TaskStore, record_judgement
-from ..taskref import TaskRef
+from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
@@ -529,7 +529,12 @@ class PullState:
     conditional on the head this cycle inspected.
     """
 
-    number: int
+    #: A `PullRef`, not an `int` (#185). This is the *source* of the pull
+    #: request numbers that end up on `Merge`, `Mergeability` and `Decision`,
+    #: so typing it here is what stops a bare pull request number ever being in
+    #: scope next to an issue's - retyping only the destinations would leave
+    #: `Merge(number=pull.number, ...)` well-typed, which is the bug itself.
+    number: PullRef
     branch: str
     sha: str = ""
     updated_at: dt.datetime | None = None
@@ -555,7 +560,7 @@ class PullState:
     def from_payload(cls, payload: Mapping[str, Any]) -> PullState:
         head = payload.get("head") if isinstance(payload.get("head"), Mapping) else {}
         return cls(
-            number=int(payload.get("number") or 0),
+            number=pull_ref(int(payload.get("number") or 0)),
             branch=str(head.get("ref") or ""),  # type: ignore[union-attr]
             sha=str(head.get("sha") or ""),  # type: ignore[union-attr]
             updated_at=_parse(payload.get("updated_at") or payload.get("created_at")),
@@ -664,12 +669,19 @@ class Merge:
     #: The pull request GitHub is asked to merge. A *different* numbering from
     #: `number`, which is why both are spelled out: `#23: merge PR #101`.
     #:
-    #: **This is the field that makes the `refused` join worth a guard.** A
-    #: `Merge` built with this number in `number`'s place is well-typed, reads
-    #: fine, and mints a ref for a pull request - so the refusal is filed under
-    #: an identity no outcome carries and the `swarm:done` goes out anyway.
-    #: `apply_checks` checks for exactly that before it merges anything.
-    pull: int
+    #: **This is the field the two numberings used to collide on, and #185 is
+    #: why they cannot any more.** A `Merge` built with this number in
+    #: `number`'s place used to be well-typed, read fine, and mint a ref for a
+    #: pull request - so the refusal was filed under an identity no outcome
+    #: carried and the `swarm:done` went out anyway. `PullRef` is nominally
+    #: distinct from the `int` beside it, so mypy now rejects the swap in both
+    #: directions and it is not expressible rather than merely detected.
+    #:
+    #: #184's `UnresolvedJoin` guard in `apply_checks` stays regardless: it
+    #: catches the same consequence arising from a *human* error - two records
+    #: that genuinely disagree about which task a merge belongs to - which no
+    #: type can rule out.
+    pull: PullRef
     branch: str
     sha: str = ""
     merge_method: str = "squash"
@@ -689,7 +701,9 @@ class Merge:
     def __str__(self) -> str:
         how = "admin override" if self.admin_override else "no override"
         after = f", deleting {self.branch}" if self.delete_branch else ""
-        return f"#{self.number}: merge PR #{self.pull} ({self.merge_method}, {how}{after})"
+        # `{self.pull}` renders `#101` on its own - the ref carries the `#` -
+        # so the literal one is gone and the printed line is byte-identical.
+        return f"#{self.number}: merge PR {self.pull} ({self.merge_method}, {how}{after})"
 
 
 @dataclass(frozen=True)
@@ -958,18 +972,18 @@ def _decide_passed(
         return Outcome(
             entry.number,
             PASSED,
-            f"checks passed - waiting for a human to merge PR #{pull.number} "
+            f"checks passed - waiting for a human to merge PR {pull.number} "
             f"({ADMIN_OVERRIDE_ENV} is off)",
         )
     return Outcome(
         number=entry.number,
         verdict=PASSED,
-        detail=f"{checks.summary()}; merging PR #{pull.number}",
+        detail=f"{checks.summary()}; merging PR {pull.number}",
         transition=Transition(
             ref=entry.ref,
             from_label=REVIEW,
             to_label=DONE,
-            reason=f"PR #{pull.number} merged: {checks.summary()}",
+            reason=f"PR {pull.number} merged: {checks.summary()}",
             task_id=entry.task_id,
         ),
         merge=Merge(
@@ -1308,7 +1322,10 @@ def apply_checks(
     for merge in plan.merges:
         try:
             answer = client.merge_pull_request(
-                merge.pull,
+                # Un-minted here and nowhere earlier: this is the endpoint that
+                # takes `{n}` in its path, and #185's point is that the
+                # hand-back is one written-out call at the API boundary.
+                pull_number(merge.pull),
                 merge_method=merge.merge_method,
                 sha=merge.sha or None,
                 commit_title=merge.commit_title or f"swarm: issue #{merge.number}",
@@ -1317,7 +1334,7 @@ def apply_checks(
             # A 405 (not mergeable), a 409 (the head moved since the checks were
             # read) or a ruleset this override does not in fact bypass. The
             # issue keeps `swarm:review` and the next cycle re-reads the checks.
-            failures.append(Failure(merge.number, f"merging PR #{merge.pull}: {exc}"))
+            failures.append(Failure(merge.number, f"merging PR {merge.pull}: {exc}"))
             refused.add(merge.ref)
             continue
         merged.append(merge.number)

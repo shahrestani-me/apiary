@@ -45,7 +45,7 @@ from fixtures import failures
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
-from swarm.github.refs import task_ref
+from swarm.github.refs import pull_number, pull_ref, task_ref
 from swarm.orchestrator.checks import (
     ADMIN_OVERRIDE_ENV,
     BRANCH_METHODS,
@@ -126,7 +126,7 @@ def pull(number: int, *, issue: int, age_s: float = 0.0, draft: bool = False,
     # carries the attempt its open pull request was pushed from, because an
     # exit 0 moves no counter (`reconcile._observe`).
     return PullState(
-        number=number,
+        number=pull_ref(number),
         branch=branch(issue, attempt),
         sha=f"{issue:0>40x}",
         updated_at=NOW - dt.timedelta(seconds=age_s),
@@ -385,7 +385,7 @@ def test_a_green_pull_request_is_merged_and_its_issue_marked_done():
     assert [str(t) for t in plan.transitions] == [
         "#23: swarm:review -> swarm:done (PR #101 merged: 1 passed)"
     ]
-    assert plan.merges[0].pull == 101
+    assert plan.merges[0].pull == pull_ref(101)
     assert plan.merges[0].admin_override is True
 
 
@@ -698,7 +698,7 @@ def test_the_pull_request_listing_is_probed_for_rather_than_assumed():
     # cannot reach each other from deadlocking.
     assert read_pulls(BlindClient()) is None
     found = read_pulls(FakeClient(open_pulls=((101, branch(23)),)))
-    assert found is not None and found[branch(23)].number == 101
+    assert found is not None and found[branch(23)].number == pull_ref(101)
 
 
 def test_check_runs_that_could_not_be_read_are_pending_not_failed():
@@ -851,17 +851,25 @@ def green_plan(*numbers: int) -> ChecksPlan:
 def filed_under_the_pull_request(plan: ChecksPlan, number: int) -> ChecksPlan:
     """`plan` with one merge's task identity replaced by its pull request's.
 
-    The drift this join has to survive, in the one form the module makes easy:
-    `Merge` carries `number` (the issue) beside `pull` (the pull request), and a
-    `Merge` built with the second in the first's place is well-typed, prints
-    plausibly, and mints a `TaskRef` for a pull request. Nothing else about the
+    The drift this join has to survive: `Merge` carries `number` (the issue)
+    beside `pull` (the pull request), and a `Merge` whose first field holds the
+    second's value mints a `TaskRef` for a pull request. Nothing else about the
     plan changes - the `Outcome` still answers for the issue, which is exactly
     what makes the two halves disagree.
+
+    **The `pull_number` call is the point of #185, not an inconvenience.** This
+    helper used to read `outcome.merge.pull` straight into `number`, because
+    both were `int` and the module made that the easy mistake to make. It no
+    longer type-checks: the value has to be un-minted, by name, before it will
+    go in the other field. What is left after that is a *human* error - a caller
+    who fetched the wrong number in the first place - and #184's guard is what
+    catches those, which is why it stays and why this test does too.
     """
     outcomes = []
     for outcome in plan.outcomes:
         if outcome.number == number and outcome.merge is not None:
-            outcome = replace(outcome, merge=replace(outcome.merge, number=outcome.merge.pull))
+            drifted = replace(outcome.merge, number=pull_number(outcome.merge.pull))
+            outcome = replace(outcome, merge=drifted)
         outcomes.append(outcome)
     return replace(plan, outcomes=tuple(outcomes))
 

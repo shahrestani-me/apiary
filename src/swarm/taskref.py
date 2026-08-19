@@ -41,6 +41,34 @@ un-mint the ref first. A tracker id is not a safe token - `#42` cannot be a
 container name - so somebody has to make one, and the choice is between the
 type that owns the value and every consumer inventing its own rule.
 
+**A pull request is not a task, and now says so in the type (#185).** `PullRef`
+sits below `TaskRef` in this module and shares nothing with it but the shape.
+It exists because `Merge` carries a task's number beside a pull request's, and
+while both were `int` the two could be filled in the wrong order and still
+type-check: a `Merge` built with the pull request in the issue's place minted a
+perfectly valid ref, just one addressing a pull request - so the refusal was
+filed under an identity no outcome answered to, and `swarm:done` went out for a
+merge that never happened. The type gate caught a *retype* and could not catch
+a *mis-sourcing*, because `task_ref()` never knew which of the two ints it had
+been handed.
+
+Two nominal types is the whole fix: `TaskRef` and `PullRef` are unrelated
+classes, so mypy rejects each in the other's place and the swap stops being
+expressible rather than being caught a layer later by a guard. They are
+deliberately *not* siblings under a common base - a base class is a hole,
+because anything annotated with it accepts both again and the two vocabularies
+re-merge at the first helper that takes one.
+
+`PullRef` is *not* opaque in `TaskRef`'s sense, and the asymmetry is ADR 0001's.
+A task system is pluggable, so core may not know how its ids are spelled; the
+*code host* is GitHub and stays GitHub-shaped, so a pull request's number is an
+address rather than an identity. `github/refs.py` mints and un-mints it -
+`pull_ref` / `pull_number`, beside `task_ref` / `issue_number` - and un-minting
+it is ordinary rather than a smell: a `PullRef` exists precisely so that it can
+be handed back to `PUT /pulls/{n}/merge` in the end. What the type buys is that
+the hand-back is a written-out call at the API boundary rather than an int
+drifting through four records on its way there.
+
 **What this does not yet buy.** `LedgerEntry` carries a `number` beside its
 `ref`, and the modules above still read that number wherever they address the
 GitHub API - a branch name, a label write, a comment. `TaskRef` is opaque; the
@@ -158,3 +186,33 @@ class TaskRef:
             # at spawn time would blame the container layer for a bad ref.
             raise ValueError(f"task ref {self.value!r} has no Docker-safe form")
         return token
+
+
+@dataclass(frozen=True)
+class PullRef:
+    """One pull request's address on the code host, in that host's spelling.
+
+    A separate class from `TaskRef` rather than a flag on it, and that is the
+    entire mechanism: mypy rejects one where the other is expected, so the two
+    numberings that `Merge`, `Mergeability` and `Decision` carry side by side
+    can no longer be filled in the wrong order (#185). See this module's
+    docstring for why they share no base class.
+
+    Construct these through the adapter (`github.refs.pull_ref`) and read the
+    number back out through `github.refs.pull_number` when an endpoint needs
+    it. Unlike `TaskRef`, un-minting is the expected end of the value's life,
+    not a leak - a pull request number is an API address and never an identity
+    the internal model keys anything on.
+    """
+
+    value: str
+
+    def __post_init__(self) -> None:
+        # Same rule as `TaskRef`, for the same reason: a blank address surfaces
+        # much later, as a request to an endpoint that is missing its path
+        # segment rather than as a bad record.
+        if not self.value or self.value.strip() != self.value:
+            raise ValueError(f"pull ref {self.value!r} is empty or padded")
+
+    def __str__(self) -> str:
+        return self.value
