@@ -41,6 +41,7 @@ from fixtures.github import response
 from fixtures.repo import VERIFY_COMMAND, ScratchRepo
 
 from swarm.containers.manager import ContainerManager, ContainerTimeout, Handle
+from swarm.github.refs import task_ref
 from swarm.run import Run
 from swarm.state import FileEdit, WorkerOutput
 from swarm.worker.entrypoint import (
@@ -336,7 +337,7 @@ def test_a_timeout_kill_still_yields_a_result(artifacts):
         }
     )
     manager = ContainerManager(run=Run.start(REPO, "add retry logic"), runner=runner, env={})
-    spawned = manager.spawn(ISSUE, BASE_COMMIT)
+    spawned = manager.spawn(task_ref(ISSUE), BASE_COMMIT, issue=ISSUE)
     started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=600)
 
     with pytest.raises(ContainerTimeout):
@@ -474,6 +475,49 @@ def test_unknown_fields_are_ignored_and_derived_ones_are_recomputed(artifacts):
     record = read_result(path)
 
     assert record.outcome == "infrastructure" and not record.consumes_attempt
+
+
+def test_the_record_lists_deletions_apart_from_writes(artifacts):
+    """A deleted file listed under `written` would send a reader of the summary
+    looking for contents that no longer exist. The field is additive with a
+    default, like `image`: no schema bump, and a record written before it
+    existed still loads."""
+    record = a_record(deleted=("obsolete.py",))
+
+    payload = record.to_dict()
+    assert payload["written"] == ["calc.py"]
+    assert payload["deleted"] == ["obsolete.py"]
+    assert read_result(write_result(record, artifacts)).deleted == ("obsolete.py",)
+
+    elder = {key: value for key, value in payload.items() if key != "deleted"}
+    assert ResultRecord.from_dict(elder).deleted == ()
+
+
+def test_from_worker_carries_the_deletions(tmp_path):
+    result = WorkerResult(
+        issue=ISSUE,
+        repo=REPO,
+        task_id="drop-legacy",
+        branch=f"swarm/issue-{ISSUE}",
+        root=tmp_path,
+        verify_command="pytest -q",
+        verify_output="1 passed",
+        passed=True,
+        commit="abc1234",
+        deleted=("obsolete.py",),
+    )
+
+    record = from_worker(result, run_id=RUN_ID, attempt=1)
+
+    assert record.deleted == ("obsolete.py",)
+    # A deletion is an edit that landed: the reason must not claim otherwise
+    # when a cleanup-only attempt fails its gate.
+    failed = from_worker(
+        WorkerResult(**{**vars(result), "passed": False, "commit": None}),
+        run_id=RUN_ID,
+        attempt=1,
+    )
+    assert failed.reason == "the verify command failed"
 
 
 def test_a_naive_timestamp_is_read_as_utc():

@@ -276,7 +276,13 @@ def pull_request_body(result: WorkerResult) -> str:
     #<n>` last and alone on its line: it is what makes the merge close the
     issue, which is how `swarm:done` is ever reached.
     """
-    written = [f"- `{path}`" for path in result.written] or ["- _nothing_"]
+    # Deletions are named as deletions: a removed file listed as a plain
+    # change would send the reviewer looking for new contents that do not
+    # exist, which is the opposite of what "What changed" is for.
+    written = [
+        *(f"- `{path}`" for path in result.written),
+        *(f"- `{path}` (deleted)" for path in result.deleted),
+    ] or ["- _nothing_"]
     lines = [
         f"Opened by an apiary worker for issue #{result.issue} (`{result.task_id}`).",
         "",

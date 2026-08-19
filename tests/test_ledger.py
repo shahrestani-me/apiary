@@ -41,6 +41,7 @@ from swarm.github.ledger import (
     resolve_state_label,
     slugify,
 )
+from swarm.github.refs import task_ref as ref
 
 
 # --------------------------------------------------------------------------
@@ -204,7 +205,7 @@ def test_code_span_in_goal_does_not_open_a_section():
     """
     contract = parse_contract(11, REAL_ISSUE_11)
 
-    assert contract.blocked_by == (9,)
+    assert contract.blocked_by == (ref(9),)
     assert contract.goal.startswith("An issue is labelled `swarm:ready`")
     assert contract.files == ("src/swarm/github/readiness.py", "tests/test_readiness.py")
     assert contract.verify == "python -m pytest -q tests/test_readiness.py"
@@ -217,7 +218,7 @@ def test_fenced_headings_open_no_section():
     # text inside `## Goal`, so none of them is a repeat and none of them wins.
     assert contract.files == ("docs/issue-contract.md",)
     assert contract.verify == "test -f docs/issue-contract.md"
-    assert contract.blocked_by == (7,)
+    assert contract.blocked_by == (ref(7),)
     assert "One sentence." in contract.goal
 
 
@@ -260,7 +261,7 @@ def test_prose_outside_the_sections_is_ignored():
 
     contract = parse_contract(3, body)
 
-    assert contract.blocked_by == (7,)
+    assert contract.blocked_by == (ref(7),)
     assert contract.goal == "`http_client.get` retries idempotent requests three times."
 
 
@@ -280,7 +281,7 @@ def test_unrecognised_heading_ends_the_previous_section():
     contract = parse_contract(4, body)
 
     assert contract.verify == "python -m pytest -q tests/test_thing.py"
-    assert contract.blocked_by == (12,)
+    assert contract.blocked_by == (ref(12),)
 
 
 # --------------------------------------------------------------------------
@@ -590,7 +591,7 @@ def test_an_unparseable_issue_is_reported_and_never_dispatched():
     assert list(ledger.entries) == ["add-retry-logic"]
     assert [(e.number, e.section) for e in ledger.errors] == [(30, "Goal")]
     # No partial record: the malformed issue contributes nothing at all.
-    assert 30 not in ledger.by_number
+    assert ref(30) not in ledger.by_ref
 
 
 def test_load_tasks_raises_on_a_malformed_issue_by_default():
@@ -721,7 +722,7 @@ def test_dependencies_outside_the_ledger_are_dropped_from_the_projection():
     ledger = load_ledger(client)
     entry = ledger.entries["add-retry-logic"]
 
-    assert entry.blocked_by == (999,)
+    assert entry.blocked_by == (ref(999),)
     assert entry.depends_on == ()
     assert ledger.tasks["add-retry-logic"]["depends_on"] == []
 
@@ -820,7 +821,7 @@ def test_a_body_with_a_stack_parses_on_the_pre_change_parser(position):
         after.verify,
         after.blocked_by,
     )
-    assert before.blocked_by == (7,)
+    assert before.blocked_by == (ref(7),)
     assert before.stack is None and after.stack == "node"
 
 

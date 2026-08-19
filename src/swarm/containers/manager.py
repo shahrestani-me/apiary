@@ -35,10 +35,18 @@ and "already gone" is the outcome both of them wanted. It is not an error.
 
 Labels are the join key for everything downstream: `apiary.run=<id>` from
 `swarm.run` (#33), which #20 reaps on and #29 names a directory after, plus
-`apiary.issue=<n>`. Every listing in this module filters on the run label. A
+`apiary.issue=<task>`. Every listing in this module filters on the run label. A
 bare `docker ps -a` on a development machine returns the human's databases and
 editors as well, and the caller of a listing here is a function that removes
 what it is handed.
+
+**Nothing here knows which tracker a run reads.** A container is labelled and
+named with `TaskRef.label_value` - the ref's own Docker-safe form - so this
+module never converts a task id, and `docs/adr/0001-task-systems-are-integrations.md`
+does not acquire an execution plane that only works for GitHub. The one piece of
+the code host that does live here is the clone URL and the worker's `--issue`
+argument, and both are deliberate: ADR 0001 keeps the *code host* integration
+and narrows only the tracker, and the worker is itself a GitHub client.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 from ..config import SETTINGS
 from ..run import RUN_ID_ENV, RUN_LABEL, SUFFIX_ALPHABET, Run, validate_run_id
+from ..taskref import TaskRef
 
 #: The image #14 builds. Overridable per manager, because a locally built tag
 #: is how anyone tests a worker change before it is published anywhere.
@@ -482,7 +491,7 @@ def find_containers(
     docker: DockerCLI,
     *,
     run_id: str | None = None,
-    issue: int | None = None,
+    task: str | None = None,
 ) -> list[Handle]:
     """Containers this system created, newest first, optionally one run's only.
 
@@ -490,11 +499,16 @@ def find_containers(
     and the daemon on a development machine is shared with everything else the
     human has running - an unfiltered listing here is a `docker rm` sweep across
     somebody's afternoon.
+
+    `task` is a label value, not a task id: `TaskRef.label_value`, which the
+    caller derives. Taking the token rather than the ref is what keeps this
+    function - and the reaper that calls it - free of any opinion about what a
+    task id looks like.
     """
     label = f"label={RUN_LABEL}" + (f"={validate_run_id(run_id)}" if run_id else "")
     args = ["ps", "--all", "--no-trunc", "--filter", label]
-    if issue is not None:
-        args += ["--filter", f"label={ISSUE_LABEL}={int(issue)}"]
+    if task is not None:
+        args += ["--filter", f"label={ISSUE_LABEL}={task}"]
     args += ["--format", _PS_FORMAT]
 
     handles: list[Handle] = []
@@ -686,19 +700,31 @@ class ContainerManager:
 
     def spawn(
         self,
-        issue: int,
+        task: TaskRef,
         base_commit: str,
         *,
+        issue: int | None = None,
         image: str | None = None,
         entrypoint: str | None = None,
         command: Sequence[str] | None = None,
     ) -> Handle:
-        """Create and start one worker container for `issue`, at `base_commit`.
+        """Create and start one worker container for `task`, at `base_commit`.
 
         Created and started as two steps rather than one `docker run -d`: a
         container that was created and then failed to start is still a
         container, and this way there is a handle to dispose it with instead of
         an id that only exists inside a failed command's output.
+
+        **`task` and `issue` are two different things and both are needed.**
+        `task` is what the *container* is: it labels and names it, and `find`
+        matches on it, all through `TaskRef.label_value` so this module never
+        learns a tracker's id format. `issue` is what the *worker* is told, on a
+        command line that reaches a process which opens pull requests and closes
+        issues - the worker is a GitHub client, and ADR 0001 keeps that. Passing
+        one and deriving the other is what would put the coupling back, silently.
+
+        `issue` is therefore required exactly when the default worker command is
+        used; a caller supplying its own `command` - a probe - needs neither.
 
         `image` is per *task*, not per manager: #98 lets an issue declare its
         stack and the toolchain that stack needs is not in one image. The
@@ -711,7 +737,8 @@ class ContainerManager:
         integration tests do and what a `swarm doctor` check would want.
         """
         image = image or self.image
-        name = self._container_name(issue)
+        token = task.label_value
+        name = self._container_name(token)
         args = [
             "create",
             "--name", name,
@@ -724,7 +751,7 @@ class ContainerManager:
             # finished task can sit on zombies until the pids limit bites.
             "--init",
             "--label", f"{RUN_LABEL}={self.run.id}",
-            "--label", f"{ISSUE_LABEL}={int(issue)}",
+            "--label", f"{ISSUE_LABEL}={token}",
             *self.limits.flags(),
             # Docker Desktop resolves this itself; a Linux host does not, and
             # the host's Ollama is the one piece of infrastructure every worker
@@ -740,12 +767,17 @@ class ContainerManager:
 
         created = self._cli(*args).strip().splitlines()
         if not created or not created[-1]:
-            raise ContainerError(f"docker create returned no container id for issue #{issue}")
+            raise ContainerError(f"docker create returned no container id for {task}")
 
         handle = Handle(
             id=created[-1].strip(),
             run_id=self.run.id,
-            issue=int(issue),
+            # `Handle.issue` is the artifact layer's field, not the container's
+            # identity - `worker/result.py` files a record under it and
+            # `artifacts.py` names a log after it, both of which are the code
+            # host's own numbering. It is the number that was passed, never one
+            # read back out of the ref.
+            issue=None if issue is None else int(issue),
             name=name,
             image=image,
         )
@@ -799,9 +831,19 @@ class ContainerManager:
         """Capture, then destroy. Idempotent; see `dispose_container`."""
         return dispose_container(handle, self._cli)
 
-    def find(self, *, issue: int | None = None) -> list[Handle]:
-        """This run's containers, running or not."""
-        return find_containers(self._cli, run_id=self.run.id, issue=issue)
+    def find(self, *, ref: TaskRef | None = None) -> list[Handle]:
+        """This run's containers, running or not, optionally one task's only.
+
+        The filter is `ref.label_value`, the same token `spawn` labelled the
+        container with. The ref is not taken apart and no adapter is consulted,
+        which is the property that lets a run against a tracker whose ids are
+        `ENG-123` find its own containers.
+        """
+        return find_containers(
+            self._cli,
+            run_id=self.run.id,
+            task=None if ref is None else ref.label_value,
+        )
 
     # --- plumbing -------------------------------------------------------
 
@@ -810,7 +852,7 @@ class ContainerManager:
         assert self.docker is not None  # set in __post_init__
         return self.docker
 
-    def _worker_args(self, issue: int, base_commit: str) -> list[str]:
+    def _worker_args(self, issue: int | None, base_commit: str) -> list[str]:
         """The three arguments `Dockerfile.worker`'s entrypoint documents.
 
         The clone URL carries no credential. The token travels as an
@@ -819,6 +861,11 @@ class ContainerManager:
         error would quote it back, and where it would survive in the image's
         history of a `docker commit`.
         """
+        if issue is None:
+            # Reachable only by a caller that wanted the default worker command
+            # without saying which issue it is for, which the worker cannot run:
+            # `--issue` is how it finds the contract to satisfy.
+            raise ContainerError("spawning a worker needs an issue number; pass issue=")
         return [
             "--repo", self.clone_url or f"https://github.com/{self.run.repo}.git",
             "--issue", str(int(issue)),
@@ -841,9 +888,15 @@ class ContainerManager:
             flags += ["--env", name if os.environ.get(name) == value else f"{name}={value}"]
         return flags
 
-    def _container_name(self, issue: int) -> str:
+    def _container_name(self, token: str) -> str:
+        """`apiary-<run>-issue-<token>-<suffix>`; `token` is Docker-safe already.
+
+        Docker names match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, which is exactly the
+        set `TaskRef.label_value` reduces a ref to - so a name is a `#`-free
+        rendering of a ref without this function knowing what a `#` means.
+        """
         tail = "".join(_secrets.choice(SUFFIX_ALPHABET) for _ in range(NAME_SUFFIX_LENGTH))
-        return f"apiary-{self.run.id}-issue-{int(issue)}-{tail}"
+        return f"apiary-{self.run.id}-issue-{token}-{tail}"
 
 
 def _inherited_env() -> dict[str, str]:

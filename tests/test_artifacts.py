@@ -33,6 +33,14 @@ import pytest
 
 from swarm.artifacts import (
     HOST_ROOT_ENV,
+    PR_CHECKS,
+    PR_MERGED,
+    PR_OPENED,
+    TASK_CLAIMED,
+    TASK_ELIGIBLE,
+    TASK_LANDED,
+    TASK_NEEDS_HUMAN,
+    TASK_RESULT,
     host_path,
     EVENT_LOG_NAME,
     RESULTS_DIR_NAME,
@@ -743,3 +751,134 @@ def test_the_image_reaches_the_run_view(root):
     )
 
     assert "apiary-worker-node:latest" in show_text(artifacts.finish())
+
+
+# --------------------------------------------------------------------------
+# The per-task lifecycle (#141)
+# --------------------------------------------------------------------------
+#
+# `events.jsonl` is append-only and read back, so the names below are a
+# published vocabulary rather than a log line. Two things are pinned here: that
+# they exist and are distinct, and that adding them left the *reader* alone -
+# a run recorded before this ticket renders exactly as it did.
+
+
+def test_the_lifecycle_names_are_distinct_and_carry_no_label_vocabulary():
+    """ADR 0001 removes the `swarm:*` labels; these names outlive them.
+
+    Asserted on the constants rather than on a payload, because the constants
+    are what a reader of a recorded run joins on - a rename is a broken replay,
+    which is exactly why `CYCLE_FINISHED` was named beside them.
+    """
+    names = [
+        TASK_ELIGIBLE,
+        TASK_CLAIMED,
+        TASK_RESULT,
+        PR_OPENED,
+        PR_CHECKS,
+        PR_MERGED,
+        TASK_LANDED,
+        TASK_NEEDS_HUMAN,
+    ]
+
+    assert len(set(names)) == len(names)
+    assert not any("swarm" in name for name in names)
+    # The two families a reader groups by, and the reason `task.needs_human`
+    # is spelled with an underscore: `name.split(".")` has to stay two parts.
+    assert all(len(name.split(".")) == 2 for name in names)
+
+
+#: One run's event log exactly as an orchestrator wrote it *before* this
+#: ticket - four names, no task events. Held as a literal rather than produced
+#: by today's writer, because a fixture the current code generates cannot
+#: notice the current code changing.
+PRE_LIFECYCLE_EVENTS = [
+    {"event": "run.started", "run": RUN_ID, "repo": REPO, "objective": OBJECTIVE},
+    {"event": "cycle.started", "run": RUN_ID, "cycle": 0},
+    {
+        "event": "cycle.finished",
+        "run": RUN_ID,
+        "cycle": 0,
+        "api_calls": 3,
+        "inference_calls": 1,
+        "inference_s": 12.5,
+        "model_swaps": 0,
+        "swap_s": 0.0,
+        "peak_queue_depth": 1,
+        "loaded_model": WORKER_MODEL,
+    },
+    {"event": "cycle.reconciled", "run": RUN_ID, "cycle": 0, "live": 1, "summary": "cycle 0"},
+    {"event": "run.finished", "run": RUN_ID, "note": "the plan is exhausted"},
+]
+
+
+def _recorded_before_this_ticket(root: Path) -> Path:
+    """A run directory as it was left by an orchestrator that predates #141."""
+    directory = root / RUN_ID
+    (directory / RESULTS_DIR_NAME).mkdir(parents=True)
+    (directory / "run.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "run_id": RUN_ID,
+                "repo": REPO,
+                "objective": OBJECTIVE,
+                "started_at": "2026-08-14T14:25:30+00:00",
+                "stack": "python",
+                "verify": "python -m pytest -q",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (directory / EVENT_LOG_NAME).write_text(
+        "".join(json.dumps(event) + "\n" for event in PRE_LIFECYCLE_EVENTS), encoding="utf-8"
+    )
+    write_result(
+        a_record(issue=7, exit_code=1, reason="the verify command failed"),
+        directory / RESULTS_DIR_NAME,
+    )
+    return directory
+
+
+def test_show_is_unchanged_for_a_run_recorded_before_the_lifecycle_existed(root):
+    """The acceptance criterion that keeps the log readable in both directions.
+
+    #141 only ever *writes* new names, so a directory that carries none of them
+    must render byte-identically to how it always did: same cycle count folded
+    out of `cycle.finished`, same event count, same "needed a human" section.
+    Pinned as the whole string, because an assertion on a substring would pass
+    for a reader that had started skipping a line.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    directory = _recorded_before_this_ticket(root)
+
+    text = show_text(read_run(directory))
+
+    assert text == "\n".join(
+        [
+            f"run {RUN_ID}",
+            f"  repo       {REPO}",
+            f"  objective  {OBJECTIVE}",
+            "  stack      python",
+            "  verify     python -m pytest -q",
+            "  started    2026-08-14T14:25:30+00:00",
+            "  finished   (never - this run did not reach its end)",
+            "",
+            f"run {RUN_ID}: 1 attempt(s), 1 consumed",
+            "  1 task-failed",
+            "  issue #7 attempt 1: task-failed (exit 1)  the verify command failed",
+            "",
+            "1 cycle(s), 3 API call(s), 1 inference call(s) in 12.5s",
+            "  0 model swap(s) costing 0.0s, peak inference queue depth 1",
+            "  busiest cycle 0: 3 API call(s)",
+            "",
+            "needed a human: #7",
+            "  #7: the verify command failed",
+            "      gate: python -m pytest -q",
+            "      | 1 passed",
+            "",
+            f"{len(PRE_LIFECYCLE_EVENTS)} event(s) in {EVENT_LOG_NAME}, "
+            "0 container log(s) in logs/",
+            f"at {directory}",
+        ]
+    )

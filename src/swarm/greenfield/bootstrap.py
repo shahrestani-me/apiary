@@ -70,6 +70,7 @@ from pydantic import BaseModel, Field
 from ..github.ledger import DEFAULT_STACK, KNOWN_STACKS
 from ..llm import orchestrator_llm, structured
 from ..state import PlannedTask
+from ..taskref import TaskRef
 from .stacks import package_names
 
 #: The task id the bootstrap always carries. Fixed rather than generated,
@@ -396,6 +397,11 @@ class Bootstrap:
 #: minutes per falsification run, twice, at provision time.
 FALSIFY_TIMEOUT_S = 120
 
+#: The task a falsification probe runs as. Not a real task and not pretending
+#: to be one: `spawn` labels every container with a task, and this container
+#: exists for the length of one `docker run` inside `falsify`.
+PROBE_TASK = TaskRef("probe")
+
 #: Commands refused before a container is created.
 #:
 #: Belt and braces: `true` and `exit 0` would be rejected by the decision table
@@ -616,8 +622,12 @@ def _container_run(command: str, tree: Path, *, stack: str = DEFAULT_STACK) -> i
             "--volume", f"{Path(tree).resolve()}:/w",
         ],
     )
+    # Not a task, and it no longer pretends to be one: this container runs a
+    # candidate verify command against a scratch tree and is disposed in this
+    # function. `PROBE_TASK` labels it as what it is, where it used to borrow
+    # issue 0 - which read, to anything listing containers, as a real task.
     handle = manager.spawn(
-        0, "", entrypoint="/bin/sh", command=["-c", f"cd /w && {command}"]
+        PROBE_TASK, "", entrypoint="/bin/sh", command=["-c", f"cd /w && {command}"]
     )
     try:
         return manager.wait(handle, timeout_s=FALSIFY_TIMEOUT_S)

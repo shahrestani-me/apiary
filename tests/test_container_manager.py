@@ -29,11 +29,10 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import pytest
-
-from pathlib import Path
 
 from swarm.containers.manager import (
     DEFAULT_STACK_IMAGES,
@@ -57,6 +56,8 @@ from swarm.containers.manager import (
     find_containers,
     missing_image,
 )
+from swarm.containers import manager as manager_module
+from swarm.github.refs import task_ref
 from swarm.run import RUN_LABEL, Run
 
 #: The repository root, for the one test that asserts a generated command names
@@ -163,7 +164,7 @@ def make_manager(**kwargs: Any) -> tuple[ContainerManager, ScriptedRunner]:
 
 
 def spawned(manager: ContainerManager, issue: int = 7) -> Handle:
-    return manager.spawn(issue, BASE_COMMIT)
+    return manager.spawn(task_ref(issue), BASE_COMMIT, issue=issue)
 
 
 # --------------------------------------------------------------------------
@@ -246,7 +247,7 @@ def test_the_message_of_a_failed_command_is_redacted_too():
 def test_a_worker_container_carries_the_run_and_issue_labels():
     manager, runner = make_manager()
 
-    handle = manager.spawn(11, BASE_COMMIT)
+    handle = manager.spawn(task_ref(11), BASE_COMMIT, issue=11)
 
     # #20 reaps on the run label and #29 names an artifacts directory after it;
     # the issue label is how either of them says which task the logs belong to.
@@ -531,7 +532,7 @@ def test_a_listing_reports_the_issue_each_container_belongs_to():
 def test_a_listing_can_be_narrowed_to_one_issue():
     manager, runner = make_manager()
 
-    manager.find(issue=7)
+    manager.find(ref=task_ref(7))
 
     assert f"label={ISSUE_LABEL}=7" in runner.argv_for("ps")
 
@@ -596,7 +597,9 @@ def live(trivial_image: str) -> ContainerManager:
 
 def shell(manager: ContainerManager, script: str, issue: int = 7) -> Handle:
     """Spawn a probe container running `script`, under this run's labels."""
-    return manager.spawn(issue, BASE_COMMIT, entrypoint="/bin/sh", command=["-c", script])
+    return manager.spawn(
+        task_ref(issue), BASE_COMMIT, issue=issue, entrypoint="/bin/sh", command=["-c", script]
+    )
 
 
 @pytest.mark.docker
@@ -640,7 +643,7 @@ def test_the_logs_of_a_failed_container_survive_its_removal(live: ContainerManag
 def test_a_still_running_container_is_disposable_and_disposal_repeats(live: ContainerManager):
     handle = shell(live, 'echo "working"; sleep 300')
 
-    assert [h.id for h in live.find(issue=7)] == [handle.id]
+    assert [h.id for h in live.find(ref=task_ref(7))] == [handle.id]
     captured = live.dispose(handle)
     live.dispose(handle)
 
@@ -795,7 +798,7 @@ def test_the_image_variable_matches_the_workers_own():
 def test_a_spawn_uses_the_image_it_was_given_not_the_managers():
     manager, runner = make_manager()
 
-    handle = manager.spawn(7, BASE_COMMIT, image="apiary-worker-node")
+    handle = manager.spawn(task_ref(7), BASE_COMMIT, issue=7, image="apiary-worker-node")
 
     assert handle.image == "apiary-worker-node"
     assert "apiary-worker-node" in runner.argv_for("create")
@@ -805,7 +808,7 @@ def test_a_spawn_with_no_image_still_uses_the_managers():
     """A run whose tasks never declare anything must keep working unchanged."""
     manager, runner = make_manager()
 
-    handle = manager.spawn(7, BASE_COMMIT)
+    handle = manager.spawn(task_ref(7), BASE_COMMIT, issue=7)
 
     assert handle.image == WORKER_IMAGE
     assert WORKER_IMAGE in runner.argv_for("create")
@@ -816,7 +819,7 @@ def test_the_worker_is_told_which_image_it_is_running_in():
     working, so #97's result record can only name the image if it is told."""
     manager, runner = make_manager()
 
-    manager.spawn(7, BASE_COMMIT, image="apiary-worker-node")
+    manager.spawn(task_ref(7), BASE_COMMIT, issue=7, image="apiary-worker-node")
 
     assert f"{IMAGE_ENV}=apiary-worker-node" in runner.argv_for("create")
 
@@ -862,3 +865,30 @@ def test_the_node_image_carries_node_and_a_writable_npm_cache():
     assert "v22." in logs
     assert "10001" in logs
     assert "cache writable" in logs
+
+
+def test_the_container_layer_never_imports_the_tracker_adapter():
+    """ADR 0001's line, asserted rather than described (#142).
+
+    `swarm/containers/` is the execution plane. It labels, names and finds a
+    container by `TaskRef.label_value`, which is the ref's own Docker-safe
+    form - so a run against a tracker whose ids are `ENG-123` needs nothing
+    here to change. An import of `swarm.github` would put that back silently,
+    and the failure would not surface until somebody wired up a second tracker,
+    which is far too late to find out.
+
+    Deliberately a source scan rather than a check of `sys.modules`: the
+    coupling that matters is the one written down, and an import inside a
+    function would pass a runtime check on any path that did not take it.
+    """
+    package = Path(manager_module.__file__).parent
+    offenders = {
+        source.name: [
+            line.strip()
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.lstrip().startswith(("import ", "from "))
+            and ("swarm.github" in line or "..github" in line or ".github " in line)
+        ]
+        for source in sorted(package.glob("*.py"))
+    }
+    assert {name: lines for name, lines in offenders.items() if lines} == {}

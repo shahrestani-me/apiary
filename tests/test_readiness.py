@@ -25,7 +25,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import pytest
 
 from swarm.github.client import GitHubHTTPError
-from swarm.github.ledger import load_ledger, render_marker
+from swarm.github.ledger import Ledger, load_ledger, render_marker
 from swarm.github.readiness import (
     BLOCKED,
     READY,
@@ -34,9 +34,12 @@ from swarm.github.readiness import (
     apply_readiness,
     compute_readiness,
     find_cycle,
-    referenced_numbers,
+    referenced_refs,
     resolve_states,
 )
+from swarm.github.refs import issue_number
+from swarm.github.refs import task_ref as ref
+from swarm.taskref import TaskRef
 
 
 # --------------------------------------------------------------------------
@@ -131,11 +134,20 @@ def plan_for(client: FakeClient):
 
 
 def verdicts_by_number(plan) -> dict[int, str]:
-    return {verdict.number: verdict.label for verdict in plan.verdicts}
+    """Verdicts back in issue-number terms, so the assertions read as before.
+
+    The plan itself is keyed on `TaskRef` (#142); un-minting here rather than
+    spelling `ref(41)` in thirty assertions keeps these tests about readiness.
+    """
+    return {issue_number(verdict.ref): verdict.label for verdict in plan.verdicts}
+
+
+def refs(numbers) -> tuple[TaskRef, ...]:
+    return tuple(ref(number) for number in numbers)
 
 
 def verdict_for(plan, number: int):
-    return next(verdict for verdict in plan.verdicts if verdict.number == number)
+    return next(verdict for verdict in plan.verdicts if verdict.ref == ref(number))
 
 
 # --------------------------------------------------------------------------
@@ -160,11 +172,11 @@ def verdict_for(plan, number: int):
     ],
 )
 def test_only_a_completed_closure_satisfies(state, reason, satisfied):
-    assert IssueState(7, state, reason).satisfied is satisfied
+    assert IssueState(ref(7), state, reason).satisfied is satisfied
 
 
 def test_a_missing_issue_satisfies_nothing_and_says_why():
-    missing = IssueState.missing(404)
+    missing = IssueState.missing(ref(404))
 
     assert missing.satisfied is False
     assert missing.resolvable is False
@@ -193,16 +205,16 @@ def test_a_linear_chain_releases_one_link_at_a_time():
     plan = plan_for(client)
 
     assert verdicts_by_number(plan) == {41: READY, 42: BLOCKED}
-    assert plan.ready == (41,)
+    assert plan.ready == refs([41])
     # The middle link's own dependency is met; #42 waits on #41 being *closed*,
     # which readiness never does - the merge does.
-    assert [ref.reason for ref in verdict_for(plan, 42).unmet] == ["#41 is open"]
+    assert [unmet.reason for unmet in verdict_for(plan, 42).unmet] == ["#41 is open"]
 
 
 def test_closing_the_middle_link_advances_the_chain():
     client = FakeClient([done(40), done(41, [40]), task(42, [41])])
 
-    assert plan_for(client).ready == (42,)
+    assert plan_for(client).ready == refs([42])
 
 
 def test_a_diamond_waits_for_both_sides():
@@ -228,7 +240,7 @@ def test_a_diamond_apex_waits_for_the_slower_side():
     plan = plan_for(client)
 
     assert verdicts_by_number(plan) == {31: READY, 16: BLOCKED}
-    assert [ref.number for ref in verdict_for(plan, 16).unmet] == [31]
+    assert [unmet.ref for unmet in verdict_for(plan, 16).unmet] == [ref(31)]
 
 
 def test_a_cycle_raises_instead_of_reporting_everything_blocked():
@@ -243,7 +255,7 @@ def test_a_cycle_raises_instead_of_reporting_everything_blocked():
     with pytest.raises(DependencyCycleError) as caught:
         plan_for(client)
 
-    assert caught.value.cycle == (50, 51, 50)
+    assert caught.value.cycle == refs([50, 51, 50])
     assert "#50 -> #51 -> #50" in str(caught.value)
 
 
@@ -253,7 +265,7 @@ def test_a_longer_ring_names_its_whole_path():
     with pytest.raises(DependencyCycleError) as caught:
         plan_for(client)
 
-    assert caught.value.cycle == (50, 52, 51, 50)
+    assert caught.value.cycle == refs([50, 52, 51, 50])
 
 
 def test_an_issue_blocked_by_itself_is_a_cycle():
@@ -262,7 +274,7 @@ def test_an_issue_blocked_by_itself_is_a_cycle():
     with pytest.raises(DependencyCycleError) as caught:
         plan_for(client)
 
-    assert caught.value.cycle == (53, 53)
+    assert caught.value.cycle == refs([53, 53])
 
 
 def test_a_cycle_reached_from_an_acyclic_prefix_is_still_found():
@@ -283,7 +295,7 @@ def test_a_ring_of_completed_work_is_not_a_cycle():
 
     plan = plan_for(client)
 
-    assert plan.ready == (52,)
+    assert plan.ready == refs([52])
 
 
 def test_a_dangling_reference_blocks_and_is_reported():
@@ -297,7 +309,7 @@ def test_a_dangling_reference_blocks_and_is_reported():
     plan = plan_for(client)
 
     assert verdicts_by_number(plan) == {60: BLOCKED}
-    assert [(e.number, e.ref) for e in plan.errors] == [(60, 999)]
+    assert [(e.task, e.ref) for e in plan.errors] == [(ref(60), ref(999))]
     assert verdict_for(plan, 60).errors[0].reason == "#999 does not exist"
 
 
@@ -307,8 +319,8 @@ def test_a_dangling_reference_pulls_a_ready_issue_back():
 
     plan = plan_for(client)
 
-    assert [(v.number, v.current_label, v.label) for v in plan.transitions] == [
-        (60, READY, BLOCKED)
+    assert [(v.ref, v.current_label, v.label) for v in plan.transitions] == [
+        (ref(60), READY, BLOCKED)
     ]
 
 
@@ -353,7 +365,7 @@ def test_the_same_dependency_closed_as_completed_does_unblock():
         [task(70, state="closed", state_reason="completed"), task(71, [70])]
     )
 
-    assert plan_for(client).ready == (71,)
+    assert plan_for(client).ready == refs([71])
 
 
 # --------------------------------------------------------------------------
@@ -373,7 +385,7 @@ def test_only_the_disagreements_are_transitions():
 
     plan = plan_for(client)
 
-    assert [(v.number, v.label) for v in plan.transitions] == [(41, READY), (42, BLOCKED)]
+    assert [(v.ref, v.label) for v in plan.transitions] == [(ref(41), READY), (ref(42), BLOCKED)]
     assert len(plan.verdicts) == 3
 
 
@@ -388,7 +400,7 @@ def test_a_label_is_added_before_the_old_one_is_removed():
 
     plan = apply_readiness(client)
 
-    assert plan.transitions[0].number == 41
+    assert plan.transitions[0].ref == ref(41)
     assert client.writes == [("add", 41, READY), ("remove", 41, BLOCKED)]
 
 
@@ -407,7 +419,7 @@ def test_issues_in_another_state_are_never_relabelled(label):
     assert client.writes == []
     # The dangling ref is still reported - the entry is out of scope for the
     # label, not for the error.
-    assert [e.number for e in plan.errors] == [80]
+    assert [e.task for e in plan.errors] == [ref(80)]
 
 
 def test_a_task_a_human_closed_is_never_readied():
@@ -441,7 +453,7 @@ def test_dry_run_computes_the_same_plan_and_writes_nothing():
 
     plan = apply_readiness(client, dry_run=True)
 
-    assert plan.ready == (41,)
+    assert plan.ready == refs([41])
     assert plan.transitions[0].changed is True
     assert client.writes == []
 
@@ -475,19 +487,19 @@ def test_resolution_reads_closed_issues_too():
 def test_a_reference_outside_the_listing_is_fetched_once():
     client = FakeClient([task(61, [37])], hidden=[{"number": 37, "state": "open"}])
 
-    states = resolve_states(client, [37, 61])
+    states = resolve_states(client, refs([37, 61]))
 
     assert client.fetched == [37]
-    assert states[37].satisfied is False
-    assert states[61].state == "open"
+    assert states[ref(37)].satisfied is False
+    assert states[ref(61)].state == "open"
 
 
 def test_a_404_becomes_a_missing_issue_rather_than_an_exception():
     client = FakeClient([task(60, [999])])
 
-    states = resolve_states(client, referenced_numbers(load_ledger(client, adopt=False)))
+    states = resolve_states(client, referenced_refs(load_ledger(client, adopt=False)))
 
-    assert states[999].exists is False
+    assert states[ref(999)].exists is False
 
 
 def test_other_http_errors_are_not_swallowed():
@@ -498,7 +510,7 @@ def test_other_http_errors_are_not_swallowed():
             raise GitHubHTTPError(403, "GET", f"/issues/{number}", b'{"message": "Forbidden"}')
 
     with pytest.raises(GitHubHTTPError):
-        resolve_states(Forbidden([task(60, [999])]), [999])
+        resolve_states(Forbidden([task(60, [999])]), refs([999]))
 
 
 def test_nothing_referenced_means_no_api_call_at_all():
@@ -509,7 +521,8 @@ def test_nothing_referenced_means_no_api_call_at_all():
 
 
 def test_find_cycle_returns_none_for_a_forest():
-    assert find_cycle({1: (2,), 2: (3,), 3: (), 4: (3,)}) is None
+    forest = {ref(1): refs([2]), ref(2): refs([3]), ref(3): (), ref(4): refs([3])}
+    assert find_cycle(forest) is None
 
 
 def test_a_reference_nobody_resolved_blocks_rather_than_passes():
@@ -523,8 +536,8 @@ def test_a_reference_nobody_resolved_blocks_rather_than_passes():
 
     plan = compute_readiness(ledger, {})
 
-    assert plan.blocked == (41,)
-    assert plan.errors[0].ref == 40
+    assert plan.blocked == refs([41])
+    assert plan.errors[0].ref == ref(40)
 
 
 # --------------------------------------------------------------------------
@@ -556,7 +569,7 @@ def backlog_client(*, merged: Sequence[int] = MERGED) -> FakeClient:
 
 def test_the_real_backlog_is_acyclic():
     """The corpus the contract doc names, walked by the real cycle detector."""
-    assert find_cycle(BACKLOG) is None
+    assert find_cycle({ref(n): refs(edges) for n, edges in BACKLOG.items()}) is None
 
 
 def test_the_real_backlog_readies_exactly_the_issues_whose_work_landed():
@@ -567,8 +580,8 @@ def test_the_real_backlog_readies_exactly_the_issues_whose_work_landed():
     """
     plan = plan_for(backlog_client())
 
-    assert plan.ready == (11, 14, 25, 31, 33)
-    assert 10 in plan.blocked and 16 in plan.blocked
+    assert plan.ready == refs([11, 14, 25, 31, 33])
+    assert ref(10) in plan.blocked and ref(16) in plan.blocked
     assert plan.errors == ()
 
 
@@ -581,8 +594,8 @@ def test_a_cancelled_root_freezes_everything_below_it_in_the_real_backlog():
 
     plan = plan_for(client)
 
-    assert 31 not in plan.ready
-    assert {10, 16, 32}.issubset(set(plan.blocked))
+    assert ref(31) not in plan.ready
+    assert set(refs([10, 16, 32])).issubset(set(plan.blocked))
 
 
 def test_one_bad_reference_in_the_backlog_does_not_stop_the_others():
@@ -592,5 +605,87 @@ def test_one_bad_reference_in_the_backlog_does_not_stop_the_others():
 
     plan = plan_for(client)
 
-    assert [e.number for e in plan.errors] == [36]
-    assert 11 in plan.ready
+    assert [e.task for e in plan.errors] == [ref(36)]
+    assert ref(11) in plan.ready
+
+
+# --------------------------------------------------------------------------
+# Identity is opaque: a ref this adapter did not mint
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ForeignEntry:
+    """A ledger entry from a tracker whose ids are not numbers (#142).
+
+    Deliberately *not* a `LedgerEntry`: that type is the GitHub adapter's
+    record and mints its ref from an issue number, so building the graph out of
+    one could never demonstrate the property under test. This carries only the
+    four fields readiness reads, which is itself the assertion - anything more
+    the graph reached for would be a piece of GitHub it has no business
+    knowing.
+    """
+
+    ref: TaskRef
+    task_id: str
+    state_label: str
+    blocked_by: tuple[TaskRef, ...] = ()
+
+
+def linear_ledger():
+    """`ENG-9 -> ENG-10 -> ENG-11`, with the root already delivered."""
+    entries = [
+        ForeignEntry(TaskRef("ENG-9"), "eng-9", "swarm:done"),
+        ForeignEntry(TaskRef("ENG-10"), "eng-10", BLOCKED, (TaskRef("ENG-9"),)),
+        ForeignEntry(TaskRef("ENG-11"), "eng-11", BLOCKED, (TaskRef("ENG-10"),)),
+    ]
+    return Ledger(entries={entry.task_id: entry for entry in entries})
+
+
+def test_a_non_numeric_ref_survives_the_readiness_graph():
+    """The property this ticket buys: nothing in the graph reads a ref.
+
+    Edges, cycle detection, the satisfied test, the verdicts and the plan's
+    `ready`/`blocked` all run over `ENG-*`, which no amount of `int()` would
+    survive.
+    """
+    states = {
+        TaskRef("ENG-9"): IssueState(TaskRef("ENG-9"), "closed", "completed"),
+        TaskRef("ENG-10"): IssueState(TaskRef("ENG-10")),
+        TaskRef("ENG-11"): IssueState(TaskRef("ENG-11")),
+    }
+
+    plan = compute_readiness(linear_ledger(), states)
+
+    assert plan.ready == (TaskRef("ENG-10"),)
+    assert plan.blocked == (TaskRef("ENG-11"),)
+    assert [str(verdict) for verdict in plan.verdicts] == [
+        "ENG-10 eng-10: ready",
+        "ENG-11 eng-11: blocked - ENG-10 is open",
+    ]
+
+
+def test_a_cycle_of_non_numeric_refs_is_still_a_cycle():
+    """The one failure that must never pass silently, on a foreign tracker."""
+    entries = [
+        ForeignEntry(TaskRef("ENG-1"), "eng-1", BLOCKED, (TaskRef("ENG-2"),)),
+        ForeignEntry(TaskRef("ENG-2"), "eng-2", BLOCKED, (TaskRef("ENG-1"),)),
+    ]
+    ledger = Ledger(entries={entry.task_id: entry for entry in entries})
+
+    with pytest.raises(DependencyCycleError) as caught:
+        compute_readiness(ledger, {})
+
+    assert caught.value.cycle == (TaskRef("ENG-1"), TaskRef("ENG-2"), TaskRef("ENG-1"))
+    assert "ENG-1 -> ENG-2 -> ENG-1" in str(caught.value)
+
+
+def test_a_foreign_ref_never_reaches_the_github_api_by_accident():
+    """`resolve_states` is the adapter half, and it says so rather than guessing.
+
+    A ref another tracker minted has no issue number in it, and the failure
+    mode of inventing one - addressing an unrelated issue in this repository -
+    is worse than the exception.
+    """
+    with pytest.raises(ValueError, match="not minted by the GitHub adapter"):
+        resolve_states(FakeClient([]), [TaskRef("ENG-9")])

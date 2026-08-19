@@ -49,6 +49,7 @@ from swarm.containers.manager import (
     Redactor,
     dispose_container,
 )
+from swarm.github.refs import task_ref
 from swarm.mcp.client import TRACKER_ENDPOINT_ENV, TRACKER_TOKEN_ENV
 from swarm.run import Run
 from swarm.security import (
@@ -432,7 +433,7 @@ def test_the_one_path_that_creates_containers_creates_no_privileged_one(run: Run
     """
     runner = EchoingRunner()
     manager = ContainerManager(run=run, env={"GITHUB_TOKEN": TOKEN}, runner=runner)
-    manager.spawn(28, BASE_COMMIT)
+    manager.spawn(task_ref(28), BASE_COMMIT, issue=28)
 
     assert_unprivileged(runner.argv_for("create"))
 
@@ -465,7 +466,7 @@ def test_a_worker_that_echoes_its_token_leaves_it_in_no_artifact(
     runner = EchoingRunner(echo_text=leaky)
     manager = ContainerManager(run=run, env={"GITHUB_TOKEN": TOKEN}, runner=runner)
 
-    handle = manager.spawn(28, BASE_COMMIT)
+    handle = manager.spawn(task_ref(28), BASE_COMMIT, issue=28)
     captured = manager.dispose(handle)
 
     artifacts = run.artifacts_dir(tmp_path)

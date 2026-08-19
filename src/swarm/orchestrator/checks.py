@@ -92,6 +92,7 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
+from ..github.refs import issue_number
 from ..worker.result import tail
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
@@ -603,6 +604,13 @@ class Outcome:
     attempt must be told.
     """
 
+    #: The issue this row is about. Still a number, where `Transition.ref` -
+    #: the field right below - is a `TaskRef`: #142 retyped the *task-identity
+    #: model* (the dependency graph, readiness and the reconciler's transition)
+    #: and stopped there deliberately, so these policy rows are one vocabulary
+    #: behind. They are internally consistent - built from the same `entry`,
+    #: compared only against each other - and nothing keys a `TaskRef` map on
+    #: one. Moving them is a follow-up, not an oversight.
     number: int
     verdict: str
     detail: str = ""
@@ -689,7 +697,7 @@ def plan_checks(
     moment = now or dt.datetime.now(dt.timezone.utc)
     outcomes: list[Outcome] = []
 
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         if entry.state_label != REVIEW or pulls is None:
             continue
         pull = pulls.get(entry.branch)
@@ -738,7 +746,7 @@ def _decide(
             verdict=FAILING,
             detail=f"CI failed in {names}, outside this issue's ## Files",
             transition=Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=REVIEW,
                 to_label=FAILED,
                 reason=(
@@ -785,7 +793,7 @@ def _decide_empty(
         verdict=EMPTY,
         detail=reason,
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=FAILED,
             reason=reason,
@@ -824,7 +832,7 @@ def _decide_passed(
         verdict=PASSED,
         detail=f"{checks.summary()}; merging PR #{pull.number}",
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=DONE,
             reason=f"PR #{pull.number} merged: {checks.summary()}",
@@ -865,7 +873,7 @@ def _retry_or_give_up(
             verdict=FAILING,
             detail=f"{named} failed; {attempt} attempt(s) against a cap of {cap}",
             transition=Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=REVIEW,
                 to_label=FAILED,
                 reason=f"{named} failed; {attempt} attempt(s) made against a cap of {cap}",
@@ -883,7 +891,7 @@ def _retry_or_give_up(
         verdict=FAILING,
         detail=f"{named} failed; retrying as attempt {attempt} of {cap}",
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=READY,
             reason=f"{named} failed on the pull request",
@@ -1017,6 +1025,23 @@ class ChecksReport:
     #: Comments this client had no method to post. `reconcile.post_comment`
     #: printed them instead.
     uncommented: tuple[int, ...] = ()
+    #: The commit each merge produced, as (issue number, sha) - GitHub's answer
+    #: to the `PUT .../merge`, which this module previously threw away.
+    #: Announcement only: nothing here reads it, and `pr.merged` (#141) is the
+    #: only consumer, because "which commit is this task now" is the one fact
+    #: about a landed task that the run directory could not otherwise recover.
+    #:
+    #: A tuple, like every other collection on this frozen record and for the
+    #: same reason: a `dict` field makes the generated `__hash__` raise, and a
+    #: frozen dataclass that cannot be hashed is frozen in name only. Absent for
+    #: a merge whose response carried no `sha` - `merge_pull_request` is typed
+    #: `Any` and a body-less 200 is a real answer.
+    merge_commits: tuple[tuple[int, str], ...] = ()
+
+    @property
+    def commit_by_issue(self) -> dict[int, str]:
+        """`merge_commits` as a lookup, for the one caller that wants one."""
+        return dict(self.merge_commits)
 
     @property
     def ok(self) -> bool:
@@ -1093,6 +1118,7 @@ def apply_checks(
     undeleted: list[str] = []
     failures: list[Failure] = []
     uncommented: list[int] = []
+    merge_commits: dict[int, str] = {}
 
     if dry_run:
         return ChecksReport(plan=plan)
@@ -1100,7 +1126,7 @@ def apply_checks(
     refused: set[int] = set()
     for merge in plan.merges:
         try:
-            client.merge_pull_request(
+            answer = client.merge_pull_request(
                 merge.pull,
                 merge_method=merge.merge_method,
                 sha=merge.sha or None,
@@ -1114,6 +1140,15 @@ def apply_checks(
             refused.add(merge.number)
             continue
         merged.append(merge.number)
+        # Whatever the merge answered, if it answered anything with a `sha`.
+        # Guarded rather than indexed: `merge_pull_request` is typed `Any`, a
+        # body-less response is a real answer, and a merge that *landed* must
+        # not be reported as a failure because the commit it produced could not
+        # be read back.
+        if isinstance(answer, Mapping):
+            commit = str(answer.get("sha") or "")
+            if commit:
+                merge_commits[merge.number] = commit
         if not merge.delete_branch:
             continue
         (deleted if delete_branch(client, merge.branch) else undeleted).append(merge.branch)
@@ -1125,15 +1160,18 @@ def apply_checks(
         try:
             if transition.attempt is not None or outcome.feedback:
                 _patch_body(client, transition, outcome.feedback)
-            client.add_labels(transition.number, [transition.to_label])
+            # `Transition` is keyed on the task, and every call here addresses
+            # the GitHub API, which takes issue numbers.
+            number = issue_number(transition.ref)
+            client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(transition.number, transition.from_label)
+                client.remove_label(number, transition.from_label)
         except GitHubError as exc:
-            failures.append(Failure(transition.number, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(outcome.number, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
-        if transition.comment and not post_comment(client, transition.number, transition.comment):
-            uncommented.append(transition.number)
+        if transition.comment and not post_comment(client, outcome.number, transition.comment):
+            uncommented.append(outcome.number)
 
     return ChecksReport(
         plan=plan,
@@ -1143,6 +1181,7 @@ def apply_checks(
         failures=tuple(failures),
         undeleted=tuple(dict.fromkeys(undeleted)),
         uncommented=tuple(dict.fromkeys(uncommented)),
+        merge_commits=tuple(merge_commits.items()),
     )
 
 
@@ -1159,13 +1198,14 @@ def _patch_body(client: Any, transition: Transition, feedback: str) -> None:
     with their own idea of where the counter lives is how a counter stops
     bounding anything.
     """
-    issue = client.get_issue(transition.number)
+    number = issue_number(transition.ref)
+    issue = client.get_issue(number)
     body = issue.get("body") or ""
     if transition.attempt is not None and transition.task_id:
         body = rewrite_marker(body, transition.task_id, transition.attempt)
     if feedback:
         body = write_feedback(body, feedback, attempt=transition.attempt or 0)
-    client.update_issue(transition.number, body=body)
+    client.update_issue(number, body=body)
 
 
 # --------------------------------------------------------------------------

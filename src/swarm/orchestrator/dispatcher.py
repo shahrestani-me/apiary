@@ -80,6 +80,7 @@ from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
 from ..run import TERMINAL_LABELS
+from ..taskref import TaskRef
 
 #: The label this module writes, and the one it writes it over. `READY` is
 #: imported rather than respelled because readiness (#11) owns that string; no
@@ -277,7 +278,14 @@ class Spawner(Protocol):
     ordering rule above is a test that does not run.
     """
 
-    def spawn(self, issue: int, base_commit: str, *, image: str | None = None) -> Handle: ...
+    def spawn(
+        self,
+        task: TaskRef,
+        base_commit: str,
+        *,
+        issue: int | None = None,
+        image: str | None = None,
+    ) -> Handle: ...
 
     #: The safe-release probe. A spawn that raised may still have left a
     #: container running - `docker start` can fail this process's read after
@@ -285,7 +293,7 @@ class Spawner(Protocol):
     #: a second worker next cycle. So the claim is only given back when the
     #: daemon says there is nothing there. This is the same question #35's
     #: recovery asks before it releases anything, asked one cycle earlier.
-    def find(self, *, issue: int | None = None) -> list[Handle]: ...
+    def find(self, *, ref: TaskRef | None = None) -> list[Handle]: ...
 
 
 # --------------------------------------------------------------------------
@@ -313,7 +321,7 @@ def held_files(entries: Iterable[LedgerEntry]) -> dict[str, int]:
     over it either way, which is the decision that matters.
     """
     held: dict[str, int] = {}
-    for entry in sorted(entries, key=lambda entry: entry.number):
+    for entry in sorted(entries, key=lambda entry: entry.ref):
         for path in entry.files:
             held.setdefault(normalise(path), entry.number)
     return held
@@ -356,6 +364,15 @@ class DispatchPlan:
 
     @property
     def numbers(self) -> tuple[int, ...]:
+        """The issues this cycle would dispatch, as numbers.
+
+        Numbers rather than `TaskRef`s, unlike `ReconcilePlan.refs` and
+        `RecoveryPlan.refs`: what `ready` *filters* on is identity and was
+        retyped (#142), but this plan's own reporting rows - here, `Deferred`,
+        `DispatchFailure` - were left in the older vocabulary along with
+        `checks` and `mergeability`, so the retype stayed the ticket's size.
+        Nothing keys a `TaskRef` map on these.
+        """
         return tuple(entry.number for entry in self.dispatch)
 
     def summary(self) -> str:
@@ -369,7 +386,7 @@ def plan_dispatch(
     ledger: Ledger,
     *,
     capacity: Capacity | None = None,
-    ready: Iterable[int] | None = None,
+    ready: Iterable[TaskRef] | None = None,
 ) -> DispatchPlan:
     """Choose this cycle's issues. Pure - no API call, no daemon, no model.
 
@@ -389,7 +406,7 @@ def plan_dispatch(
 
     in_flight: list[LedgerEntry] = []
     candidates: list[LedgerEntry] = []
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         if entry.state_label in RESERVING_LABELS:
             in_flight.append(entry)
             continue
@@ -401,7 +418,7 @@ def plan_dispatch(
         if allowed is None:
             if entry.state_label != READY:
                 continue
-        elif entry.number not in allowed or entry.state_label != READY:
+        elif entry.ref not in allowed or entry.state_label != READY:
             continue
         candidates.append(entry)
 
@@ -549,7 +566,7 @@ def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
     issue as still claimed, which is exactly what #35 was built to sweep.
     """
     try:
-        if manager.find(issue=entry.number):
+        if manager.find(ref=entry.ref):
             return False
     except ContainerError:
         # The probe itself could not answer. "Do not release" is the reading
@@ -570,7 +587,7 @@ def dispatch(
     base_commit: str,
     *,
     capacity: Capacity | None = None,
-    ready: Iterable[int] | None = None,
+    ready: Iterable[TaskRef] | None = None,
     dry_run: bool = False,
     images: StackImages | None = None,
 ) -> DispatchReport:
@@ -638,7 +655,12 @@ def dispatch(
             failed.append(DispatchFailure(entry.number, f"claim failed: {exc}", fatal=True))
             break
         try:
-            handle = manager.spawn(entry.number, base_commit, image=image)
+            # Both, and they are not the same fact: the container is labelled
+            # and named by task, and the worker is handed the issue number it
+            # needs to read a contract and open a pull request against it.
+            handle = manager.spawn(
+                entry.ref, base_commit, issue=entry.number, image=image
+            )
         except ContainerError as exc:
             fatal = daemon_is_down(exc)
             if missing_image(exc):

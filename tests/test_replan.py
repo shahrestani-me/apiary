@@ -39,6 +39,7 @@ import pytest
 from fixtures.github import REPO, response
 from swarm.github.client import GitHubError
 from swarm.github.ledger import Ledger, LedgerEntry, load_ledger, render_marker
+from swarm.github.refs import task_ref as ref
 from swarm.nodes.judge import (
     Observation,
     Verdict,
@@ -61,6 +62,7 @@ from swarm.orchestrator.replan import (
     replan,
 )
 from swarm.state import Plan, PlannedTask, ProgressJudgement, TaskRecord
+from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord
 
 READY = "swarm:ready"
@@ -171,10 +173,10 @@ def verdict_of(
     current: Ledger,
     previous: Ledger | None = None,
     *,
-    results: dict[int, ResultRecord] | None = None,
-    prior_results: dict[int, ResultRecord] | None = None,
-    churn: dict[int, int] | None = None,
-    prior_churn: dict[int, int] | None = None,
+    results: dict[TaskRef, ResultRecord] | None = None,
+    prior_results: dict[TaskRef, ResultRecord] | None = None,
+    churn: dict[TaskRef, int] | None = None,
+    prior_churn: dict[TaskRef, int] | None = None,
     stalls: int = 0,
     oracle: Any = None,
 ) -> Verdict:
@@ -257,8 +259,8 @@ def test_the_same_failure_twice_is_a_loop_without_a_model():
     verdict = verdict_of(
         ledger(entry(1, attempt=2), entry(2, label=BLOCKED)),
         ledger(entry(1, attempt=1), entry(2, label=BLOCKED)),
-        results={1: second},
-        prior_results={1: first},
+        results={ref(1): second},
+        prior_results={ref(1): first},
     )
 
     assert verdict.judgement.in_loop and verdict.stalled
@@ -275,8 +277,8 @@ def test_one_task_looping_while_another_lands_is_still_progress():
     verdict = verdict_of(
         after,
         before,
-        results={1: record(1, attempt=1, **failure)},
-        prior_results={1: record(1, attempt=0, **failure)},
+        results={ref(1): record(1, attempt=1, **failure)},
+        prior_results={ref(1): record(1, attempt=0, **failure)},
     )
 
     assert not verdict.judgement.in_loop and verdict.judgement.progress_being_made
@@ -287,7 +289,7 @@ def test_an_infrastructure_failure_is_not_the_tasks_failure():
     # Exit 2 does not consume an attempt (§4) and says nothing about the task,
     # so it must not become the signature two cycles are compared on.
     broken = record(1, exit_code=2, reason="ollama is unreachable")
-    observation = Observation.of(ledger(entry(1)), results={1: broken})
+    observation = Observation.of(ledger(entry(1)), results={ref(1): broken})
 
     assert observation.signals["task-1"].failure == ""
 
@@ -302,7 +304,7 @@ def test_a_pull_request_being_rebased_is_progress_not_a_stall():
     # same attempt, same (absent) failure. Only the base-update count moves.
     review = ledger(entry(1, label=REVIEW), entry(2, label=DONE))
 
-    verdict = verdict_of(review, review, churn={1: 3}, prior_churn={1: 2})
+    verdict = verdict_of(review, review, churn={ref(1): 3}, prior_churn={ref(1): 2})
 
     assert not verdict.stalled and verdict.judgement.progress_being_made
     assert not verdict.consulted
@@ -317,10 +319,10 @@ def test_a_conflicted_pull_request_redispatched_is_not_read_as_a_loop():
     verdict = verdict_of(
         ledger(entry(1, label=READY, attempt=2)),
         ledger(entry(1, label=REVIEW, attempt=1)),
-        results={1: record(1, attempt=1, **conflict)},
-        prior_results={1: record(1, attempt=0, **conflict)},
-        churn={1: 2},
-        prior_churn={1: 1},
+        results={ref(1): record(1, attempt=1, **conflict)},
+        prior_results={ref(1): record(1, attempt=0, **conflict)},
+        churn={ref(1): 2},
+        prior_churn={ref(1): 1},
     )
 
     assert not verdict.judgement.in_loop and not verdict.stalled
@@ -409,7 +411,7 @@ def test_a_failure_outside_the_file_set_needs_a_human_not_a_replan():
         output="src/swarm/orchestrator/reconcile.py:12: ImportError",
     )
 
-    verdict = verdict_of(stuck, stuck, results={1: outside}, prior_results={1: outside})
+    verdict = verdict_of(stuck, stuck, results={ref(1): outside}, prior_results={ref(1): outside})
 
     assert verdict.needs_human
     blocker = verdict.blockers[0]
@@ -425,7 +427,7 @@ def test_a_failure_inside_the_file_set_is_the_tasks_own_problem():
         1, attempt=1, reason="assert failed", output="src/swarm/nodes/judge.py:88: AssertionError"
     )
 
-    assert Observation.of(own, results={1: inside}).blockers == ()
+    assert Observation.of(own, results={ref(1): inside}).blockers == ()
 
 
 def test_one_attempt_is_not_yet_evidence_of_a_wall():
@@ -434,7 +436,7 @@ def test_one_attempt_is_not_yet_evidence_of_a_wall():
     early = ledger(entry(1, attempt=1, files=("src/swarm/nodes/judge.py",)))
     outside = record(1, attempt=0, output="src/swarm/github/client.py:4: ImportError")
 
-    assert Observation.of(early, results={1: outside}).blockers == ()
+    assert Observation.of(early, results={ref(1): outside}).blockers == ()
 
 
 def test_only_paths_the_repository_could_own_are_evidence():
@@ -818,8 +820,8 @@ def test_the_prompt_carries_the_failures_and_every_existing_id():
     verdict = verdict_of(
         tasks,
         tasks,
-        results={1: record(1, attempt=1, reason="ZeroDivisionError")},
-        prior_results={1: record(1, attempt=1, reason="ZeroDivisionError")},
+        results={ref(1): record(1, attempt=1, reason="ZeroDivisionError")},
+        prior_results={ref(1): record(1, attempt=1, reason="ZeroDivisionError")},
         oracle=stall,
     )
 
@@ -998,9 +1000,15 @@ def test_a_repeatedly_failing_run_replans_instead_of_retrying_forever(tracker):
 
     # Three cycles: the task fails, is retried, and fails identically.
     cycles = [
-        (ledger(entry(1, task_id="parse-headers", attempt=1)), {1: record(1, **boom)}),
-        (ledger(entry(1, task_id="parse-headers", attempt=2)), {1: record(1, attempt=1, **boom)}),
-        (ledger(entry(1, task_id="parse-headers", attempt=3)), {1: record(1, attempt=2, **boom)}),
+        (ledger(entry(1, task_id="parse-headers", attempt=1)), {ref(1): record(1, **boom)}),
+        (
+            ledger(entry(1, task_id="parse-headers", attempt=2)),
+            {ref(1): record(1, attempt=1, **boom)},
+        ),
+        (
+            ledger(entry(1, task_id="parse-headers", attempt=3)),
+            {ref(1): record(1, attempt=2, **boom)},
+        ),
     ]
 
     # The first cycle has nothing to compare against, so it is the one place a
@@ -1057,7 +1065,7 @@ def test_a_run_whose_pull_requests_are_only_being_rebased_never_replans():
     previous: Observation | None = None
     verdict = None
     for cycle in range(4):
-        observation = Observation.of(review, churn={1: cycle, 2: cycle})
+        observation = Observation.of(review, churn={ref(1): cycle, ref(2): cycle})
         verdict = judge(observation, previous, objective=OBJECTIVE, stalls=stalls, oracle=Never())
         previous, stalls = observation, verdict.stalls
 

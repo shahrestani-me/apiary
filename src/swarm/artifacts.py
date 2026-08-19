@@ -98,12 +98,20 @@ __all__ = [
     "DEFAULT_CONSOLE_ROOT",
     "EVENT_LOG_NAME",
     "LOGS_DIR_NAME",
+    "PR_CHECKS",
+    "PR_MERGED",
+    "PR_OPENED",
     "RESULTS_DIR_NAME",
     "RUN_FILE_NAME",
     "RUN_FINISHED",
     "RUN_STARTED",
     "SCHEMA_VERSION",
     "SUMMARY_FILE_NAME",
+    "TASK_CLAIMED",
+    "TASK_ELIGIBLE",
+    "TASK_LANDED",
+    "TASK_NEEDS_HUMAN",
+    "TASK_RESULT",
     "ArtifactsError",
     "CycleMetrics",
     "EventLog",
@@ -670,6 +678,27 @@ RUN_FINISHED = "run.finished"
 CYCLE_STARTED = "cycle.started"
 CYCLE_FINISHED = "cycle.finished"
 CONTAINER_LOGGED = "container.logged"
+
+#: The per-task lifecycle (#141). A cycle is minutes long and everything worth
+#: watching happens inside one, so the run-level names above cannot say when a
+#: task became eligible, which container took it, or why it stopped. These can.
+#:
+#: **They speak apiary's own vocabulary, never the tracker's.** Every one of
+#: them is keyed by the *task ref* - the slug `Transition.task_id` already
+#: carries - and the states they name are apiary's own internal ones (ADR
+#: 0001's, plus `blocked`), not the `swarm:*` labels that store them today. `events.jsonl` is
+#: append-only and read back (`RunMetrics.from_events`, `console_external`), so
+#: a run recorded now is still readable after epic #140 has removed the labels;
+#: an issue number or a label name baked in here would have invalidated every
+#: recorded run the day it was removed.
+TASK_ELIGIBLE = "task.eligible"
+TASK_CLAIMED = "task.claimed"
+TASK_RESULT = "task.result"
+PR_OPENED = "pr.opened"
+PR_CHECKS = "pr.checks"
+PR_MERGED = "pr.merged"
+TASK_LANDED = "task.landed"
+TASK_NEEDS_HUMAN = "task.needs_human"
 
 
 # --------------------------------------------------------------------------

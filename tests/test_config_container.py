@@ -65,6 +65,7 @@ from swarm.config import (
     resolve_ollama_target,
 )
 from swarm.containers.manager import ContainerError, ContainerManager, DockerCLI, Handle
+from swarm.github.refs import task_ref
 from swarm.run import Run
 
 #: What SETUP.md tells the operator to give the *server* so containers can
@@ -583,7 +584,9 @@ def test_a_worker_container_reaches_the_host_ollama(python_image: str):
         "import urllib.request;"
         f"print(urllib.request.urlopen('{CONTAINER_OLLAMA_URL}/api/version', timeout=15).read())"
     )
-    handle: Handle = manager.spawn(13, BASE_COMMIT, entrypoint="python", command=["-c", probe])
+    handle: Handle = manager.spawn(
+        task_ref(13), BASE_COMMIT, issue=13, entrypoint="python", command=["-c", probe]
+    )
     try:
         exit_code = manager.wait(handle, timeout_s=60)
         logs = manager.logs(handle)

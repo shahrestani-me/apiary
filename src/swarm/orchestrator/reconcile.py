@@ -113,7 +113,9 @@ from ..github.readiness import (
     ReadinessPlan,
     apply_readiness,
 )
+from ..github.refs import issue_number, task_ref
 from ..run import TERMINAL_LABELS, Run, live_entries
+from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord, summarise_dir, tail
 from .dispatcher import CLAIMED, REVIEW, Capacity, DispatchReport, Spawner, dispatch
@@ -205,7 +207,7 @@ class Snapshot:
         """Every issue in the repository, as GitHub returned it."""
         return self.list_issues(state="all")
 
-    def states(self) -> dict[int, IssueState]:
+    def states(self) -> dict[TaskRef, IssueState]:
         """Open/closed and `state_reason` per issue, at no additional cost.
 
         The same shape `readiness.resolve_states` produces, built from the
@@ -214,18 +216,21 @@ class Snapshot:
         readiness's own resolver relies on too.
         """
         return {
-            int(payload["number"]): IssueState.from_payload(payload)
-            for payload in self.issues
+            state.ref: state
+            for state in (IssueState.from_payload(payload) for payload in self.issues)
         }
 
-    def labels(self) -> dict[int, frozenset[str]]:
+    def labels(self) -> dict[TaskRef, frozenset[str]]:
         """Label names per issue, including issues the ledger refused to parse.
 
         A malformed issue never reaches `Ledger.entries`, so its current state
         label is not available anywhere else - and §1.4's policy is to move it
         to `swarm:failed`, which needs to know what it is moving from.
         """
-        return {int(payload["number"]): _label_names(payload) for payload in self.issues}
+        return {
+            task_ref(int(payload["number"])): _label_names(payload)
+            for payload in self.issues
+        }
 
     def pull_requests(self) -> tuple[dict[str, Any], ...]:
         """Every open PR, or nothing at all if this client cannot list them.
@@ -317,7 +322,7 @@ class Fleet(Spawner, Protocol):
     does not run.
     """
 
-    def find(self, *, issue: int | None = None) -> list[Handle]: ...
+    def find(self, *, ref: TaskRef | None = None) -> list[Handle]: ...
 
     def dispose(self, handle: Handle) -> str: ...
 
@@ -337,7 +342,7 @@ class Transition:
     that can lose a human's concurrent edit for nothing.
     """
 
-    number: int
+    ref: TaskRef
     from_label: str
     to_label: str
     reason: str
@@ -363,7 +368,7 @@ class Transition:
 
     def __str__(self) -> str:
         counter = "" if self.attempt is None else f", attempt {self.attempt}"
-        return f"#{self.number}: {self.from_label} -> {self.to_label}{counter} ({self.reason})"
+        return f"{self.ref}: {self.from_label} -> {self.to_label}{counter} ({self.reason})"
 
 
 @dataclass(frozen=True)
@@ -411,8 +416,8 @@ class InfrastructurePolicy:
 
 
 def infrastructure_streaks(
-    previous: Mapping[int, int], transitions: Iterable[Transition]
-) -> dict[int, int]:
+    previous: Mapping[TaskRef, int], transitions: Iterable[Transition]
+) -> dict[TaskRef, int]:
     """The streak map after a cycle, folded forward from the one before it.
 
     Pure arithmetic, so the ceiling is testable as data and invariant 2 holds -
@@ -433,9 +438,9 @@ def infrastructure_streaks(
     streaks = dict(previous)
     for transition in transitions:
         if transition.infrastructure:
-            streaks[transition.number] = streaks.get(transition.number, 0) + 1
+            streaks[transition.ref] = streaks.get(transition.ref, 0) + 1
         else:
-            streaks.pop(transition.number, None)
+            streaks.pop(transition.ref, None)
     return streaks
 
 
@@ -448,11 +453,11 @@ class Disposal:
     daemon that will not remove one must not stop the label from moving.
     """
 
-    number: int
+    ref: TaskRef
     reason: str
 
     def __str__(self) -> str:
-        return f"#{self.number}: dispose ({self.reason})"
+        return f"{self.ref}: dispose ({self.reason})"
 
 
 @dataclass(frozen=True)
@@ -477,8 +482,8 @@ class ReconcilePlan:
         return bool(self.transitions or self.disposals or self.repairs)
 
     @property
-    def numbers(self) -> tuple[int, ...]:
-        return tuple(transition.number for transition in self.transitions)
+    def refs(self) -> tuple[TaskRef, ...]:
+        return tuple(transition.ref for transition in self.transitions)
 
     def summary(self) -> str:
         parts = [
@@ -743,7 +748,7 @@ def _retry_or_give_up(
 
     if attempt >= total_cap:
         return Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=entry.state_label,
             to_label=FAILED,
             reason=f"{reason}; {attempt} attempt(s) made against a total cap of {total_cap}",
@@ -765,7 +770,7 @@ def _retry_or_give_up(
     # up here, exactly as it did before failures had signatures.
     if streak >= cap:
         return Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=entry.state_label,
             to_label=FAILED,
             reason=(
@@ -792,7 +797,7 @@ def _retry_or_give_up(
             f"{streak} of {cap}, total {attempt} of {total_cap})."
         )
     return Transition(
-        number=entry.number,
+        ref=entry.ref,
         from_label=entry.state_label,
         to_label=READY,
         reason=reason,
@@ -807,14 +812,14 @@ def _retry_or_give_up(
 def plan_reconcile(
     ledger: Ledger,
     *,
-    states: Mapping[int, IssueState] | None = None,
+    states: Mapping[TaskRef, IssueState] | None = None,
     open_branches: Collection[str] | None = None,
-    results: Mapping[int, ResultRecord] | None = None,
-    running: Collection[int] = (),
-    labels: Mapping[int, frozenset[str]] | None = None,
+    results: Mapping[TaskRef, ResultRecord] | None = None,
+    running: Collection[TaskRef] = (),
+    labels: Mapping[TaskRef, frozenset[str]] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
-    infrastructure: Mapping[int, int] | None = None,
+    infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
 ) -> ReconcilePlan:
     """Compare desired state with actual state. Pure - no API call, no daemon.
@@ -843,8 +848,8 @@ def plan_reconcile(
     transitions: list[Transition] = []
     disposals: list[Disposal] = []
 
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
-        state = states.get(entry.number)
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
+        state = states.get(entry.ref)
         terminal = entry.state_label in TERMINAL_LABELS
 
         # 1. GitHub wins. A closed issue leaves the run, and its container goes
@@ -855,22 +860,22 @@ def plan_reconcile(
             label, reason = _closed_verdict(state)
             transitions.append(
                 Transition(
-                    number=entry.number,
+                    ref=entry.ref,
                     from_label=entry.state_label,
                     to_label=label,
                     reason=reason,
                     task_id=entry.task_id,
                 )
             )
-            if entry.number in live:
-                disposals.append(Disposal(entry.number, reason))
+            if entry.ref in live:
+                disposals.append(Disposal(entry.ref, reason))
             continue
 
         # 2. Terminal work keeps no container. Reached by an issue a previous
         #    cycle finished, or one a human labelled `swarm:done` by hand.
         if terminal:
-            if entry.number in live:
-                disposals.append(Disposal(entry.number, f"{entry.state_label} is terminal"))
+            if entry.ref in live:
+                disposals.append(Disposal(entry.ref, f"{entry.state_label} is terminal"))
             continue
 
         # 3. A worker that finished and said so. The record is written last by
@@ -878,7 +883,7 @@ def plan_reconcile(
         #    container is done; `attempt >= entry.attempt` is what stops a
         #    record being acted on twice, since the counter moves and the file
         #    does not.
-        record = results.get(entry.number)
+        record = results.get(entry.ref)
         finished = record is not None and record.attempt >= entry.attempt
         if entry.state_label == CLAIMED and finished and record is not None:
             transition, disposal = _observe(
@@ -886,12 +891,12 @@ def plan_reconcile(
                 record,
                 max_attempts,
                 max_total_attempts=max_total_attempts,
-                infrastructure_streak=infrastructure.get(entry.number, 0),
+                infrastructure_streak=infrastructure.get(entry.ref, 0),
                 policy=infrastructure_policy,
             )
             if transition is not None:
                 transitions.append(transition)
-            if entry.number in live:
+            if entry.ref in live:
                 disposals.append(disposal)
             continue
 
@@ -912,27 +917,31 @@ def plan_reconcile(
                     max_total_attempts=max_total_attempts,
                 )
             )
-            if entry.number in live:
-                disposals.append(Disposal(entry.number, "its pull request was closed"))
-        elif finished and entry.number in live:
+            if entry.ref in live:
+                disposals.append(Disposal(entry.ref, "its pull request was closed"))
+        elif finished and entry.ref in live:
             # The PR is open, so the label is right and nothing moves - but the
             # worker wrote its record, which it does last, so the container is
             # only holding a clone. Waiting for the merge to dispose it would
             # leak one container per task for the length of the review.
-            disposals.append(Disposal(entry.number, "the worker published its pull request"))
+            disposals.append(Disposal(entry.ref, "the worker published its pull request"))
 
     # 5. A malformed body is labelled `swarm:failed` and the reason is posted on
     #    the issue (§1.4), once - an issue already carrying the label is left
     #    alone, or every cycle would comment on it again. These issues are not
     #    in `entries` at all, which is why their label comes from `labels`.
     for error in ledger.errors:
-        carried = labels.get(error.number, frozenset())
+        # `ContractError` is a parse failure and carries the issue number the
+        # parse was handed; the ref is minted here rather than there, so the
+        # plan speaks one vocabulary.
+        error_ref = task_ref(error.number)
+        carried = labels.get(error_ref, frozenset())
         current, _ = resolve_state_label(error.number, carried)
         if current is None or current in TERMINAL_LABELS:
             continue
         transitions.append(
             Transition(
-                number=error.number,
+                ref=error_ref,
                 from_label=current,
                 to_label=FAILED,
                 reason=f"malformed contract: {error.reason}",
@@ -944,10 +953,10 @@ def plan_reconcile(
     #    deleted it, or stripped its `swarm:*` label mid-run. Nothing will ever
     #    look at that work again, so the container is holding a clone for
     #    nobody.
-    known = {entry.number for entry in ledger.entries.values()}
-    planned = {disposal.number for disposal in disposals}
-    for number in sorted(live - known - planned):
-        disposals.append(Disposal(number, "its issue is no longer in the ledger"))
+    known = {entry.ref for entry in ledger.entries.values()}
+    planned = {disposal.ref for disposal in disposals}
+    for ref in sorted(live - known - planned):
+        disposals.append(Disposal(ref, "its issue is no longer in the ledger"))
 
     return ReconcilePlan(
         transitions=tuple(transitions),
@@ -975,7 +984,7 @@ def _observe(
     one's. Taking it here would race the worker for the same write.
     """
     if record.exit_code == EXIT_OK:
-        return None, Disposal(entry.number, "the worker published its pull request")
+        return None, Disposal(entry.ref, "the worker published its pull request")
 
     detail = record.reason or record.outcome
     if record.consumes_attempt:
@@ -992,7 +1001,7 @@ def _observe(
                 verify_output=record.verify_output,
                 max_total_attempts=max_total_attempts,
             ),
-            Disposal(entry.number, f"worker exit {record.exit_code}"),
+            Disposal(entry.ref, f"worker exit {record.exit_code}"),
         )
     # Exit 2. The task never really ran, so the attempt is not consumed - a
     # broken Ollama would otherwise burn every task's budget before anyone
@@ -1008,7 +1017,7 @@ def _observe(
     if streak >= policy.cap:
         return (
             Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=entry.state_label,
                 to_label=FAILED,
                 # The counter is deliberately left alone. The attempts were
@@ -1030,18 +1039,18 @@ def _observe(
                 ),
                 infrastructure=True,
             ),
-            Disposal(entry.number, f"worker exit 2 x{streak} (infrastructure, escalated)"),
+            Disposal(entry.ref, f"worker exit 2 x{streak} (infrastructure, escalated)"),
         )
     return (
         Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=entry.state_label,
             to_label=READY,
             reason=f"infrastructure failure: {detail}; the attempt was not consumed",
             task_id=entry.task_id,
             infrastructure=True,
         ),
-        Disposal(entry.number, "worker exit 2 (infrastructure)"),
+        Disposal(entry.ref, "worker exit 2 (infrastructure)"),
     )
 
 
@@ -1054,12 +1063,12 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
     disagreement would last exactly until the next read, i.e. long enough to
     dispatch a container against it.
     """
-    by_number = {transition.number: transition for transition in transitions}
-    if not by_number:
+    by_ref = {transition.ref: transition for transition in transitions}
+    if not by_ref:
         return ledger
     entries: dict[str, LedgerEntry] = {}
     for task_id, entry in ledger.entries.items():
-        transition = by_number.get(entry.number)
+        transition = by_ref.get(entry.ref)
         if transition is None:
             entries[task_id] = entry
             continue
@@ -1170,11 +1179,11 @@ class Failure:
     state nobody planned.
     """
 
-    number: int
+    ref: TaskRef
     reason: str
 
     def __str__(self) -> str:
-        return f"#{self.number}: {self.reason}"
+        return f"{self.ref}: {self.reason}"
 
 
 @dataclass(frozen=True)
@@ -1183,14 +1192,14 @@ class ReconcileReport:
 
     plan: ReconcilePlan
     applied: tuple[Transition, ...] = ()
-    disposed: tuple[int, ...] = ()
-    repaired: tuple[int, ...] = ()
+    disposed: tuple[TaskRef, ...] = ()
+    repaired: tuple[TaskRef, ...] = ()
     failures: tuple[Failure, ...] = ()
     #: Comments §1.4 wanted posted and this client had no method for. Not a
     #: failure - the text was printed - but the gap is worth reporting rather
     #: than swallowing, because the reason an issue was failed is otherwise
     #: nowhere a human will look.
-    uncommented: tuple[int, ...] = ()
+    uncommented: tuple[TaskRef, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1206,7 +1215,7 @@ class ReconcileReport:
             detail = "; ".join(str(failure) for failure in self.failures)
             parts.append(f"{len(self.failures)} failed: {detail}")
         if self.uncommented:
-            names = ", ".join(f"#{number}" for number in self.uncommented)
+            names = ", ".join(str(ref) for ref in self.uncommented)
             parts.append(f"could not comment on {names} - the client has no {COMMENT_METHOD}")
         return ", ".join(parts)
 
@@ -1236,7 +1245,7 @@ def apply_plan(
     plan: ReconcilePlan,
     *,
     fleet: Fleet | None = None,
-    handles: Mapping[int, Handle] | None = None,
+    handles: Mapping[TaskRef, Handle] | None = None,
     dry_run: bool = False,
 ) -> ReconcileReport:
     """Write the plan. Never raises for one issue; see `Failure`.
@@ -1250,10 +1259,10 @@ def apply_plan(
     """
     handles = handles or {}
     applied: list[Transition] = []
-    disposed: list[int] = []
-    repaired: list[int] = []
+    disposed: list[TaskRef] = []
+    repaired: list[TaskRef] = []
     failures: list[Failure] = []
-    uncommented: list[int] = []
+    uncommented: list[TaskRef] = []
 
     if dry_run:
         return ReconcileReport(plan=plan)
@@ -1263,46 +1272,49 @@ def apply_plan(
             for label in repair.removed:
                 client.remove_label(repair.number, label)
         except GitHubError as exc:
-            failures.append(Failure(repair.number, f"repairing labels: {exc}"))
+            failures.append(Failure(repair.ref, f"repairing labels: {exc}"))
             continue
-        repaired.append(repair.number)
+        repaired.append(repair.ref)
         if not post_comment(client, repair.number, f"apiary: {repair}"):
-            uncommented.append(repair.number)
+            uncommented.append(repair.ref)
 
     for transition in plan.transitions:
+        # The one place this loop needs the tracker's own spelling: every call
+        # below addresses the GitHub API, which takes issue numbers.
+        number = issue_number(transition.ref)
         try:
             if transition.attempt is not None and transition.task_id:
                 bump_attempt(
                     client,
-                    transition.number,
+                    number,
                     transition.task_id,
                     transition.attempt,
                     blocker=transition.blocker,
                     streak=transition.streak,
                 )
-            client.add_labels(transition.number, [transition.to_label])
+            client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(transition.number, transition.from_label)
+                client.remove_label(number, transition.from_label)
         except GitHubError as exc:
             # A human deleting or relabelling this issue between the read and
             # the write lands here. It is a fact about one issue, not a reason
             # to abandon the cycle - the next read sees whatever they did.
-            failures.append(Failure(transition.number, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(transition.ref, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
-        if transition.comment and not post_comment(client, transition.number, transition.comment):
-            uncommented.append(transition.number)
+        if transition.comment and not post_comment(client, number, transition.comment):
+            uncommented.append(transition.ref)
 
     for disposal in plan.disposals:
-        handle = handles.get(disposal.number)
+        handle = handles.get(disposal.ref)
         if handle is None or fleet is None:
             continue
         try:
             fleet.dispose(handle)
         except ContainerError as exc:
-            failures.append(Failure(disposal.number, f"disposing {handle}: {exc}"))
+            failures.append(Failure(disposal.ref, f"disposing {handle}: {exc}"))
             continue
-        disposed.append(disposal.number)
+        disposed.append(disposal.ref)
 
     return ReconcileReport(
         plan=plan,
@@ -1422,6 +1434,19 @@ class CycleReport:
         return "; ".join(parts)
 
 
+def _lifecycle_log() -> Any:
+    """`lifecycle.LifecycleLog`, imported at call time.
+
+    `lifecycle` imports this module - it projects a `CycleReport` and reads the
+    two terminal labels - so the dependency points that way and a top-level
+    import here would be a cycle. Same shape, and the same reason, as `checks`
+    and `mergeability` inside `cycle`.
+    """
+    from .lifecycle import LifecycleLog
+
+    return LifecycleLog()
+
+
 @dataclass
 class Reconciler:
     """The loop body, and the thing that paces it.
@@ -1512,6 +1537,14 @@ class Reconciler:
     #: the end is a run nobody can watch, and it is also how the merge gate's
     #: verdicts reach the operator while there is still time to act on them.
     on_cycle: Callable[[CycleReport], None] | None = None
+    #: Where the per-task lifecycle is announced (#141) - `RunArtifacts.event`
+    #: in a real run, so the events land in `events.jsonl` and are redacted like
+    #: everything else. `None` announces nothing, which is what a reconciler
+    #: with no run directory behind it should do. Separate from `on_cycle`
+    #: because the two answer different questions: `on_cycle` is one line per
+    #: cycle for whoever is watching, this is one event per task transition for
+    #: whoever reads the run back afterwards.
+    events: Callable[..., Any] | None = None
 
     _cycles: int = field(default=0, repr=False)
     #: The progress ledger, run-scoped. See the module docstring.
@@ -1519,12 +1552,17 @@ class Reconciler:
     _stalls: int = field(default=0, repr=False)
     _replans: int = field(default=0, repr=False)
     _goal_rounds: int = field(default=0, repr=False)
-    #: Consecutive infrastructure verdicts per issue number. In-process for the
+    #: Consecutive infrastructure verdicts per task. In-process for the
     #: same reason `update_budget` and `_stalls` are: it is a question about a
     #: sequence, GitHub only ever shows the current state, and a restart
     #: granting a clean slate is the safe direction for a counter whose job is
     #: bounding one run.
-    _infrastructure: dict[int, int] = field(default_factory=dict, repr=False)
+    _infrastructure: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: Which task events have already been announced (#141). Run-scoped for the
+    #: same reason, and holding nothing a decision reads. Typed loosely and
+    #: built through a local import, for `merge_policy`'s reason: `lifecycle`
+    #: imports this module.
+    _lifecycle: Any = field(default_factory=_lifecycle_log, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1579,14 +1617,27 @@ class Reconciler:
         if self.recovery is not None:
             recovered = self.recovery.sweep(
                 ledger,
-                # `.values()`, because `_handles()` is keyed by issue number and
+                # `.values()`, because `_handles()` is keyed by task ref and
                 # iterating the mapping yields the keys - `holders` would then
-                # ask an int for its `.issue`.
+                # ask a `TaskRef` for its `.issue`.
                 containers=handles.values(),
                 states=snapshot.states(),
                 open_branches=snapshot.open_branches(),
             )
             ledger = fold(ledger, recovered.result.applied)
+
+        # Local, because `checks` imports this module: it is the policy over the
+        # state this one folds, so the dependency points this way and a
+        # top-level import would be a cycle.
+        from .checks import read_pulls
+
+        # Read outside the merge gate, and free: `open_branches()` above already
+        # forced `Snapshot`'s one pull-request listing, so this is a fold over
+        # payloads the cycle is holding. Outside the gate because a run merging
+        # by hand still wants `pr.opened` in its event log - the gate being off
+        # is not a reason for the run directory to stop recording that a task
+        # reached review.
+        pulls = read_pulls(snapshot)
 
         # The merge gate. Mergeability runs first and *subtracts* from the plan
         # checks built: a PR that is green against a base that has since moved
@@ -1594,16 +1645,11 @@ class Reconciler:
         # against what it is landing on. `plan.admitted` is what survives.
         mergeability = None
         checks = None
+        check_runs: dict[int, Any] = {}
         if self.merge_gate:
-            # Local, because `checks` and `mergeability` both import this
-            # module: they are the policy over the state this one folds,
-            # so the dependency points this way and a top-level import
-            # would be a cycle.
-            from .checks import apply_checks, plan_checks, read_checks, read_pulls
+            from .checks import apply_checks, plan_checks, read_checks
             from .mergeability import run_mergeability
 
-            pulls = read_pulls(snapshot)
-            check_runs = {}
             if pulls is not None:
                 for entry in ledger.entries.values():
                     pull = pulls.get(entry.branch) if entry.state_label == REVIEW else None
@@ -1668,12 +1714,26 @@ class Reconciler:
             cycle_error=cycle_error,
             live=len(live_entries(ledger)),
         )
-        return self._judge(snapshot, report, results=results)
+        judged = self._judge(snapshot, report, results=results)
+        # Last, and on the grown report: the announcement (#141) is a projection
+        # of a cycle that has already decided, already written and already been
+        # judged, which is what makes "this changes no behaviour" a structural
+        # claim rather than a promise. The three facts it needs are passed
+        # rather than hung on `CycleReport`, so there is nothing on the report
+        # for a future rule to read - see `lifecycle.lifecycle_events`.
+        self._lifecycle.announce(
+            judged,
+            emit=self.events,
+            results=results,
+            pulls=pulls or {},
+            checks=check_runs,
+        )
+        return judged
 
     # --- step 5 ----------------------------------------------------------
 
     def _judge(
-        self, client: Any, report: CycleReport, *, results: Mapping[int, ResultRecord]
+        self, client: Any, report: CycleReport, *, results: Mapping[TaskRef, ResultRecord]
     ) -> CycleReport:
         """Judge this cycle, and act on the judgement. Returns the report, grown.
 
@@ -1841,22 +1901,26 @@ class Reconciler:
 
     # --- what the cycle reads --------------------------------------------
 
-    def _handles(self) -> dict[int, Handle]:
-        """This run's containers, by issue. One `docker ps`, whatever the count.
+    def _handles(self) -> dict[TaskRef, Handle]:
+        """This run's containers, by task. One `docker ps`, whatever the count.
 
         A container with no issue label is not this run's worker - the label is
         written at `docker create` - so it is left for the reaper (#20), which
         is the module allowed to remove things it did not spawn.
+
+        The label is an issue number, because that is what a container name and
+        a docker label may contain; it is minted into a ref here so the plan
+        above keys on the same identity everything else does.
         """
         if self.fleet is None:
             return {}
-        found: dict[int, Handle] = {}
+        found: dict[TaskRef, Handle] = {}
         for handle in self.fleet.find():
             if handle.issue is not None:
-                found.setdefault(int(handle.issue), handle)
+                found.setdefault(task_ref(int(handle.issue)), handle)
         return found
 
-    def _results(self) -> dict[int, ResultRecord]:
+    def _results(self) -> dict[TaskRef, ResultRecord]:
         """The latest artifact record per issue, or nothing if there is no directory.
 
         The worker writes its record last (`worker/result.py`), so a record is
@@ -1866,7 +1930,12 @@ class Reconciler:
         """
         if self.artifacts is None:
             return {}
-        return dict(summarise_dir(self.artifacts, run_id=self.run.id).latest)
+        # `summarise_dir` keys on the issue number the worker wrote into the
+        # record's filename; minted here for `_handles`' reason.
+        return {
+            task_ref(number): record
+            for number, record in summarise_dir(self.artifacts, run_id=self.run.id).latest.items()
+        }
 
 
 if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docstring

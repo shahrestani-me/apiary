@@ -55,6 +55,7 @@ from ..config import SETTINGS
 from ..github.ledger import STATUS_BY_LABEL, Ledger
 from ..llm import orchestrator_llm, structured
 from ..state import ProgressJudgement, SwarmState, TaskRecord, TaskStatus
+from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord
 
@@ -324,17 +325,19 @@ class Observation:
         cls,
         ledger: Ledger,
         *,
-        results: Mapping[int, ResultRecord] | None = None,
-        churn: Mapping[int, int] | None = None,
+        results: Mapping[TaskRef, ResultRecord] | None = None,
+        churn: Mapping[TaskRef, int] | None = None,
     ) -> Observation:
         """Observe a v2 ledger, plus what the workers and #34 left behind.
 
-        `results` is `RunSummary.latest` - the newest attempt per issue, which
+        `results` is `RunSummary.latest` - the newest attempt per task, which
         is what the reconciler already reads for the same cycle - and `churn`
-        is the per-issue count of base updates #34 has performed. Both are
-        keyed by issue number because that is how the rest of v2 addresses an
-        issue; the signals are keyed by task id because that is what identity
-        is (§2), and what survives a replan.
+        is the per-task count of base updates #34 has performed. Both are keyed
+        by `TaskRef` because that is how the rest of v2 addresses a task (#142);
+        the signals are keyed by task id because that is what identity is (§2),
+        and what survives a replan. The distinction matters here more than
+        anywhere: a key that misses reads as "no evidence", which is a judge
+        that silently forgets every failure rather than one that raises.
 
         The newest record is used whatever attempt it belongs to, deliberately.
         The counter is bumped in the same cycle that observes the record that
@@ -347,13 +350,13 @@ class Observation:
         churn = churn or {}
         signals: dict[str, Signal] = {}
         for task_id, entry in ledger.entries.items():
-            evidence = _evidence(results.get(entry.number))
+            evidence = _evidence(results.get(entry.ref))
             signals[task_id] = Signal(
                 task_id=task_id,
                 status=STATUS_BY_LABEL[entry.state_label],
                 attempts=entry.attempt,
                 failure=failure_signature(evidence),
-                churn=int(churn.get(entry.number, 0)),
+                churn=int(churn.get(entry.ref, 0)),
                 number=entry.number,
                 files=entry.files,
                 evidence=evidence,
