@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "run_id": "trip-planner-20260819-090000-a1b2",
+  "issue": 12,
+  "attempt": 0,
+  "task_id": "cli",
+  "repo": "shahrestani-me/trip-planner",
+  "branch": "apiary/%2312-attempt-0",
+  "exit_code": 0,
+  "outcome": "success",
+  "consumes_attempt": true,
+  "reason": "",
+  "verify_command": "pytest -q",
+  "verify_output": "",
+  "written": [],
+  "deleted": [],
+  "image": "apiary-worker:latest",
+  "commit": null,
+  "started_at": "2026-08-19T09:01:03.000Z",
+  "finished_at": "2026-08-19T09:03:03.000Z",
+  "duration_s": 120.0,
+  "synthesised": false
+}

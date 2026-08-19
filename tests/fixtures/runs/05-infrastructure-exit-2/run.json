@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "run_id": "trip-planner-20260819-140000-c9d0",
+  "repo": "shahrestani-me/trip-planner",
+  "objective": "a trip planner with a CLI",
+  "started_at": "2026-08-19T09:00:00.000Z",
+  "stack": "python",
+  "verify": "pytest -q"
+}

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "Three consecutive exit 2s. None consumes an attempt (issue-contract.md \u00a74), so all three write the SAME result filename and the artifacts hold one record where three failures happened. The third trips InfrastructurePolicy.cap, which is counted from transitions and is therefore invisible to anything reading the directory.",
+  "exercises": [
+    "exit 2 not consuming an attempt",
+    "three records collapsing onto one filename",
+    "the infrastructure ceiling, which is not derivable"
+  ],
+  "expected_divergences": [
+    {
+      "cycle": 7,
+      "task": "bootstrap",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "reconcile.infrastructure_streaks counts transitions, not results, and says why in its own docstring: an infrastructure verdict does not bump the attempt, so two mechanical failures in a row write the same filename and the artifacts cannot tell them apart. ADR 0001 lists 'the infrastructure cap hit' as a source of needs-human; this run is the demonstration that that half of the claim is false. Nothing in derived.py can close this without a durable counter, which is ADR 0002 territory."
+    }
+  ]
+}

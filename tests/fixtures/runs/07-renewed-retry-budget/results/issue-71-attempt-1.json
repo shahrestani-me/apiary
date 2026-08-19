@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "run_id": "trip-planner-20260819-171500-a3c4",
+  "issue": 71,
+  "attempt": 1,
+  "task_id": "importer",
+  "repo": "shahrestani-me/trip-planner",
+  "branch": "apiary/%2371-attempt-1",
+  "exit_code": 1,
+  "outcome": "verify-failed",
+  "consumes_attempt": true,
+  "reason": "ModuleNotFoundError: No module named 'httpx'",
+  "verify_command": "pytest -q",
+  "verify_output": "ModuleNotFoundError: No module named 'httpx'",
+  "written": [],
+  "deleted": [],
+  "image": "apiary-worker:latest",
+  "commit": null,
+  "started_at": "2026-08-19T09:00:42.000Z",
+  "finished_at": "2026-08-19T09:02:42.000Z",
+  "duration_s": 120.0,
+  "synthesised": false
+}

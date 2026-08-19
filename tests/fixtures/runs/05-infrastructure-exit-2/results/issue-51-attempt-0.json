@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "run_id": "trip-planner-20260819-140000-c9d0",
+  "issue": 51,
+  "attempt": 0,
+  "task_id": "bootstrap",
+  "repo": "shahrestani-me/trip-planner",
+  "branch": "apiary/%2351-attempt-0",
+  "exit_code": 2,
+  "outcome": "infrastructure",
+  "consumes_attempt": false,
+  "reason": "pulling the worker image was denied",
+  "verify_command": "pytest -q",
+  "verify_output": "pulling the worker image was denied",
+  "written": [],
+  "deleted": [],
+  "image": "apiary-worker:latest",
+  "commit": null,
+  "started_at": "2026-08-19T09:01:03.000Z",
+  "finished_at": "2026-08-19T09:03:03.000Z",
+  "duration_s": 120.0,
+  "synthesised": false
+}
