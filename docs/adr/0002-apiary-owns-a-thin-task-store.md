@@ -118,6 +118,31 @@ its own root (`APIARY_STORE_DIR`, default `.swarm/store`), a sibling of the
 artifacts tree deriving nothing from it — the rule `artifacts.CONSOLE_ROOT_ENV`
 already states.
 
+**And the reason given above for the per-project store is not the reason it is
+safe.** The paragraph before this one says an empty store "reads as 'every task
+is on attempt 0 with no blocker'". The second half is true; the first half is
+not, because the counter never moved into the store — it stays in the issue
+marker, so `max_total_attempts_per_task` still bites on an empty store.
+
+What actually protects the budget is two pieces of arithmetic in
+`orchestrator/reconcile.py`, and both deserve naming because a later reader
+tidying either one would open the hole this ADR only *thought* it had closed:
+
+- `previous_streak = entry.attempt if entry.streak is None else entry.streak`.
+  A missing judgment falls back to the attempt counter, and `streak` only ever
+  increments alongside `attempt` and resets on renewal, so `streak <= attempt`
+  always holds. The fallback is therefore the **largest** streak consistent
+  with the counter: absence gives up sooner, never later. Simplifying that
+  fallback to `0` is the change that would make the ADR's stated fear real.
+- `renewed = bool(entry.blocker) and sig != entry.blocker`. Renewal — the only
+  thing that can *extend* a budget — is gated on a blocker being **present**. A
+  missing judgment yields an empty blocker, so a miss can never renew.
+
+The decision stands; the argument for it was weaker than the code. Measured on
+a task at attempt 5 against a cap of 3 with no store row: the join returns
+`blocker='' streak=None renewals=0` and the verdict is `swarm:failed`. The safe
+direction, reached by a mechanism this document had not identified.
+
 SQLite won over a directory of JSON files on one requirement: a corrupt store
 has to be recognisable as corrupt. A directory degrades a file at a time, and a
 reader cannot tell "this task has no judgment yet" from "this task's judgment
