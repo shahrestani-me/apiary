@@ -531,17 +531,25 @@ def test_an_unknown_exit_code_is_charged_like_a_failure():
     assert plan.transitions[0].attempt == 1
 
 
-def test_a_worker_that_published_moves_no_label():
+def test_a_worker_that_published_is_moved_to_review_here():
     plan = plan_reconcile(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 0)},
         running=[ref(4)],
     )
 
-    # `claimed -> review` is the worker's row (§4): it knows the PR exists at
-    # the instant it does, and taking the write here would race it. An exit 0
-    # whose label did not stick is #35's stale claim, not this module's.
-    assert plan.transitions == ()
+    # `claimed -> review` is this module's row since #148. It used to be the
+    # worker's, on the argument that a container knows the PR exists at the
+    # instant it does - but that was a tracker write issued from inside
+    # model-generated code to announce a fact `derived.py` now reads off the
+    # pull request itself, so the label is written from out here instead.
+    transition = plan.transitions[0]
+    assert (transition.from_label, transition.to_label) == (CLAIMED, REVIEW)
+    # The attempt succeeded: nothing is charged for it, and `review -> ready` is
+    # where a rejected pull request is accounted for.
+    assert transition.attempt is None
+    # And the record is retired, so a second cycle cannot re-observe it.
+    assert transition.observed_record
     assert [d.ref for d in plan.disposals] == [ref(4)]
 
 

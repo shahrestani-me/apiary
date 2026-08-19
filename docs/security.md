@@ -51,6 +51,51 @@ exactly one**:
 That is the whole list. `swarm.security.REQUIRED_PERMISSIONS` is the same list in
 code.
 
+### The worker's half, and why it is smaller
+
+**Workers never write to the tracker.** Not "should not" — there is no call left
+to make. `worker/pr.py` pushes the branch and opens or updates one pull request,
+and those are the only endpoints it addresses; the module's own docstring
+("No tracker call, of any kind") is the argument, and
+`tests/test_worker_pr.py::test_the_worker_reaches_no_tracker_endpoint` is the
+assertion. It fails on the presence of an issue call rather than on the absence
+of a state, because a test that only checked that `swarm:review` still appears
+would pass with the write still in place.
+
+Until #148 the worker applied `swarm:review` itself, immediately after opening
+the pull request. That made `issues:write` a requirement of a credential held by
+a process running model-generated code — the exact shape §2 exists for — to
+announce a fact the pull request already carries. `orchestrator/derived.py` reads
+`review` off *an open pull request whose head branch names this task*, and
+`reconcile._verdict` writes the label from outside the container when it observes
+the worker's exit 0. So the state still appears within one cycle, and the
+permission is gone rather than moved.
+
+What a container's credential needs is therefore strictly less than the table
+above:
+
+| Permission | Level | Why |
+|---|---|---|
+| Contents | Read and write | push the work branch |
+| Pull requests | Read and write | open and update its one pull request |
+| Issues | **Read-only** | `entrypoint` reads the task contract and the retry comments |
+| Metadata | Read-only | mandatory |
+
+`swarm.security.WORKER_PERMISSIONS` is that list in code, and
+`assert_scoped_token(..., permissions=WORKER_PERMISSIONS)` is how a refusal on
+the worker path names it — a message asking for `issues:write` would be asking a
+human to grant a scope for a call that no longer exists, which is how a
+permission outlives its reason.
+
+**This is a narrower requirement, not yet a narrower token.**
+`ContainerManager` passes `GITHUB_TOKEN` through
+(`containers.manager.INHERITED_ENV`), so a worker still holds the same work key
+the orchestrator does, issue write included. What #148 changed is that the
+worker no longer *uses* it — which is what makes a second, narrower credential a
+configuration change rather than a redesign, and it is the seam §6 now names.
+The reads that remain are what #151 moves behind the tracker MCP server, after
+which the worker path needs no tracker permission at all.
+
 ### What must stay off
 
 `swarm.security.FORBIDDEN_PERMISSIONS`, and one of them matters far more than the
@@ -477,7 +522,8 @@ page.
 
 ## 6. Seams that are not closed yet
 
-Two, both waiting on tickets whose file sets this one could not reach.
+Four, each waiting on a ticket whose file set was out of reach of the one that
+found it.
 
 **The dispatcher does not pass the confinement flags yet (#21).**
 `swarm.security.worker_create_flags()` returns
@@ -492,6 +538,14 @@ this gap is the worker's, and it closes with one argument.
 preflight in `swarm.cli`, alongside the existing "GITHUB_TOKEN is not set" check
 in `github/client.py`; neither file is in this ticket's `## Files`. Until then it
 is a function a human runs, and the suite is what keeps it correct.
+
+**A worker holds the orchestrator's token, not a worker-shaped one.**
+`WORKER_PERMISSIONS` says what the worker path actually needs — no issue write,
+since #148 — and `INHERITED_ENV` still hands the container `GITHUB_TOKEN`. Two
+credentials would close it, at the cost of a third token for an operator to mint
+and rotate; #151 closes it from the other direction by moving the remaining
+issue *reads* onto the tracker MCP server, at which point a worker needs nothing
+from the tracker and the split is worth making.
 
 **The orchestrator image has no docker CLI.** `containers/manager.py` shells out
 to `docker`, `Dockerfile` installs only git, and `DOCKER_HOST` is useless without
@@ -563,7 +617,7 @@ incompatible permissions, so apiary uses two credentials.
 |---|---|---|
 | Variable | `GITHUB_TOKEN` | `APIARY_PROVISION_TOKEN` |
 | Permissions | contents:write, pull_requests:write, issues:write, actions:read, metadata:read | administration:write, contents:write, workflows:write, issues:write, metadata:read |
-| Used by | Orchestrator and every worker | `greenfield/provision.py`, once |
+| Used by | Orchestrator, and every worker for its own narrower half (§1) | `greenfield/provision.py`, once |
 | Lifetime | The whole run | The seconds it takes to create the repo |
 | Reaches model output | Yes | No — it runs before the first container exists |
 

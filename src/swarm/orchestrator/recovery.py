@@ -448,9 +448,14 @@ def plan_recovery(
             held.append(Held(entry.ref, f"a container of run {handle.run_id!r} is holding it"))
             continue
 
-        # 3. The worker got as far as a pull request and died before it could
-        #    write `swarm:review` (`worker/pr.py` labels last, deliberately).
-        #    The work exists; moving the label forward is all that is left.
+        # 3. The worker got as far as a pull request and no cycle survived to
+        #    observe its result - the orchestrator died with the claim
+        #    outstanding, which is what `Recovery.startup` runs on. (Before #148
+        #    the worker wrote `swarm:review` itself and this row covered a worker
+        #    dying between the push and that write; the write now belongs to
+        #    `reconcile._verdict`, so the case is the orchestrator's death rather
+        #    than the container's.) The work exists; moving the label forward is
+        #    all that is left.
         #
         #    Matched on the ref inside the head branch rather than on
         #    `entry.branch`, for the module docstring's reason: the name on the
@@ -466,7 +471,7 @@ def plan_recovery(
                     to_label=REVIEW,
                     reason=(
                         f"{branch} has an open pull request; "
-                        f"the worker died before relabelling"
+                        f"no cycle survived to observe the result"
                     ),
                     task_id=entry.task_id,
                 )

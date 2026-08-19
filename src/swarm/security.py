@@ -53,6 +53,7 @@ __all__ = [
     "CredentialError",
     "PolicyError",
     "REQUIRED_PERMISSIONS",
+    "WORKER_PERMISSIONS",
     "FORBIDDEN_PERMISSIONS",
     "PROVISION_TOKEN_ENV",
     "PROVISION_PERMISSIONS",
@@ -98,6 +99,10 @@ class PolicyError(SecurityError):
 #:   pull_requests  open and update the one PR per issue
 #:   issues         read the contract, write `swarm:*` labels and comments
 #:   metadata       mandatory on every fine-grained PAT; GitHub adds it anyway
+#:
+#: This is the **orchestrator's** requirement, and since #148 that is a
+#: distinction rather than a synonym: `WORKER_PERMISSIONS` below is the subset a
+#: credential inside a container needs, and it does not include the issue write.
 REQUIRED_PERMISSIONS: dict[str, str] = {
     "contents": "write",
     "pull_requests": "write",
@@ -115,6 +120,38 @@ REQUIRED_PERMISSIONS: dict[str, str] = {
     # the very workflow judging it - the same failure `workflows` is forbidden
     # for, reached by a different door.
     "actions": "read",
+    "metadata": "read",
+}
+
+#: What the credential a **worker** holds needs, which is strictly less (#148).
+#: The container executes model-generated code, so every entry here has to be
+#: justified by something `worker/` actually calls:
+#:
+#:   contents       `worker/pr.py` pushes `apiary/<ref>-attempt-<n>`
+#:   pull_requests  it opens or updates the one pull request on that branch
+#:   issues:read    `entrypoint._fetch_contract` reads the task contract, and
+#:                  `fetch_feedback` the retry comments - reads, both of them
+#:   metadata       mandatory on every fine-grained PAT
+#:
+#: **`issues` is `read`, and that is the whole point of the ticket.** The worker
+#: used to write `swarm:review` after opening its pull request, which made
+#: `issues:write` a requirement of a token held by a process running
+#: model-generated code. The orchestrator derives `review` from the open pull
+#: request instead (`orchestrator/derived.py`) and writes the label from outside
+#: the container (`reconcile._verdict`), so nothing on the worker path writes to
+#: a tracker at all - see `docs/security.md` §1, "The worker's half".
+#:
+#: Two things this constant is not. It is not an *enforcement* - apiary hands
+#: workers `GITHUB_TOKEN`, the same work key the orchestrator holds, so the
+#: narrowing is available to an operator who mints a second token rather than
+#: applied by this module (`docs/security.md` §6 names the seam). And it is not a
+#: second opinion about the shape of a credential: `assert_scoped_token` takes it
+#: as `permissions=` so that a refusal on the worker path names this list, and
+#: never asks a human to grant an issue write for a call that no longer exists.
+WORKER_PERMISSIONS: dict[str, str] = {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "read",
     "metadata": "read",
 }
 
@@ -262,7 +299,12 @@ def assert_no_provision_token(env: Mapping[str, str] | None) -> None:
             )
 
 
-def assert_scoped_token(token: str | None, *, allow_unrecognised: bool = False) -> str:
+def assert_scoped_token(
+    token: str | None,
+    *,
+    allow_unrecognised: bool = False,
+    permissions: Mapping[str, str] = REQUIRED_PERMISSIONS,
+) -> str:
     """Refuse a credential that cannot be repo-scoped. Returns its kind.
 
     The goal sentence of #28 is that a worker "cannot reach an unrelated repo",
@@ -275,6 +317,13 @@ def assert_scoped_token(token: str | None, *, allow_unrecognised: bool = False) 
     prefix is not one of GitHub.com's. It is opt-in rather than the default so
     that a typo'd or truncated token fails here rather than as a 401 inside a
     container, three minutes of inference later.
+
+    `permissions` is what the refusal tells a human to grant, and it defaults to
+    the orchestrator's list. Pass `WORKER_PERMISSIONS` where the credential is
+    one a container will hold: since #148 nothing on the worker path writes to
+    the tracker, and a message that asked for `issues:write` anyway would be
+    asking for a permission to cover a call that no longer exists - which is how
+    a scope outlives its reason.
     """
     kind = classify_token(token)
     if kind in ("fine-grained", "app"):
@@ -284,7 +333,7 @@ def assert_scoped_token(token: str | None, *, allow_unrecognised: bool = False) 
             "this is a classic or OAuth token, which is scoped to verbs and not to "
             "repositories: it reaches every repository the account can reach. Mint a "
             "fine-grained PAT on the single target repo with "
-            + ", ".join(f"{name}:{level}" for name, level in REQUIRED_PERMISSIONS.items())
+            + ", ".join(f"{name}:{level}" for name, level in permissions.items())
             + " - see docs/security.md"
         )
     if not token:
@@ -330,7 +379,10 @@ OLLAMA_HOST_NAME = "host.docker.internal"
 #: orchestrator's environment and `containers.manager.INHERITED_ENV` does not
 #: carry it, so a worker that reached `mcp.linear.app` is answered 401. That is
 #: the same reasoning `assert_scoped_token` sets out for `github.com`: one host
-#: serves every customer, and only the credential knows which.
+#: serves every customer, and only the credential knows which. And since #148
+#: there is nothing on the worker path that wants a tracker in the first place
+#: (`WORKER_PERMISSIONS`), so the 401 is now the backstop rather than the whole
+#: of the confinement.
 MCP_HOSTS: tuple[str, ...] = ("mcp.linear.app",)
 
 EGRESS_ALLOWLIST: tuple[str, ...] = (*GITHUB_HOSTS, OLLAMA_HOST_NAME, *MCP_HOSTS)

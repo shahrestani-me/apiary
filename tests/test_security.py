@@ -63,6 +63,7 @@ from swarm.security import (
     SOCKET_PROXY_ENV,
     SOCKET_PROXY_HOST,
     WORKER_NETWORK,
+    WORKER_PERMISSIONS,
     CredentialError,
     EgressPolicy,
     PolicyError,
@@ -199,6 +200,52 @@ def test_the_required_permissions_are_these_and_only_these() -> None:
         "metadata": "read",
     }
     assert REQUIRED_PERMISSIONS["actions"] == "read"
+
+
+def test_a_worker_needs_no_issue_write() -> None:
+    """#148, as the permission it removes rather than as the call it deletes.
+
+    `worker/pr.py` used to apply `swarm:review` after opening its pull request,
+    which made `issues:write` a requirement of a credential held by a container
+    running model-generated code. The orchestrator derives `review` from the
+    open pull request and writes the label itself, so the worker's half of the
+    work key is strictly smaller - and this is the assertion that keeps it that
+    way, because a scope nobody re-checks is a scope that grows back.
+    """
+    assert WORKER_PERMISSIONS == {
+        "contents": "write",
+        "pull_requests": "write",
+        # A read: `entrypoint` still reads the contract and the retry comments.
+        # #151 moves those behind the tracker MCP server.
+        "issues": "read",
+        "metadata": "read",
+    }
+    # Strictly a narrowing of the work key, never a different set: a permission
+    # here that the orchestrator's token does not carry would be a scope apiary
+    # asks nobody to grant, which fails as a 403 three minutes into a run.
+    assert set(WORKER_PERMISSIONS) <= set(REQUIRED_PERMISSIONS)
+    assert not set(WORKER_PERMISSIONS) & set(FORBIDDEN_PERMISSIONS)
+
+
+def test_a_refusal_on_the_worker_path_does_not_ask_for_an_issue_write() -> None:
+    """The remedy in the message is what a human actually grants.
+
+    A refusal that names `issues:write` for a worker credential is how the
+    permission #148 removed comes back: nobody mints two tokens to be told the
+    narrower one is wrong.
+    """
+    with pytest.raises(CredentialError) as caught:
+        assert_scoped_token(
+            "ghp_16charsminimum0000000000", permissions=WORKER_PERMISSIONS
+        )
+
+    message = str(caught.value)
+    assert "issues:read" in message
+    assert "issues:write" not in message
+    # The default is still the orchestrator's list, which does ask for it.
+    with pytest.raises(CredentialError) as work_key:
+        assert_scoped_token("ghp_16charsminimum0000000000")
+    assert "issues:write" in str(work_key.value)
 
 
 def test_workflows_is_forbidden() -> None:
