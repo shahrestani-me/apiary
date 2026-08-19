@@ -7,13 +7,18 @@ tool means what. That opinion is the capability contract (#150), and keeping it
 out of here is what lets the contract change shape without the transport
 changing at all.
 
-Two modules, and the seam between them is the point:
+Three modules, and the seams between them are the point:
 
 - `client.py` connects, lists tools, and calls one by name. It has no idea what
   a name means and never will.
 - `contract.py` says which tool means what, as per-organization configuration.
   #143 found that ADR 0001's sketched contract could not make a single real
   call; the shape moved, and the transport did not have to.
+- `tracker.py` spends the contract (#151): intake, comment and create leave
+  apiary over MCP rather than over `GitHubClient`'s issue endpoints, and
+  `TrackerView` is the one object that decides so. Nothing above it - not
+  `reconcile`, not `planner`, not `readiness` - learns that a tracker exists,
+  which is what kept the cutover to one construction site.
 """
 
 from __future__ import annotations
@@ -59,16 +64,32 @@ from .contract import (
     load_tracker,
     parse_tracker,
 )
+from .tracker import (
+    CODE_HOST,
+    LABEL_PLANE,
+    PAGING_GAP,
+    TRACKER_ENDPOINTS,
+    NoSuchCapability,
+    Tracker,
+    TrackerError,
+    TrackerView,
+    tracker_for,
+    view_for,
+)
 
 __all__ = [
     "CANONICAL_FIELDS",
     "CAPABILITIES",
+    "CODE_HOST",
     "COMMENT",
     "CREATE",
     "INTAKE",
+    "LABEL_PLANE",
+    "PAGING_GAP",
     "PROFILES",
     "PROTOCOL_VERSION",
     "STDIO_SCHEME",
+    "TRACKER_ENDPOINTS",
     "TRACKER_ENDPOINT_ENV",
     "TRACKER_TOKEN_ENV",
     "McpAuthError",
@@ -82,6 +103,7 @@ __all__ = [
     "McpToolError",
     "McpTransportError",
     "McpUnreachable",
+    "NoSuchCapability",
     "Auth",
     "Capability",
     "ContractError",
@@ -91,11 +113,16 @@ __all__ = [
     "StdioTransport",
     "ToolResult",
     "ToolSpec",
+    "Tracker",
     "TrackerContract",
+    "TrackerError",
+    "TrackerView",
     "Transport",
     "UrllibTransport",
     "assert_endpoint_allowed",
     "client_for",
     "load_tracker",
     "parse_tracker",
+    "tracker_for",
+    "view_for",
 ]

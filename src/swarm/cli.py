@@ -66,7 +66,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from .capture import LLM_LOG_NAME, Recorder as CaptureRecorder
 from .capture import enabled as capture_enabled
@@ -83,6 +83,7 @@ from .github.readiness import DependencyCycleError, ReadinessError, apply_readin
 from .greenfield.bootstrap import Bootstrap
 from .greenfield.provision import ProvisionPlan, provision
 from .greenfield.scaffold import UnsupportedStack
+from .mcp.tracker import TrackerError, view_for
 from .security import EgressPolicy, worker_create_flags
 from .artifacts import (
     ArtifactsError,
@@ -355,6 +356,10 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
         GitHubError,
         LedgerError,
         ReadinessError,
+        # A tracker that will not answer is one `!` line and exit 1, like every
+        # other refusal an operator can fix. `ContractError` needs no entry: it
+        # is a `ConfigError`, which is a `ValueError`.
+        TrackerError,
         ValueError,
     ) as exc:
         print(f"! {exc}", file=sys.stderr)
@@ -555,15 +560,67 @@ def _run(
 
     repo, objective, verify, bootstrap = _target(args, parser, client=client)
 
+    # **The one place a run decides how it reaches the task system** (#151).
+    # `view_for` returns the object every collaborator below is handed, so
+    # intake, comment and create go over MCP for the whole run or for none of
+    # it - there is no per-call choice anywhere downstream, which is what makes
+    # "the tracker path is the MCP path" a property of this line rather than a
+    # promise repeated in nine modules.
+    #
+    # The client is built *here* rather than left as a repository slug for each
+    # callee to resolve, because a view has to wrap something: `start_run`,
+    # `plan_node` and `_loop` each used to call `GitHubClient.from_env`
+    # themselves, and a slug that reached one of them unwrapped would be a
+    # collaborator quietly back on the direct path. `_loop`'s conversion is now
+    # the same conversion it always was, one frame earlier.
+    #
+    # `None` for the tracker is a normal installation, not a failure: apiary
+    # runs on the label control plane until #152, so a tree with no tracker
+    # block gets exactly the client it got before. Announced either way -
+    # `source_summary`'s discipline - because a run whose control plane nobody
+    # printed is a run nobody chose.
+    source, tracker = view_for(client if client is not None else GitHubClient.from_env(repo))
+    if tracker is not None:
+        print(f"» {tracker.summary()}")
+    else:
+        print(
+            f"» tracker: none configured ({SETTINGS.tracker_config} does not exist); "
+            f"this run reads and writes issues directly"
+        )
+    try:
+        return _plan_and_run(args, source, repo, objective, verify, bootstrap)
+    finally:
+        # A stdio server is a subprocess of this process. Whatever ends the run -
+        # the loop finishing, Ctrl-C, an exception on the way out - it has to be
+        # reaped here, because nothing else in the tree knows it was started.
+        if tracker is not None:
+            tracker.close()
+
+
+def _plan_and_run(
+    args: argparse.Namespace,
+    source: Any,
+    repo: str,
+    objective: str,
+    verify: str,
+    bootstrap: Any,
+) -> int:
+    """Plan if this is a fresh run, then loop. Split out of `_run` for one reason.
+
+    `_run` now owns a resource with a lifetime - the tracker's transport, which
+    for a stdio server is a subprocess - and a function that both acquires one
+    and has five `return` statements is a function that leaks it on four of
+    them. The `try/finally` belongs around the whole body, so the body is a
+    function.
+    """
     attachment = start_run(
         repo,
         objective,
-        source=client if client is not None else repo,
+        source=source,
         adopt=not args.dry_run,
     )
     _report_run(attachment, dry_run=args.dry_run)
 
-    source = client if client is not None else repo
     ledger = attachment.ledger
 
     if not attachment.resumed:
@@ -649,6 +706,10 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # and the run died three frames into `apply_plan` asking a `str` for
     # `get_issue`. One conversion, at the top, or this recurs per collaborator.
     github = source if not isinstance(source, str) else GitHubClient.from_env(source)
+    # ...and since #151 `source` is the object `_run` chose - a `mcp.TrackerView`
+    # when this installation has a tracker block, the bare client when it does
+    # not. Every collaborator below therefore reaches the task system the way
+    # the run announced, and none of them can tell which.
 
     # A context manager, and used as one: leaving through an exception is
     # recorded rather than swallowed, and the run summary is written on the way

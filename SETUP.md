@@ -289,6 +289,82 @@ swarm --resume a3f9c1d2
 
 ---
 
+## 5b. Point it at your task system (optional today, required soon)
+
+apiary reaches a task system through **your own MCP server**, named in one
+config file. It ships no Linear, Jira or GitHub Issues adapter, and GitHub
+Issues goes through the same path as everything else — that is
+`docs/adr/0001-task-systems-are-integrations.md`, and it is what makes
+supporting another tracker configuration rather than code.
+
+Without this file apiary reads and writes issues directly, which is still a
+normal installation. `swarm run` prints which of the two it is doing on every
+run, and `swarm doctor` reports an absent tracker as a skip.
+
+**One file, and for GitHub it needs no new credential.**
+
+```bash
+mkdir -p .swarm/tracker
+cat > .swarm/tracker/tracker.yaml <<'YAML'
+tracker:
+  mcp: github
+  args:
+    owner: your-org
+    repo: your-repo
+  intake:
+    args:
+      # The server's own filter parameters, forwarded verbatim. apiary never
+      # parses these, so their names and spellings are the server's — check
+      # them against your MCP server's tool schema, not against this file.
+      state: all
+      perPage: 100
+YAML
+export APIARY_TRACKER_CONFIG=.swarm/tracker/tracker.yaml
+```
+
+`mcp: github` selects a built-in profile, so the block above is only the
+constants nobody but you can know. The profile pins the tool names, the
+`method: create` discriminator GitHub's fused create/update tool needs, the
+`issue_number` field map and the `number` ref rule. It also selects the **local
+stdio** server (`github-mcp-server`), which takes a fine-grained PAT from its
+own environment — the same `GITHUB_TOKEN` apiary already holds, in a second use.
+No new variable, and no new hole in the egress allowlist.
+
+Check the block, and then check the server, without starting a run:
+
+```bash
+python -m swarm.mcp.contract .swarm/tracker/tracker.yaml   # opens no socket
+python -m swarm.mcp.tracker                                # one intake call, reads only
+swarm doctor                                               # tracker.config/reachable/auth/tools
+```
+
+**Two arguments in `intake.args` deserve a sentence each**, because apiary
+cannot supply them for you and both fail quietly:
+
+- **List closed items too.** A finished task is a *closed* issue, and a ledger
+  that cannot see closed work reports the run unfinished forever and loses the
+  dependency edges pointing at it. The parameter that does this is the server's
+  (`state` on GitHub), so it lives here rather than in the profile.
+- **Raise the page size.** Intake is one call: the capability contract carries
+  no paging rule yet, so a project with more items than one page returns a
+  partial ledger — and a task nothing lists is a task nothing looks at again.
+
+**What still goes direct**, deliberately: pull requests, check runs, merges,
+branches and the repository tree are the *code host*, which is GitHub by design
+in this architecture. The six `swarm:*` labels and the attempt counter in the
+issue body are also still written directly — they are apiary's own vocabulary,
+which the ADR forbids putting in your tracker at all, and they are being removed
+rather than routed.
+
+**In the containerised orchestrator** (`compose.yaml`), `./.swarm/tracker` is
+mounted read-only at `/etc/apiary/tracker`, so set
+`APIARY_TRACKER_CONFIG=/etc/apiary/tracker/tracker.yaml` there. Note that the
+`github` profile spawns a local server binary, and the orchestrator image does
+not carry one — a containerised orchestrator on the GitHub profile needs
+`github-mcp-server` added to `Dockerfile`, or a tracker reached over HTTP.
+
+---
+
 ## 6. Tuning knobs
 
 All via environment variables — see `src/swarm/config.py`.
