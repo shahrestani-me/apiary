@@ -711,8 +711,8 @@ def classify(
                 f"cap of {infrastructure_cap}. ADR 0001: the ceiling is counted from "
                 "transitions, because exit 2 does not bump the attempt and the "
                 "observation carries one record per task - so N mechanical failures "
-                "displace one another there and the artifacts cannot tell one from "
-                f"three. Not derivable at all, and {one.derived} is what the task "
+                "displace one another there and nothing that survives that collapse "
+                f"can count them. Not derivable at all, and {one.derived} is what the task "
                 "reads without it."
             )
         elif (
