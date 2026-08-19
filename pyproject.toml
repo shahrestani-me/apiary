@@ -27,6 +27,11 @@ dependencies = [
     "langchain-ollama>=1.1.0",
     "langchain-core>=1.5.0",
     "pydantic>=2.9",
+    # The tracker capability contract (#150) is a YAML block a customer edits.
+    # ADR 0001, the #143 spike and every example in the docs write it as YAML,
+    # and `yaml.safe_load` reads JSON too - so one small dependency covers both
+    # spellings and nobody has to hand-write a parser for a config file.
+    "pyyaml>=6.0",
 ]
 
 [project.urls]

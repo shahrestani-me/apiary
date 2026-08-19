@@ -43,6 +43,8 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from fixtures.github import page, response
+from fixtures.mcp import ENDPOINT, FakeMcpServer
+from fixtures.mcp import client as mcp_client
 from swarm.config import Settings
 from swarm.containers.manager import (
     DEFAULT_STACK_IMAGES,
@@ -64,6 +66,10 @@ from swarm.doctor import (
     CHECK_REPO,
     CHECK_TIMEOUTS,
     CHECK_TOKEN,
+    CHECK_TRACKER_AUTH,
+    CHECK_TRACKER_CONFIG,
+    CHECK_TRACKER_REACHABLE,
+    CHECK_TRACKER_TOOLS,
     CHECK_WORKER_IMAGE,
     FAIL,
     OK,
@@ -77,6 +83,7 @@ from swarm.doctor import (
     stack_check,
 )
 from swarm.github.labels import SWARM_LABELS
+from swarm.mcp.contract import ContractError, parse_tracker
 
 REPO = "shahrestani-me/apiary"
 
@@ -88,6 +95,13 @@ TOKEN = "github_pat_11ABCDEFG0doctorpreflightfixture"
 
 #: What `config.py` produces on a correctly configured machine.
 GOOD_URL = "http://localhost:11434"
+
+#: The tracker credential the built-in `linear` profile names, and a contract
+#: written the way a customer's is: a profile, plus the one constant only that
+#: organization knows.
+LINEAR_TOKEN = "lin_api_" + "c" * 32
+TRACKER_BLOCK = "mcp: linear\nargs: { teamId: TEAM-1 }\n"
+TRACKER = parse_tracker(TRACKER_BLOCK, source=".swarm/tracker.yaml")
 
 #: What it produces on a machine that exported the *server's* bind address,
 #: which SETUP.md tells the operator to do so containers can reach Ollama.
@@ -270,6 +284,7 @@ def doctor(fake_github) -> Any:
         script: Sequence[Any] | None = None,
         inference: FakeInference | None = None,
         runner: RecordingRunner | None = None,
+        server: FakeMcpServer | None = None,
         env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
@@ -282,7 +297,20 @@ def doctor(fake_github) -> Any:
             github=gh,
             docker=DockerCLI(runner=docker_runner),
             inference=probe,
-            env={"GITHUB_TOKEN": TOKEN, PROVISION_TOKEN_ENV: BOOT_TOKEN} if env is None else env,
+            env=(
+                {
+                    "GITHUB_TOKEN": TOKEN,
+                    PROVISION_TOKEN_ENV: BOOT_TOKEN,
+                    "APIARY_LINEAR_TOKEN": LINEAR_TOKEN,
+                }
+                if env is None
+                else env
+            ),
+            # A contract and a server by default, so the healthy case exercises
+            # the tracker checks rather than skipping past them. `tracker=None`
+            # is how a test says "this installation configures no tracker".
+            tracker=kwargs.pop("tracker", TRACKER),
+            mcp=kwargs.pop("mcp", mcp_client(server or FakeMcpServer())),
             which=kwargs.pop("which", lambda name: f"/usr/local/bin/{name}"),
             in_container=kwargs.pop("in_container", False),
             **kwargs,
@@ -305,6 +333,21 @@ def test_a_failing_check_cannot_be_built_without_a_fix():
     # The other two statuses have nothing to remedy.
     assert Check.passed("some.check", "fine").fix == ""
     assert Check.skipped("some.check", "not attempted").fix == ""
+
+
+def test_a_multi_line_fix_stays_inside_its_column():
+    """The report is read as a table.
+
+    A fix whose useful shape is a sentence and then the command on its own line
+    - which is how every refusal `mcp/contract.py` hands over is written -
+    would otherwise print its second line flush left, where it reads as a new
+    check rather than as part of this one.
+    """
+    lines = Check.failed("some.check", "broken", fix="do this:\n    then-run --this").lines()
+
+    assert len(lines) == 3
+    assert lines[1].lstrip().startswith("fix: do this:")
+    assert lines[2].startswith(" " * 20) and "then-run --this" in lines[2]
 
 
 def test_unknown_status_is_refused():
@@ -356,6 +399,13 @@ def test_a_healthy_environment_passes_every_check(doctor):
         stack_check("node"),
         stack_check("python"),
         stack_check("react"),
+        # The capability contract (#150). Four rather than one because "there
+        # is no block", "nothing answered", "the credential was refused" and
+        # "that tool does not exist" have four unrelated remedies.
+        CHECK_TRACKER_CONFIG,
+        CHECK_TRACKER_REACHABLE,
+        CHECK_TRACKER_AUTH,
+        CHECK_TRACKER_TOOLS,
     ]
     assert diagnosis.ok, diagnosis.report()
     assert not diagnosis.skipped
@@ -384,7 +434,7 @@ def test_the_report_is_readable(doctor):
     subject, _, _, _ = doctor()
     report = subject.run().report()
 
-    assert "all 15 preconditions met" in report
+    assert "all 19 preconditions met" in report
     for name in (CHECK_OLLAMA_SCHEMA, CHECK_TOKEN, stack_check("python")):
         assert name in report
 
@@ -748,8 +798,214 @@ def test_a_docker_failure_cannot_print_the_token():
 
 
 # --------------------------------------------------------------------------
+# The tracker
+#
+# Four checks over one handshake, and the cuts between them are the point:
+# "there is no block", "nothing answered", "the credential was refused" and
+# "that tool does not exist" have four different remedies, and an operator told
+# the wrong one of the four goes looking in the wrong place. The read-only
+# constraint gets stricter here than anywhere else in this module - a
+# `tools/call` against a tracker is a comment somebody receives.
+# --------------------------------------------------------------------------
+
+
+def test_a_healthy_tracker_passes_all_four_checks(doctor):
+    server = FakeMcpServer()
+    subject, _, _, _ = doctor(server=server)
+    diagnosis = subject.run()
+
+    for name in (
+        CHECK_TRACKER_CONFIG,
+        CHECK_TRACKER_REACHABLE,
+        CHECK_TRACKER_AUTH,
+        CHECK_TRACKER_TOOLS,
+    ):
+        assert diagnosis.by_name(name).status == OK, diagnosis.by_name(name)
+    assert "list_issues" in diagnosis.by_name(CHECK_TRACKER_TOOLS).detail
+
+
+def test_the_tracker_probe_calls_no_tool(doctor):
+    """The read-only rule, at the point where breaking it is most expensive.
+
+    `tools/call` on somebody's tracker is a comment they receive or a ticket
+    they have to triage, and unlike the GitHub half of this module the write
+    would land in a system apiary does not own.
+    """
+    server = FakeMcpServer()
+    subject, _, _, _ = doctor(server=server)
+    subject.run()
+
+    assert server.called_tools == []
+    assert set(server.methods) <= {
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "session/delete",
+    }, server.methods
+
+
+def test_the_probe_is_closed_when_the_run_finishes(doctor):
+    """A stdio contract's client is a subprocess, and doctor is a diagnostic.
+
+    One left running per invocation would be a leak in the tool an operator
+    reaches for when they already suspect their machine.
+    """
+    server = FakeMcpServer()
+    subject, _, _, _ = doctor(server=server)
+    subject.run()
+
+    assert server.closed
+
+
+def test_one_handshake_serves_every_tracker_check(doctor):
+    """Three checks read one `initialize`.
+
+    Connecting per check would be three chances to trip somebody's rate limit
+    while reporting that nothing is wrong.
+    """
+    server = FakeMcpServer()
+    subject, _, _, _ = doctor(server=server)
+    subject.run()
+
+    assert server.methods.count("initialize") == 1
+
+
+def test_no_tracker_configured_is_one_skip_and_not_a_failure(doctor):
+    """apiary runs on the label control plane until #152.
+
+    An installation with no contract is a normal one. Three further lines
+    reading "not attempted" would describe a machine with nothing wrong with
+    it, and a preflight that reports non-problems is one people stop reading.
+    """
+    subject, _, _, _ = doctor(tracker=None, mcp=None)
+    diagnosis = subject.run()
+
+    assert diagnosis.ok
+    assert diagnosis.by_name(CHECK_TRACKER_CONFIG).status == SKIP
+    assert "no tracker configured" in diagnosis.by_name(CHECK_TRACKER_CONFIG).detail
+    for name in (CHECK_TRACKER_REACHABLE, CHECK_TRACKER_AUTH, CHECK_TRACKER_TOOLS):
+        with pytest.raises(KeyError):
+            diagnosis.by_name(name)
+
+
+def test_a_malformed_block_is_reported_as_a_verdict_not_a_traceback(doctor):
+    """`from_env` catches `ContractError`, and this is why.
+
+    An unparseable block is the single most likely thing to be wrong on the run
+    where somebody types `swarm doctor`, and dying of it would report nothing
+    else at all.
+    """
+    try:
+        parse_tracker("mcp: github\ncomments: { tool: t }", source=".swarm/tracker.yaml")
+    except ContractError as exc:
+        message = str(exc)
+
+    subject, _, _, _ = doctor(tracker=None, mcp=None, tracker_error=message)
+    verdict = subject.run().by_name(CHECK_TRACKER_CONFIG)
+
+    assert verdict.status == FAIL
+    assert "comments" in verdict.detail
+    assert "python -m swarm.mcp.contract" in verdict.fix
+
+
+def test_an_unreachable_server_is_not_reported_as_an_unauthorized_one(doctor):
+    server = FakeMcpServer(unreachable=OSError("connection refused"))
+    subject, _, _, _ = doctor(server=server)
+    diagnosis = subject.run()
+
+    reachable = diagnosis.by_name(CHECK_TRACKER_REACHABLE)
+    assert reachable.status == FAIL
+    assert ENDPOINT in reachable.detail
+    assert "curl -i" in reachable.fix
+    # And the checks that cannot be answered say which one to fix first.
+    assert diagnosis.by_name(CHECK_TRACKER_AUTH).status == SKIP
+    assert diagnosis.by_name(CHECK_TRACKER_TOOLS).status == SKIP
+
+
+def test_a_refused_credential_still_proves_the_server_is_there(doctor):
+    """The cut that makes four checks worth having.
+
+    A 401 is an answer. Reporting it as "unreachable" sends the operator to
+    their network, and reporting an unreachable host as "unauthorized" sends
+    them to mint a token they already have.
+    """
+    server = FakeMcpServer(unauthorized=True)
+    subject, _, _, _ = doctor(server=server)
+    diagnosis = subject.run()
+
+    assert diagnosis.by_name(CHECK_TRACKER_REACHABLE).status == OK
+    auth = diagnosis.by_name(CHECK_TRACKER_AUTH)
+    assert auth.status == FAIL
+    assert "APIARY_LINEAR_TOKEN" in auth.detail
+    # The per-server minting command, which is the whole content of a useful
+    # 401 and which differs per tracker (#143).
+    assert "linear.app/settings/api" in auth.fix
+    assert "not retried" in auth.fix
+
+
+def test_an_absent_credential_names_the_variable_before_the_network_is_blamed(doctor):
+    subject, _, _, _ = doctor(env={"GITHUB_TOKEN": TOKEN})
+    verdict = subject.run().by_name(CHECK_TRACKER_AUTH)
+
+    assert verdict.status == FAIL
+    assert "export APIARY_LINEAR_TOKEN=" in verdict.fix
+
+
+def test_a_tool_the_server_does_not_have_is_caught_here(doctor):
+    """The failure #150 exists to move.
+
+    A renamed or mistyped tool is not discovered until the first cycle that
+    needs the capability - which for `comment` is the moment a pull request has
+    been opened and nobody is told about it.
+    """
+    server = FakeMcpServer(tools=("list_issues", "create_issue"))
+    subject, _, _, _ = doctor(server=server)
+    verdict = subject.run().by_name(CHECK_TRACKER_TOOLS)
+
+    assert verdict.status == FAIL
+    assert "create_comment" in verdict.detail
+    # Which capability named it, and what the server does offer instead.
+    assert "comment" in verdict.detail
+    assert "list_issues" in verdict.fix
+
+
+def test_a_server_with_no_tools_capability_says_so_separately(doctor):
+    """Pointed at a vendor's API root rather than at its MCP endpoint.
+
+    Reported as a missing tool it would read as a contract to edit, when what
+    is wrong is the URL.
+    """
+    server = FakeMcpServer(capabilities={})
+    subject, _, _, _ = doctor(server=server)
+    verdict = subject.run().by_name(CHECK_TRACKER_TOOLS)
+
+    assert verdict.status == FAIL
+    assert "no `tools` capability" in verdict.detail
+
+
+def test_a_local_server_is_told_to_check_the_binary_not_the_network(doctor):
+    """Two completely different problems wearing the same exception.
+
+    The GitHub profile's server is a separate download that nothing in this
+    repository installs, so "not on PATH" is the likelier of the two and
+    `curl` is advice that cannot help.
+    """
+    github = parse_tracker("mcp: github\nargs: { owner: o, repo: r }", source="t.yaml")
+    server = FakeMcpServer(unreachable=OSError("no such file or directory"))
+    subject, _, _, _ = doctor(tracker=github, mcp=mcp_client(server))
+    verdict = subject.run().by_name(CHECK_TRACKER_REACHABLE)
+
+    assert verdict.status == FAIL
+    assert "which github-mcp-server" in verdict.fix
+
+
+# --------------------------------------------------------------------------
 # The two clauses of "done when"
 # --------------------------------------------------------------------------
+
+
+#: One `ContractError`, rendered the way `Doctor.from_env` hands it over.
+_BAD_BLOCK = "tracker.yaml: tracker.create.tool is missing.\n    create: { tool: issue_write }"
 
 
 def provoked_failures(doctor) -> list[Check]:
@@ -772,6 +1028,10 @@ def provoked_failures(doctor) -> list[Check]:
         (CHECK_DOCKER_CLI, {"which": lambda name: None}),
         (CHECK_DOCKER_DAEMON, {"runner": DeadRunner()}),
         (stack_check("python"), {"runner": RecordingRunner(images={})}),
+        (CHECK_TRACKER_CONFIG, {"tracker": None, "mcp": None, "tracker_error": _BAD_BLOCK}),
+        (CHECK_TRACKER_REACHABLE, {"server": FakeMcpServer(unreachable=OSError("refused"))}),
+        (CHECK_TRACKER_AUTH, {"server": FakeMcpServer(unauthorized=True)}),
+        (CHECK_TRACKER_TOOLS, {"server": FakeMcpServer(tools=("list_issues",))}),
     ]
 
     failures: list[Check] = []
@@ -786,7 +1046,7 @@ def provoked_failures(doctor) -> list[Check]:
 def test_every_check_can_be_provoked_to_fail(doctor):
     """The first clause of the ticket's "done when", for every check."""
     names = [check.name for check in provoked_failures(doctor)]
-    assert len(names) == len(set(names)) == 12
+    assert len(names) == len(set(names)) == 16
 
 
 def test_every_failure_names_a_command(doctor):
@@ -810,7 +1070,7 @@ def test_every_failure_names_a_command(doctor):
 def test_main_exits_non_zero_when_something_is_wrong(doctor, capsys):
     healthy, _, _, _ = doctor()
     assert main([REPO], doctor=healthy) == 0
-    assert "all 15 preconditions met" in capsys.readouterr().out
+    assert "all 19 preconditions met" in capsys.readouterr().out
 
     broken, _, _, _ = doctor(runner=RecordingRunner(images=()))
     assert main([REPO], doctor=broken) == 1
@@ -850,6 +1110,36 @@ def test_live_models_honour_the_schema():
         pytest.skip(reachable.detail)
     assert subject.check_models().ok, subject.check_models().detail
     assert subject.check_schema().ok, subject.check_schema().detail
+
+
+@pytest.mark.network
+def test_live_linear_answers_the_tracker_probe():
+    """The half a double cannot prove: that this is really how a server behaves.
+
+    `mcp.linear.app` challenges an unauthenticated `tools/list` with a 401
+    (#143 probed it and quoted the response), so with no credential exported
+    the correct verdicts are *reachable* and *unauthorized* - which is the cut
+    this file's hermetic tests assert against a fake, and the cut that would be
+    worth nothing if a real server did something else. No token is needed to
+    run it, and none is sent.
+    """
+    subject = Doctor(
+        env={},
+        settings=settings(),
+        inference=FakeInference(),
+        tracker=parse_tracker(TRACKER_BLOCK, source="<live>"),
+    )
+    try:
+        reachable = subject.check_tracker_reachable()
+        if not reachable.ok:
+            pytest.skip(reachable.detail)
+        assert "refused the credential" in reachable.detail
+
+        auth = subject.check_tracker_auth()
+        assert auth.status == FAIL
+        assert "APIARY_LINEAR_TOKEN" in auth.fix
+    finally:
+        subject._close_probe()
 
 
 @pytest.mark.docker

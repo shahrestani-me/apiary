@@ -55,6 +55,36 @@ tripped over it:
   `APIARY_OLLAMA_HOST`; a process started from a shell that exported the bind
   address does not, and gets a connection error that reads like a dead server.
 
+**The tracker checks are the same argument, one integration further out.**
+ADR 0001 reaches a customer's task system through *their* MCP server, named in
+a capability contract (`mcp/contract.py`, #150). Everything that can be wrong
+with that arrangement fails late and reads as something else: a tool name the
+server does not have surfaces on the first cycle that needs it, a credential
+that expired surfaces as an orchestrator that has gone quiet, and a host
+missing from the egress allowlist is answered `403 Filtered` by the proxy,
+which reads exactly like the server refusing the request. So `tracker.*` asks
+all four questions up front - the block is valid, the server answers, the
+credential is accepted, every named tool exists - and each answer names its own
+remedy, including the *per-server* command that mints a credential, because
+those differ and "401" on its own is not actionable.
+
+Three notes on how those four are cut, each of them a distinction that would
+otherwise be lost:
+
+- **A 401 proves reachability.** The probe is built without a credential when
+  none is exported, so a server that refuses it has still answered - and
+  "unreachable" and "unauthorized" stay separate verdicts with separate fixes
+  rather than one confusing one.
+- **No tracker configured is not a failure.** apiary runs on the label control
+  plane until #152, so an installation with no contract is a normal one; it
+  gets a single skip that says so, and nothing that depends on it is reported
+  as broken.
+- **Still read-only, and now against somebody else's system.** The tracker
+  probe makes exactly two calls, `initialize` and `tools/list`. It never calls
+  a tool: `tools/call` on a tracker is a comment somebody receives or a ticket
+  somebody triages, which is the most expensive way this module could break its
+  own rule. `tests/test_doctor.py` asserts the recorded call list.
+
 Manual run against a real repo - reads only, writes nothing:
 
     GITHUB_TOKEN=... python -m swarm.doctor shahrestani-me/apiary
@@ -79,7 +109,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from pydantic import BaseModel
 
-from .config import SETTINGS, Settings
+from .config import SETTINGS, TRACKER_CONFIG_ENV, Settings
 from .containers.manager import (
     DEFAULT_STACK_IMAGES,
     STACK_LABEL,
@@ -93,6 +123,14 @@ from .containers.manager import (
 from .github.client import GitHubClient, GitHubError, GitHubHTTPError
 from .github.labels import SWARM_LABELS, list_label_names
 from .llm import orchestrator_llm, structured, worker_llm
+from .mcp.client import McpAuthError, McpEgressBlocked, McpError, ServerInfo, ToolSpec
+from .mcp.contract import (
+    CAPABILITIES,
+    ContractError,
+    TrackerContract,
+    client_for,
+    load_tracker,
+)
 from .security import (
     PROVISION_PERMISSIONS,
     PROVISION_TOKEN_ENV,
@@ -109,6 +147,7 @@ __all__ = [
     "Doctor",
     "HostInference",
     "Inference",
+    "TrackerProbe",
     "OK",
     "FAIL",
     "SKIP",
@@ -145,6 +184,13 @@ CHECK_CI = "github.ci"
 CHECK_TIMEOUTS = "config.timeouts"
 CHECK_DOCKER_CLI = "docker.cli"
 CHECK_DOCKER_DAEMON = "docker.daemon"
+#: The capability contract (#150), in the four ways it can be wrong. Four
+#: rather than one because their remedies have nothing in common: edit a file,
+#: open an egress hole, mint a credential, rename a tool.
+CHECK_TRACKER_CONFIG = "tracker.config"
+CHECK_TRACKER_REACHABLE = "tracker.reachable"
+CHECK_TRACKER_AUTH = "tracker.auth"
+CHECK_TRACKER_TOOLS = "tracker.tools"
 #: The prefix a per-stack image check reports under: `docker.image.node`. One
 #: per stack rather than one `docker.image`, because #99 chooses the image per
 #: task - "the worker image is present" stopped being a single fact about a
@@ -168,6 +214,7 @@ _NAME_WIDTH = max(
         CHECK_OLLAMA_TARGET, CHECK_OLLAMA_REACHABLE, CHECK_OLLAMA_MODELS, CHECK_OLLAMA_SCHEMA,
         CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI, CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON,
+        CHECK_TRACKER_CONFIG, CHECK_TRACKER_REACHABLE, CHECK_TRACKER_AUTH, CHECK_TRACKER_TOOLS,
         *(stack_check(stack) for stack in DEFAULT_STACK_IMAGES),
     )
 )
@@ -218,8 +265,20 @@ class Check:
         return self.status == OK
 
     def lines(self) -> list[str]:
+        """The verdict, and its remedy indented under the same column.
+
+        A fix may be more than one line - the useful shape for one is a
+        sentence and then the command on its own, which is how `mcp/contract.py`
+        writes every refusal it hands over. Continuation lines are padded to the
+        same column rather than printed flush left, because the report is read
+        as a table and a stray line at column zero reads as a new check.
+        """
         head = f"{_MARK[self.status]}  {self.name:<{_NAME_WIDTH}}  {self.detail}"
-        return [head, f"{'':6}{'':<{_NAME_WIDTH}}  fix: {self.fix}"] if self.fix else [head]
+        if not self.fix:
+            return [head]
+        pad = f"{'':6}{'':<{_NAME_WIDTH}}  "
+        first, *rest = self.fix.splitlines()
+        return [head, f"{pad}fix: {first}", *(f"{pad}     {line.strip()}" for line in rest)]
 
     def __str__(self) -> str:
         return "\n".join(self.lines())
@@ -437,6 +496,23 @@ DEFAULT_CI_REF = "main"
 _DENIED_MARKERS: tuple[str, ...] = ("403", "forbidden")
 
 
+class TrackerProbe(Protocol):
+    """What doctor asks of an MCP server, and the whole of it.
+
+    Two reads and a teardown. `McpClient` satisfies this structurally, and the
+    narrowness is the point rather than an accident of what the tests needed:
+    the type an operator can see makes it obvious that a preflight against
+    somebody's live Jira cannot file a ticket in it, because there is no method
+    here that would.
+    """
+
+    def connect(self) -> ServerInfo: ...
+
+    def list_tools(self) -> list[ToolSpec]: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass
 class Doctor:
     """Every check, and the collaborators each of them needs.
@@ -464,6 +540,21 @@ class Doctor:
     stacks: Sequence[str] = tuple(sorted(DEFAULT_STACK_IMAGES))
     ci_ref: str = DEFAULT_CI_REF
     probe_schema: bool = True
+    #: The capability contract, or None when this installation configures no
+    #: tracker - which is still the normal case until #152 removes the label
+    #: control plane, and is reported as a skip rather than as a failure.
+    tracker: TrackerContract | None = None
+    #: Why there is no contract, when a file said there should be one. Carried
+    #: as a string because `from_env` must not raise: an unparseable block is
+    #: precisely what this module exists to report.
+    tracker_error: str = ""
+    #: The seam, same shape and same reason as `inference` and `github`. Left
+    #: unset in production, where `check_tracker_*` builds an `McpClient` from
+    #: the contract itself.
+    mcp: TrackerProbe | None = None
+    _probe: tuple[Any, Exception | None] | None = field(
+        init=False, default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.inference is None:
@@ -484,7 +575,10 @@ class Doctor:
 
         A missing or malformed target leaves `github` unset rather than
         raising: "there is no usable token" is a verdict this module reports,
-        not an error it dies of.
+        not an error it dies of. The tracker contract is loaded the same way
+        and for the same reason - a block that will not parse is the single
+        most likely thing to be wrong on the run where somebody types `swarm
+        doctor`, and dying of it would report nothing else at all.
         """
         env: Mapping[str, str] = kwargs.pop("env", None) or dict(os.environ)
         repo = repo or env.get("GITHUB_REPOSITORY") or None
@@ -492,7 +586,22 @@ class Doctor:
         github = kwargs.pop("github", None)
         if github is None and token and repo and _is_repo(repo):
             github = GitHubClient(repo, token)
-        return cls(repo=repo, github=github, env=env, **kwargs)
+
+        tracker = kwargs.pop("tracker", None)
+        tracker_error = kwargs.pop("tracker_error", "")
+        if tracker is None and not tracker_error:
+            try:
+                tracker = load_tracker(env=env)
+            except ContractError as exc:
+                tracker_error = str(exc)
+        return cls(
+            repo=repo,
+            github=github,
+            env=env,
+            tracker=tracker,
+            tracker_error=tracker_error,
+            **kwargs,
+        )
 
     # --- the run --------------------------------------------------------
 
@@ -538,7 +647,33 @@ class Doctor:
                 self._after(daemon, stack_check(stack), partial(self.check_stack_image, stack))
             )
 
+        checks += self.tracker_checks()
         return Diagnosis(tuple(checks))
+
+    def tracker_checks(self) -> list[Check]:
+        """The capability contract, in the four ways it can be wrong.
+
+        One check rather than four when nothing is configured, and that is a
+        judgement rather than tidiness: three further lines reading "not
+        attempted: tracker.config did not pass" describe an installation that
+        has nothing wrong with it, and a preflight that reports three
+        non-problems on every run is one people stop reading.
+
+        The probe is closed at the end whatever the verdicts were. A stdio
+        contract's client is a *subprocess*, and a diagnostic that left one
+        running per invocation would be a leak in the tool an operator reaches
+        for when they already suspect their machine.
+        """
+        config = self.check_tracker_config()
+        if self.tracker is None:
+            return [config]
+        try:
+            reachable = self._after(config, CHECK_TRACKER_REACHABLE, self.check_tracker_reachable)
+            auth = self._after(reachable, CHECK_TRACKER_AUTH, self.check_tracker_auth)
+            tools = self._after(auth, CHECK_TRACKER_TOOLS, self.check_tracker_tools)
+            return [config, reachable, auth, tools]
+        finally:
+            self._close_probe()
 
     @staticmethod
     def _after(prior: Check, name: str, check: Callable[[], Check]) -> Check:
@@ -1030,10 +1165,276 @@ class Doctor:
             )
         return Check.passed(name, f"{image} present for {labelled} ({image_id[:19]})")
 
+    # --- the tracker ------------------------------------------------------
+
+    def check_tracker_config(self) -> Check:
+        """Does a capability contract exist, and does it validate?
+
+        Costs no I/O and runs before everything else that touches the tracker,
+        because a block that names the wrong tool is not a network problem and
+        the three checks after this one would all be describing it as one.
+        """
+        if self.tracker_error:
+            detail, fix = _contract_verdict(self.tracker_error, self.settings.tracker_config)
+            return Check.failed(CHECK_TRACKER_CONFIG, detail, fix=fix)
+        if self.tracker is None:
+            return Check.skipped(
+                CHECK_TRACKER_CONFIG,
+                f"no tracker configured: {self.settings.tracker_config} does not exist and "
+                f"{TRACKER_CONFIG_ENV} is unset, which is still a normal installation - "
+                f"apiary runs on the label control plane until the tracker path lands "
+                f"(ADR 0001)",
+            )
+        contract = self.tracker
+        return Check.passed(
+            CHECK_TRACKER_CONFIG,
+            f"{contract.source}: {contract.mcp} at {contract.endpoint}, "
+            f"{'/'.join(contract.capability(name).tool for name in CAPABILITIES)}",
+        )
+
+    def check_tracker_reachable(self) -> Check:
+        """Does the configured server answer at all?
+
+        A refused *credential* counts as reachable, and separating the two is
+        the whole reason this is not one check: "nothing is listening there"
+        and "your token expired" have nothing in common except that both stop
+        the run, and an operator told the wrong one of the two goes looking in
+        entirely the wrong place. The probe is built without a credential when
+        none is exported precisely so that this question can still be asked.
+        """
+        contract = self.tracker
+        assert contract is not None  # guarded by `tracker_checks`
+        info, error = self._tracker_probe()
+
+        if isinstance(error, McpAuthError):
+            return Check.passed(
+                CHECK_TRACKER_REACHABLE,
+                f"{contract.endpoint} answered, and refused the credential "
+                f"(see {CHECK_TRACKER_AUTH})",
+            )
+        if isinstance(error, McpEgressBlocked):
+            return Check.failed(
+                CHECK_TRACKER_REACHABLE,
+                f"{contract.endpoint}: {error}",
+                fix=(
+                    f"add the host to security.MCP_HOSTS and to the FilterURL block in "
+                    f"compose.yaml - tests/test_security.py asserts the two agree. "
+                    f"(APIARY_EGRESS_ALLOW is documented in four places and read by none; "
+                    f"the enforced list is generated from the tuple in "
+                    f"src/swarm/security.py.)"
+                ),
+            )
+        if error is not None:
+            return Check.failed(
+                CHECK_TRACKER_REACHABLE,
+                f"{contract.endpoint} did not answer: {error}",
+                fix=self._unreachable_fix(contract),
+            )
+        assert info is not None
+        return Check.passed(
+            CHECK_TRACKER_REACHABLE,
+            f"{contract.endpoint}: {info.name} {info.version}, MCP {info.protocol_version}",
+        )
+
+    def check_tracker_auth(self) -> Check:
+        """Is there a credential, and does the server accept it?
+
+        Asked before a cycle needs it because #143 settled that apiary drives
+        no OAuth flow and holds no refresh token: the credential is pre-minted
+        and static, which makes expiry a routine event rather than an
+        exceptional one. A 401 is never retried (`mcp/client.py`), so an
+        expired token is a run that stops, and the only useful thing to say
+        about it is the command that mints a new one - which differs per
+        server, and which the contract therefore carries.
+        """
+        contract = self.tracker
+        assert contract is not None
+        auth = contract.auth
+        if not auth.credential(self.env):
+            return Check.failed(
+                CHECK_TRACKER_AUTH,
+                f"{auth.value_env} is not set, and it is where {contract.mcp}'s credential "
+                f"is read from",
+                fix=auth.absent_fix(),
+            )
+
+        info, error = self._tracker_probe()
+        if isinstance(error, McpAuthError):
+            return Check.failed(
+                CHECK_TRACKER_AUTH,
+                f"{contract.endpoint} rejected the credential in {auth.value_env} "
+                f"({error.status})",
+                fix=(
+                    f"the token is expired or revoked, which is not transient and is not "
+                    f"retried - mint a new one and re-export it:\n    {auth.absent_fix()}"
+                ),
+            )
+        if error is not None:  # pragma: no cover - `reachable` already failed
+            return Check.skipped(
+                CHECK_TRACKER_AUTH, f"not attempted: {CHECK_TRACKER_REACHABLE} did not pass"
+            )
+        assert info is not None
+        delivery = (
+            f"the server reads it from {auth.server_env}"
+            if contract.is_stdio
+            else f"{auth.header}: {auth.scheme}"
+        )
+        return Check.passed(
+            CHECK_TRACKER_AUTH, f"{auth.value_env} accepted by {info.name} ({delivery})"
+        )
+
+    def check_tracker_tools(self) -> Check:
+        """Does every tool the contract names exist on the server?
+
+        The failure this is for is the one #150 is written around: a tool name
+        that is a typo, or that a server renamed between versions, is not
+        discovered until the first cycle that needs the capability - which for
+        `create` may be an hour into a run, and for `comment` is the moment a
+        pull request has already been opened and nobody is told about it.
+
+        `tools/list` and nothing else. Proving a tool *works* means calling it,
+        and calling a tracker's tools means writing to somebody's tracker.
+        """
+        contract = self.tracker
+        assert contract is not None
+        info, _ = self._tracker_probe()
+        assert info is not None  # guarded by `_after(auth, ...)`
+
+        if not info.supports_tools:
+            return Check.failed(
+                CHECK_TRACKER_TOOLS,
+                f"{info.name} advertises no `tools` capability, so it offers nothing to call",
+                fix=(
+                    f"check {contract.endpoint} is the MCP endpoint rather than the "
+                    f"vendor's API root, and re-check the block with:\n"
+                    f"    python -m swarm.mcp.contract {contract.source}"
+                ),
+            )
+        try:
+            offered = {spec.name for spec in self._tracker_client().list_tools()}
+        except McpError as exc:
+            return Check.failed(
+                CHECK_TRACKER_TOOLS,
+                f"{contract.endpoint} would not list its tools: {exc}",
+                fix=self._unreachable_fix(contract),
+            )
+
+        missing = [name for name in contract.tools if name not in offered]
+        if missing:
+            named_by = {
+                name: [
+                    capability
+                    for capability in CAPABILITIES
+                    if contract.capability(capability).tool == name
+                ]
+                for name in missing
+            }
+            return Check.failed(
+                CHECK_TRACKER_TOOLS,
+                f"{info.name} has no "
+                + ", ".join(f"{name} ({'/'.join(named_by[name])})" for name in missing),
+                fix=(
+                    f"it offers {', '.join(sorted(offered)) or 'nothing'}. Name one of those "
+                    f"in {contract.source}, then re-check with:\n"
+                    f"    python -m swarm.mcp.contract {contract.source}"
+                ),
+            )
+        return Check.passed(
+            CHECK_TRACKER_TOOLS,
+            f"{info.name} offers all {len(contract.tools)} named tools "
+            f"({', '.join(contract.tools)}); none was called",
+        )
+
+    # --- the tracker probe ------------------------------------------------
+
+    def _tracker_client(self) -> TrackerProbe:
+        """The injected probe, or one built from the contract.
+
+        `require_credential=False`: an absent credential is a verdict
+        `tracker.auth` reports, not a reason to be unable to ask whether the
+        server exists.
+        """
+        contract = self.tracker
+        assert contract is not None
+        if self.mcp is None:
+            self.mcp = client_for(contract, env=self.env, require_credential=False)
+        return self.mcp
+
+    def _tracker_probe(self) -> tuple[Any, Exception | None]:
+        """`initialize`, once, and whatever it answered - a `ServerInfo` or a refusal.
+
+        Memoized because three checks read one handshake, and because a
+        preflight that connected three times to somebody's tracker would be
+        three chances to trip a rate limit while reporting that nothing is
+        wrong.
+        """
+        if self._probe is None:
+            try:
+                self._probe = (self._tracker_client().connect(), None)
+            except (McpError, ContractError, OSError) as exc:
+                # The three families a connect can refuse through: the client's
+                # own classification, a contract that could not be turned into
+                # a client, and a socket. Anything else is a bug in this
+                # module rather than a verdict about the operator's machine,
+                # and hiding it as a check result would be the wrong trade.
+                self._probe = (None, exc)
+        return self._probe
+
+    def _close_probe(self) -> None:
+        """End the session, and the subprocess if there was one. Best effort."""
+        probe, self.mcp, self._probe = self.mcp, None, None
+        if probe is None:
+            return
+        try:
+            probe.close()
+        except Exception:  # noqa: BLE001 - a teardown must not become the verdict
+            pass
+
+    @staticmethod
+    def _unreachable_fix(contract: TrackerContract) -> str:
+        """Two completely different problems wearing the same exception.
+
+        A remote server that does not answer is a URL, a network or a proxy. A
+        local one is a binary that is not on this PATH - and `command:` naming
+        something uninstalled is the likelier of the two, because the GitHub
+        profile's server is a separate download that nothing in this repository
+        installs.
+        """
+        if contract.is_stdio:
+            binary = contract.command[0] if contract.command else contract.endpoint
+            return (
+                f"`which {binary}` - a stdio tracker is a local binary, and the GitHub "
+                f"profile's is a separate install "
+                f"(https://github.com/github/github-mcp-server). Correct `command:` in "
+                f"{contract.source} if it is installed under another name:\n"
+                f"    python -m swarm.mcp.contract {contract.source}"
+            )
+        return (
+            f"check the endpoint with `curl -i {contract.endpoint}` - a 4xx means the URL "
+            f"is wrong and a timeout means the network is. Inside compose, confirm the "
+            f"host is in security.MCP_HOSTS and in compose.yaml's FilterURL block:\n"
+            f"    python -m swarm.mcp.contract {contract.source}"
+        )
+
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _contract_verdict(message: str, path: str) -> tuple[str, str]:
+    """One `ContractError` as `(detail, fix)`.
+
+    Every refusal in `mcp/contract.py` is written as a sentence naming the
+    field, then the example that fixes it on the following lines - which is the
+    same two halves a `Check` carries, so the split is a split rather than a
+    rewrite. A message with no second half still gets a fix, because
+    `Check.__post_init__` is right to insist on one.
+    """
+    head, _, tail = message.partition("\n")
+    remedy = " ".join(part.strip() for part in tail.splitlines() if part.strip())
+    validate = f"python -m swarm.mcp.contract {path}"
+    return head.strip(), f"{remedy}  ({validate})" if remedy else validate
 
 
 def _is_repo(value: str) -> bool:
