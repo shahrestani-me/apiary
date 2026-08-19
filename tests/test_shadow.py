@@ -47,6 +47,7 @@ from swarm.artifacts import (
 )
 from swarm.containers.manager import CREATED_STATE, RUNNING_STATE, Handle
 from swarm.github.readiness import IssueState
+from swarm.github.refs import pull_ref
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.checks import PullState
 from swarm.orchestrator.reconcile import (
@@ -79,6 +80,7 @@ from test_reconcile import (  # the doubles that drive a real cycle
     REPO,
     RUN_ID,
     TASK_ISSUE,
+    TASK_PULL,
     TASK_REF,
     a_lifecycle_run,
     entry,
@@ -152,7 +154,9 @@ def handle(issue: int, *, state: str = RUNNING_STATE) -> Handle:
 
 
 def pull(number: int, branch: str, *, sha: str = "") -> PullState:
-    return PullState(number=number, branch=branch, sha=sha or f"{number:0>40x}")
+    """A `PullState` the way a listing produces one: the number is a `PullRef`
+    since #185, minted through the adapter rather than constructed here."""
+    return PullState(number=pull_ref(number), branch=branch, sha=sha or f"{number:0>40x}")
 
 
 def divergences(seen: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -709,6 +713,48 @@ def test_a_task_that_reaches_review_agrees_with_the_control_plane(tmp_path):
 
     assert [one for one in seen if one[0] == STATE_SHADOW]
     assert unexplained == []
+
+
+def test_a_whole_lifecycle_never_breaks_the_window(tmp_path):
+    """The guard the `except Exception` makes necessary.
+
+    Swallowing is the right behaviour and it has a cost: a genuine defect in
+    this module reads as a shadow that quietly stopped reporting, which is
+    silence in the direction of the bug. So the suite asserts `broken` rather
+    than trusting the absence of a failure - and it asserts it after a cycle
+    that has been through dispatch, a result, review, a check set and a merge,
+    which is where the five other modules' records are actually touched.
+
+    This is not hypothetical: the first version of this ticket read
+    `PullState.number` as an `int`, #185 had just made it a `PullRef`, and the
+    only symptom was a line on stderr.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.cycle()
+    reaches_review(client, fleet, pending())
+    write_result(record(TASK_ISSUE, 0, attempt=0, reason="verified"), tmp_path)
+    loop.cycle()
+    client.check_runs = {client.head_of(TASK_PULL): green()}
+    loop.cycle()
+
+    assert loop._shadow.broken is False
+    assert [one for one in seen if one[0] == STATE_SHADOW]
+
+
+def test_a_failing_task_walked_to_escalation_never_breaks_the_window(tmp_path):
+    """The other half of the same guard: the paths where a counter moves, a
+    comment is refused and a terminal label is written."""
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+    loop.max_attempts = 2
+    for attempt in range(3):
+        loop.cycle()
+        write_result(record(TASK_ISSUE, 1, attempt=attempt), tmp_path)
+        fleet.handles.clear()
+        loop.cycle()
+
+    assert loop._shadow.broken is False
 
 
 def test_the_merge_cycle_reports_the_one_expected_divergence(tmp_path):

@@ -23,6 +23,14 @@ stderr rather than through the loop. A shadow that raised would turn an
 observation into an outage; a shadow that retried or slept would change the
 pacing it is meant to be measuring. It observes.
 
+That swallow has a cost worth naming: a genuine defect here reads as a shadow
+that quietly stopped reporting, which is silence in the direction of the bug.
+So `ShadowWindow.broken` is a field rather than a local, and
+`tests/test_shadow.py` asserts it is false after a cycle that has been through
+dispatch, a result, review, a check set and a merge. It is not hypothetical -
+the first version of this module read `PullState.number` as an `int`, #185 had
+just made it a `PullRef`, and the only symptom was a line on stderr.
+
 **It costs no API call.** Everything it reads is passed in by
 `Reconciler.cycle` from that cycle's own reads - the handles from one
 `docker ps`, the pull requests from the listing `Snapshot` already forced, the
@@ -155,9 +163,10 @@ from typing import Any, Callable, Iterable, Mapping
 from ..containers.manager import CREATED_STATE, Handle
 from ..github.branches import parse_task_branch, task_branch
 from ..github.readiness import SATISFYING_STATE_REASONS, IssueState
-from ..github.refs import issue_number, task_ref
+from ..github.refs import issue_number, pull_number, task_ref
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord, record_path
+from .checks import PullState
 from .derived import (
     NEEDS_HUMAN,
     AttemptFact,
@@ -299,7 +308,7 @@ def observation_for(
     report: CycleReport,
     *,
     handles: Mapping[TaskRef, Handle] | None = None,
-    pulls: Mapping[str, Any] | None = None,
+    pulls: Mapping[str, PullState] | None = None,
     results: Mapping[TaskRef, ResultRecord] | None = None,
     states: Mapping[TaskRef, IssueState] | None = None,
     budget: Budget | None = None,
@@ -343,11 +352,19 @@ def observation_for(
             continue
         facts.append(
             PullFact(
-                number=int(getattr(pull, "number", 0)),
+                # `PullState.number` is a `PullRef` since #185 and `PullFact`'s
+                # is an `int`, which is not an oversight in either: a pull
+                # request number is an API address, and un-minting it through
+                # the adapter is the expected end of the value's life rather
+                # than a leak (`github/refs.pull_number`). Reaching for
+                # `int(...)` here instead is what a bare `PullRef` in scope
+                # beside an issue number produced before #185, and is exactly
+                # the mistake that type exists to make unexpressible.
+                number=pull_number(pull.number),
                 ref=parsed.ref,
                 attempt=parsed.attempt,
-                draft=bool(getattr(pull, "draft", False)),
-                head_sha=str(getattr(pull, "sha", "") or ""),
+                draft=bool(pull.draft),
+                head_sha=str(pull.sha or ""),
             )
         )
 
@@ -708,7 +725,7 @@ class ShadowWindow:
         report: CycleReport,
         *,
         handles: Mapping[TaskRef, Handle] | None = None,
-        pulls: Mapping[str, Any] | None = None,
+        pulls: Mapping[str, PullState] | None = None,
         results: Mapping[TaskRef, ResultRecord] | None = None,
         states: Mapping[TaskRef, IssueState] | None = None,
         infrastructure: Mapping[TaskRef, int] | None = None,
@@ -762,7 +779,7 @@ class ShadowWindow:
         report: CycleReport,
         *,
         handles: Mapping[TaskRef, Handle] | None,
-        pulls: Mapping[str, Any] | None,
+        pulls: Mapping[str, PullState] | None,
         results: Mapping[TaskRef, ResultRecord] | None,
         states: Mapping[TaskRef, IssueState] | None,
         infrastructure: Mapping[TaskRef, int] | None,
