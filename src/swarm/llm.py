@@ -226,7 +226,7 @@ class Provider:
     options: tuple[Option, ...] = ()
 
 
-def _callbacks(role: str, model: str) -> list | None:
+def _callbacks(role: str, model: str, provider: str = "") -> list | None:
     """Capture's hook, or nothing at all when `APIARY_CAPTURE` is unset.
 
     Imported here rather than at module scope so that a process with capture
@@ -242,7 +242,7 @@ def _callbacks(role: str, model: str) -> list | None:
     """
     from .capture import handler_for  # noqa: PLC0415 - deliberately lazy, see above
 
-    handler = handler_for(role=role, model=model)
+    handler = handler_for(role=role, model=model, provider=provider)
     return [handler] if handler is not None else None
 
 
@@ -554,7 +554,9 @@ def _build(role: str, spec: ModelSpec | None) -> Any:
     resolution = resolve(role, spec)
     announce(role, resolution)
     chosen = resolution.spec
-    return PROVIDERS[chosen.provider].build(chosen, _callbacks(role, chosen.model))
+    return PROVIDERS[chosen.provider].build(
+        chosen, _callbacks(role, chosen.model, chosen.provider)
+    )
 
 
 def orchestrator_llm(spec: ModelSpec | None = None):
