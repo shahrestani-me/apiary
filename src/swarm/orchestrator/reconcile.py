@@ -412,6 +412,11 @@ class Transition:
     #: counts these and a counter keyed on prose is a counter that stops
     #: counting the day somebody rewords a sentence.
     infrastructure: bool = False
+    #: `ResultRecord.identity` of the worker testimony this move was made from;
+    #: empty for a move no result caused. Carried so the next cycle can tell
+    #: "the record I already acted on" from "a second failure that looks like
+    #: the first" - `observed_results` folds it forward. See #203.
+    observed: str = ""
 
     def __str__(self) -> str:
         counter = "" if self.attempt is None else f", attempt {self.attempt}"
@@ -478,6 +483,12 @@ def infrastructure_streaks(
     account for, so one infrastructure transition is exactly one infrastructure
     verdict, and re-reading an unchanged results directory produces none.
 
+    That last clause is what `observed_results` below exists to keep true. It
+    was not: exit 2 leaves `entry.attempt` alone, so the dead attempt's record
+    still satisfied `record.attempt >= entry.attempt` while its own retry was
+    in flight, `_observe` ran on it a second time, and one host failure counted
+    twice against `APIARY_MAX_INFRASTRUCTURE` (#203).
+
     Any other transition on an issue clears its streak: a real task failure
     after a mechanical one means the machine recovered and the run is back to
     arguing about code, which is the case the counter must not carry over.
@@ -489,6 +500,36 @@ def infrastructure_streaks(
         else:
             streaks.pop(transition.ref, None)
     return streaks
+
+
+def observed_results(
+    previous: Mapping[TaskRef, str], transitions: Iterable[Transition]
+) -> dict[TaskRef, str]:
+    """Which result record each task's last landed move was made from (#203).
+
+    Pure arithmetic, folded forward from the cycle before, and folded from what
+    **landed** rather than what was planned - `infrastructure_streaks`' rule,
+    for its reason: a label write GitHub refused left the task where it was, and
+    marking its record spent would retire the only evidence the retry never
+    happened.
+
+    `entry.attempt` is what normally retires a record, and for an exit 1 it
+    does. Exit 2 is the hole: `docs/issue-contract.md` §4 does not consume an
+    attempt for a mechanical failure, so attempt N's record still reads as
+    current after attempt N's retry is dispatched, and the cycle after the
+    re-dispatch found a claimed issue with a "finished" record and acted on it
+    again - a second infrastructure transition, a second increment of the
+    streak, and the freshly-spawned container disposed out from under the retry.
+
+    The identity is the record's content rather than `(issue, attempt)`, because
+    two mechanical failures in a row at the same attempt are two verdicts and
+    both must count. `ResultRecord.identity` says why content is enough.
+    """
+    seen = dict(previous)
+    for transition in transitions:
+        if transition.observed:
+            seen[transition.ref] = transition.observed
+    return seen
 
 
 @dataclass(frozen=True)
@@ -928,6 +969,7 @@ def plan_reconcile(
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
+    observed: Mapping[TaskRef, str] | None = None,
 ) -> ReconcilePlan:
     """Compare desired state with actual state. Pure - no API call, no daemon.
 
@@ -976,6 +1018,11 @@ def plan_reconcile(
     # because this function stays pure. `infrastructure_streaks` folds the
     # answer forward and `Reconciler` carries it between cycles.
     infrastructure = infrastructure or {}
+    # Which result record this run has already acted on, per task. Passed in
+    # for `infrastructure`'s reason - this function stays pure - and read only
+    # by rule 3, which is the one rule that can be handed the same record
+    # twice. `observed_results` folds it forward. See #203.
+    observed = observed or {}
     live = set(running)
 
     transitions: list[Transition] = []
@@ -1018,9 +1065,16 @@ def plan_reconcile(
         #    container is done; `attempt >= entry.attempt` is what stops a
         #    record being acted on twice, since the counter moves and the file
         #    does not.
+        #
+        #    Except after an exit 2, where §4 deliberately does not move the
+        #    counter - so the identity of the record this run already acted on
+        #    is what closes that hole, and only that hole: every other verdict
+        #    is retired by the attempt guard one line up before it is reached
+        #    (#203).
         record = results.get(entry.ref)
         finished = record is not None and record.attempt >= entry.attempt
-        if was == CLAIMED_STATE and finished and record is not None:
+        fresh = record is not None and record.identity != observed.get(entry.ref)
+        if was == CLAIMED_STATE and finished and fresh and record is not None:
             transition, disposal = _observe(
                 entry,
                 record,
@@ -1121,6 +1175,12 @@ def _observe(
     writes it at the instant the PR exists; an exit 0 whose label did not stick
     leaves a claimed issue with an open PR, and that is #35's row, not this
     one's. Taking it here would race the worker for the same write.
+
+    Every transition this returns names the record it was made from, so a cycle
+    that lands one can retire that record (`observed_results`). Stamped here,
+    once, rather than at each `Transition(...)` below: this is the only function
+    that turns a record into a move, and a branch that forgot the stamp would be
+    a branch that silently counts its verdict twice.
     """
     if record.exit_code == EXIT_OK:
         return None, Disposal(entry.ref, "the worker published its pull request")
@@ -1128,17 +1188,21 @@ def _observe(
     detail = record.reason or record.outcome
     if record.consumes_attempt:
         return (
-            _retry_or_give_up(
-                entry,
-                f"worker exit {record.exit_code}: {detail}",
-                max_attempts,
-                # The record is the only place the gate's own words survive the
-                # container, and they are what the retry comment - and through
-                # it, the next attempt's prompt - is made of. The failure
-                # signature is computed from the same text, so "the same
-                # failure again" is judged on what the gate actually said.
-                verify_output=record.verify_output,
-                max_total_attempts=max_total_attempts,
+            replace(
+                _retry_or_give_up(
+                    entry,
+                    f"worker exit {record.exit_code}: {detail}",
+                    max_attempts,
+                    # The record is the only place the gate's own words survive
+                    # the container, and they are what the retry comment - and
+                    # through it, the next attempt's prompt - is made of. The
+                    # failure signature is computed from the same text, so "the
+                    # same failure again" is judged on what the gate actually
+                    # said.
+                    verify_output=record.verify_output,
+                    max_total_attempts=max_total_attempts,
+                ),
+                observed=record.identity,
             ),
             Disposal(entry.ref, f"worker exit {record.exit_code}"),
         )
@@ -1177,6 +1241,7 @@ def _observe(
                     f"to `{READY}`."
                 ),
                 infrastructure=True,
+                observed=record.identity,
             ),
             Disposal(entry.ref, f"worker exit 2 x{streak} (infrastructure, escalated)"),
         )
@@ -1188,6 +1253,7 @@ def _observe(
             reason=f"infrastructure failure: {detail}; the attempt was not consumed",
             task_id=entry.task_id,
             infrastructure=True,
+            observed=record.identity,
         ),
         Disposal(entry.ref, "worker exit 2 (infrastructure)"),
     )
@@ -1792,6 +1858,13 @@ class Reconciler:
     #: granting a clean slate is the safe direction for a counter whose job is
     #: bounding one run.
     _infrastructure: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: The result record each task's last landed move was made from (#203).
+    #: Run-scoped for `_infrastructure`'s reason, and failing the same safe
+    #: way: a restart forgets which record it acted on, and the worst that buys
+    #: is one duplicate observation of a record whose retry is still in flight -
+    #: where carrying it across a restart would risk retiring a verdict this
+    #: process never acted on at all.
+    _observed: dict[TaskRef, str] = field(default_factory=dict, repr=False)
     #: Which task events have already been announced (#141). Run-scoped for the
     #: same reason, and holding nothing a decision reads. Typed loosely and
     #: built through a local import, for `merge_policy`'s reason: `lifecycle`
@@ -1927,6 +2000,7 @@ class Reconciler:
             max_total_attempts=self.max_total_attempts,
             infrastructure=self._infrastructure,
             infrastructure_policy=self.infrastructure_policy,
+            observed=self._observed,
         )
         result = apply_plan(
             snapshot,
@@ -1948,6 +2022,10 @@ class Reconciler:
         # it would escalate a task on the strength of a move that never
         # happened. Same rule `fold` follows one line up, for the same reason.
         self._infrastructure = infrastructure_streaks(self._infrastructure, result.applied)
+        # Same input, same rule, same reason: a record whose move landed has
+        # been accounted for and must not be accounted for again while its
+        # retry - which §4 runs at the *same* attempt number - is in flight.
+        self._observed = observed_results(self._observed, result.applied)
 
         # Containers this cycle actually removed. Read from what `apply_plan`
         # and the recovery sweep report rather than from what they planned, for

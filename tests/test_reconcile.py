@@ -32,7 +32,7 @@ the request count is the client's own and not a stub's.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -41,7 +41,7 @@ from types import SimpleNamespace
 import pytest
 
 from fixtures.github import SentRequest, not_modified, page, response
-from swarm.containers.manager import DockerError, Handle
+from swarm.containers.manager import RUNNING_STATE, DockerError, Handle
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import (
@@ -63,6 +63,7 @@ from swarm.orchestrator.reconcile import (
     INFRASTRUCTURE_CAP_ENV,
     InfrastructurePolicy,
     infrastructure_streaks,
+    observed_results,
     COMMENT_METHOD,
     PULLS_METHOD,
     DONE,
@@ -2631,6 +2632,115 @@ def test_a_second_infrastructure_failure_at_the_same_attempt_is_announced(tmp_pa
     loop.cycle()
 
     assert names(seen).count("task.result") == 2
+
+
+# --------------------------------------------------------------------------
+# One exit 2 is one infrastructure verdict (#203)
+# --------------------------------------------------------------------------
+#
+# The count, not the labels. A cycle that reads the previous attempt's record a
+# second time produces the *same* `swarm:claimed -> swarm:ready`, on the same
+# issue, at the same attempt number - so a fixture asserting on labels or on
+# the plan's prose passes either way, which is how this survived a rewrite of
+# everything around it.
+#
+# It takes three cycles to see. Cycle 1 dispatches, cycle 2 observes the exit 2
+# and re-dispatches at the same attempt (§4 consumes none), and cycle 3 is the
+# one that used to read the dead attempt's record again: a second
+# `infrastructure=True` transition, a second increment, and the container cycle
+# 2 had just spawned disposed out from under the retry.
+
+
+def alive(fleet: FakeFleet) -> None:
+    """What `docker ps` says about a container the fleet just spawned.
+
+    `FakeFleet.spawn` leaves `state` empty, exactly as the real `spawn` does -
+    "a container that started and exited in the same breath is the ordinary
+    case for a worker". The daemon fills it in on the *next* listing, and a
+    retry that is genuinely in flight is listed `running`; without this the
+    resolver reads every one of this harness's containers as finished and
+    believes a claimed task eligible, which is a different bug's fixture.
+    """
+    fleet.handles = {
+        issue: replace(handle, state=RUNNING_STATE) for issue, handle in fleet.handles.items()
+    }
+
+
+def test_one_exit_2_increments_the_infrastructure_streak_exactly_once(tmp_path):
+    """One host failure, one verdict - across the cycle that re-dispatches it.
+
+    `APIARY_MAX_INFRASTRUCTURE` is a ceiling on *consecutive mechanical
+    failures*, and #197 made it authoritative for `needs-human`. Counting one
+    failure twice halves the ceiling and escalates naming a streak the host
+    never had.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
+    loop.cycle()
+    alive(fleet)
+    loop.cycle()
+
+    assert loop._infrastructure == {ref(TASK_ISSUE): 1}
+    # And the second half of it: the retry cycle 2 spawned is still running.
+    # The double count and the disposal are the same read of the same record.
+    assert fleet.spawned == [TASK_ISSUE, TASK_ISSUE]
+    assert fleet.disposed == [TASK_ISSUE]
+    # §4 is untouched: a mechanical failure still costs no attempt, so the
+    # retry was announced ready at the number the first attempt already had.
+    assert [f["attempt"] for n, f in seen if n == "task.eligible"] == [0, 0]
+
+
+def test_the_retrys_own_failure_is_a_second_verdict_and_counts(tmp_path):
+    """The other direction, and the reason the guard is keyed on the record's
+    content rather than on `(issue, attempt)`.
+
+    A retry that fails mechanically too is a second verdict about the host, and
+    it writes a record at the *same* attempt number - so a guard that retired
+    an attempt would stop counting a host that is broken three times over,
+    which is precisely the run the ceiling exists for.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
+    loop.cycle()
+    alive(fleet)
+    loop.cycle()
+    # The retry dies the same way and writes its own testimony. Same attempt,
+    # different record: `write_result` bumps the filename rather than replacing
+    # the evidence of the attempt before it.
+    write_result(
+        record(TASK_ISSUE, 2, attempt=0, reason="docker: daemon not running"), tmp_path
+    )
+    loop.cycle()
+
+    assert loop._infrastructure == {ref(TASK_ISSUE): 2}
+
+
+def test_a_record_that_moved_nothing_is_not_retired():
+    """Folded from what landed, not from what was planned - `fold`'s rule and
+    `infrastructure_streaks`' rule, for the same reason. A label write GitHub
+    refused leaves the task where it was, and retiring its record would lose
+    the only evidence the retry never happened."""
+    moved_nothing = Transition(ref(4), CLAIMED, READY, "no record caused this")
+
+    assert observed_results({}, []) == {}
+    assert observed_results({ref(4): "kept"}, [moved_nothing]) == {ref(4): "kept"}
+
+
+def test_the_guard_is_the_records_own_identity():
+    """`ResultRecord.identity` is content, so two records that differ only in
+    when they finished are two verdicts, and re-reading one file is one."""
+    first = record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image")
+    again = record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image")
+    later = record(TASK_ISSUE, 2, attempt=0, reason="docker: daemon not running")
+
+    assert first.identity == again.identity
+    assert first.identity != later.identity
 
 
 # --- announcement only -----------------------------------------------------
