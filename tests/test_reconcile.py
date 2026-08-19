@@ -526,6 +526,48 @@ def test_a_records_verdict_is_not_applied_twice():
     assert plan.transitions == ()
 
 
+def test_a_record_behind_the_counter_is_discarded_and_the_claim_stands():
+    """The live wedge, pinned as the guard's correct behaviour: a retry's
+    model call blew up and the worker filed the exit-2 record under attempt 0
+    against a ledger already on attempt 2. The staleness guard rightly
+    discards it - a record behind the counter has already been acted on, for
+    all this cycle can tell - so the issue stays claimed against an exited
+    container, forever. The guard is not the bug; the record writer had to
+    learn to tell the truth (`worker/entrypoint.py` stamps the real attempt,
+    and `worker/result.py` files an unknowable one under the next free index,
+    which is never behind the counter)."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2)),
+        results={
+            ref(4): record(4, 2, attempt=0, reason="model call failed: OutputParserException")
+        },
+        running=[ref(4)],
+    )
+
+    assert plan.transitions == () and plan.disposals == ()
+
+
+def test_the_corrected_record_is_observed_and_costs_no_attempt():
+    """The same failure carrying its real attempt: the observation proceeds,
+    the issue is re-readied, the container is disposed - and the budget is
+    untouched, because an infrastructure verdict never consumes an attempt
+    however late in the retry sequence it lands."""
+    plan = plan_reconcile(
+        ledger(entry(4, label=CLAIMED, attempt=2)),
+        results={
+            ref(4): record(4, 2, attempt=2, reason="model call failed: OutputParserException")
+        },
+        running=[ref(4)],
+    )
+
+    transition = plan.transitions[0]
+    assert (transition.to_label, transition.attempt) == (READY, None)
+    # Counted toward the infrastructure ceiling, not the task's budget.
+    assert transition.infrastructure
+    assert "OutputParserException" in transition.reason
+    assert [d.ref for d in plan.disposals] == [ref(4)]
+
+
 # --------------------------------------------------------------------------
 # Retry feedback: diagnose() and the comment a retry leaves behind
 # --------------------------------------------------------------------------

@@ -242,6 +242,16 @@ class InfrastructureError(RuntimeError):
     record built from it is written on exactly the path where that matters
     most. "The clone failed" and "the gate passed and the push failed" are both
     exit 2, and only one of them has a command and a file list to report.
+    `deleted` rides along with `written` for the same reason: a cleanup task
+    that removed its files and then hit a broken gate did real work, and a
+    record listing nothing would read as an attempt that never started.
+
+    `attempt` is which attempt this failure killed, or `None` when the failure
+    happened before the contract - the only place the number is written down -
+    could be read. `run_worker` stamps it the moment the contract is in hand;
+    it is state on the exception rather than an argument threaded through every
+    raise site, because most raisers (a git subprocess, the model transport)
+    have no idea the concept exists.
     """
 
     def __init__(
@@ -250,14 +260,24 @@ class InfrastructureError(RuntimeError):
         *,
         verify_command: str = "",
         written: Sequence[str] = (),
+        deleted: Sequence[str] = (),
         task_id: str = "",
     ) -> None:
         super().__init__(message)
         self.verify_command = verify_command
         self.written = tuple(written)
+        self.deleted = tuple(deleted)
         self.task_id = task_id
+        self.attempt: int | None = None
 
-    def learned(self, *, verify_command: str, written: Sequence[str], task_id: str) -> None:
+    def learned(
+        self,
+        *,
+        verify_command: str,
+        written: Sequence[str],
+        task_id: str,
+        deleted: Sequence[str] = (),
+    ) -> None:
         """Fill in context the raiser did not have. Mutates and does not re-raise.
 
         `run_verify` cannot know which files were written and `commit_edits`
@@ -266,6 +286,7 @@ class InfrastructureError(RuntimeError):
         """
         self.verify_command = self.verify_command or verify_command
         self.written = self.written or tuple(written)
+        self.deleted = self.deleted or tuple(deleted)
         self.task_id = self.task_id or task_id
 
 
@@ -882,38 +903,134 @@ def run_worker(
     branch = task_branch(task_ref(issue), contract.attempt)
     task_id = contract.task_id or f"issue-{issue}"
 
-    # A retry gets told why the last attempt failed, or it is not a retry - it
-    # is the same attempt again. `attempt > 0` is the marker's own testimony
-    # that at least one was consumed, and it is checked before the fetch so a
-    # first attempt costs no comment listing at all.
-    goal = contract.goal
-    if contract.attempt > 0:
-        feedback = fetch_feedback(client, issue)
-        if feedback:
-            print(f"  · attempt {contract.attempt + 1}; folding in the failure report")
-            goal = _with_feedback(goal, feedback)
+    try:
+        # A retry gets told why the last attempt failed, or it is not a retry -
+        # it is the same attempt again. `attempt > 0` is the marker's own
+        # testimony that at least one was consumed, and it is checked before
+        # the fetch so a first attempt costs no comment listing at all.
+        goal = contract.goal
+        if contract.attempt > 0:
+            feedback = fetch_feedback(client, issue)
+            if feedback:
+                print(f"  · attempt {contract.attempt + 1}; folding in the failure report")
+                goal = _with_feedback(goal, feedback)
 
-    root = prepare_checkout(clone_url, workspace / f"issue-{issue}", base_commit, branch)
+        root = prepare_checkout(clone_url, workspace / f"issue-{issue}", base_commit, branch)
 
-    writable = read_writable(root, contract.files)
-    readable = gather_context(root, contract.files)
-    print(f"  · {len(writable)} file(s) to edit, {len(readable)} for context")
+        writable = read_writable(root, contract.files)
+        readable = gather_context(root, contract.files)
+        print(f"  · {len(writable)} file(s) to edit, {len(readable)} for context")
 
-    output = propose_edits(goal, writable, readable, llm=editor)
-    # The declared set plus the dependency manifests: a worker may always say
-    # what its code needs, and refusing `requirements.txt` while installing it
-    # before the gate would make the install a rule the model cannot satisfy.
-    # Everything else keeps `apply_edits`' refusal semantics untouched.
-    applied: Applied = apply_edits(root, output.edits, (*contract.files, *DEPENDENCY_MANIFESTS))
-    for path, reason in applied.refused:
-        print(f"  ! refused {path}: {reason}", file=sys.stderr)
+        output = propose_edits(goal, writable, readable, llm=editor)
+        # The declared set plus the dependency manifests: a worker may always
+        # say what its code needs, and refusing `requirements.txt` while
+        # installing it before the gate would make the install a rule the model
+        # cannot satisfy. Everything else keeps `apply_edits`' refusal
+        # semantics untouched.
+        applied: Applied = apply_edits(
+            root, output.edits, (*contract.files, *DEPENDENCY_MANIFESTS)
+        )
+        for path, reason in applied.refused:
+            print(f"  ! refused {path}: {reason}", file=sys.stderr)
 
-    if not applied.written and not applied.deleted:
-        # No commit and no verification: there is nothing to verify, and
-        # running the command anyway would report the repository's existing
-        # state as this task's result. A deletion counts as an edit here - a
-        # cleanup task may legitimately do nothing but remove files, and the
-        # gate still has to prove the tree works without them.
+        if not applied.written and not applied.deleted:
+            # No commit and no verification: there is nothing to verify, and
+            # running the command anyway would report the repository's existing
+            # state as this task's result. A deletion counts as an edit here -
+            # a cleanup task may legitimately do nothing but remove files, and
+            # the gate still has to prove the tree works without them.
+            return WorkerResult(
+                issue=issue,
+                repo=repo,
+                task_id=task_id,
+                branch=branch,
+                root=root,
+                verify_command=contract.verify,
+                verify_output="the model produced no edit inside the declared file set",
+                passed=False,
+                refused=applied.refused,
+                attempt=contract.attempt,
+            )
+
+        if applied.written:
+            print(f"  · wrote {', '.join(applied.written)}")
+        if applied.deleted:
+            print(f"  · deleted {', '.join(applied.deleted)}")
+        print(f"  · verifying: {contract.verify}")
+        # From here on the attempt knows what its gate is and what it wrote, so
+        # an infrastructure failure carries both rather than reporting an empty
+        # command for a run that had already got as far as a green suite.
+        try:
+            # A written Python file that does not parse fails here, before
+            # anything is installed or run: the gate cannot be trusted to catch
+            # it (the observed case is a suite whose `testpaths` never
+            # collected the broken file), and the SyntaxError text is better
+            # retry feedback than whatever a suite that tripped over it
+            # second-hand would say. Deleted files are exempt by construction -
+            # `applied.deleted` is a separate set, and a file that is gone has
+            # nothing left to parse.
+            unparsed = syntax_failure(root, applied.written)
+            if unparsed is not None:
+                passed, verify_output = False, unparsed
+            else:
+                # Declared dependencies go in before the gate opens; a failed
+                # install IS the verify verdict, because it is the task's real
+                # blocker and the next retry's feedback. See
+                # `install_dependencies` for why it is a failed task and never
+                # infrastructure.
+                blocked = install_dependencies(root)
+                if blocked is not None:
+                    passed, verify_output = False, blocked
+                else:
+                    passed, verify_output = run_verify(root, contract.verify)
+                    if passed:
+                        # A green pytest gate only counts if it actually
+                        # collected the tests this attempt wrote - see
+                        # `audit_collection`. It runs on passes only: a failed
+                        # gate already carries its own, better feedback. Handed
+                        # `applied.written` and never `applied.deleted`: a
+                        # deleted test file no longer needs collecting, which
+                        # is exactly what makes a cleanup task that removes
+                        # obsolete tests winnable at all.
+                        uncollected = audit_collection(
+                            root, contract.verify, applied.written
+                        )
+                        if uncollected is not None:
+                            passed, verify_output = False, uncollected
+
+            commit = None
+            if passed:
+                subject = f"swarm[{task_id}]: {(title or contract.goal)[:60]}"
+                try:
+                    # The gate has run by now, which is the only moment a
+                    # lockfile exists to commit: it is produced *by* the verify
+                    # command, so staging before verification would always find
+                    # nothing. Deletions travel in the same path list: `git add
+                    # --force -- <path>` stages the removal of a tracked file
+                    # that is gone from the tree, and staging only
+                    # `applied.written` would silently commit a cleanup that
+                    # cleaned nothing up.
+                    commit = commit_edits(
+                        root,
+                        subject,
+                        (*applied.written, *applied.deleted),
+                        generated=generated_for(contract.stack),
+                    )
+                except GitError as exc:
+                    raise InfrastructureError(f"committing issue #{issue}: {exc}") from exc
+        except InfrastructureError as exc:
+            # Deletions travel with the writes, and for the record's reason:
+            # "what had this attempt already done" is exactly the question an
+            # exit-2 record exists to answer, and a cleanup task that removed
+            # its files before the gate broke did real work.
+            exc.learned(
+                verify_command=contract.verify,
+                written=applied.written,
+                deleted=applied.deleted,
+                task_id=task_id,
+            )
+            raise
+
         return WorkerResult(
             issue=issue,
             repo=repo,
@@ -921,93 +1038,28 @@ def run_worker(
             branch=branch,
             root=root,
             verify_command=contract.verify,
-            verify_output="the model produced no edit inside the declared file set",
-            passed=False,
+            verify_output=verify_output,
+            passed=passed,
+            commit=commit,
+            written=applied.written,
             refused=applied.refused,
+            deleted=applied.deleted,
             attempt=contract.attempt,
         )
-
-    if applied.written:
-        print(f"  · wrote {', '.join(applied.written)}")
-    if applied.deleted:
-        print(f"  · deleted {', '.join(applied.deleted)}")
-    print(f"  · verifying: {contract.verify}")
-    # From here on the attempt knows what its gate is and what it wrote, so an
-    # infrastructure failure carries both rather than reporting an empty
-    # command for a run that had already got as far as a green suite.
-    try:
-        # A written Python file that does not parse fails here, before anything
-        # is installed or run: the gate cannot be trusted to catch it (the
-        # observed case is a suite whose `testpaths` never collected the broken
-        # file), and the SyntaxError text is better retry feedback than
-        # whatever a suite that tripped over it second-hand would say.
-        # Deleted files are exempt by construction - `applied.deleted` is a
-        # separate set, and a file that is gone has nothing left to parse.
-        unparsed = syntax_failure(root, applied.written)
-        if unparsed is not None:
-            passed, verify_output = False, unparsed
-        else:
-            # Declared dependencies go in before the gate opens; a failed
-            # install IS the verify verdict, because it is the task's real
-            # blocker and the next retry's feedback. See `install_dependencies`
-            # for why it is a failed task and never infrastructure.
-            blocked = install_dependencies(root)
-            if blocked is not None:
-                passed, verify_output = False, blocked
-            else:
-                passed, verify_output = run_verify(root, contract.verify)
-                if passed:
-                    # A green pytest gate only counts if it actually collected
-                    # the tests this attempt wrote - see `audit_collection`. It
-                    # runs on passes only: a failed gate already carries its
-                    # own, better feedback. Handed `applied.written` and never
-                    # `applied.deleted`: a deleted test file no longer needs
-                    # collecting, which is exactly what makes a cleanup task
-                    # that removes obsolete tests winnable at all.
-                    uncollected = audit_collection(root, contract.verify, applied.written)
-                    if uncollected is not None:
-                        passed, verify_output = False, uncollected
-
-        commit = None
-        if passed:
-            subject = f"swarm[{task_id}]: {(title or contract.goal)[:60]}"
-            try:
-                # The gate has run by now, which is the only moment a lockfile
-                # exists to commit: it is produced *by* the verify command, so
-                # staging before verification would always find nothing.
-                # Deletions travel in the same path list: `git add --force --
-                # <path>` stages the removal of a tracked file that is gone
-                # from the tree, and staging only `applied.written` would
-                # silently commit a cleanup that cleaned nothing up.
-                commit = commit_edits(
-                    root,
-                    subject,
-                    (*applied.written, *applied.deleted),
-                    generated=generated_for(contract.stack),
-                )
-            except GitError as exc:
-                raise InfrastructureError(f"committing issue #{issue}: {exc}") from exc
-    except InfrastructureError as exc:
-        exc.learned(
-            verify_command=contract.verify, written=applied.written, task_id=task_id
-        )
+    except (InfrastructureError, EditError, GitError, GitHubError, OSError) as exc:
+        # The contract is in hand from here on, so any failure that escapes can
+        # testify which attempt it killed. The record built from it files under
+        # that number, and the reconciler discards a record whose attempt is
+        # behind the ledger's counter as stale (`record.attempt >=
+        # entry.attempt`) - observed live as a run showing "1 in flight"
+        # forever against an exited container, because the exit-2 record was
+        # hardcoded to attempt 0 against a ledger already on attempt 2. Stamped
+        # as an attribute, fill-if-absent like `learned`, because most raisers
+        # (a git subprocess, the model transport) rightly know nothing about
+        # attempt counters.
+        if getattr(exc, "attempt", None) is None:
+            exc.attempt = contract.attempt  # type: ignore[union-attr,attr-defined]
         raise
-
-    return WorkerResult(
-        issue=issue,
-        repo=repo,
-        task_id=task_id,
-        branch=branch,
-        root=root,
-        verify_command=contract.verify,
-        verify_output=verify_output,
-        passed=passed,
-        commit=commit,
-        written=applied.written,
-        refused=applied.refused,
-        deleted=applied.deleted,
-        attempt=contract.attempt,
-    )
 
 
 def _publish(result: WorkerResult, client: GitHubClient) -> None:
@@ -1092,7 +1144,37 @@ def split_repo(value: str) -> tuple[str | None, str]:
     return None, value
 
 
-def _record(result: WorkerResult, exit_code: int) -> None:
+#: How much of a failure's text the record's `reason` field keeps. The field is
+#: printed inline in run summaries, one line per issue, so it wants the head of
+#: the story rather than the whole of it - `verify_output` is the field that
+#: carries evidence at `OUTPUT_TAIL_CHARS`.
+REASON_MAX_CHARS = 500
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """The failure's own words, flattened and bounded for the record's `reason`.
+
+    The head, not the tail, because an exception introduces itself first -
+    `model call failed: OutputParserException: Invalid json output:` - and may
+    drag kilobytes of model output behind it, which `verify_output` already
+    preserves. This exists because the observed failure record said "no edit
+    landed inside the declared file set" - the *previous* attempt's reason,
+    inferred from an empty file list - while the OutputParserException that
+    actually happened survived only in the container log. The reason field is
+    the one line an operator and the reconciler's escalation comment read, so
+    it must be the failure itself.
+    """
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    return text[:REASON_MAX_CHARS]
+
+
+def _record(
+    result: WorkerResult,
+    exit_code: int,
+    *,
+    attempt: int | None,
+    reason: str | None = None,
+) -> None:
     """Write this attempt's result file. Never raises.
 
     The orchestrator reads exit codes from these records rather than blocking
@@ -1101,6 +1183,21 @@ def _record(result: WorkerResult, exit_code: int) -> None:
     crashed. It is best-effort by design: an unwritable artifacts directory is
     a reason to lose the record, never a reason to change the exit code the
     task actually earned.
+
+    `attempt` is passed explicitly, and is required, because the callers that
+    know it best are the exception paths - where there is no honest
+    `WorkerResult.attempt` to read, only whatever the escaping exception was
+    stamped with. `None` means the failure happened before the contract - the
+    only place the number lives - was readable; `result.report` then files the
+    record under the next free index on disk rather than under a guessed 0. A
+    wrong-but-fresh number keeps the observation alive and clobbers nothing; a
+    hardcoded 0 was observed live to overwrite the real first attempt's record
+    *and* be discarded as stale against a ledger already on attempt 2, wedging
+    the run behind an exited container.
+
+    `reason` is the failure's own text where the caller has one; left `None`,
+    the record derives it from the result's shape, which is only honest for a
+    result the worker actually returned.
     """
     # Imported here, not at module scope: `result.py` depends on this module
     # for `WorkerResult` and the exit codes, so the top-level import would be a
@@ -1112,8 +1209,9 @@ def _record(result: WorkerResult, exit_code: int) -> None:
         path = write_worker_result(
             result,
             run_id=os.environ.get(RUN_ID_ENV, "unattached"),
-            attempt=result.attempt,
+            attempt=attempt,
             exit_code=exit_code,
+            reason=reason,
             image=os.environ.get(IMAGE_ENV, ""),
         )
     except OSError as exc:
@@ -1129,6 +1227,7 @@ def _unrun(
     *,
     verify_command: str = "",
     written: tuple[str, ...] = (),
+    deleted: tuple[str, ...] = (),
     task_id: str = "",
     attempt: int = 0,
 ) -> WorkerResult:
@@ -1139,7 +1238,9 @@ def _unrun(
     a human asks about an attempt that died here are "what was it about to run"
     and "had it written anything first". A clone that failed genuinely has
     neither; a push that failed after a green gate has both, and reporting an
-    empty command for it is a record that actively misleads.
+    empty command for it is a record that actively misleads. `deleted` is the
+    same fact for the files the attempt removed - a cleanup task's whole
+    output - and used to be dropped on exactly this path.
     """
     return WorkerResult(
         issue=issue,
@@ -1156,6 +1257,7 @@ def _unrun(
         verify_output=reason,
         passed=False,
         written=written,
+        deleted=deleted,
     )
 
 
@@ -1187,14 +1289,25 @@ def main(
         )
     except ContractError as exc:
         # Task failure, not infrastructure: this body will not parse any better
-        # on a second attempt (see the module docstring).
+        # on a second attempt (see the module docstring). A body that does not
+        # parse has no readable attempt marker either, so the attempt is
+        # unknown here and the record files under the next free index.
         print(f"! {exc}", file=sys.stderr)
-        _record(_unrun(args.issue, slug, str(exc)), EXIT_TASK_FAILED)
+        _record(
+            _unrun(args.issue, slug, str(exc)),
+            EXIT_TASK_FAILED,
+            attempt=None,
+            reason=_failure_reason(exc),
+        )
         return EXIT_TASK_FAILED
     except (InfrastructureError, EditError, GitError, GitHubError, OSError) as exc:
         print(f"! {exc}", file=sys.stderr)
         # Exit 2 is the code the reconciler must see to leave the attempt
-        # budget alone, and it can only see it in a record.
+        # budget alone, and it can only see it in a record - filed under the
+        # attempt `run_worker` stamped on the exception, so the reconciler's
+        # staleness guard does not discard it on a retry. `reason` is the
+        # exception's own words: the record used to infer one from its empty
+        # file list and claim "no edit landed" for a model call that blew up.
         _record(
             _unrun(
                 args.issue,
@@ -1202,9 +1315,12 @@ def main(
                 str(exc),
                 verify_command=getattr(exc, "verify_command", ""),
                 written=tuple(getattr(exc, "written", ())),
+                deleted=tuple(getattr(exc, "deleted", ())),
                 task_id=getattr(exc, "task_id", ""),
             ),
             EXIT_INFRASTRUCTURE,
+            attempt=getattr(exc, "attempt", None),
+            reason=_failure_reason(exc),
         )
         return EXIT_INFRASTRUCTURE
 
@@ -1223,10 +1339,19 @@ def main(
             _publish(result, client if client is not None else GitHubClient.from_env(slug))
         except GitHubError as exc:
             print(f"! {exc}", file=sys.stderr)
-            _record(result, EXIT_INFRASTRUCTURE)
+            # The run itself finished, so its result carries the real attempt;
+            # only the reason is the publish failure's, because "verified and
+            # committed" on an exit-2 record would be a sentence at war with
+            # its own exit code.
+            _record(
+                result,
+                EXIT_INFRASTRUCTURE,
+                attempt=result.attempt,
+                reason=_failure_reason(exc),
+            )
             return EXIT_INFRASTRUCTURE
 
-    _record(result, result.exit_code)
+    _record(result, result.exit_code, attempt=result.attempt)
 
     if result.exit_code != EXIT_OK and not args.keep:
         # The container is cattle and its filesystem dies with it, so this only
