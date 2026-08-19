@@ -372,7 +372,13 @@ class Ledger:
 
     @property
     def by_ref(self) -> dict[TaskRef, str]:
-        """Task ref → task id, for resolving `## Blocked by` refs and PRs."""
+        """Task ref → task id, for resolving what a `## Blocked by` ref names.
+
+        Keyed on the ref rather than the number, like everything else the graph
+        touches (#142). A caller holding an issue *number* - a pull request's
+        `Closes #<n>`, say - has to mint one first (`github/refs.task_ref`)
+        rather than indexing this with an int, which would miss in silence.
+        """
         return {entry.ref: task_id for task_id, entry in self.entries.items()}
 
 

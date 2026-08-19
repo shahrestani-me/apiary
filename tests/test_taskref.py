@@ -65,6 +65,22 @@ def test_refs_from_different_trackers_still_have_a_total_order():
     assert sorted(mixed) == sorted(reversed(mixed))
 
 
+def test_two_refs_that_look_alike_numerically_are_still_ordered():
+    """Zero padding is where a natural key stops being a strict weak ordering.
+
+    `PROJ-007` and `PROJ-7` share every numeric chunk, so without a tiebreaker
+    they compare neither equal nor less-than in either direction and `sorted()`
+    silently falls back to insertion order - which is exactly the
+    non-determinism `find_cycle` promises it does not have. Unreachable through
+    `task_ref` (`int()` normalises), reachable for any tracker that pads.
+    """
+    padded, bare = TaskRef("PROJ-007"), TaskRef("PROJ-7")
+
+    assert padded != bare
+    assert (padded < bare) != (bare < padded), "neither is ordered before the other"
+    assert sorted([padded, bare]) == sorted([bare, padded])
+
+
 def test_a_ref_is_not_ordered_against_anything_else():
     with pytest.raises(TypeError):
         _ = task_ref(1) < 1

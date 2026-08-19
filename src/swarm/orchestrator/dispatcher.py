@@ -357,6 +357,15 @@ class DispatchPlan:
 
     @property
     def numbers(self) -> tuple[int, ...]:
+        """The issues this cycle would dispatch, as numbers.
+
+        Numbers rather than `TaskRef`s, unlike `ReconcilePlan.refs` and
+        `RecoveryPlan.refs`: what `ready` *filters* on is identity and was
+        retyped (#142), but this plan's own reporting rows - here, `Deferred`,
+        `DispatchFailure` - were left in the older vocabulary along with
+        `checks` and `mergeability`, so the retype stayed the ticket's size.
+        Nothing keys a `TaskRef` map on these.
+        """
         return tuple(entry.number for entry in self.dispatch)
 
     def summary(self) -> str:

@@ -805,10 +805,18 @@ class ContainerManager:
         """This run's containers, running or not, optionally one task's only.
 
         Takes a `TaskRef` because that is the identity the orchestrator holds
-        (`swarm/taskref.py`); the docker label it filters on is an issue
-        number, because a label value and a container name are written at
-        `docker create` and have to stay what they have always been. The
-        conversion is the GitHub adapter's, not this module's.
+        (`swarm/taskref.py`); the label it filters on is an issue number,
+        because a label value and a container name are written at `docker
+        create` and changing what they contain is a behaviour change.
+
+        **This is the one place this package reaches into `..github`, and it is
+        a seam, not a design.** Everything else here is tracker-free -
+        `spawn`, `Handle.issue`, `find_containers` and `_container_name` all
+        speak in numbers - so the ref is converted on the way in and re-minted
+        by the callers on the way out. `docs/adr/0001-task-systems-are-integrations.md`
+        wants the container to carry the task ref itself, which removes both
+        the conversion and this import; that is a container-layer ticket, and
+        #142 deliberately changed no label format.
         """
         return find_containers(
             self._cli,

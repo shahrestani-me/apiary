@@ -6,15 +6,22 @@ here. Everything else - readiness, the reconciler, the container lookup - holds
 refs, compares them, keys dictionaries on them and prints them, and asks this
 module the two questions that need the spelling:
 
-- `task_ref(42)` when a GitHub payload, a `## Blocked by` line or a docker
-  label has just produced a number, and
-- `issue_number(ref)` immediately before a `GitHubClient` call, which addresses
-  issues by number and always will.
+- `task_ref(42)` when a GitHub payload, a `## Blocked by` line, a docker label
+  or an artifact filename has just produced a number, and
+- `issue_number(ref)` when something that is addressed by issue number is about
+  to be called.
 
-Callers of `issue_number` are therefore the API call sites and nothing else. A
-module reaching for it to *decide* something - to sort, to compare, to derive a
-branch name - is a module assuming refs are numeric, which is exactly what
-`docs/adr/0001-task-systems-are-integrations.md` says no core module may do.
+That second list is the GitHub API in every case but one: `ContainerManager.find`
+turns a ref back into the `apiary.issue` label value, because a docker label and
+a container name were written with a number at `docker create` and changing that
+is a behaviour change (`docs/adr/0001-task-systems-are-integrations.md` wants the
+container to carry the ref itself; that is a container-layer ticket).
+
+What no caller may do is reach for `issue_number` to *decide* something - to
+sort, to compare, or to derive a name - because that is a module assuming refs
+are numeric, which is exactly what the ADR says no core module may do. Note that
+`#42` is not a branch-safe token, so the ticket that puts the ref in a branch
+name will need a third function here rather than a number to interpolate.
 """
 
 from __future__ import annotations

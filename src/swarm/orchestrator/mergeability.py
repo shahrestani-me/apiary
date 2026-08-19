@@ -423,6 +423,13 @@ class Decision:
     going ahead this cycle.
     """
 
+    #: The issue this row is about. Still a number, where `Transition.ref` -
+    #: the field right below - is a `TaskRef`: #142 retyped the *task-identity
+    #: model* (the dependency graph, readiness and the reconciler's transition)
+    #: and stopped there deliberately, so these policy rows are one vocabulary
+    #: behind. They are internally consistent - built from the same `entry`,
+    #: compared only against each other - and nothing keys a `TaskRef` map on
+    #: one. Moving them is a follow-up, not an oversight.
     number: int
     pull: int
     verdict: str

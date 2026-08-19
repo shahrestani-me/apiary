@@ -114,8 +114,8 @@ from ..github.readiness import (
     apply_readiness,
 )
 from ..github.refs import issue_number, task_ref
-from ..taskref import TaskRef
 from ..run import TERMINAL_LABELS, Run, live_entries
+from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
 from ..worker.result import ResultRecord, summarise_dir, tail
 from .dispatcher import CLAIMED, REVIEW, Capacity, DispatchReport, Spawner, dispatch
@@ -216,8 +216,8 @@ class Snapshot:
         readiness's own resolver relies on too.
         """
         return {
-            task_ref(int(payload["number"])): IssueState.from_payload(payload)
-            for payload in self.issues
+            state.ref: state
+            for state in (IssueState.from_payload(payload) for payload in self.issues)
         }
 
     def labels(self) -> dict[TaskRef, frozenset[str]]:

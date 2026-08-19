@@ -106,10 +106,13 @@ class DependencyCycleError(ReadinessError):
 class UnresolvableReferenceError(ReadinessError):
     """A `## Blocked by` ref that cannot be resolved to an issue in this repo.
 
-    Collected rather than raised: one issue naming a dead number must not stop
-    the other twenty from running. Carries the dependant's ref because the
-    reconciler posts this back as a comment on that issue and labels it
-    `swarm:failed` (`docs/issue-contract.md` §1.4, §4).
+    Collected rather than raised: one issue naming a dead reference must not
+    stop the other twenty from running.
+
+    Two refs, and the names are the whole distinction: `task` is the dependant,
+    carried because the reconciler posts this back as a comment on *that* issue
+    and labels it `swarm:failed` (`docs/issue-contract.md` §1.4, §4), and `ref`
+    is the unresolvable thing it named.
     """
 
     def __init__(self, task: TaskRef, ref: TaskRef, reason: str) -> None:

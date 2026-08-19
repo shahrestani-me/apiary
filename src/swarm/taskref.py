@@ -33,6 +33,14 @@ and `ENG-9` before `ENG-10` for the tracker that has not been written yet.
 message a human reads is unchanged by the retype. That is a property of the
 adapter's chosen spelling, not a promise core may rely on: core prints refs, it
 does not build them.
+
+**What this does not yet buy.** `LedgerEntry` carries a `number` beside its
+`ref`, and the modules above still read that number wherever they address the
+GitHub API - a branch name, a label write, a comment. `TaskRef` is opaque; the
+*ledger record* is still GitHub-shaped, and swapping the tracker means dealing
+with those sites too. What this type finishes is narrower and was the actual
+latent bug: the dependency graph, which decides what may run, no longer assumes
+identity is an integer.
 """
 
 from __future__ import annotations
@@ -47,20 +55,32 @@ from functools import lru_cache, total_ordering
 _DIGITS = re.compile(r"(\d+)")
 
 
+# Cached because `__lt__` recomputes both operands' keys on every comparison,
+# and a sort of n refs makes O(n log n) of them over a set of values that is
+# small, fixed per cycle and reused every cycle.
 @lru_cache(maxsize=4096)
 def _natural_key(value: str) -> tuple[tuple[int, int | str], ...]:
     """A sort key where digit runs compare as numbers, not as text.
 
     Each chunk is tagged, so an int is never compared against a str: two
     numeric chunks compare numerically, two textual chunks lexicographically,
-    and a numeric chunk sorts before a textual one. That makes the order total
-    over any two values, which is what a dictionary of mixed refs would need.
+    and a numeric chunk sorts before a textual one.
+
+    The value itself is the last element, and it is not decoration. Without it
+    the key is not injective - `#042` and `#42` share one - so two unequal refs
+    would compare neither equal nor less-than in either direction, and
+    `sorted()` would fall back to insertion order. That is precisely the
+    non-determinism the ordering exists to remove: `find_cycle` promises the
+    same graph names the same ring every run.
     """
-    return tuple(
-        (0, int(chunk)) if chunk.isdigit() else (1, chunk)
+    chunks: tuple[tuple[int, int | str], ...] = tuple(
+        # `isdecimal`, not `isdigit`: the latter is true of superscripts and
+        # other digit-like codepoints that `int()` then refuses.
+        (0, int(chunk)) if chunk.isdecimal() else (1, chunk)
         for chunk in _DIGITS.split(value)
         if chunk
     )
+    return (*chunks, (2, value))
 
 
 @total_ordering
