@@ -36,30 +36,74 @@ Everything is built. Nothing has been pointed at reality.
 
 #147's gate: **ten consecutive runs with zero unexplained divergences.**
 
-Two things make that harder to satisfy honestly than it looks, and both are
-already instrumented — read them before deciding a clean run is a good one.
+**The measurement moved from live to offline** (#244), and the gate did not
+change. The shadow window used to resolve beside each cycle and emit
+`state.shadow` / `state.divergence` as it went; it is deleted. What produces the
+evidence is the **recorder**, which is still there: a line of `observed.jsonl`
+carries *both* sides of the comparison — the derived world and the `control`
+labels the cycle left behind — so the divergences can be computed from the
+recording afterwards, as many times as you like, with the window gone.
 
-**A clean window with a small independent count is a weak result.**
-`plan_reconcile` computes a cycle's labels from the same listings the resolver
-reads. So agreement on a task the cycle itself just wrote proves only that two
-reducers implement one rule set. `ShadowReport.independent` counts the
-comparisons that are genuinely independent — the tasks the cycle did *not*
-write — and `swarm show` prints it. A run reporting `40 task-cycle(s) compared
-… 3 of them independent` is close to no evidence at all.
+So a run is no longer judged by reading `swarm show`. It is judged by replaying
+its own recording:
 
-**Zero divergences is ambiguous unless the window actually ran.** An events log
-with no `state.divergence` line in it is either a clean shadowed run or a run
-with the flag off. That is why every shadowed cycle emits `state.shadow`, and
-why `swarm show` distinguishes three cases explicitly:
+```bash
+PYTHONPATH=src:tests python - <<'PY'
+from pathlib import Path
+from fixtures.corpus import load_corpus
+from swarm.orchestrator.derived import diverge, resolve
 
+run = load_corpus(Path(".swarm/runs/<run-id>"))
+found, unexplained = 0, []
+for cycle in run.cycles:
+    for one in diverge(resolve(cycle.observation), cycle.control):
+        found += 1
+        if not run.reason_for(one):
+            unexplained.append(one)
+
+print(f"origin={run.origin} cycles={len(run.cycles)} "
+      f"divergences={found} unexplained={len(unexplained)}")
+for one in unexplained:
+    print("  UNEXPLAINED", one)
+PY
 ```
-derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)
-derived shadow: ran for 6 cycle(s) and compared no tasks - this run is unmeasured, not clean
-derived shadow: 40 task-cycle(s) compared over 6 cycle(s); 31 of them independent of this cycle's own writes
-  2 divergence(s), 0 unexplained (dispatched-this-cycle 2)
-```
 
-Only the third shape counts toward the ten.
+A run counts toward the ten when it prints `origin=recorded`, a non-zero cycle
+count, and `unexplained=0`. Each of the three matters and the first two are the
+ones that used to be a `swarm show` line:
+
+- **`origin=recorded`.** `RunArtifacts.observed` stamps the manifest, and a
+  *synthesised* corpus proves the reducer self-consistent and nothing about
+  reality (`tests/fixtures/runs/README.md`). A replay of the wrong directory is
+  the easiest way to believe you have evidence you do not.
+- **A non-zero cycle count.** No `observed.jsonl`, or one with no cycles in it,
+  is a run that measured nothing. Unmeasured is not clean, and it is the failure
+  the deleted `swarm show` block existed to spell out — it now shows up as
+  `cycles=0` instead.
+- **`unexplained=0`, not `divergences=0`.** An *expected* divergence is evidence
+  the model is right: ADR 0001 names three states no code-host fact can derive,
+  and they diverge by construction. `reason_for` matches each one against the
+  `expected_divergences` your manifest declares, so declaring them is how the
+  gate is passed honestly rather than by there being nothing to explain. That
+  declaration is a human writing a sentence per divergence, which is what the
+  classifier used to guess at.
+
+**One number is gone, and it is the one that separated strong evidence from
+weak.** `ShadowReport.independent` counted the comparisons independent of the
+cycle's own writes — `plan_reconcile` computes a cycle's labels from the same
+listings the resolver reads, so agreement on a task the cycle itself just wrote
+proves only that two reducers implement one rule set. That count came from
+`written_this_cycle(report)` and the `CycleReport` is not in `observed.jsonl`, so
+a run recorded after #244 cannot report it. The two runs measured while the
+window still existed came out at 8/12 and 47/48 independent, so the ratio is high
+in practice — but treat a small run with few tasks as weak evidence on judgement
+rather than on a printed number, because nothing will print it for you.
+
+**Record while c3 is open, and this is the real deadline.** `control` is only
+populated while the labels are still being written. A run recorded before #152's
+c3 carries both sides of the comparison forever and can be replayed against any
+future resolver; a run recorded after it carries an empty `control` and can never
+be part of this gate. c3 should not land until enough runs exist.
 
 ## 3. Preconditions
 
@@ -76,12 +120,15 @@ Classic and OAuth tokens are refused by design in
 here reaches every repository the account owns while holding `administration`.
 Do not work around it.
 
-Leave both shadow-related environment variables **unset**:
+Leave the state-source variable **unset**:
 
 | | default | what setting it would do |
 |---|---|---|
-| `APIARY_DERIVED_SHADOW` | on | off means the run records nothing and counts for nothing |
 | `APIARY_STATE_SOURCE` | `derived` | `labels` is the escape hatch; a run on it measures nothing |
+
+`APIARY_DERIVED_SHADOW` was the other one and no longer exists — #244 deleted the
+window it switched. The recorder it did not switch is unconditional, so there is
+nothing left to leave unset: every run records.
 
 Then the images, and a read-only preflight:
 
