@@ -881,6 +881,11 @@ def test_show_is_unchanged_for_a_run_recorded_before_the_lifecycle_existed(root)
             "      gate: python -m pytest -q",
             "      | 1 passed",
             "",
+            # #146. A run recorded before the shadow window existed carries no
+            # `state.shadow`, and the line says "not run" rather than reporting
+            # zero divergences - the distinction the whole tally exists for.
+            "derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)",
+            "",
             f"{len(PRE_LIFECYCLE_EVENTS)} event(s) in {EVENT_LOG_NAME}, "
             "0 container log(s) in logs/",
             f"at {directory}",

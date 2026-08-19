@@ -2099,7 +2099,25 @@ def recorder() -> tuple[list[tuple[str, dict[str, Any]]], Callable[..., None]]:
 
 
 def names(seen: Iterable[tuple[str, dict[str, Any]]]) -> list[str]:
-    return [name for name, _ in seen]
+    """The #141 lifecycle names a cycle announced, in order.
+
+    `state.*` is filtered out because #146's shadow window emits through the
+    same `events` seam and is a different concern with its own suite
+    (`tests/test_shadow.py`): it announces once per cycle whether or not
+    anything disagreed, so leaving it in would make every assertion here about
+    a task's lifecycle also an assertion about how many cycles the fixture ran.
+    Filtered by prefix rather than by name, so a lifecycle event added tomorrow
+    is still visible to these tests and a shadow event added tomorrow is still
+    not.
+    """
+    return [name for name, _ in lifecycle_only(seen)]
+
+
+def lifecycle_only(
+    seen: Iterable[tuple[str, dict[str, Any]]]
+) -> list[tuple[str, dict[str, Any]]]:
+    """`seen` without #146's `state.*` events. See `names`."""
+    return [(name, fields) for name, fields in seen if not name.startswith("state.")]
 
 
 #: Four digits, and deliberately not a number any payload field could coincide
@@ -2163,7 +2181,7 @@ def test_one_task_announces_its_whole_lifecycle_in_order(tmp_path):
         "task.landed",
     ]
     # "A reader builds a per-task timeline without joining on anything."
-    assert {fields["task"] for _, fields in seen} == {TASK_REF}
+    assert {fields["task"] for _, fields in lifecycle_only(seen)} == {TASK_REF}
     assert client.merges == [TASK_PULL]
 
 
@@ -2518,11 +2536,11 @@ def test_a_standing_fact_is_announced_once_rather_than_every_cycle(tmp_path):
 
     mark = len(seen)
     loop.cycle()
-    first = seen[mark:]
+    first = lifecycle_only(seen[mark:])
     loop.cycle()
 
     assert names(first) == ["task.result", "pr.opened", "pr.checks"]
-    assert seen[mark:] == first
+    assert lifecycle_only(seen[mark:]) == first
 
 
 def test_a_check_name_is_announced_verbatim(tmp_path):

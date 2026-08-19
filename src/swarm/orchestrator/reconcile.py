@@ -1529,6 +1529,24 @@ def _lifecycle_log() -> Any:
     return LifecycleLog()
 
 
+def _shadow_window() -> Any:
+    """`shadow.ShadowWindow`, imported at call time. `_lifecycle_log`'s reason.
+
+    `shadow` imports this module for `CycleReport` and imports `lifecycle` for
+    the label translation, so the dependency points the same way it does for the
+    announcement and for the same reason: this file is the body that *decides*,
+    and the modules that project a finished cycle sit downstream of it.
+
+    Constructed with the environment already read (`APIARY_DERIVED_SHADOW`), so
+    a `Reconciler` built in a test gets the shadow unless the test says
+    otherwise - which is the right default for an observer that must never be
+    the reason a cycle behaves differently.
+    """
+    from .shadow import ShadowWindow, shadow_enabled
+
+    return ShadowWindow(enabled=shadow_enabled())
+
+
 @dataclass
 class Reconciler:
     """The loop body, and the thing that paces it.
@@ -1638,6 +1656,17 @@ class Reconciler:
     #: cycle for whoever is watching, this is one event per task transition for
     #: whoever reads the run back afterwards.
     events: Callable[..., Any] | None = None
+    #: Where a shadowed cycle's `Observation` is recorded - `RunArtifacts.observed`
+    #: in a real run, so `observed.jsonl` lands beside `events.jsonl` and is
+    #: redacted by the same redactor. `None` records nothing, which is what a
+    #: reconciler with no run directory behind it should do.
+    #:
+    #: **This is what makes every real run a replay corpus run.**
+    #: `tests/fixtures/runs/README.md` names the missing recorder as the whole
+    #: reason #145's corpus is synthesised, and a synthesised corpus proves the
+    #: reducer self-consistent and nothing about reality. Four of the five files
+    #: are already written by every run; this is the fifth.
+    record: Callable[..., Any] | None = None
 
     _cycles: int = field(default=0, repr=False)
     #: The progress ledger, run-scoped. See the module docstring.
@@ -1656,6 +1685,11 @@ class Reconciler:
     #: built through a local import, for `merge_policy`'s reason: `lifecycle`
     #: imports this module.
     _lifecycle: Any = field(default_factory=_lifecycle_log, repr=False)
+    #: The derived-state shadow (#146), run-scoped so "have I warned about an
+    #: unexplained divergence yet" is asked once per run rather than once per
+    #: cycle. Typed loosely and built through a local import for `_lifecycle`'s
+    #: reason. It reads nothing the cycle decides and decides nothing itself.
+    _shadow: Any = field(default_factory=_shadow_window, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1865,6 +1899,27 @@ class Reconciler:
             results=results,
             pulls=pulls or {},
             checks=check_runs,
+        )
+        # The shadow window (#146), last and on the same grown report, for the
+        # announcement's reason and one of its own: it diffs the derived state
+        # against the control plane **as this cycle left it**, so it has to run
+        # after every write this cycle made. Every fact it needs is one this
+        # cycle already read, which is why they are passed rather than fetched -
+        # shadowing adds no API call, and there is no client in `shadow.py` to
+        # add one with. It cannot raise; see `ShadowWindow.run`.
+        self._shadow.run(
+            judged,
+            handles=handles,
+            pulls=pulls or {},
+            results=results,
+            states=snapshot.states(),
+            infrastructure=self._infrastructure,
+            infrastructure_cap=self.infrastructure_policy.cap,
+            max_attempts=self.max_attempts,
+            max_total_attempts=self.max_total_attempts,
+            live_run_ids=(self.run.id,),
+            emit=self.events,
+            record=self.record,
         )
         return judged
 

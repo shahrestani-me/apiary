@@ -78,7 +78,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-from swarm.artifacts import EVENT_LOG_NAME, RESULTS_DIR_NAME, read_events, read_run
+from swarm.artifacts import (
+    CORPUS_MANIFEST_NAME,
+    EVENT_LOG_NAME,
+    OBSERVED_LOG_NAME,
+    RESULTS_DIR_NAME,
+    read_events,
+    read_run,
+)
 from swarm.github.branches import parse_task_branch
 from swarm.github.refs import task_ref
 from swarm.taskref import TaskRef
@@ -101,8 +108,12 @@ from swarm.worker.result import ResultRecord
 #: not naming the interesting case.
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 
-MANIFEST_NAME = "corpus.json"
-OBSERVED_NAME = "observed.jsonl"
+#: Both names come from `swarm.artifacts` since #146, because a live run now
+#: writes both: the shadow window records `observed.jsonl` every cycle and drops
+#: the manifest beside it. Two spellings of these would be the seam along which
+#: "a recorded run drops in with no code change" quietly stopped being true.
+MANIFEST_NAME = CORPUS_MANIFEST_NAME
+OBSERVED_NAME = OBSERVED_LOG_NAME
 
 #: Bumped when a field in `observed.jsonl` changes meaning, never when one is
 #: added - `artifacts.SCHEMA_VERSION`'s rule, and the loader below obeys the

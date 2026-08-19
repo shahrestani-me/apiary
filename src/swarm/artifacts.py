@@ -92,12 +92,14 @@ __all__ = [
     "ARTIFACTS_ROOT_ENV",
     "CONSOLE_ROOT_ENV",
     "CONTAINER_LOGGED",
+    "CORPUS_MANIFEST_NAME",
     "CYCLE_FINISHED",
     "CYCLE_STARTED",
     "DEFAULT_ARTIFACTS_ROOT",
     "DEFAULT_CONSOLE_ROOT",
     "EVENT_LOG_NAME",
     "LOGS_DIR_NAME",
+    "OBSERVED_LOG_NAME",
     "PR_CHECKS",
     "PR_MERGED",
     "PR_OPENED",
@@ -106,6 +108,8 @@ __all__ = [
     "RUN_FINISHED",
     "RUN_STARTED",
     "SCHEMA_VERSION",
+    "STATE_DIVERGENCE",
+    "STATE_SHADOW",
     "SUMMARY_FILE_NAME",
     "TASK_CLAIMED",
     "TASK_ELIGIBLE",
@@ -114,7 +118,9 @@ __all__ = [
     "TASK_RESULT",
     "ArtifactsError",
     "CycleMetrics",
+    "DivergenceTally",
     "EventLog",
+    "ObservationLog",
     "RunArtifacts",
     "RunMetrics",
     "RunView",
@@ -161,6 +167,18 @@ DEFAULT_CONSOLE_ROOT = ".swarm/console"
 #: spellings produces an empty report rather than an error.
 RUN_FILE_NAME = "run.json"
 EVENT_LOG_NAME = "events.jsonl"
+#: One line per shadowed cycle: the world that cycle read, and the labels the
+#: control plane held for it (#146). Named here rather than in the test corpus
+#: because it is now written by a live run: `tests/fixtures/corpus.py` imports
+#: this constant, which is what makes "a recorded run drops in beside a
+#: synthesised one with no code change" a fact rather than an intention.
+OBSERVED_LOG_NAME = "observed.jsonl"
+#: The manifest a corpus run needs beside the four files a run already writes.
+#: Emitted with `origin: "recorded"` and **no declared divergences**, so the
+#: replay harness refuses the run until a human has written the argument for
+#: each one - `tests/fixtures/runs/README.md`'s rule, and the one part of
+#: recording a machine must not do on somebody's behalf.
+CORPUS_MANIFEST_NAME = "corpus.json"
 SUMMARY_FILE_NAME = "summary.json"
 RESULTS_DIR_NAME = "results"
 LOGS_DIR_NAME = "logs"
@@ -339,9 +357,9 @@ def write_json(
     """Write one JSON document atomically, redacting every string on the way in.
 
     Module-level because redaction in this file is **per writer, not per
-    directory** - `EventLog.emit`, `RunArtifacts._write_json` and
-    `container_log` redact, and `worker/result.py` writes into the same tree
-    without redacting at all (`tests/test_artifacts.py` asserts that gap). A
+    directory** - `EventLog.emit`, `ObservationLog.write`,
+    `RunArtifacts._write_json` and `container_log` redact, and
+    `worker/result.py` writes into the same tree without redacting at all (`tests/test_artifacts.py` asserts that gap). A
     fourth writer that hand-rolled `json.dumps` would inherit the gap rather
     than the guarantee, so there is one function to reach for and it takes the
     redactor as an argument rather than defaulting to something safe-looking.
@@ -404,6 +422,38 @@ class EventLog:
 
     def events(self) -> tuple[dict[str, Any], ...]:
         return read_events(self.path)
+
+
+@dataclass
+class ObservationLog:
+    """`observed.jsonl`: one recorded cycle per line, redacted on the way in.
+
+    A sibling of `EventLog` rather than a use of it, because the two files have
+    different readers and one of them is strict. `EventLog.emit` stamps every
+    line with `ts` and `event`; `tests/fixtures/corpus.py` reads this file with
+    a loader that **refuses** a line it cannot parse (a cycle silently dropped
+    there is a divergence that silently stops being asserted), so the payload
+    written here is exactly the object the loader expects and nothing else.
+
+    Opened per write for `EventLog`'s reasons: a `SIGKILL`ed orchestrator leaves
+    a file whose last line is complete or absent, which is the only shape a
+    strict loader can survive.
+    """
+
+    path: Path
+    redact: Callable[[str], str] = _identity
+
+    def write(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Append one cycle. Returns what was written, already redacted."""
+        recorded = _redacted(dict(payload), self.redact)
+        line = json.dumps(recorded, default=str, sort_keys=False)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            raise ArtifactsError(f"writing {self.path}: {exc}") from exc
+        return recorded
 
 
 def read_events(path: str | Path) -> tuple[dict[str, Any], ...]:
@@ -700,6 +750,18 @@ PR_MERGED = "pr.merged"
 TASK_LANDED = "task.landed"
 TASK_NEEDS_HUMAN = "task.needs_human"
 
+#: The derived-state shadow window (#146). `state.shadow` is emitted once per
+#: shadowed cycle whether or not anything disagreed, and that is not redundancy:
+#: an event log with no `state.divergence` line in it is either a clean run or a
+#: run with `APIARY_DERIVED_SHADOW=0`, and epic #140's go/no-go - ten runs with
+#: no unexplained divergence - is not a gate at all if it cannot tell zero from
+#: unmeasured. `state.divergence` names one task, one cycle and both states, in
+#: apiary's own vocabulary on both sides, because #145's acceptance criteria
+#: refuse a count: "the resolver agreed 94% of the time" is compatible with
+#: every disagreement being on `needs-human`.
+STATE_SHADOW = "state.shadow"
+STATE_DIVERGENCE = "state.divergence"
+
 
 # --------------------------------------------------------------------------
 # Writing a run
@@ -806,6 +868,64 @@ class RunArtifacts:
     @property
     def log(self) -> EventLog:
         return EventLog(self.events_path, redact=self.redact)
+
+    @property
+    def observed_path(self) -> Path:
+        return self.path / OBSERVED_LOG_NAME
+
+    @property
+    def observations(self) -> ObservationLog:
+        return ObservationLog(self.observed_path, redact=self.redact)
+
+    def observed(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Record one shadowed cycle's world and control plane (#146).
+
+        The seam `Reconciler.record` is wired to, mirroring `event` exactly so
+        that a caller holding a `RunArtifacts` gets redaction by having used
+        this object at all.
+
+        **Why a live run writes this at all.** Four of the five files a replay
+        corpus run needs - `run.json`, `events.jsonl`, `results/*.json` and the
+        directory itself - are already produced verbatim by every run.
+        `observed.jsonl` was the fifth and the only one that needed a recorder,
+        and `tests/fixtures/runs/README.md` names writing it "the cheapest
+        retirement of the largest risk in the epic": the corpus that proves the
+        derived resolver is entirely synthesised, and a recorded run is a
+        `cp -r` away from fixing that. The manifest goes with it - see
+        `corpus_manifest`, which declares nothing on purpose.
+        """
+        first = not self.observed_path.exists()
+        recorded = self.observations.write(payload)
+        if first:
+            self.corpus_manifest()
+        return recorded
+
+    def corpus_manifest(self) -> Path:
+        """Write `corpus.json` so this directory is a replay corpus run.
+
+        `origin: "recorded"` is metadata and nothing branches on it -
+        `tests/test_derived.py` proves that by flipping the field and asserting
+        the replay is identical. `expected_divergences` is **empty and stays
+        empty**: the harness fails on an undeclared divergence, so a recorded
+        run refuses to pass until somebody writes the argument for each one, and
+        the README is explicit that the declaration *is* the argument. A
+        recorder that pre-declared what it had just seen would be a harness
+        tuning itself to agree, which is the one thing the corpus was built not
+        to be.
+        """
+        target = self.path / CORPUS_MANIFEST_NAME
+        if not target.exists():
+            self._write_json(
+                target,
+                {
+                    "schema": 1,
+                    "origin": "recorded",
+                    "describes": self.run.objective or f"recorded run {self.run.id}",
+                    "exercises": [],
+                    "expected_divergences": [],
+                },
+            )
+        return target
 
     def mount_flags(self) -> list[str]:
         """The `docker create` flags that give a worker somewhere to write.
@@ -1049,6 +1169,85 @@ def _log_name(handle: Handle) -> str:
 
 
 @dataclass(frozen=True)
+class DivergenceTally:
+    """What the derived-state shadow saw across one run (#146).
+
+    **`ran` is the field that matters, and it is not a count.** Zero
+    divergences and a shadow that never executed produce the same empty list of
+    `state.divergence` events, and epic #140's go/no-go is "ten consecutive runs
+    with zero unexplained divergences" - a gate that reads an unmeasured run as
+    a clean one passes on nothing at all. So `state.shadow` is emitted every
+    shadowed cycle and its presence is what `ran` reports.
+
+    `unexplained` rather than `total` is the number the gate reads.
+    `orchestrator/shadow.py` classifies each divergence against ADR 0001's three
+    non-derivable states and the cycle's own after-the-read actions, and an
+    expected divergence is evidence the model is right rather than a defect.
+    """
+
+    ran: bool = False
+    cycles: int = 0
+    total: int = 0
+    unexplained: int = 0
+    #: Kind -> count, expected kinds only, in descending order of count.
+    by_kind: tuple[tuple[str, int], ...] = ()
+    #: Task ids with at least one unexplained divergence, in first-seen order.
+    #: Named rather than counted for `derived.Divergence`'s reason: a count is
+    #: compatible with every disagreement being on the one state ADR 0001
+    #: reports outbound.
+    tasks: tuple[str, ...] = ()
+
+    @classmethod
+    def from_events(cls, events: Iterable[Mapping[str, Any]]) -> DivergenceTally:
+        cycles = 0
+        total = 0
+        unexplained = 0
+        kinds: dict[str, int] = {}
+        tasks: list[str] = []
+        ran = False
+        for payload in events:
+            name = payload.get("event")
+            if name == STATE_SHADOW:
+                ran = True
+                cycles += 1
+                continue
+            if name != STATE_DIVERGENCE:
+                continue
+            ran = True
+            total += 1
+            kind = str(payload.get("kind") or "")
+            if kind:
+                kinds[kind] = kinds.get(kind, 0) + 1
+                continue
+            unexplained += 1
+            task = str(payload.get("task") or "")
+            if task and task not in tasks:
+                tasks.append(task)
+        return cls(
+            ran=ran,
+            cycles=cycles,
+            total=total,
+            unexplained=unexplained,
+            by_kind=tuple(sorted(kinds.items(), key=lambda one: (-one[1], one[0]))),
+            tasks=tuple(tasks),
+        )
+
+    def text(self) -> str:
+        """The line `swarm show` prints. Says "not run" rather than implying clean."""
+        if not self.ran:
+            return "derived shadow: not run (APIARY_DERIVED_SHADOW off, or a run from before #146)"
+        head = (
+            f"derived shadow: {self.total} divergence(s) over {self.cycles} cycle(s), "
+            f"{self.unexplained} unexplained"
+        )
+        if self.by_kind:
+            head += " (" + ", ".join(f"{kind} {count}" for kind, count in self.by_kind) + ")"
+        if self.tasks:
+            head += "\n  unexplained on: " + ", ".join(self.tasks)
+        return head
+
+
+@dataclass(frozen=True)
 class RunView:
     """One run directory, read from disk. What `swarm show <run-id>` prints.
 
@@ -1093,6 +1292,16 @@ class RunView:
             for issue, record in sorted(self.results.latest.items())
             if record.outcome != "pr-open"
         )
+
+    def divergences(self) -> DivergenceTally:
+        """The shadow window's verdict on this run (#146).
+
+        A method rather than a field, and read lazily on purpose: `list_runs`
+        builds a `RunView` per directory for `swarm runs`, and folding every
+        run's event log to print one table would make listing cost the whole
+        history. `swarm show` asks for one run and pays for one read.
+        """
+        return DivergenceTally.from_events(read_events(self.path / EVENT_LOG_NAME))
 
     def audit(self, *, env: Mapping[str, str] | None = None) -> list[Leak]:
         return scan_artifacts(self.path, env=os.environ if env is None else env)
@@ -1269,6 +1478,12 @@ def show_text(view: RunView) -> str:
         lines.append("needed a human: nothing")
 
     lines += [
+        "",
+        # Before the file counts rather than after: an unexplained divergence is
+        # the one thing in a run directory that says the system's own model of
+        # its state is wrong, and #146 asks that a shadowed run report without
+        # anybody reading the JSONL by hand.
+        view.divergences().text(),
         "",
         f"{view.event_count} event(s) in {EVENT_LOG_NAME}, "
         f"{len(view.container_logs)} container log(s) in {LOGS_DIR_NAME}/",

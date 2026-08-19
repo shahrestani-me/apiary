@@ -140,6 +140,39 @@ decision — the store holds only apiary's own judgments, so nothing here is a
 fact the tracker owns — but a reader who took the original table literally would
 build a resolver that reads three states wrong.
 
+### And three more that the shadow window found (#146)
+
+Wiring the resolver into the live cycle added three divergence classes to the
+three above. None of them changes the decision; all three are things a reader of
+a divergence log has to be told, because they look identical to a real one.
+
+**Two are the cycle acting after it reads, not a disagreement about a fact.** A
+cycle samples the world once, at the top, and then writes: the merge gate merges
+a pull request that was open when the listing was taken, and the dispatcher
+claims and spawns after the container listing. So on the cycle a task lands, the
+control plane says `landed` and the derived side — reading the pre-merge
+listing — says `review`; on the cycle a task is dispatched, the same happens for
+`claimed`. Both converge on the next cycle. They could only be removed by
+feeding the cycle's own writes back into the observation, which is the sourcing
+violation the whole exercise exists to avoid, so they are named instead.
+
+**One is `claimed` being liveness rather than existence.** `#187` gave
+`Handle` the container's state so that an *exited* worker's container stops
+reading as a claim, which it had to for a shadow window to be worth running at
+all. The other edge of that is the create-to-start gap: `docker ps --all` lists
+a container from the instant `docker create` returns, and until `docker start`
+takes effect it reads `created`, so the resolver says not-claimed while the
+label says claimed. `dispatcher.release` takes the opposite reading of the same
+window and is right to — it is deciding whether to *act*, and "any container
+blocks a release" is the only reading that cannot produce two workers — but a
+resolver that decides nothing should read what is true rather than what is safe.
+
+**And one finding that is a gap rather than a limit.** A work item a human
+closed *as not planned* escalates to `needs-human` through
+`reconcile._closed_verdict`, and the resolver has no rule for it even though
+`TaskFact.state_reason` carries the fact. Unlike the three above it is
+derivable, and #147 should derive it.
+
 ## Deterministic and model-driven MCP are different call sites
 
 MCP is a protocol, not a model. Plain code can call an MCP tool, and the
