@@ -263,6 +263,15 @@ def test_the_body_survives_backticks_in_the_verify_output(tmp_path):
     assert body.splitlines()[-1] == f"Closes #{ISSUE}"
 
 
+def test_deleted_files_are_listed_as_deletions_not_writes(tmp_path):
+    """A removed file presented as a plain change sends the reviewer looking
+    for new contents that do not exist."""
+    body = pull_request_body(result_at(tmp_path, deleted=("obsolete.py",)))
+
+    assert "- `calc.py`" in body
+    assert "- `obsolete.py` (deleted)" in body
+
+
 def test_refused_edits_are_reported_to_the_reviewer(tmp_path):
     """The clearest signal that `## Files` and the work asked for have drifted."""
     body = pull_request_body(

@@ -287,6 +287,11 @@ class WorkerResult:
     commit: str | None = None
     written: tuple[str, ...] = ()
     refused: tuple[tuple[str, str], ...] = ()
+    #: Files this attempt removed (an empty-content edit - see
+    #: `edit.apply_edits`). Kept apart from `written` so the record and the PR
+    #: body can say "deleted" where a "write" would tell the reviewer the
+    #: opposite of what happened.
+    deleted: tuple[str, ...] = ()
     #: The attempt this run is, taken from the contract's identity marker. The
     #: worker is the only process that reads that marker before doing the work,
     #: so carrying it here is cheaper than threading a counter through
@@ -300,7 +305,8 @@ class WorkerResult:
 
     def summary(self) -> str:
         verdict = "PASS" if self.passed else "FAIL"
-        files = ", ".join(self.written) or "no files"
+        touched = [*self.written, *(f"{path} (deleted)" for path in self.deleted)]
+        files = ", ".join(touched) or "no files"
         return f"issue #{self.issue}: {verdict} [{self.verify_command}] on {files}"
 
 
@@ -425,6 +431,13 @@ def commit_edits(
     Nothing outside the declared paths and the stack's generated set can reach
     this call; `git add -A` after a verify run would sweep `node_modules` and
     every cache the command wrote into the pull request.
+
+    A path in `paths` may name a file `apply_edits` *deleted* as well as one it
+    wrote: since git 2.0, `git add --force -- <path>` stages the removal of a
+    tracked file that is absent from the working tree, so deletions ride the
+    same staging rule with no second command - which is why the caller passes
+    written and deleted paths together rather than this function growing a
+    `git rm` branch that would need its own missing-file semantics.
 
     Identity comes from the environment - `Dockerfile.worker` sets
     `GIT_AUTHOR_*` and `GIT_COMMITTER_*` so the orchestrator can override them
@@ -885,10 +898,12 @@ def run_worker(
     for path, reason in applied.refused:
         print(f"  ! refused {path}: {reason}", file=sys.stderr)
 
-    if not applied.written:
+    if not applied.written and not applied.deleted:
         # No commit and no verification: there is nothing to verify, and
         # running the command anyway would report the repository's existing
-        # state as this task's result.
+        # state as this task's result. A deletion counts as an edit here - a
+        # cleanup task may legitimately do nothing but remove files, and the
+        # gate still has to prove the tree works without them.
         return WorkerResult(
             issue=issue,
             repo=repo,
@@ -902,7 +917,10 @@ def run_worker(
             attempt=contract.attempt,
         )
 
-    print(f"  · wrote {', '.join(applied.written)}")
+    if applied.written:
+        print(f"  · wrote {', '.join(applied.written)}")
+    if applied.deleted:
+        print(f"  · deleted {', '.join(applied.deleted)}")
     print(f"  · verifying: {contract.verify}")
     # From here on the attempt knows what its gate is and what it wrote, so an
     # infrastructure failure carries both rather than reporting an empty
@@ -913,6 +931,8 @@ def run_worker(
         # observed case is a suite whose `testpaths` never collected the broken
         # file), and the SyntaxError text is better retry feedback than
         # whatever a suite that tripped over it second-hand would say.
+        # Deleted files are exempt by construction - `applied.deleted` is a
+        # separate set, and a file that is gone has nothing left to parse.
         unparsed = syntax_failure(root, applied.written)
         if unparsed is not None:
             passed, verify_output = False, unparsed
@@ -930,7 +950,10 @@ def run_worker(
                     # A green pytest gate only counts if it actually collected
                     # the tests this attempt wrote - see `audit_collection`. It
                     # runs on passes only: a failed gate already carries its
-                    # own, better feedback.
+                    # own, better feedback. Handed `applied.written` and never
+                    # `applied.deleted`: a deleted test file no longer needs
+                    # collecting, which is exactly what makes a cleanup task
+                    # that removes obsolete tests winnable at all.
                     uncollected = audit_collection(root, contract.verify, applied.written)
                     if uncollected is not None:
                         passed, verify_output = False, uncollected
@@ -942,8 +965,15 @@ def run_worker(
                 # The gate has run by now, which is the only moment a lockfile
                 # exists to commit: it is produced *by* the verify command, so
                 # staging before verification would always find nothing.
+                # Deletions travel in the same path list: `git add --force --
+                # <path>` stages the removal of a tracked file that is gone
+                # from the tree, and staging only `applied.written` would
+                # silently commit a cleanup that cleaned nothing up.
                 commit = commit_edits(
-                    root, subject, applied.written, generated=generated_for(contract.stack)
+                    root,
+                    subject,
+                    (*applied.written, *applied.deleted),
+                    generated=generated_for(contract.stack),
                 )
             except GitError as exc:
                 raise InfrastructureError(f"committing issue #{issue}: {exc}") from exc
@@ -965,6 +995,7 @@ def run_worker(
         commit=commit,
         written=applied.written,
         refused=applied.refused,
+        deleted=applied.deleted,
         attempt=contract.attempt,
     )
 

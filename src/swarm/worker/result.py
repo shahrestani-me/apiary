@@ -161,6 +161,11 @@ class ResultRecord:
     branch: str = ""
     commit: str | None = None
     written: tuple[str, ...] = ()
+    #: Files the attempt deleted (empty-content edits - `worker.edit.apply_edits`).
+    #: Additive with a default, like `image`: an old record loads with `()`,
+    #: and folding these into `written` instead would make a summary claim the
+    #: attempt wrote files that no longer exist.
+    deleted: tuple[str, ...] = ()
     #: The container image this attempt ran in. Additive with a default, so no
     #: schema bump: a record written before this field existed reads back as
     #: `ResultRecord(image="")` rather than failing to load, and #99 makes the
@@ -184,6 +189,7 @@ class ResultRecord:
         object.__setattr__(self, "attempt", int(self.attempt))
         object.__setattr__(self, "exit_code", int(self.exit_code))
         object.__setattr__(self, "written", tuple(str(path) for path in self.written))
+        object.__setattr__(self, "deleted", tuple(str(path) for path in self.deleted))
         object.__setattr__(self, "verify_output", tail(self.verify_output))
         object.__setattr__(self, "started_at", _utc(self.started_at))
         object.__setattr__(self, "finished_at", _utc(self.finished_at))
@@ -243,6 +249,7 @@ class ResultRecord:
             "verify_command": self.verify_command,
             "verify_output": self.verify_output,
             "written": list(self.written),
+            "deleted": list(self.deleted),
             "image": self.image,
             "commit": self.commit,
             "started_at": _iso(self.started_at),
@@ -268,6 +275,7 @@ class ResultRecord:
                 branch=str(payload.get("branch", "")),
                 commit=payload.get("commit") or None,
                 written=tuple(payload.get("written") or ()),
+                deleted=tuple(payload.get("deleted") or ()),
                 # Additive, so absent is empty rather than an error: a record
                 # written before this field existed must still load, which is
                 # what "no schema bump" means in practice.
@@ -330,6 +338,7 @@ def from_worker(
         branch=result.branch,
         commit=result.commit,
         written=result.written,
+        deleted=result.deleted,
         image=image,
         started_at=started_at,
         finished_at=finished_at or dt.datetime.now(dt.timezone.utc),
@@ -341,7 +350,7 @@ def _worker_reason(result: WorkerResult) -> str:
         return "verified and committed"
     if result.passed:
         return "verified, but the edits changed nothing there was a commit to make"
-    if not result.written:
+    if not result.written and not result.deleted:
         return "no edit landed inside the declared file set"
     return "the verify command failed"
 

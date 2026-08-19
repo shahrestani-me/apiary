@@ -408,6 +408,206 @@ def test_declared_paths_are_matched_exactly(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Deletion: an empty-content edit removes the file
+# --------------------------------------------------------------------------
+#
+# The vocabulary used to be whole-file writes only, and it made any goal that
+# includes removing a file structurally unwinnable: observed live, a worker
+# told to delete an obsolete persistence stack *emptied* the test files
+# instead, and the collection audit (correctly) failed the attempt three times
+# out of three - an existing `test_*.py` that collects zero tests proves
+# nothing. Empty content now means delete, held to the same guard rails as a
+# write.
+
+
+def test_an_empty_content_edit_deletes_a_declared_file(tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "obsolete.py").write_text("legacy = True\n")
+
+    applied = edit_module.apply_edits(
+        root, [FileEdit(path="obsolete.py", content="")], ["obsolete.py"]
+    )
+
+    assert applied.deleted == ("obsolete.py",)
+    assert applied.written == ()
+    assert applied.refused == ()
+    assert not (root / "obsolete.py").exists()
+
+
+def test_whitespace_only_content_counts_as_a_deletion(tmp_path):
+    """A file of two spaces and a newline was never what anyone intended, and
+    treating it as a write would let a model's stray whitespace produce exactly
+    the emptied-not-removed file the delete vocabulary exists to end."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "obsolete.py").write_text("legacy = True\n")
+
+    applied = edit_module.apply_edits(
+        root, [FileEdit(path="obsolete.py", content="  \n\t\n")], ["obsolete.py"]
+    )
+
+    assert applied.deleted == ("obsolete.py",)
+    assert not (root / "obsolete.py").exists()
+
+
+def test_deleting_a_file_that_does_not_exist_is_a_refusal(tmp_path):
+    """Deleting nothing is model confusion about the tree it was shown, and it
+    is surfaced like every other refusal rather than swallowed as a no-op."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+
+    applied = edit_module.apply_edits(
+        root, [FileEdit(path="ghost.py", content="")], ["ghost.py"]
+    )
+
+    assert applied.deleted == ()
+    assert applied.written == ()
+    assert applied.refused == (("ghost.py", "deletes a file that does not exist"),)
+
+
+def test_a_deletion_outside_the_declared_set_is_still_refused(tmp_path):
+    """The guard rail guards deletions exactly as it guards writes: readable
+    context grants no right to remove a file either."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "README.md").write_text("# keep me\n")
+
+    applied = edit_module.apply_edits(
+        root, [FileEdit(path="README.md", content="")], ["calc.py"]
+    )
+
+    assert applied.refused == (("README.md", "not in the declared file set"),)
+    assert (root / "README.md").read_text() == "# keep me\n"
+
+
+def test_deletion_prunes_emptied_directories_but_never_the_root(tmp_path):
+    """git cannot commit an empty directory, so one left behind exists only in
+    the working tree - and the checkout root must survive even a deletion of
+    the repository's last file."""
+    root = tmp_path / "checkout"
+    (root / "pkg" / "sub").mkdir(parents=True)
+    (root / "pkg" / "sub" / "only.py").write_text("x = 1\n")
+    (root / "only.py").write_text("y = 2\n")
+
+    edit_module.apply_edits(
+        root,
+        [FileEdit(path="pkg/sub/only.py", content=""), FileEdit(path="only.py", content="")],
+        ["pkg/sub/only.py", "only.py"],
+    )
+
+    assert not (root / "pkg").exists()
+    assert root.is_dir()
+
+
+def test_deletion_stops_pruning_at_the_first_occupied_directory(tmp_path):
+    root = tmp_path / "checkout"
+    (root / "pkg" / "sub").mkdir(parents=True)
+    (root / "pkg" / "sub" / "only.py").write_text("x = 1\n")
+    (root / "pkg" / "keep.py").write_text("y = 2\n")
+
+    edit_module.apply_edits(
+        root, [FileEdit(path="pkg/sub/only.py", content="")], ["pkg/sub/only.py"]
+    )
+
+    assert not (root / "pkg" / "sub").exists()
+    assert (root / "pkg" / "keep.py").exists()
+
+
+def test_the_ledger_reports_net_effect_per_path(tmp_path):
+    """Written-then-deleted must not reach `commit_edits` in both lists: a path
+    the batch itself created and then removed leaves nothing for `git add` to
+    stage, and reporting it as either a write or a deletion would be a lie."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "old.py").write_text("x = 1\n")
+
+    applied = edit_module.apply_edits(
+        root,
+        [
+            # Pre-existing, written and then deleted: a real deletion.
+            FileEdit(path="old.py", content="x = 2\n"),
+            FileEdit(path="old.py", content=""),
+            # Created by this batch and then deleted: net nothing.
+            FileEdit(path="new.py", content="y = 1\n"),
+            FileEdit(path="new.py", content=""),
+        ],
+        ["old.py", "new.py"],
+    )
+
+    assert applied.written == ()
+    assert applied.deleted == ("old.py",)
+    assert not (root / "old.py").exists() and not (root / "new.py").exists()
+
+
+def test_the_worker_prompt_teaches_deletion():
+    """The vocabulary only exists if the model is told it does: one sentence in
+    `SYSTEM` says empty content deletes, and that removing an obsolete file is
+    often the right cleanup edit."""
+    assert "empty content" in edit_module.SYSTEM
+    assert "DELETE" in edit_module.SYSTEM
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_deletion_reaches_the_commit(fake_github, scratch_repo, workspace):
+    """The headline: the commit records the file's removal, not an emptying."""
+    scratch_repo.write("obsolete.py", "legacy = True\n")
+    scratch_repo.commit("seed the obsolete module")
+    scratch_repo.push()
+    gh, _, _ = fake_github(issue(files=("calc.py", "obsolete.py")), *publishes())
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC, "obsolete.py": ""}))
+
+    assert main(argv(scratch_repo, workspace), client=gh, editor=editor) == EXIT_OK
+
+    work = checkout(workspace, scratch_repo)
+    assert not (work.path / "obsolete.py").exists()
+    assert sorted(work.out("show", "--name-only", "--format=", "HEAD").split()) == [
+        "calc.py",
+        "obsolete.py",
+    ]
+    assert "obsolete.py" not in work.out("ls-tree", "-r", "--name-only", "HEAD").split()
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_deleted_test_file_is_exempt_from_the_parse_gate_and_the_audit(
+    fake_github, scratch_repo, workspace
+):
+    """The live failure, made winnable end to end.
+
+    An obsolete test file that does not even parse, in a repository whose
+    `testpaths` would never collect it: the only correct edit is to remove it.
+    Before deletion existed the worker emptied it instead, the collection audit
+    (correctly) refused an existing `test_*.py` that collects zero tests, and
+    the task burned all three attempts. A deleted file has nothing left to
+    parse and nothing left to collect, so both gates must pass it by."""
+    scratch_repo.write(
+        "pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'
+    )
+    scratch_repo.write("tests/test_main.py", "def test_ok():\n    assert True\n")
+    scratch_repo.write("test_obsolete.py", "def broken(:\n")
+    scratch_repo.commit("seed the debris")
+    scratch_repo.push()
+    gh, _, _ = fake_github(issue(files=("test_obsolete.py",)))
+    editor = FakeEditor(edits({"test_obsolete.py": ""}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert result.passed and result.commit
+    assert result.written == ()
+    assert result.deleted == ("test_obsolete.py",)
+    assert "test_obsolete.py (deleted)" in result.summary()
+    assert not (result.root / "test_obsolete.py").exists()
+
+
+# --------------------------------------------------------------------------
 # Dependencies: the manifest a worker may always write, and the install
 # --------------------------------------------------------------------------
 
