@@ -188,6 +188,17 @@ _RUNNING_FILTER = "status=running"
 #: as a live worker.
 RUNNING_STATE = "running"
 
+#: The value of `{{.State}}` for a container `docker create` has returned for and
+#: `docker start` has not yet taken effect on. `recovery.py` notes that
+#: `docker ps --all` lists a container from the instant `create` returns, so this
+#: is a real window in which a container exists, is not running, and a task is
+#: legitimately claimed. `spawn` closes it by calling `start` in the same breath,
+#: but the value is named here rather than spelled at the one site that reads it
+#: (`orchestrator/shadow.py`, which reports the window as an expected divergence
+#: rather than a finding): a second spelling of a state string is how two
+#: readings of the same daemon field drift apart.
+CREATED_STATE = "created"
+
 #: Container names carry a random tail for the same reason run ids do: a second
 #: attempt at one issue inside one run must not collide with the corpse of the
 #: first if that one's removal failed.

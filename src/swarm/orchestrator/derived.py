@@ -10,9 +10,10 @@ false, the ADR is wrong and the labels are load-bearing.
 
 This module is the half of the answer that computes. It reads the code host,
 the container layer and the run artifacts, and it says what each task's state
-is. **It is wired to nothing**: #146 runs it in shadow beside the labels and
-#147 makes it authoritative. Nothing here writes, and nothing in the loop reads
-it yet.
+is. **Nothing here writes, and no decision reads it.** #146 wired it into the
+live cycle through `orchestrator/shadow.py`, which resolves every cycle beside
+the labels and records where the two disagree; making the derived value
+authoritative is #147, and it does not start until the shadow reports clean.
 
 ## The sourcing invariant, which is the entire point
 
@@ -93,8 +94,12 @@ resolver reading it as it stood would hold a task in `claimed` from the moment
 its worker exited until the reaper got to it. That is precisely the cycle in
 which `claimed` and `review` disagree, so it is not a rare window. `#187` added
 `{{.State}}` to `_PS_FORMAT`, so `containers.manager.Handle` now carries the
-state and answers `running`; `ContainerFact.running` is that fact, and wiring
-the two together is #146's, since a shadow window cannot run without it.
+state and answers `running`; `ContainerFact.running` is that fact, and #146
+wired the two together, since a shadow window cannot run without it. The other
+edge of the same field is the create-to-start gap, which `shadow.py` reports as
+an expected divergence rather than as a claim - see its docstring for why
+liveness is the right reading here and existence is the right one in
+`dispatcher.release`.
 
 ## Where the attempt counter is read from, and why not the issue body
 
@@ -148,8 +153,10 @@ report a divergence on every task in every plan that has an edge.
 There is no `__main__` here, unlike `mergeability.py`. A dry run needs a run
 directory to read, and reading one is the corpus loader's job
 (`tests/fixtures/corpus.py`) - putting a second reader of the same format in
-the shipped package would give the format two implementations to drift apart
-before anything has recorded a real run in it.
+the shipped package would give the format two implementations to drift apart.
+The shipped package does now *write* that format: `RunArtifacts.observed`
+records one line per shadowed cycle (#146), so a real run replays through the
+same loader a synthesised one does.
 """
 
 from __future__ import annotations
@@ -810,6 +817,7 @@ def observe(
     results: Iterable[AttemptFact] = (),
     budget: Budget | None = None,
     live_run_ids: Iterable[str] = (),
+    state_reasons: Mapping[TaskRef, str | None] | None = None,
 ) -> Observation:
     """Assemble one `Observation` from what a cycle already holds. Read-only.
 
@@ -817,7 +825,8 @@ def observe(
     either: the caller has already listed the containers, read the pulls and
     loaded the results, because a cycle does all three for its own reasons and a
     resolver that repeated them would double the API budget to answer a question
-    nobody has wired up yet. #146 is the ticket that calls this.
+    nobody has wired up yet. `orchestrator/shadow.py` is the caller (#146), and
+    it passes only facts the cycle already holds.
 
     Branch names come in as strings and are parsed here, because
     `github/branches.parse_task_branch` answers `None` for everything apiary did
@@ -825,12 +834,23 @@ def observe(
     #144 - and the caller counting those rather than acting on them is the
     discipline that module's docstring asks for. Dropping them silently is
     correct: a branch this system did not create says nothing about a task.
+
+    `state_reasons` is the one fact an `_Entry` does not carry and `_landed`
+    needs. A closed work item discharges a dependency only when it was closed
+    **as completed** - `github/readiness.IssueState.satisfied`'s rule, and
+    `reconcile._closed_verdict`'s - so without it every issue somebody closed as
+    not planned would read `landed` here while the control plane escalated it.
+    Keyed by ref and optional, because the caller that has a snapshot of issue
+    states has it for free (#146) and a caller that does not should not have to
+    invent one. It is a code-host fact and not a state: `TaskFact` has carried
+    the field since #145 and the sourcing invariant is untouched.
     """
     parsed: list[TaskBranch] = []
     for name in branch_names:
         branch = parse_task_branch(name)
         if branch is not None:
             parsed.append(branch)
+    reasons: Mapping[TaskRef, str | None] = state_reasons or {}
     return Observation(
         cycle=cycle,
         tasks=tuple(
@@ -839,12 +859,12 @@ def observe(
                 task_id=entry.task_id,
                 depends_on=tuple(entry.blocked_by),
                 closed=entry.closed,
-                # A closed work item with no reason recorded reads as completed,
-                # matching `readiness.SATISFYING_STATE_REASONS`' inclusion of
-                # `None`: GitHub omits the field on issues closed before it
-                # existed, and treating those as "not planned" would strand
-                # every plan that depends on old work.
-                state_reason=None,
+                # A closed work item the caller recorded no reason for reads as
+                # completed, matching `readiness.SATISFYING_STATE_REASONS`'
+                # inclusion of `None`: GitHub omits the field on issues closed
+                # before it existed, and treating those as "not planned" would
+                # strand every plan that depends on old work.
+                state_reason=reasons.get(entry.ref),
             )
             for entry in entries
         ),

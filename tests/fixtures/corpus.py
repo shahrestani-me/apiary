@@ -78,7 +78,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-from swarm.artifacts import EVENT_LOG_NAME, RESULTS_DIR_NAME, read_events, read_run
+from swarm.artifacts import (
+    CORPUS_MANIFEST_NAME,
+    CORPUS_SCHEMA as ARTIFACTS_CORPUS_SCHEMA,
+    EVENT_LOG_NAME,
+    OBSERVED_LOG_NAME,
+    RESULTS_DIR_NAME,
+    read_events,
+    read_run,
+)
 from swarm.github.branches import parse_task_branch
 from swarm.github.refs import task_ref
 from swarm.taskref import TaskRef
@@ -92,7 +100,7 @@ from swarm.orchestrator.derived import (
     TaskFact,
 )
 from swarm.orchestrator.lifecycle import INTERNAL_STATE
-from swarm.worker.result import ResultRecord
+from swarm.worker.result import ResultRecord, record_path
 
 #: Where the committed runs live. A directory rather than a roster, so a run
 #: added tomorrow is replayed because it exists - the same ratchet
@@ -101,13 +109,23 @@ from swarm.worker.result import ResultRecord
 #: not naming the interesting case.
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 
-MANIFEST_NAME = "corpus.json"
-OBSERVED_NAME = "observed.jsonl"
+#: Both names come from `swarm.artifacts` since #146, because a live run now
+#: writes both: the shadow window records `observed.jsonl` every cycle and drops
+#: the manifest beside it. Two spellings of these would be the seam along which
+#: "a recorded run drops in with no code change" quietly stopped being true.
+MANIFEST_NAME = CORPUS_MANIFEST_NAME
+OBSERVED_NAME = OBSERVED_LOG_NAME
 
 #: Bumped when a field in `observed.jsonl` changes meaning, never when one is
 #: added - `artifacts.SCHEMA_VERSION`'s rule, and the loader below obeys the
 #: other half of it by ignoring keys it does not know.
-CORPUS_SCHEMA = 1
+#:
+#: **From `swarm.artifacts` since #146**, because the recorder there stamps the
+#: number this loader checks. Two spellings would be worse than none: the check
+#: below only refuses a number *greater* than this one, so a bump made on one
+#: side alone leaves the recorder stamping the old number and this loader
+#: silently reading new-meaning fields as old ones.
+CORPUS_SCHEMA = ARTIFACTS_CORPUS_SCHEMA
 
 #: The two provenances a run can have. `origin` is metadata and nothing branches
 #: on it; both constants exist so that a recorded run can be *labelled* as one
@@ -415,7 +433,11 @@ def _ref(value: Any) -> TaskRef:
 
 
 def _result_name(record: ResultRecord) -> str:
-    return f"issue-{record.issue}-attempt-{record.attempt}.json"
+    """`worker.result.record_path`'s name, never a second spelling of it.
+
+    The recorder (`orchestrator/shadow.observed_line`) builds the same name the
+    same way, so a rename in `worker/result.py` moves both sides at once."""
+    return record_path("", record.issue, record.attempt).name
 
 
 def _load_results(directory: Path) -> tuple[ResultRecord, ...]:

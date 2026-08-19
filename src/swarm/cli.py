@@ -749,6 +749,12 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
         # one is the cycle a human is watching, the other is the timeline a
         # reader reconstructs afterwards.
         events=artifacts.event,
+        # The derived-state shadow's recorder (#146). It writes `observed.jsonl`
+        # beside the event log, which is the fifth and last file a replay corpus
+        # run needs - so every real run from here is a run that
+        # `tests/fixtures/corpus.py` can replay, and #145's corpus stops being
+        # entirely synthesised the first time anybody copies one in.
+        record=artifacts.observed,
         dry_run=args.dry_run,
     )
 

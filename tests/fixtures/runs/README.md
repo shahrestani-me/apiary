@@ -21,8 +21,26 @@ and it needs at least one genuine run through it.
 
 Anyone who acquires a working credential should record runs and re-run this
 suite against them. That is the cheapest retirement of the largest risk in the
-epic, and it costs no code: record, drop the directory in here, set
-`"origin": "recorded"`, run `pytest tests/test_derived.py`.
+epic, and since #146 it costs **no work at all**.
+
+## Recording a real run (#146)
+
+Every run with the shadow window on - the default, `APIARY_DERIVED_SHADOW`
+- writes `observed.jsonl` and a `corpus.json` into its own run directory as it
+goes. The other four files were always written. So a recorded run is:
+
+    cp -r .swarm/runs/<run-id> tests/fixtures/runs/08-<a-name-for-it>
+    pytest tests/test_derived.py -q
+
+The manifest the recorder leaves declares **no divergences**, deliberately: the
+harness fails on an undeclared one, so a recorded run refuses to pass until
+somebody has written the argument for each divergence it produced. That is the
+rule at the bottom of this file, and it is the one part of recording a machine
+must not do on a human's behalf. `describes` and `exercises` are also for a
+human to fill in - the recorder writes the objective and an empty list.
+
+`swarm show <run-id>` reports the same divergences in one line, so the question
+"is this run worth committing" is answerable before the copy.
 
 ## The directory
 
@@ -37,11 +55,21 @@ Four of the five are produced verbatim by a live run today, and `load_corpus`
 calls `artifacts.read_run` on every directory to keep it that way: a corpus run
 that `swarm show` cannot read has drifted from the format it claims to be in.
 
-`observed.jsonl` is the one file a recorder has to add, and it is not new state.
-Every field is something a cycle **already reads** for its own reasons —
+`observed.jsonl` was the one file a recorder had to add, and #146 added it
+(`orchestrator/shadow.py`, through `RunArtifacts.observed`). It is not new
+state: every field is something a cycle **already reads** for its own reasons —
 `ContainerManager.find`, `checks.read_pulls`, the branch listing `recovery`
 sweeps, `worker.result.load_results`, `Ledger.entries`. So recording one is a
 projection of a cycle's own inputs, not a second source of truth.
+
+Two fields a recorded run fills more narrowly than a synthesised one can, and
+neither is a defect in the format: `branches` carries the head refs of open
+pull requests only, because a remote branch listing is not a call the cycle
+makes and #146 forbids adding one; and `pulls` carries open pull requests only,
+for `Snapshot.pull_requests`' own reason - a merge closes its issue through
+`Closes #<n>`, so `landed` arrives through `closed` and `state_reason` instead.
+`attempts_spent` takes the maximum of three lower bounds, so a narrower source
+lowers the bound rather than corrupting it.
 
 ### `observed.jsonl`, one line per cycle
 

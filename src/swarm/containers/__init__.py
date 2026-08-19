@@ -12,6 +12,7 @@ redact a token or capture logs before removing the thing that held them.
 from __future__ import annotations
 
 from .manager import (
+    CREATED_STATE,
     DEFAULT_LIMITS,
     ISSUE_LABEL,
     MAX_LOG_CHARS,
@@ -35,6 +36,7 @@ from .manager import (
 )
 
 __all__ = [
+    "CREATED_STATE",
     "DEFAULT_LIMITS",
     "ISSUE_LABEL",
     "MAX_LOG_CHARS",

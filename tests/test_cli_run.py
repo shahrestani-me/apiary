@@ -928,6 +928,9 @@ def test_the_loop_hands_every_collaborator_the_same_client(monkeypatch):
             # worker's exit code.
             results_dir="/var/apiary/results",
             event=lambda name, **fields: {},
+            # #146's recorder seam. `_loop` hands it to the reconciler, so a
+            # double without it stops resembling the object under test.
+            observed=lambda payload: {},
         )))
 
     client = FakeClient([issue(1, marker="task-one", labels=("swarm:ready",))])

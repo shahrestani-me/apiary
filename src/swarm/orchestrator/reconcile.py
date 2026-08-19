@@ -1529,6 +1529,24 @@ def _lifecycle_log() -> Any:
     return LifecycleLog()
 
 
+def _shadow_window() -> Any:
+    """`shadow.ShadowWindow`, imported at call time. `_lifecycle_log`'s reason.
+
+    `shadow` imports this module for `CycleReport` and imports `lifecycle` for
+    the label translation, so the dependency points the same way it does for the
+    announcement and for the same reason: this file is the body that *decides*,
+    and the modules that project a finished cycle sit downstream of it.
+
+    Constructed with the environment already read (`APIARY_DERIVED_SHADOW`), so
+    a `Reconciler` built in a test gets the shadow unless the test says
+    otherwise - which is the right default for an observer that must never be
+    the reason a cycle behaves differently.
+    """
+    from .shadow import ShadowWindow, shadow_enabled
+
+    return ShadowWindow(enabled=shadow_enabled())
+
+
 @dataclass
 class Reconciler:
     """The loop body, and the thing that paces it.
@@ -1638,6 +1656,17 @@ class Reconciler:
     #: cycle for whoever is watching, this is one event per task transition for
     #: whoever reads the run back afterwards.
     events: Callable[..., Any] | None = None
+    #: Where a shadowed cycle's `Observation` is recorded - `RunArtifacts.observed`
+    #: in a real run, so `observed.jsonl` lands beside `events.jsonl` and is
+    #: redacted by the same redactor. `None` records nothing, which is what a
+    #: reconciler with no run directory behind it should do.
+    #:
+    #: **This is what makes every real run a replay corpus run.**
+    #: `tests/fixtures/runs/README.md` names the missing recorder as the whole
+    #: reason #145's corpus is synthesised, and a synthesised corpus proves the
+    #: reducer self-consistent and nothing about reality. Four of the five files
+    #: are already written by every run; this is the fifth.
+    record: Callable[..., Any] | None = None
 
     _cycles: int = field(default=0, repr=False)
     #: The progress ledger, run-scoped. See the module docstring.
@@ -1656,6 +1685,11 @@ class Reconciler:
     #: built through a local import, for `merge_policy`'s reason: `lifecycle`
     #: imports this module.
     _lifecycle: Any = field(default_factory=_lifecycle_log, repr=False)
+    #: The derived-state shadow (#146), run-scoped so "have I warned about an
+    #: unexplained divergence yet" is asked once per run rather than once per
+    #: cycle. Typed loosely and built through a local import for `_lifecycle`'s
+    #: reason. It reads nothing the cycle decides and decides nothing itself.
+    _shadow: Any = field(default_factory=_shadow_window, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -1677,15 +1711,23 @@ class Reconciler:
             store=self.store,
         )
 
-        handles = self._handles()
+        # One `docker ps`, read twice: the raw listing for the shadow window,
+        # which must be able to see two containers under one task, and the
+        # collapsed map every rule in this cycle wants.
+        containers = self._containers()
+        handles = self._handles(containers)
         # Read once and shared with step 5: the judge's observation carries each
         # task's latest failure text, and that text is what a replan is written
         # from (`replan.brief`). A second read here would be a second directory
         # listing for facts this cycle already has.
         results = self._results()
+        # One fold over the cached issue listing, shared by the three readers in
+        # this cycle. No API call either way - `Snapshot` caches the listing -
+        # but three walks of it to build the same mapping is three walks.
+        states = snapshot.states()
         plan = plan_reconcile(
             ledger,
-            states=snapshot.states(),
+            states=states,
             open_branches=snapshot.open_branches(),
             results=results,
             running=tuple(handles),
@@ -1723,7 +1765,7 @@ class Reconciler:
                 # iterating the mapping yields the keys - `holders` would then
                 # ask a `TaskRef` for its `.issue`.
                 containers=handles.values(),
-                states=snapshot.states(),
+                states=states,
                 open_branches=snapshot.open_branches(),
             )
             ledger = fold(ledger, recovered.result.applied)
@@ -1865,6 +1907,43 @@ class Reconciler:
             results=results,
             pulls=pulls or {},
             checks=check_runs,
+        )
+        # The shadow window (#146), last and on the same grown report, for the
+        # announcement's reason and one of its own: it diffs the derived state
+        # against the control plane **as this cycle left it**, so it has to run
+        # after every write this cycle made. Every fact it needs is one this
+        # cycle already read, which is why they are passed rather than fetched -
+        # shadowing adds no API call, and there is no client in `shadow.py` to
+        # add one with. It cannot raise; see `ShadowWindow.run`.
+        #
+        # **Not on a dry run.** `apply_plan` returns before writing, so nothing
+        # is folded and `control_labels` would report *last* cycle's labels -
+        # exactly the lagging-cache comparison `shadow.py` argues against. The
+        # recorder is worse: `RunArtifacts.observed` stamps the directory
+        # `origin: "recorded"`, so a dry run would enter the replay corpus
+        # wearing the one label that means "this happened for real".
+        if self.dry_run:
+            return judged
+        self._shadow.run(
+            judged,
+            # The raw listing, not `handles`: a resolver handed a first-wins map
+            # cannot see two containers under one task, which is one of the
+            # cases #146 gives as a reason to shadow.
+            containers=containers,
+            # `pulls`, not `pulls or {}`. `None` means this cycle could not
+            # list pull requests, and `ShadowWindow.run` announces that as a
+            # blind cycle - `checks.read_pulls`' distinction, which conflating
+            # would emit one manufactured divergence per task in review.
+            pulls=pulls,
+            results=results,
+            states=states,
+            infrastructure=self._infrastructure,
+            infrastructure_cap=self.infrastructure_policy.cap,
+            max_attempts=self.max_attempts,
+            max_total_attempts=self.max_total_attempts,
+            live_run_ids=(self.run.id,),
+            emit=self.events,
+            record=self.record,
         )
         return judged
 
@@ -2039,21 +2118,38 @@ class Reconciler:
 
     # --- what the cycle reads --------------------------------------------
 
-    def _handles(self) -> dict[TaskRef, Handle]:
-        """This run's containers, by task. One `docker ps`, whatever the count.
+    def _containers(self) -> list[Handle]:
+        """This run's containers, as the daemon listed them. One `docker ps`.
+
+        **The raw listing, one entry per container**, which `_handles` below
+        then collapses. Both exist because they answer different questions and
+        the collapse is lossy in a way that matters exactly once: two
+        containers under one task is the double-spawn `dispatcher.release`'s
+        docstring is written about, and it is one of the cases #146 gives as a
+        reason to shadow at all. A resolver handed the collapsed map could not
+        see it, so `orchestrator/shadow.py` takes this list.
 
         A container with no issue label is not this run's worker - the label is
         written at `docker create` - so it is left for the reaper (#20), which
         is the module allowed to remove things it did not spawn.
+        """
+        if self.fleet is None:
+            return []
+        return [handle for handle in self.fleet.find() if handle.issue is not None]
+
+    def _handles(self, containers: Iterable[Handle] | None = None) -> dict[TaskRef, Handle]:
+        """This run's containers, by task. One entry per task, first wins.
 
         The label is an issue number, because that is what a container name and
         a docker label may contain; it is minted into a ref here so the plan
         above keys on the same identity everything else does.
+
+        First-wins is what the plan wants - it asks "is anything running for
+        this task" - and is exactly what a resolver must not be handed. See
+        `_containers`.
         """
-        if self.fleet is None:
-            return {}
         found: dict[TaskRef, Handle] = {}
-        for handle in self.fleet.find():
+        for handle in self._containers() if containers is None else containers:
             if handle.issue is not None:
                 found.setdefault(task_ref(int(handle.issue)), handle)
         return found
