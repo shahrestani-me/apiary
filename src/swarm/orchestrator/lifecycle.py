@@ -273,7 +273,7 @@ def lifecycle_events(
         )
 
     for number, check_set in sorted(checks.items()):
-        entry = by_issue.get(number)
+        entry = by_issue.get(number)  # type: ignore[assignment]
         task = by_number.get(number, "")
         pull = by_pull_ref.get(entry.ref) if entry is not None else None
         if not task or pull is None:
@@ -330,7 +330,7 @@ def lifecycle_events(
     #    in the next one, and the log should read in that order.
     if report.readiness is not None:
         for verdict in report.readiness.verdicts:
-            entry = entries.get(verdict.ref)
+            entry = entries.get(verdict.ref)  # type: ignore[assignment]
             if not verdict.ready or not verdict.task_id or entry is None:
                 continue
             emit(

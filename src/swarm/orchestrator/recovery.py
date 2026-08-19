@@ -587,7 +587,7 @@ class Recovery:
         does inside a cycle.
         """
         snapshot = Snapshot(self.client)
-        ledger = load_ledger(snapshot, adopt=not self.dry_run)
+        ledger = load_ledger(snapshot, adopt=not self.dry_run)  # type: ignore[arg-type]
         return self.sweep(
             ledger,
             states=snapshot.states(),

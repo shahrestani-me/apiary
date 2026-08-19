@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from ..config import SETTINGS
 from ..state import SwarmState, TaskRecord
@@ -30,7 +31,7 @@ def _run_verify(cwd: Path) -> tuple[bool, str]:
     return proc.returncode == 0, output[-4000:]
 
 
-def verify_node(state: SwarmState) -> dict:
+def verify_node(state: SwarmState) -> dict[str, Any]:
     """Verify every task currently in 'running'."""
     tasks = state.get("tasks", {})
     updates: dict[str, TaskRecord] = {}

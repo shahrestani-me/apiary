@@ -15,6 +15,7 @@ once the rest of the machinery is proven - the graph does not change.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from ..config import SETTINGS
 from ..llm import structured, worker_llm
@@ -47,7 +48,12 @@ def _read_context(root: Path, files: list[str]) -> str:
     return "\n\n".join(chunks) if chunks else "(no files provided)"
 
 
-def worker_node(state: SwarmState, config=None) -> dict:
+# LangGraph reads this signature and warns unless `config` is annotated as its
+# own `RunnableConfig`, which is a framework import this package does not have
+# and #168 is not the ticket that adds one. So the parameter stays bare and the
+# finding is excluded here rather than in `pyproject.toml`, where it would switch
+# the code off for every function in the module.
+def worker_node(state: SwarmState, config=None) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Invoked once per task, in parallel, via Send()."""
     task: TaskRecord = state["task"]  # type: ignore[typeddict-item]
     task_id = task["id"]

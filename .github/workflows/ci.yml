@@ -48,3 +48,52 @@ jobs:
             tail -n 1 pytest.log 2>/dev/null || true
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  types:
+    # #168. pytest alone let #142's retype ship broken: `Reconciler._results()`
+    # went ref-keyed while `judge.Observation.of` still read
+    # `results.get(entry.number)`, a dict miss returns rather than raises, and
+    # 1480 tests stayed green over a dead judgement path. This job is the
+    # mechanical half of that review.
+    #
+    # A separate job rather than a step in `test`, deliberately: the two answer
+    # different questions and a red one must not hide the other's result. It is
+    # in this workflow because the ticket asked for one gate, not two.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # No arguments: `packages = ["swarm"]` in pyproject.toml is the target, so
+      # a module added tomorrow is checked because it exists rather than because
+      # somebody remembered to list it here.
+      - name: Type check
+        run: mypy
+
+      - name: How to run this locally
+        if: failure()
+        run: |
+          {
+            echo "### Type check failed"
+            echo
+            echo 'Reproduce it locally with:'
+            echo
+            echo '```'
+            echo 'pip install -e ".[dev]"'
+            echo 'mypy'
+            echo '```'
+            echo
+            echo 'The settings are in `pyproject.toml` under `[tool.mypy]`, with'
+            echo 'the excluded backlog listed there module by module. If the'
+            echo 'error is pre-existing rather than yours, say so in the pull'
+            echo 'request - do not widen a `disable_error_code` list to get'
+            echo 'green, because that switches the code off for the whole module.'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"

@@ -388,7 +388,7 @@ def _evidence(name: str, conclusion: str, run: Mapping[str, Any]) -> str:
     output = run.get("output") if isinstance(run.get("output"), Mapping) else {}
     lines = [f"{name}: {conclusion or 'no conclusion'}"]
     for key in ("title", "summary", "text"):
-        value = str(output.get(key) or "").strip()
+        value = str(output.get(key) or "").strip()  # type: ignore[union-attr]
         if value:
             lines.append(value)
     url = str(run.get("details_url") or run.get("html_url") or "").strip()
@@ -488,8 +488,8 @@ class PullState:
         head = payload.get("head") if isinstance(payload.get("head"), Mapping) else {}
         return cls(
             number=int(payload.get("number") or 0),
-            branch=str(head.get("ref") or ""),
-            sha=str(head.get("sha") or ""),
+            branch=str(head.get("ref") or ""),  # type: ignore[union-attr]
+            sha=str(head.get("sha") or ""),  # type: ignore[union-attr]
             updated_at=_parse(payload.get("updated_at") or payload.get("created_at")),
             draft=bool(payload.get("draft", False)),
         )
