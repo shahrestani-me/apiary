@@ -182,7 +182,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Protocol, Sequence
 
 from ..github.branches import TaskBranch, parse_task_branch
-from ..taskref import TaskRef
+from ..taskref import PullRef, TaskRef
 from ..worker.result import EXIT_INFRASTRUCTURE
 
 __all__ = [
@@ -318,23 +318,23 @@ class PullFact:
     """One pull request, joined to a task the way #144 says to join one.
 
     **By the ref inside the head branch, never by `Closes #<n>` and never by
-    `LedgerEntry.branch`.** `number` is an `int` and `ref` is a `TaskRef` because they
-    are not the same fact in two spellings: the number addresses the API and
-    the ref identifies the work. **`number` should be a `PullRef` and is not
-    yet** - #185 retyped the orchestrator's pull-request numbers and stopped at
-    the resolver's edge, so this field is the follow-up rather than an exception
-    to `mergeability.py`'s rule. Retyping it needs `PullRef` to sort first; see
-    `taskref.py`. Comparing against a rebuilt
-    `entry.branch` is right until the counter moves, and the cycle where it
-    moves is the cycle a crash happened, which is the only cycle any of this
-    matters in.
+    `LedgerEntry.branch`.** `number` is a `PullRef` and `ref` is a `TaskRef`
+    because they are not the same fact in two spellings: the number addresses
+    the API and the ref identifies the work. #185 retyped the orchestrator's
+    pull-request numbers and stopped at the resolver's edge, leaving this field
+    an `int` because retyping it needed `PullRef` to sort and it did not; #208
+    gave it an ordering and closed the gap, so `mergeability.py`'s rule - a task
+    is a ref, an API address is a number - now holds through the resolver too.
+    Comparing against a rebuilt `entry.branch` is right until the counter moves,
+    and the cycle where it moves is the cycle a crash happened, which is the only
+    cycle any of this matters in.
 
     `attempt` comes out of the same name and is the second half of what #144 put
     there. It is what lets `attempts_spent` survive an orchestrator that lost
     every scrap of local memory.
     """
 
-    number: int
+    number: PullRef
     ref: TaskRef
     attempt: int = 0
     merged: bool = False
@@ -479,7 +479,12 @@ class Verdict:
     state: str
     because: str
     attempts_spent: int = 0
-    pull: int | None = None
+    #: A `PullRef`, not an `int` (#208). It is copied straight off `PullFact`, so
+    #: an `int` here would put a bare number back beside `ref` on the one record
+    #: the decision path reads - which is the shape #185 removed. Nothing
+    #: un-mints it: a verdict is read by a human or a board, never by an
+    #: endpoint, and `str(pull)` already renders `#101`.
+    pull: PullRef | None = None
     container: str = ""
 
     def __str__(self) -> str:
@@ -594,9 +599,16 @@ def _landed(observation: Observation, tasks: Sequence[TaskFact]) -> dict[TaskRef
     moved on.
     """
     merged: dict[TaskRef, str] = {}
+    # Sorted so that a task with two merged pull requests - the orphan
+    # `recovery.py` documents, merged by a human rather than closed - names the
+    # same one every cycle instead of whichever GitHub's listing happened to
+    # return first. The key was an `int`; `PullRef` sorts since #208.
     for pull in sorted(observation.pulls, key=lambda one: one.number):
         if pull.merged:
-            merged.setdefault(pull.ref, f"pull request #{pull.number} merged")
+            # `{pull.number}` renders `#101` on its own - the ref carries the
+            # `#` - so there is no second one in the format string. The sentence
+            # a human reads is byte-for-byte the one the `int` produced.
+            merged.setdefault(pull.ref, f"pull request {pull.number} merged")
     for fact in tasks:
         if fact.ref not in merged and fact.closed_as_completed:
             merged[fact.ref] = "the work item is closed as completed"
@@ -618,7 +630,7 @@ def _verdict(
             state=LANDED,
             because=landed[fact.ref],
             attempts_spent=spent,
-            pull=_merged_pull_number(fact.ref, observation),
+            pull=_merged_pull(fact.ref, observation),
         )
 
     # Before the budget, because a human's closure outranks apiary's arithmetic
@@ -663,7 +675,7 @@ def _verdict(
             ref=fact.ref,
             task_id=fact.task_id,
             state=REVIEW,
-            because=f"pull request #{pull.number} is open for this task",
+            because=f"pull request {pull.number} is open for this task",
             attempts_spent=spent,
             pull=pull.number,
         )
@@ -766,6 +778,14 @@ def _open_pull(ref: TaskRef, observation: Observation) -> PullFact | None:
     Until they do, two are open for one task. The highest attempt is the one the
     run is actually waiting on; the other is a leftover, and reporting the
     leftover's number would send a reader to the wrong diff.
+
+    The number is the tiebreak when both are on the same attempt, and it is the
+    third site that needed `PullRef` to sort (#208) - the `>` below is a tuple
+    comparison, so it reaches the second element only when the attempts are
+    equal, and an unordered second element would have made that comparison a
+    `TypeError` rather than a wrong answer. Two open pull requests on one
+    attempt means a worker published twice for one dispatch; the higher number
+    is the newer one.
     """
     best: PullFact | None = None
     for pull in observation.pulls:
@@ -776,7 +796,16 @@ def _open_pull(ref: TaskRef, observation: Observation) -> PullFact | None:
     return best
 
 
-def _merged_pull_number(ref: TaskRef, observation: Observation) -> int | None:
+def _merged_pull(ref: TaskRef, observation: Observation) -> PullRef | None:
+    """The merged pull request this task landed through, lowest number first.
+
+    The same key as `_landed`, and it has to be: that function writes the
+    sentence this number is rendered beside, so a reader told "pull request #101
+    merged" and linked to #104 would be sent to a diff that explains nothing.
+    What the ordering buys is that neither answer depends on the order GitHub
+    listed the pull requests in - which is not stable between cycles, and is not
+    the same in a replay as it was in the run being replayed.
+    """
     for pull in sorted(observation.pulls, key=lambda one: one.number):
         if pull.ref == ref and pull.merged:
             return pull.number

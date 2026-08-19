@@ -49,7 +49,7 @@ import pytest
 from swarm.artifacts import STATE_OVERRIDE, DivergenceTally
 from swarm.github.ledger import load_ledger
 from swarm.github.readiness import BLOCKED, READY, compute_readiness
-from swarm.github.refs import task_ref as ref
+from swarm.github.refs import pull_ref, task_ref as ref
 from swarm.orchestrator.authority import (
     BUDGET_RENEWED,
     BUDGET_SPENT,
@@ -530,7 +530,7 @@ def test_a_renewed_budget_is_read_from_the_store_and_not_from_the_branches():
     """
     task = entry(4, attempt=4, streak=1)
     spent = replace(task, streak=3)
-    observation = world(task, pulls=(PullFact(number=900, ref=ref(4), attempt=4),))
+    observation = world(task, pulls=(PullFact(number=pull_ref(900), ref=ref(4), attempt=4),))
 
     renewed = believe(ledger(task), observation, max_attempts=3)
     assert renewed.state("task-4") == REVIEW_STATE
@@ -539,7 +539,7 @@ def test_a_renewed_budget_is_read_from_the_store_and_not_from_the_branches():
     # The same world with the store saying the streak really did reach the cap.
     given_up = believe(
         ledger(spent),
-        world(spent, pulls=(PullFact(number=900, ref=ref(4), attempt=4),)),
+        world(spent, pulls=(PullFact(number=pull_ref(900), ref=ref(4), attempt=4),)),
         max_attempts=3,
     )
     assert given_up.state("task-4") == NEEDS_HUMAN
@@ -1060,7 +1060,9 @@ def test_a_failed_label_typed_onto_merged_work_no_longer_resigns_the_run():
     task that had landed, with the objective never assessed at all.
     """
     book, derived, labels = a_hand_edited(
-        FAILED, REVIEW_STATE, pulls=(PullFact(number=TASK_PULL, ref=ref(4), merged=True),)
+        FAILED,
+        REVIEW_STATE,
+        pulls=(PullFact(number=pull_ref(TASK_PULL), ref=ref(4), merged=True),),
     )
     assert derived.state("task-4") == LANDED
 
@@ -1089,7 +1091,7 @@ def test_a_done_label_typed_onto_an_open_pull_request_no_longer_assesses_early()
     a task whose pull request was still open.
     """
     book, derived, labels = a_hand_edited(
-        DONE, CLAIMED_STATE, pulls=(PullFact(number=TASK_PULL, ref=ref(4)),)
+        DONE, CLAIMED_STATE, pulls=(PullFact(number=pull_ref(TASK_PULL), ref=ref(4)),)
     )
     assert derived.state("task-4") == REVIEW_STATE
 
@@ -1118,7 +1120,9 @@ def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
     every id it is shown.
     """
     book, derived, labels = a_hand_edited(
-        FAILED, REVIEW_STATE, pulls=(PullFact(number=TASK_PULL, ref=ref(4), merged=True),)
+        FAILED,
+        REVIEW_STATE,
+        pulls=(PullFact(number=pull_ref(TASK_PULL), ref=ref(4), merged=True),),
     )
     verdict = stalled()
 

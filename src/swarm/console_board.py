@@ -103,7 +103,7 @@ from .config import SETTINGS
 from .github.branches import BRANCH_PREFIX, parse_task_branch
 from .github.client import GitHubClient
 from .github.ledger import LedgerEntry, load_ledger
-from .github.refs import task_ref
+from .github.refs import pull_ref, task_ref
 from .orchestrator.authority import WAITING, budget_spent
 from .orchestrator.derived import (
     LANDED,
@@ -554,7 +554,12 @@ def _pull_facts(
         merged = bool(pull.get("merged_at"))
         facts.append(
             PullFact(
-                number=int(pull["number"]),
+                # Minted here because here is the edge: `pulls` is the listing
+                # payload as GitHub sent it, and `github/refs.pull_ref` is the
+                # one place a number becomes a `PullRef` (#185, #208). The card's
+                # link is built from the payload further down rather than from
+                # this field - a URL wants the number, not the ref.
+                number=pull_ref(int(pull["number"])),
                 ref=parsed.ref,
                 attempt=parsed.attempt,
                 merged=merged,

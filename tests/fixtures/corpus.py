@@ -88,7 +88,7 @@ from swarm.artifacts import (
     read_run,
 )
 from swarm.github.branches import parse_task_branch
-from swarm.github.refs import task_ref
+from swarm.github.refs import pull_ref, task_ref
 from swarm.taskref import TaskRef
 from swarm.orchestrator.derived import (
     AttemptFact,
@@ -346,7 +346,13 @@ def _cycle(
             continue
         pulls.append(
             PullFact(
-                number=int(one["number"]),
+                # The file holds a JSON number and `PullFact.number` is a
+                # `PullRef` since #208, so the loader mints - through
+                # `github/refs.pull_ref`, the only minter, exactly as a live
+                # listing does. `shadow.observed_line` un-mints on the way out,
+                # which is what keeps the recorded and the hand-written line the
+                # same shape.
+                number=pull_ref(int(one["number"])),
                 ref=branch.ref,
                 attempt=branch.attempt,
                 merged=bool(one.get("merged", False)),
