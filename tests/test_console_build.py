@@ -744,3 +744,32 @@ def test_the_real_preflight_answers_for_this_host():
     assert diagnosis.checks
     for check in diagnosis.failures:
         assert check.fix, f"{check.name} failed without naming a fix"
+
+
+def test_a_repository_that_was_created_is_named_even_when_its_issues_are_not():
+    """The one failure that must not arrive as a traceback.
+
+    By the time `write_plan` runs the repository is real, and a refusal that
+    did not name it would leave the operator with something they cannot find
+    and did not ask for - while pressing the button again would create a
+    second one.
+    """
+    class Refuses:
+        repo = "shahrestani-me/expense-tracker"
+
+        def list_issues(self, **_):
+            raise RuntimeError("403 Resource not accessible by personal access token")
+
+    console, provisioner, _ = console_with(client_for=lambda repo: Refuses())
+
+    _, job = build(console, planned(console))
+
+    assert job["state"] == "error"
+    assert len(provisioner.calls) == 1
+    assert "https://github.com/shahrestani-me/expense-tracker" in job["error"]["message"]
+    assert "issues could not be written" in job["error"]["message"].replace(
+        "its issues", "issues")
+    assert "issues: write" in job["error"]["fix"]
+    # Not a traceback dump: the fix is the point, and it says what to do with
+    # the repository that now exists rather than "try again".
+    assert "delete it" in job["error"]["fix"]

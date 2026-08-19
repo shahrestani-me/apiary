@@ -360,12 +360,29 @@ class Builder:
         # `cli._target`'s reasoning and the same trap either way — a `## Verify`
         # disagreeing with the required status check is a task that was red
         # before a worker touched it.
-        written = write_plan(
-            self.client_for(report.repo),
-            plan,
-            verify=report.verify_command,
-            stack=stack,
-        )
+        try:
+            written = write_plan(
+                self.client_for(report.repo),
+                plan,
+                verify=report.verify_command,
+                stack=stack,
+            )
+        except Exception as exc:  # noqa: BLE001 - the repository outlives this
+            # The one failure that must not arrive as a traceback. By this line
+            # the repository is real, and a refusal that did not name it would
+            # leave the operator with something they cannot find and did not
+            # ask for - the same reasoning `provision` gives for reporting what
+            # exists rather than pretending an abort undid it. Pressing the
+            # button again would create a *second* repository, so the fix says
+            # what to do with the first.
+            raise BuildError(
+                f"{report.repo} was created at {report.html_url}, but its issues "
+                f"could not be written: {type(exc).__name__}: {exc}",
+                fix=f"the repository exists and is empty of work - fix the cause and "
+                    f"run `swarm run --repo {report.repo} --objective ...`, or delete it "
+                    f"before pressing Start building again; a GITHUB_TOKEN without "
+                    f"`issues: write` fails exactly here",
+            ) from exc
         issues = tuple(
             WrittenIssue(
                 number=action.number,
