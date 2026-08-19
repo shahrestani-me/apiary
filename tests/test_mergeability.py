@@ -38,7 +38,7 @@ that the states the fake payloads simulate are the states git actually produces.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Callable, Iterable, Mapping, cast
 
 import pytest
 
@@ -77,7 +77,10 @@ from swarm.orchestrator.mergeability import (
 )
 from swarm.orchestrator.reconcile import DONE, FAILED, READY
 from swarm.taskref import TaskRef
+from swarm.orchestrator.authority import Belief
+from swarm.orchestrator.lifecycle import internal_state
 from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
+from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
 
 # --------------------------------------------------------------------------
@@ -1170,3 +1173,82 @@ def test_a_conflict_at_the_cap_is_not_offered_to_the_next_attempt():
 
     assert client.comments and "giving up" in client.comments[0][1]
     assert fetch_feedback(client, 23) == ""
+
+
+# --------------------------------------------------------------------------
+# `from_state` is the label the issue carries (#243)
+# --------------------------------------------------------------------------
+
+
+def relabelled(label: str, attempt: int = 0):
+    """#23 in review by belief, wearing the label a human typed onto it.
+
+    The two plans are built together because this module gates the other's:
+    the *selection* is the check gate's, and that reads the belief, so the
+    ledger can carry any label at all by the time a rule here fires.
+    """
+    tasks = ledger(entry(23, label=label, attempt=attempt))
+    checks = plan_checks(
+        tasks,
+        pulls=pulls(pull(101, issue=23, attempt=attempt)),
+        checks={task_ref(23): summarise_checks([
+            {"name": "test", "status": "completed", "conclusion": "success"}
+        ])},
+        believed=Belief(states={"task-23": REVIEW_STATE}),
+    )
+    return tasks, checks
+
+
+#: Two labels per rule, never one - see `tests/test_reconcile.py`.
+CARRIED = (DONE, "swarm:blocked")
+
+CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
+    (
+        "the branch conflicts and the budget holds",
+        lambda label: plan_mergeability(
+            *relabelled(label),
+            states={task_ref(23): conflicted(101, issue=23)},
+            files={task_ref(23): ("src/mod23.py",)},
+            max_attempts=3,
+        ),
+        ELIGIBLE,
+    ),
+    (
+        "the branch conflicts and the attempts are spent",
+        lambda label: plan_mergeability(
+            *relabelled(label, attempt=2),
+            states={task_ref(23): conflicted(101, issue=23)},
+            files={task_ref(23): ("src/mod23.py",)},
+            max_attempts=3,
+        ),
+        NEEDS_HUMAN,
+    ),
+    (
+        "the pull request is starved of update rounds",
+        lambda label: plan_mergeability(
+            *relabelled(label),
+            states={task_ref(23): behind(101, issue=23)},
+            budget=UpdateBudget(cap=2, rounds={task_ref(23): 2}),
+        ),
+        NEEDS_HUMAN,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "rule, world, decides", CARRIED_LABEL_RULES, ids=[case[0] for case in CARRIED_LABEL_RULES]
+)
+def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides):
+    """#243, this module's half. These transitions named `review` as a constant
+    too, and the constant is wrong for the same reason: it names what the gate
+    believes rather than what the issue is wearing, so a task relabelled by
+    hand mid-review ends up with two state labels after the write.
+    """
+    for label in CARRIED:
+        transition = world(label).transitions[0]
+
+        assert transition.to_state == decides, f"{rule}: the rule stopped firing"
+        assert transition.from_state == internal_state(label), (
+            f"{rule} carrying {label}: removed the believed label"
+        )
+        assert transition.from_state != REVIEW_STATE
