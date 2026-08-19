@@ -328,7 +328,7 @@ labels and fight.
 a decision runs on is derived from the code host, the containers, the run
 artifacts and apiary's own store ([ADR 0001](adr/0001-task-systems-are-integrations.md),
 [ADR 0002](adr/0002-apiary-owns-a-thin-task-store.md)), and the labels below are
-written and compared but not believed. Two consequences for anyone reading this
+written and compared but not believed. Three consequences for anyone reading this
 table as a specification:
 
 - The two `any -> …` rows a **human** writes no longer move the swarm. An issue
@@ -336,6 +336,34 @@ table as a specification:
   orchestrator carries on from what the world says. Closing the issue still
   works, and always did: "GitHub wins, every cycle" is about the issue being
   closed, not about its labels.
+- **`done` is terminal for the life of the orchestrator process, and reopening
+  the issue does not take it back.** The last row already says a reopened issue
+  is new work with a new id; this is what enforces it. Once a run has believed a
+  task landed, `orchestrator/authority.py`'s `landed-stands` ratchet holds that
+  belief whatever the world later shows, because the world stops showing a merge
+  — a merged pull request leaves the open listing, so the only remaining evidence
+  is the issue being closed as completed, and both a reopen and the window in
+  which the merge gate has written `swarm:done` before GitHub honoured
+  `Closes #<n>` take that evidence away. Without the ratchet the resolver reads
+  `eligible` and a worker is dispatched over code that is already on the default
+  branch.
+
+  The consequence falls on a human and is the reason this is written down rather
+  than only argued in a docstring: **a `swarm:done` issue reopened mid-run to
+  have the work redone stays pinned until the process restarts.** The relabel is
+  ignored for the reason in the bullet above; the reopen is ignored for this one.
+  It is not a judgement about which of the two is more likely — from a fresh
+  process a reopened `swarm:done` issue, a merge whose pull request omitted the
+  closing keyword, and the gate's own write-before-close window are the same
+  three facts (`swarm:done`, issue open, no open pull request), and two of the
+  three must not be dispatched. The routes back, in the order to reach for them:
+
+  1. File the work as a new issue. This is the row's own answer and the only one
+     that needs nothing from an operator.
+  2. Change the label *before* the next process starts. The first cycle a task
+     is seen is the one place the label still seeds the belief, so a restart with
+     the issue already moved off `swarm:done` is honoured.
+  3. `APIARY_STATE_SOURCE=labels`, which restores every row below as a read.
 - `APIARY_STATE_SOURCE=labels` restores every row here as a read as well as a
   write. #152 removes the writes, at which point this section describes the
   GitHub Issues adapter and nothing else.
