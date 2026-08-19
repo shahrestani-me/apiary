@@ -309,6 +309,60 @@ def test_list_milestones():
 
 
 # --------------------------------------------------------------------------
+# The repository tree
+# --------------------------------------------------------------------------
+
+
+def test_list_tree_asks_recursively_and_returns_only_blobs():
+    """One GET with `recursive=1`, blobs only: a `tree` entry is a directory,
+    and the consumer - the planner's repository listing - talks in files."""
+    gh, transport, _ = client(
+        response(200, {"default_branch": "trunk"}),
+        response(
+            200,
+            {
+                "sha": "abc123",
+                "truncated": False,
+                "tree": [
+                    {"path": "src", "type": "tree"},
+                    {"path": "src/app.py", "type": "blob"},
+                    {"path": "README.md", "type": "blob"},
+                ],
+            },
+        ),
+    )
+
+    assert gh.list_tree() == ["src/app.py", "README.md"]
+    # No ref given, so the default branch is looked up first - `head_sha`'s rule.
+    assert transport.sent[0].url == f"{API}/repos/{REPO}"
+    assert transport.sent[1].url == f"{API}/repos/{REPO}/git/trees/trunk?recursive=1"
+
+
+def test_list_tree_with_a_ref_skips_the_repo_lookup():
+    gh, transport, _ = client(
+        response(200, {"sha": "abc123", "truncated": False,
+                       "tree": [{"path": "a.py", "type": "blob"}]})
+    )
+
+    assert gh.list_tree("main") == ["a.py"]
+    assert len(transport.sent) == 1
+    assert transport.sent[0].url == f"{API}/repos/{REPO}/git/trees/main?recursive=1"
+
+
+def test_list_tree_serves_a_truncated_tree_as_is():
+    """The trees API does not paginate; its bound is the `truncated` flag. An
+    incomplete listing is served rather than raised on, because the caller
+    wants an advisory picture and caps the listing itself - a partial tree is
+    strictly more useful than none."""
+    gh, _, _ = client(
+        response(200, {"sha": "abc123", "truncated": True,
+                       "tree": [{"path": "a.py", "type": "blob"}]})
+    )
+
+    assert gh.list_tree("main") == ["a.py"]
+
+
+# --------------------------------------------------------------------------
 # Retry behaviour
 # --------------------------------------------------------------------------
 

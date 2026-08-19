@@ -567,6 +567,273 @@ def test_a_hung_install_is_a_failure_not_a_wait(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# The parse gate: a written .py file must at least parse
+# --------------------------------------------------------------------------
+
+#: The literal failure this defense exists for, observed merged in a real
+#: generated repository (wallet-tracker-service): a model thought-leak inside
+#: a test file, a SyntaxError no gate ever saw because pytest's `testpaths`
+#: never collected the file.
+THOUGHT_LEAK = (
+    "def test_deposit():\n"
+    "    amount=3.5 far, typo in my thought process again  # I'll use 3.50\n"
+)
+
+
+def test_a_written_syntax_error_names_file_line_and_text(tmp_path):
+    (tmp_path / "calc.py").write_text(THOUGHT_LEAK)
+
+    failure = edit_module.syntax_failure(tmp_path, ("calc.py",))
+
+    assert failure is not None
+    # The first line is pinned: `reconcile.diagnose` matches it by shape.
+    assert failure.startswith("python syntax error in calc.py, line 2:")
+    assert "amount=3.5 far" in failure
+    assert "The verify command was not run" in failure
+
+
+def test_a_fullwidth_unicode_stop_does_not_parse(tmp_path):
+    # The second merged SyntaxError from the same repository: a full-width
+    # `．` where a `.` belongs, invisible in review and fatal to the parser.
+    (tmp_path / "test_money.py").write_text(
+        "def test_price():\n    assert 3．50\n", encoding="utf-8"
+    )
+
+    failure = edit_module.syntax_failure(tmp_path, ("test_money.py",))
+
+    assert failure is not None
+    assert "python syntax error in test_money.py, line 2" in failure
+
+
+def test_clean_python_and_non_python_files_pass_the_parse_gate(tmp_path):
+    (tmp_path / "calc.py").write_text(GOOD_CALC)
+    # Broken-looking non-Python content is none of the parser's business.
+    (tmp_path / "requirements.txt").write_text("this is not python (\n")
+    (tmp_path / "notes.md").write_text("# unbalanced ( everywhere\n")
+
+    checked = ("calc.py", "requirements.txt", "notes.md")
+    assert edit_module.syntax_failure(tmp_path, checked) is None
+
+
+def test_every_broken_file_is_reported_not_just_the_first(tmp_path):
+    # The text is the retry's feedback; one error per attempt would spend the
+    # budget one line at a time.
+    (tmp_path / "a.py").write_text("def broken(:\n")
+    (tmp_path / "b.py").write_text("x = (\n")
+
+    failure = edit_module.syntax_failure(tmp_path, ("a.py", "b.py"))
+
+    assert failure is not None
+    assert "python syntax error in a.py" in failure
+    assert "python syntax error in b.py" in failure
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_syntax_error_fails_the_attempt_before_anything_runs(
+    fake_github, scratch_repo, workspace, monkeypatch
+):
+    """A file that does not parse fails the attempt with the SyntaxError as the
+    verify output - before the install, before the gate, and with no commit -
+    so the retry comment quotes the exact line to fix."""
+
+    def never_installs(root):  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("the install ran on a file that does not parse")
+
+    monkeypatch.setattr(entrypoint, "install_dependencies", never_installs)
+    gate = f'{sys.executable} -c "open(\'gate.txt\', \'w\')"'
+    gh, _, _ = fake_github(issue(verify=gate))
+    editor = FakeEditor(edits({"calc.py": THOUGHT_LEAK}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert not result.passed and result.commit is None
+    assert result.exit_code == EXIT_TASK_FAILED
+    assert result.verify_output.startswith("python syntax error in calc.py")
+    assert not (result.root / "gate.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# The collection audit: a passed pytest gate must have seen this attempt's tests
+# --------------------------------------------------------------------------
+
+#: What `pytest --collect-only -q` prints for a healthy one-test suite.
+COLLECTED_MAIN = "tests/test_main.py::test_health\n\n1 test collected in 0.01s\n"
+
+
+def _never_collects(*args, **kwargs):  # pragma: no cover - asserts non-execution
+    raise AssertionError("the collection probe ran when the audit should not apply")
+
+
+def test_the_audit_skips_a_gate_that_is_not_pytest(tmp_path, monkeypatch):
+    monkeypatch.setattr(entrypoint.subprocess, "run", _never_collects)
+
+    assert entrypoint.audit_collection(tmp_path, "make test", ("test_x.py",)) is None
+
+
+def test_the_audit_skips_an_attempt_that_wrote_no_test_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(entrypoint.subprocess, "run", _never_collects)
+
+    written = ("calc.py", "conftest.py", "requirements.txt")
+    assert entrypoint.audit_collection(tmp_path, VERIFY_COMMAND, written) is None
+
+
+def test_a_collected_file_passes_and_the_probe_names_no_paths(tmp_path, monkeypatch):
+    """The probe is argument-less on purpose: `testpaths` only applies when the
+    command line names nothing, so probing `--collect-only <file>` would
+    collect exactly the file the real gate excludes."""
+    seen: dict = {}
+    monkeypatch.setattr(entrypoint.subprocess, "run", _pip(0, stdout=COLLECTED_MAIN, seen=seen))
+
+    verdict = entrypoint.audit_collection(tmp_path, VERIFY_COMMAND, ("tests/test_main.py",))
+
+    assert verdict is None
+    assert seen["command"] == f"{sys.executable} -m pytest --collect-only -q"
+    assert seen["cwd"] == str(tmp_path)
+    assert seen["timeout"] == entrypoint.AUDIT_TIMEOUT_S
+    # The verify command's own filtered environment, credentials gone.
+    assert "GITHUB_TOKEN" not in seen["env"]
+
+
+def test_an_uncollected_file_fails_with_the_pinned_sentence(tmp_path, monkeypatch):
+    monkeypatch.setattr(entrypoint.subprocess, "run", _pip(0, stdout=COLLECTED_MAIN))
+
+    failure = entrypoint.audit_collection(
+        tmp_path, VERIFY_COMMAND, ("calc.py", "tests/test_db.py")
+    )
+
+    assert failure is not None
+    assert "tests/test_db.py was not collected by the verify command" in failure
+    assert "testpaths" in failure
+    assert "a test that never runs proves nothing" in failure
+    # And the collected suite travels along as evidence.
+    assert "tests/test_main.py::test_health" in failure
+
+
+def test_a_probe_that_errors_proves_nothing_and_fails(tmp_path, monkeypatch):
+    # Exit 4 is pytest's usage error; whatever the cause, the file cannot be
+    # proven to run, which is the same verdict as "did not run".
+    monkeypatch.setattr(
+        entrypoint.subprocess, "run", _pip(4, stderr="ERROR: unrecognized arguments")
+    )
+
+    failure = entrypoint.audit_collection(tmp_path, VERIFY_COMMAND, ("tests/test_db.py",))
+
+    assert failure is not None
+    assert "tests/test_db.py was not collected" in failure
+    assert "unrecognized arguments" in failure
+
+
+def test_a_hung_probe_fails_the_audit(tmp_path, monkeypatch):
+    def hang(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(entrypoint.subprocess, "run", hang)
+
+    failure = entrypoint.audit_collection(tmp_path, VERIFY_COMMAND, ("tests/test_db.py",))
+
+    assert failure is not None
+    assert "timed out" in failure
+
+
+def test_the_audit_catches_a_testpaths_exclusion_with_real_pytest(tmp_path):
+    """The observed failure, end to end and unfaked: `testpaths = ["tests"]`
+    means an argument-less pytest never sees a test file outside `tests/`, so
+    the gate is green while the file never runs. This is also the proof that
+    the probe must be argument-less - `pytest --collect-only test_orphan.py`
+    would collect the orphan happily, because explicit paths override
+    `testpaths`."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_main.py").write_text("def test_ok():\n    assert True\n")
+    (tmp_path / "test_orphan.py").write_text("def test_never_runs():\n    assert True\n")
+
+    collected = entrypoint.audit_collection(tmp_path, VERIFY_COMMAND, ("tests/test_main.py",))
+    orphaned = entrypoint.audit_collection(tmp_path, VERIFY_COMMAND, ("test_orphan.py",))
+
+    assert collected is None
+    assert orphaned is not None
+    assert "test_orphan.py was not collected" in orphaned
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_green_gate_that_never_collected_the_tests_is_a_failed_attempt(
+    fake_github, scratch_repo, workspace, monkeypatch
+):
+    """The audit's verdict lands as a failed verify - no commit, exit 1, and
+    the failure text as the output the retry comment quotes. It is handed only
+    what this attempt wrote, never the repository's historical test files."""
+    audited: list[tuple] = []
+    failure = "the verify command passed, but tests/test_db.py was not collected"
+
+    def fake_audit(root, command, written):
+        audited.append((root, command, written))
+        return failure
+
+    monkeypatch.setattr(entrypoint, "audit_collection", fake_audit)
+    gh, _, _ = fake_github(issue())
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert not result.passed and result.commit is None
+    assert result.exit_code == EXIT_TASK_FAILED
+    assert result.verify_output == failure
+    assert audited == [(result.root, VERIFY_COMMAND, ("calc.py",))]
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_failed_gate_is_never_audited(fake_github, scratch_repo, workspace, monkeypatch):
+    # A failed verify already carries its own, better feedback; auditing it
+    # would only replace a real failure with a bureaucratic one.
+    monkeypatch.setattr(entrypoint, "audit_collection", _never_collects)
+    gh, _, _ = fake_github(issue(verify=ALWAYS_FAILS))
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert not result.passed and result.commit is None
+
+
+def test_written_test_files_match_pytests_default_shapes():
+    written = (
+        "calc.py",
+        "tests/test_db.py",
+        "wallet_test.py",
+        "conftest.py",
+        "test_data.json",
+        "contest_entry.py",
+    )
+
+    assert entrypoint.written_test_files(written) == ("tests/test_db.py", "wallet_test.py")
+
+
+# --------------------------------------------------------------------------
 # Retry feedback: what a second attempt is told
 # --------------------------------------------------------------------------
 

@@ -516,6 +516,33 @@ class GitHubClient:
         """The repository itself - default branch, visibility, permissions."""
         return self._get(self._url(f"/repos/{self.repo}"))
 
+    def list_tree(self, ref: str | None = None) -> list[str]:
+        """Every blob path in the repository at `ref`; the default branch by default.
+
+        This is what lets the planner *see* the repository it is planning
+        against - without it, every plan was drawn from the objective alone,
+        and a real run implemented the same domain three times because the
+        model had no way to know the first implementation existed.
+
+        One GET against the git trees API with `recursive=1`. The endpoint does
+        not paginate through `Link` headers the way the listings above do; its
+        bound is the `truncated` flag, set when the tree is too large to answer
+        in one response. A truncated answer is served as-is rather than raised
+        on, because the caller wants an advisory picture of what exists and
+        caps the listing itself - an incomplete tree is strictly more useful
+        than none. Only blobs are returned: a `tree` entry is a directory, and
+        the planner talks in files.
+        """
+        target = ref or self.get_repo().get("default_branch") or "main"
+        path = f"/repos/{self.repo}/git/trees/{urllib.parse.quote(target, safe='')}"
+        payload = self._get(self._url(path, {"recursive": "1"}))
+        entries = (payload or {}).get("tree") or []
+        return [
+            str(entry["path"])
+            for entry in entries
+            if entry.get("type") == "blob" and entry.get("path")
+        ]
+
     def list_workflow_runs(self, head_sha: str) -> list[dict[str, Any]]:
         """Actions runs for one commit - the CI signal a fine-grained PAT can read.
 

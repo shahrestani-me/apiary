@@ -108,11 +108,13 @@ projecting the plan it just sent. Anything else would be a second ledger, and
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Literal, Mapping, Sequence
 
 from ..config import SETTINGS
@@ -175,6 +177,17 @@ So every task must be a slice that command can see:
   are two halves of one, and the half holding the tests cannot pass alone.
 - If part of the objective is something that command cannot exercise, say so in
   reasoning and plan only the part it can.
+
+When the tasks build components that call each other - a controller and a
+service, a service and a repository, any two modules that share a boundary -
+the plan must end with an integration task, depending (via depends_on) on the
+tasks that built those components. Its goal is to exercise the real wiring end
+to end: real objects on both sides of every boundary under test, no mocks or
+stubs at those boundaries, and tests that fail if the interfaces do not
+actually meet. Each component's own tests pass with its neighbour mocked as
+imagined, so this task is the only one that can notice the imagined interfaces
+never met. A plan whose tasks share no boundary - a single module, or genuinely
+independent slices - needs no integration task; do not invent one for it.
 
 Constraints:
 - Two tasks must NEVER list the same file. If they would, merge them into one task.
@@ -265,6 +278,150 @@ tasks at all rather than inventing work.
 The shipped files are on the branch you are extending, so a follow-up task may
 list a file an earlier task created - the hard rule about non-overlapping files
 applies among the tasks you emit now, not against work that is already in."""
+
+
+# --------------------------------------------------------------------------
+# The repository listing
+# --------------------------------------------------------------------------
+
+#: What the listing *is*, said before the paths, because a bare list of files
+#: is ambiguous: shown without a verb, a model reads it as inventory and plans
+#: around it. The observed failure this exists for: planned blind, a run
+#: implemented the same spending-tracker domain three times - root modules, a
+#: class in src/main.py, and a DB layer - and invented an "Entries" entity
+#: when the domain's real one already sat in the tree.
+LISTING_HEADER = """The repository currently contains these files. Extend and reuse them: do not
+create a parallel implementation of something that already exists, and when the
+work belongs in an existing file, name that existing file in the task's files
+rather than inventing a new module beside it."""
+
+#: The most paths a prompt will carry. The listing is advisory context, and a
+#: big repository must not be able to drown the objective and the rules under
+#: thousands of paths; whatever is cut is summarised as a count, so the model
+#: knows the list is a sample rather than the whole truth.
+LISTING_CAP = 200
+
+#: Directories that are machinery, not subject matter. A path with one of
+#: these as a segment says nothing about what the project *is*, and the big
+#: ones (node_modules, .venv) are exactly what would blow the cap and push the
+#: real sources off the end of it.
+_LISTING_SKIP_DIRS = frozenset(
+    {
+        ".git", ".hg", ".svn", ".idea", ".vscode",
+        ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        "__pycache__", ".eggs", "node_modules", "bower_components",
+        "vendor", "vendored", "third_party", "dist", "build", "target",
+        "site-packages",
+    }
+)
+
+#: Files a model cannot read anything useful out of a *name* of: binaries,
+#: media, archives, compiled artefacts. Suffix-matched, casefolded.
+_LISTING_SKIP_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
+    ".pdf", ".zip", ".gz", ".tgz", ".tar", ".bz2", ".xz", ".7z",
+    ".whl", ".egg", ".so", ".dylib", ".dll", ".exe", ".bin", ".o", ".a",
+    ".pyc", ".pyo", ".class", ".jar",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".mov", ".webm", ".wav", ".avi",
+    ".sqlite", ".sqlite3", ".db", ".lock",
+)
+
+#: Lockfiles whose names do not end in `.lock`. Machine-written, enormous, and
+#: their existence is implied by the manifest sitting next to them.
+_LISTING_SKIP_NAMES = frozenset(
+    {"package-lock.json", "pnpm-lock.yaml", "npm-shrinkwrap.json"}
+)
+
+
+def _listable(path: str) -> bool:
+    """Whether one path earns a line in the prompt. See the filters above."""
+    clean = path.strip().strip("/")
+    if not clean:
+        return False
+    parts = clean.split("/")
+    if any(part.casefold() in _LISTING_SKIP_DIRS for part in parts[:-1]):
+        return False
+    name = parts[-1].casefold()
+    return name not in _LISTING_SKIP_NAMES and not name.endswith(_LISTING_SKIP_SUFFIXES)
+
+
+def format_listing(files: Sequence[str]) -> str:
+    """The repository listing as the prompt carries it, or "" for nothing.
+
+    Sorted so the same tree always renders the same block (and so siblings sit
+    together, which is what lets a model see that `src/main.py` already has a
+    neighbour), filtered so machinery cannot crowd out sources, and capped with
+    an honest count of what was cut. Empty in, empty out: the caller appends
+    nothing rather than a header announcing no files.
+    """
+    kept = sorted({clean for path in files if _listable(path) and (clean := path.strip().strip("/"))})
+    if not kept:
+        return ""
+    shown = kept[:LISTING_CAP]
+    lines = [LISTING_HEADER, "", *shown]
+    if len(kept) > len(shown):
+        lines.append(f"… and {len(kept) - len(shown)} more files")
+    return "\n".join(lines)
+
+
+def human_prompt(objective: str, files: Sequence[str] | None = None) -> str:
+    """The human turn every planning call sends: the objective, then the tree.
+
+    One builder for all four callers (fresh plan, replan, the goal gate's
+    follow-up, the console) because the console's founding rule is that the
+    prompt it shows is byte-identical to the one production sends - a second
+    assembly of this string anywhere would quietly break that. With no listing
+    the result is exactly the pre-listing prompt, byte for byte, which is what
+    keeps the listing advisory: a caller that could not obtain one sends the
+    prompt that has been working all along.
+    """
+    human = f"Objective:\n{objective}"
+    listing = format_listing(files) if files else ""
+    return f"{human}\n\n{listing}" if listing else human
+
+
+def _walk(root: Path) -> tuple[str, ...]:
+    """Relative POSIX paths of every file under `root`, skip-dirs pruned.
+
+    Pruned during the walk, not just filtered afterwards, because the point of
+    skipping `.venv` and `node_modules` is not only to keep them out of the
+    prompt - it is to not spend seconds enumerating tens of thousands of files
+    that were never going to be shown.
+    """
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames if name.casefold() not in _LISTING_SKIP_DIRS
+        )
+        rel = Path(dirpath).relative_to(root)
+        found.extend((rel / name).as_posix() for name in filenames)
+    return tuple(sorted(found))
+
+
+def repository_files(source: GitHubClient | str | None) -> tuple[str, ...] | None:
+    """What the target repository contains, or None when that cannot be known.
+
+    The seam every caller of the planner resolves its listing through. A repo
+    name or client asks the trees API; no target at all is the local/v1 path,
+    which walks the checkout `SETTINGS.repo_path` names (guarded on `.git`, so
+    an unrelated working directory is not presented as the project).
+
+    Any failure - a 502 from the trees API, an empty repository the endpoint
+    404s on, a client double with no `list_tree` - degrades to None, and None
+    degrades to the prompt as it was before listings existed. The listing is
+    advisory context, never a blocker: a planner that refused to plan because
+    a tree read failed would turn a transient read error into a failed run.
+    """
+    try:
+        if source is None:
+            root = Path(SETTINGS.repo_path or "").expanduser()
+            if not (root / ".git").exists():
+                return None
+            return _walk(root)
+        return tuple(_as_client(source).list_tree())
+    except Exception:  # noqa: BLE001 - every failure reads the same: no listing
+        return None
 
 # `## Blocked by` with no list items parses to no dependencies (§1.3). Written
 # out rather than left blank so a human reading the issue sees an answer.
@@ -1294,6 +1451,7 @@ def prompt_for(
     *,
     verify: str | None = None,
     stack: str | None = None,
+    files: Sequence[str] | None = None,
 ) -> tuple[str, str]:
     """The exact `(system, human)` pair the planner sends.
 
@@ -1303,9 +1461,15 @@ def prompt_for(
     `swarm console` exposes fresh-plan mode only, and says so, rather than
     showing a replan prompt that would be right for one round and wrong for
     every other.
+
+    `files` is the repository's current listing when the caller could obtain
+    one (`repository_files` is the resolver), rendered into the *human* turn:
+    it is a fact about this run, like the objective, not a rule. Absent or
+    empty, the pair is byte-identical to what it was before listings existed -
+    which is what the console relies on, having no repository to list.
     """
     system = _replan_prompt(existing) if existing else system_prompt(verify=verify, stack=stack)
-    return system, f"Objective:\n{objective}"
+    return system, human_prompt(objective, files)
 
 
 def draft_plan(
@@ -1314,6 +1478,7 @@ def draft_plan(
     existing: Mapping[str, TaskRecord] | None = None,
     verify: str | None = None,
     stack: str | None = None,
+    files: Sequence[str] | None = None,
     llm=None,
 ) -> Plan:
     """One planning call, and nothing else - no ledger, no issues, no writes.
@@ -1326,7 +1491,7 @@ def draft_plan(
     `llm` is the seam the other five call sites already have and this one did
     not, which is why every test of it has to monkeypatch two module globals.
     """
-    system, human = prompt_for(objective, existing, verify=verify, stack=stack)
+    system, human = prompt_for(objective, existing, verify=verify, stack=stack, files=files)
     model = structured(orchestrator_llm(), Plan) if llm is None else llm
     return model.invoke([("system", system), ("human", human)])
 
@@ -1357,14 +1522,26 @@ def plan_node(
     """
     objective = state["objective"]
     existing = state.get("tasks") or {}
+    # Resolved before the model call because the model is the consumer: the
+    # listing of what the target already contains has to be in the prompt, not
+    # merely in this function's hands. `repository_files` degrades to None on
+    # any failure, so a tree read that 502s costs the plan its listing and
+    # nothing else.
+    target = _source(state, source)
 
     # `verify` and `stack` were already parameters of this function, used only
     # to stamp the issues after the model had answered. The model is now told
     # them first, which is what makes a task's gate knowable while it is still
-    # being invented rather than after.
-    plan: Plan = draft_plan(objective, existing=existing, verify=verify, stack=stack)
-
-    target = _source(state, source)
+    # being invented rather than after - and it is shown the repository's own
+    # files for the same reason, so it extends what exists instead of planning
+    # a parallel implementation beside it.
+    plan: Plan = draft_plan(
+        objective,
+        existing=existing,
+        verify=verify,
+        stack=stack,
+        files=repository_files(target),
+    )
     if target is None:
         tasks: dict[str, TaskRecord] = {
             task.id: TaskRecord(
