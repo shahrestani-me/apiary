@@ -531,19 +531,43 @@ class Remembered(str):
     permanent one.
     """
 
-    __slots__ = ("ref", "stands")
+    __slots__ = ("ref", "stands", "announced")
 
     #: The work item this state was believed about, so an id reused for another
     #: one cannot inherit it.
     ref: TaskRef
     #: Did the `landed-stands` ratchet produce this state, rather than the world?
     stands: bool
+    #: The control-plane state this ratchet was last announced against, or
+    #: `None` for a value that is not a standing ratchet.
+    announced: str | None
 
-    def __new__(cls, state: str, ref: TaskRef, *, stands: bool = False) -> Remembered:
+    def __new__(
+        cls,
+        state: str,
+        ref: TaskRef,
+        *,
+        stands: bool = False,
+        announced: str | None = None,
+    ) -> Remembered:
         self = super().__new__(cls, state)
         self.ref = ref
         self.stands = stands
+        #: The control-plane state this ratchet was last announced against.
+        #: Carried so the suppression is "quiet about the same disagreement"
+        #: rather than "quiet forever": a human relabelling a landed task
+        #: `swarm:failed` mid-run is a *new* divergence, and it is the very
+        #: scenario `Belief.hold`'s guard was written for - so silencing it
+        #: would mute the one event telling an operator the guard did work.
+        self.announced = announced
         return self
+
+    def __getnewargs__(self) -> tuple[str, TaskRef]:
+        # `str.__getnewargs__` returns `(value,)`, so `copy`, `deepcopy` and
+        # `pickle` would all re-enter `__new__` without a ref and raise. Nothing
+        # in `src/` copies a belief today; a `str` subclass that explodes on
+        # `copy.copy` is a trap for whoever first does.
+        return str(self), self.ref
 
     def about(self, ref: TaskRef) -> bool:
         """Is this remembered state about `ref`? The id-reuse check, spelled once."""
@@ -856,7 +880,25 @@ def believe(
 
     by_label = {entry.task_id: _internal(entry.state_label) for entry in entries}
     refs = {entry.task_id: entry.ref for entry in entries}
-    seen = dict(remembered or {})
+    # A remembered state whose ref no longer matches the task id it is filed
+    # under is dropped here, not only at the ratchet (#201's AC 2, applied in
+    # full). `ledger._adopted_id` leases the bare slug to the first taker in
+    # issue order, so an id can be re-minted for a *different* issue - and
+    # `previous` is what `plan_reconcile`'s edge-triggered rules read through
+    # `_was`. Left in, a re-minted id inherited the departed issue's `review`,
+    # rule 4 saw a pull request that was never its own missing from the open
+    # listing, and `_retry_or_give_up` charged an attempt to a brand-new issue -
+    # escalating it to `swarm:failed` at the cap.
+    #
+    # The consequence is chosen rather than inherited: a re-minted id falls back
+    # to the cycle-0 label seed, because a re-minted id **is** a first sight.
+    # That is the same answer `docs/issue-contract.md` §4 already gives for the
+    # human case - "a reopened issue is new work with a new id".
+    seen = {
+        task_id: state
+        for task_id, state in (remembered or {}).items()
+        if not isinstance(state, Remembered) or state.about(refs.get(task_id))
+    }
     previous = {**by_label, **seen}
 
     if source != DERIVED or observation is None:
@@ -949,7 +991,9 @@ def believe(
                 # cycle" is not evidence that a merge was undone, and letting a
                 # silent cycle drop the belief would put the ratchet back at the
                 # mercy of whatever the label happens to read next.
-                states[entry.task_id] = Remembered(LANDED, entry.ref, stands=True)
+                states[entry.task_id] = Remembered(
+                    LANDED, entry.ref, stands=True, announced=was_stored
+                )
                 if not standing:
                     overrides.append(
                         Override(
@@ -1071,7 +1115,10 @@ def believe(
             )
 
         states[entry.task_id] = Remembered(
-            believed, entry.ref, stands=kind == LANDED_STANDS
+            believed,
+            entry.ref,
+            stands=kind == LANDED_STANDS,
+            announced=was_stored if kind == LANDED_STANDS else None,
         )
         # Recorded when the belief differs from the label **or** from the
         # resolver, and `kind` is what tells a reader which. The second half is
@@ -1091,7 +1138,15 @@ def believe(
         # `infrastructure-ceiling` re-read inputs that, for a task which stays
         # given up, cannot change - so they repeat too. #201 scoped only the
         # ratchet and this comment does not claim more than it fixed.
-        if (believed != was_stored or kind) and not (kind == LANDED_STANDS and standing):
+        # Quiet about the *same* disagreement, not quiet forever: a task the
+        # ratchet is holding whose label a human then changes is news, and it is
+        # exactly the case `hold`'s guard exists for.
+        muted = (
+            kind == LANDED_STANDS
+            and standing
+            and getattr(held, "announced", None) == was_stored
+        )
+        if (believed != was_stored or kind) and not muted:
             overrides.append(
                 Override(
                     task_id=entry.task_id,

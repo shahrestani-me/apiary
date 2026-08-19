@@ -84,7 +84,7 @@ from swarm.orchestrator.derived import PullFact
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity, plan_dispatch
 from swarm.orchestrator.goal import FAILED as GAVE_UP
 from swarm.orchestrator.goal import IN_FLIGHT, abandoned, assess, live, shipped
-from swarm.orchestrator.reconcile import DONE, FAILED, plan_reconcile
+from swarm.orchestrator.reconcile import DONE, FAILED, Transition, plan_reconcile
 from swarm.orchestrator.recovery import plan_recovery
 from swarm.orchestrator.replan import brief
 from swarm.store import STORE_DIR_ENV
@@ -1148,6 +1148,98 @@ def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
 # dispatched and never escalated, and a run ends reporting work as shipped that
 # nothing ever ran. Asserting that an ordinary merge still ratchets proves none
 # of that, which is why each test below ends on a dispatch plan.
+
+
+def test_the_merge_gates_own_transition_seeds_the_ratchet():
+    """The ordinary route in, and the one every other test in this section skips.
+
+    Each of its neighbours hands `believe` a hand-built `Remembered`. None of
+    them drives the path a real cycle takes: the merge gate applies a
+    `swarm:done` transition, `Belief.fold` records it, `_carry_forward` hands
+    the result to the next cycle as `remembered`. That path runs through
+    `Belief._remember`, and replacing that function's body with `return state`
+    left the **entire suite green** while breaking exactly the hole
+    `LANDED_STANDS` exists for - the landing cycle's pull request is already out
+    of the open listing, the issue is not yet closed, the resolver reads
+    `eligible`, and a worker goes back onto merged code.
+
+    So this test folds a real transition rather than asserting one was folded.
+    """
+    landing = entry(4, label=REVIEW)
+    book = ledger(landing)
+
+    # Cycle 1: the merge gate lands it. `fold` is what a real cycle calls.
+    believed = believe(book, world(landing))
+    after_merge = believed.fold(
+        [
+            Transition(
+                ref=ref(4),
+                from_label=REVIEW,
+                to_label=DONE,
+                reason="its pull request merged",
+                task_id="task-4",
+            )
+        ]
+    )
+    assert after_merge.state("task-4") == LANDED
+
+    # Cycle 2: the evidence is gone - no open pull request, issue still open -
+    # and the belief carried forward is the only thing standing between the
+    # resolver and a second worker.
+    merged = entry(4, label=DONE)
+    next_cycle = believe(
+        ledger(merged), world(merged), remembered=dict(after_merge.states)
+    )
+
+    assert next_cycle.state("task-4") == LANDED
+    assert dispatchable(ledger(merged), next_cycle, ref(4)) == ()
+
+
+def test_a_reminted_id_does_not_inherit_the_departed_issues_edge():
+    """#201's AC 2 in the place it was only half applied.
+
+    `Remembered.about` gated the *ratchet*, but `Belief.previous` carried the
+    remembered value unfiltered - and `previous` is what `plan_reconcile`'s
+    edge-triggered rules read through `_was`. So a re-minted id inherited the
+    departed issue's `review`, rule 4 found a pull request that was never its
+    own missing from the open listing, and `_retry_or_give_up` charged an
+    attempt to a brand-new issue - escalating it to `swarm:failed` at the cap.
+
+    The fallback is deliberate rather than inherited: a re-minted id drops to
+    the label seed, because a re-minted id **is** a first sight. That is the
+    answer `docs/issue-contract.md` §4 already gives for the human case.
+    """
+    fresh = entry(9, label=READY)
+    carried = {"task-9": Remembered(REVIEW_STATE, ref(7))}  # believed about #7
+
+    held = believe(ledger(fresh), world(fresh), remembered=carried)
+
+    assert held.previous["task-9"] != REVIEW_STATE, "inherited another issue's edge"
+    assert held.previous["task-9"] == ELIGIBLE  # the label seed, as a first sight
+
+
+def test_a_standing_ratchet_speaks_again_when_the_label_changes():
+    """Quiet about the same disagreement, not quiet forever.
+
+    The suppression was keyed only on "the ratchet already spoke", so once
+    standing it silenced a *changed* label too. That is the very scenario
+    `Belief.hold`'s guard was written for - a human relabelling landed work
+    `swarm:failed` mid-run - so the run would mute the one event telling an
+    operator the guard had done its job.
+    """
+    done = entry(4, label=DONE)
+    first = believe(ledger(done), world(done), remembered={"task-4": Remembered(LANDED, ref(4))})
+    assert [one.kind for one in first.overrides] == [LANDED_STANDS]
+
+    # Same label again: quiet.
+    quiet = believe(ledger(done), world(done), remembered=dict(first.states))
+    assert [one.kind for one in quiet.overrides] == []
+
+    # A human moves it. The disagreement is new, so the log says so.
+    moved = entry(4, label=FAILED)
+    spoke = believe(ledger(moved), world(moved), remembered=dict(quiet.states))
+    assert [one.kind for one in spoke.overrides] == [LANDED_STANDS]
+    assert spoke.state("task-4") == LANDED
 
 
 def dispatchable(book: Any, held: Belief, *refs: Any) -> tuple[int, ...]:
