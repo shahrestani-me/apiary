@@ -648,26 +648,27 @@ class Merge:
     """
 
     #: The issue this merge closes - a GitHub issue number, and the same one
-    #: the `Outcome` carrying this record holds. Documented rather than retyped
-    #: (#174) because moving it is the *reporting* surface's migration rather
-    #: than this gate's: it keys `ChecksReport.merged` and
+    #: the `Outcome` carrying this record holds. Kept a number (#174) because
+    #: what still reads it is the *reporting* surface, whose migration is not
+    #: this gate's: it keys `ChecksReport.merged` and
     #: `ChecksReport.merge_commits`, and `lifecycle.py` joins it against the
     #: issue-numbered half of its own index.
     #:
-    #: **One join in this module does read it, and it is on the decision path.**
-    #: `apply_checks` collects the merges GitHub refused into `refused` by this
-    #: number and tests `outcome.number` against it, to stop a `swarm:done`
-    #: being written for a merge that did not happen. That is int-against-int
-    #: and safe *by construction rather than by type*: both sides are the one
-    #: `entry.number` `_decide_passed` put on the pair, built and consumed
-    #: inside a single `apply_checks` call, with no map surviving it. What keeps
-    #: it that way is the type gate - retyping either half alone produces
-    #: `Non-overlapping container check [comparison-overlap]` on that line under
-    #: `strict_equality`, which is the ratchet #168 installed for exactly this.
-    #: Retyping it is a follow-up; asserting it is not a hazard would be wrong.
+    #: **`ref` below is the half that joins**, as it is on `Outcome` and for the
+    #: same reason. `apply_checks` collects the merges GitHub refused and tests
+    #: each outcome against that set, to stop a `swarm:done` being written for a
+    #: merge that did not happen; #174 left that join int-against-int and #181
+    #: moved it, because "safe by construction" was the argument and this record
+    #: is the one place in the module where two numberings sit side by side.
     number: int
     #: The pull request GitHub is asked to merge. A *different* numbering from
     #: `number`, which is why both are spelled out: `#23: merge PR #101`.
+    #:
+    #: **This is the field that makes the `refused` join worth a guard.** A
+    #: `Merge` built with this number in `number`'s place is well-typed, reads
+    #: fine, and mints a ref for a pull request - so the refusal is filed under
+    #: an identity no outcome carries and the `swarm:done` goes out anyway.
+    #: `apply_checks` checks for exactly that before it merges anything.
     pull: int
     branch: str
     sha: str = ""
@@ -675,6 +676,15 @@ class Merge:
     delete_branch: bool = True
     admin_override: bool = True
     commit_title: str = ""
+
+    @property
+    def ref(self) -> TaskRef:
+        """The task this merge closes, in the internal model's vocabulary.
+
+        The same ref the `Outcome` carrying this record answers, which is the
+        whole point: `apply_checks` joins the two.
+        """
+        return task_ref(self.number)
 
     def __str__(self) -> str:
         how = "admin override" if self.admin_override else "no override"
@@ -1241,7 +1251,42 @@ def apply_checks(
     `None` records none - for a caller exercising the label half alone - and
     `Reconciler` always passes one, because an attempt consumed without its
     signature recorded is an attempt that renews somebody's budget for free.
+
+    **A merge that matches no outcome raises, before anything is merged (#181).**
+    The refusal path is what makes "only label what merged" true: a merge GitHub
+    turns down is collected into `refused` and its outcome's transition is
+    skipped. That join is filed under the merge's task and read under the
+    outcome's, and a merge whose ref no outcome answers to would be *filed under
+    a key nobody looks up* - so the refusal is lost, the transition is applied,
+    and `swarm:done` is written for a merge that did not happen. That is the one
+    direction this function's own docstring calls a lie the system cannot
+    detect, so it is not defaulted (#174's rule) and it is not reported as a
+    `Failure` either, because a `Failure` is a thing that went wrong with *one
+    issue* and this is the plan and the gate disagreeing about what the issues
+    are.
+
+    Checked here rather than at the join because here nothing has happened yet:
+    `plan.merges` is derived from `plan.outcomes`, so both sides exist before
+    the first API call, and `Reconciler.cycle`'s reason for catching
+    `UnresolvedJoin` - that no merge was issued and no label of this gate's was
+    written - stays true. The dry run is checked too: a plan this gate would
+    refuse to apply is not a plan a dry run should call fine.
     """
+    unresolved = sorted(
+        str(ref)
+        for ref in {merge.ref for merge in plan.merges}
+        - {outcome.ref for outcome in plan.outcomes}
+    )
+    if unresolved:
+        raise UnresolvedJoin(
+            f"merge(s) for {unresolved} match no outcome in the plan that carries them. "
+            f"Every merge is built onto one of these outcomes, so this is the two halves "
+            f"having drifted apart - and the miss cannot be defaulted: a refusal filed "
+            f"under a ref nothing reads is a swarm:done written for a merge GitHub turned "
+            f"down. Outcomes: "
+            f"{render_keys(str(outcome.ref) for outcome in plan.outcomes)}"
+        )
+
     merged: list[int] = []
     applied: list[Transition] = []
     deleted: list[str] = []
@@ -1253,7 +1298,13 @@ def apply_checks(
     if dry_run:
         return ChecksReport(plan=plan)
 
-    refused: set[int] = set()
+    # The merges GitHub turned down, by task. Ref-keyed rather than int-keyed
+    # (#181) so the join below is a task against a set of tasks: the guard above
+    # is what makes a miss impossible rather than merely unlikely, and
+    # `strict_equality` is what stops either half drifting back to a number
+    # without mypy saying so - `outcome.number in refused` is a
+    # `comparison-overlap` error the moment somebody writes it.
+    refused: set[TaskRef] = set()
     for merge in plan.merges:
         try:
             answer = client.merge_pull_request(
@@ -1267,7 +1318,7 @@ def apply_checks(
             # read) or a ruleset this override does not in fact bypass. The
             # issue keeps `swarm:review` and the next cycle re-reads the checks.
             failures.append(Failure(merge.number, f"merging PR #{merge.pull}: {exc}"))
-            refused.add(merge.number)
+            refused.add(merge.ref)
             continue
         merged.append(merge.number)
         # Whatever the merge answered, if it answered anything with a `sha`.
@@ -1285,7 +1336,7 @@ def apply_checks(
 
     for outcome in plan.outcomes:
         transition = outcome.transition
-        if transition is None or outcome.number in refused:
+        if transition is None or outcome.ref in refused:
             continue
         try:
             if transition.attempt is not None:

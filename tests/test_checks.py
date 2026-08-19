@@ -36,7 +36,7 @@ moves on its own.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, cast
 
 import pytest
@@ -269,6 +269,23 @@ class CommentingClient(FakeClient):
     def create_issue_comment(self, number: int, text: str) -> dict[str, Any]:
         self.comments.append((number, text))
         return {"id": len(self.comments)}
+
+
+@dataclass
+class RefusingClient(FakeClient):
+    """A client that turns down *some* merges. `FakeClient.merge_error` is all
+    or nothing, which cannot express the one case the refusal join is for: a
+    cycle where one pull request lands and another does not."""
+
+    refuses: set[int] = field(default_factory=set)
+
+    def merge_pull_request(self, number: int, **kwargs: Any) -> dict[str, Any]:
+        self.log.append(f"merge PR #{number}")
+        if number in self.refuses:
+            raise GitHubHTTPError(
+                405, "PUT", f"/pulls/{number}/merge", b'{"message":"not mergeable"}'
+            )
+        return {"sha": f"{number:0>40x}"}
 
 
 class BlindClient(FakeClient):
@@ -819,6 +836,111 @@ def test_a_refused_merge_leaves_the_issue_in_review_for_the_next_cycle():
         "#23: merging PR #101: PUT /pulls/101/merge -> 405: not mergeable"
     ]
     assert client.labels_on(23) == {REVIEW}
+
+
+def green_plan(*numbers: int) -> ChecksPlan:
+    """A plan that would merge every `numbers` on green. The refusal tests' input."""
+    return plan_checks(
+        ledger(*(entry(n) for n in numbers)),
+        pulls=pulls(*(pull(100 + n, issue=n) for n in numbers)),
+        checks={task_ref(n): summarise_checks([run("test", "success")]) for n in numbers},
+        now=NOW,
+    )
+
+
+def filed_under_the_pull_request(plan: ChecksPlan, number: int) -> ChecksPlan:
+    """`plan` with one merge's task identity replaced by its pull request's.
+
+    The drift this join has to survive, in the one form the module makes easy:
+    `Merge` carries `number` (the issue) beside `pull` (the pull request), and a
+    `Merge` built with the second in the first's place is well-typed, prints
+    plausibly, and mints a `TaskRef` for a pull request. Nothing else about the
+    plan changes - the `Outcome` still answers for the issue, which is exactly
+    what makes the two halves disagree.
+    """
+    outcomes = []
+    for outcome in plan.outcomes:
+        if outcome.number == number and outcome.merge is not None:
+            outcome = replace(outcome, merge=replace(outcome.merge, number=outcome.merge.pull))
+        outcomes.append(outcome)
+    return replace(plan, outcomes=tuple(outcomes))
+
+
+def test_a_refused_merge_whose_identity_drifted_still_never_writes_swarm_done():
+    """The headline (#181), asserted on the label rather than on the mechanism.
+
+    `apply_checks` files a refusal under the merge's task and reads it under the
+    outcome's. Let those two disagree and the refusal is filed under a key
+    nothing looks up: the merge GitHub turned down is skipped, the transition is
+    not, and `swarm:done` - terminal, never re-read by any later cycle - is
+    written for a merge that did not happen.
+
+    Deliberately indifferent to *how* that is prevented, because the property is
+    the label and not the exception. Revert either half of the join to the
+    number and this goes red on the assert: the issue comes back carrying
+    `swarm:done` for a pull request still open."""
+    client = client_with(issues={23: issue_payload(23)})
+    client.merge_error = GitHubHTTPError(
+        405, "PUT", "/pulls/123/merge", b'{"message":"not mergeable"}'
+    )
+
+    try:
+        apply_checks(client, filed_under_the_pull_request(green_plan(23), 23))
+    except UnresolvedJoin:
+        pass
+
+    assert DONE not in client.labels_on(23)
+    assert client.labels_on(23) == {REVIEW}
+
+
+def test_a_merge_that_matches_no_outcome_stops_the_gate_before_it_merges():
+    """And the mechanism, which is the same one #174 gave the other three joins.
+
+    Checked before the first API call rather than at the join, because both
+    sides are derived from `plan.outcomes` and so both exist before anything has
+    happened. That is what keeps `Reconciler.cycle`'s reason for catching
+    `UnresolvedJoin` true - no merge issued, no label written - so the assert on
+    the empty log is part of the fix and not decoration."""
+    client = client_with(issues={23: issue_payload(23)})
+
+    with pytest.raises(UnresolvedJoin) as raised:
+        apply_checks(client, filed_under_the_pull_request(green_plan(23), 23))
+
+    # The ref the refusal would have been filed under, and the ones anything
+    # reads. An operator needs both to see which way the two halves drifted.
+    assert "#123" in str(raised.value)
+    assert "#23" in str(raised.value)
+    assert client.log == []
+
+
+def test_a_dry_run_does_not_call_a_plan_the_gate_would_refuse_to_apply():
+    """The check precedes the dry-run return, because the dry run's whole job is
+    to answer "would this be applied" and a plan carrying this fault would
+    not."""
+    with pytest.raises(UnresolvedJoin):
+        apply_checks(
+            client_with(issues={23: issue_payload(23)}),
+            filed_under_the_pull_request(green_plan(23), 23),
+            dry_run=True,
+        )
+
+
+def test_a_refusal_is_matched_to_its_own_issue_and_not_to_the_others():
+    """The join has to discriminate, which one refusal cannot show.
+
+    A single-issue test passes for a `refused` that holds everything and for one
+    that holds nothing - the first writes no label at all, the second writes
+    them all, and with one issue in play only one of those is even visible. Two
+    issues, one merge refused, separates them: #23 keeps `swarm:review` and #24
+    reaches `swarm:done`."""
+    client = RefusingClient(issues={23: issue_payload(23), 24: issue_payload(24)})
+    client.refuses = {123}
+
+    report = apply_checks(client, green_plan(23, 24))
+
+    assert report.merged == (24,)
+    assert client.labels_on(23) == {REVIEW}
+    assert client.labels_on(24) == {DONE}
 
 
 def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
