@@ -416,14 +416,44 @@ def _modules():
 
 
 def test_only_llm_py_constructs_a_model():
-    """A call site that built its own `ChatOllama` would be silently uncaptured.
+    """A call site that built its own client would be silently uncaptured.
 
     Same shape as the negative pin in `test_reconcile.py`: the guarantee here is
     "every model in this system comes from the two factories", and it is worth
     exactly as much as the test that says so.
+
+    Read off `llm.PROVIDERS` rather than naming `ChatOllama`, because the guard
+    is only worth its name if it grows with the registry. Before ADR 0006 there
+    was one provider and one class to pin; a second provider added with this
+    test left as it was would be a whole client class nobody was watching -
+    which is precisely the tenth-call-site problem this section exists for.
     """
-    offenders = [name for name, tree in _modules() if _calls_named(tree, "ChatOllama")]
-    assert offenders == ["llm.py"]
+    from swarm.llm import PROVIDERS
+
+    clients = {name for provider in PROVIDERS.values() for name in provider.client_names}
+    assert clients, "no provider declares a client class; the pin below would assert nothing"
+
+    for client in sorted(clients):
+        offenders = [name for name, tree in _modules() if _calls_named(tree, client)]
+        assert offenders == ["llm.py"], f"{client} is constructed outside llm.py: {offenders}"
+
+
+def test_every_registered_provider_is_actually_built_somewhere():
+    """The other direction, and the cheaper mistake to make.
+
+    A registry entry whose constructor is never called is a provider an
+    operator can select and then watch do nothing - and the test above would
+    stay green, because "constructed nowhere" satisfies "constructed only in
+    `llm.py`" for free.
+    """
+    from swarm.llm import PROVIDERS
+
+    trees = dict(_modules())
+    for provider in PROVIDERS.values():
+        assert any(_calls_named(trees["llm.py"], client) for client in provider.client_names), (
+            f"provider {provider.name!r} is registered but llm.py constructs none of "
+            f"{provider.client_names}"
+        )
 
 
 def test_structured_output_never_asks_for_the_raw_response():
