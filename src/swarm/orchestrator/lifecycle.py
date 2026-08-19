@@ -239,9 +239,12 @@ def lifecycle_events(
             TASK_RESULT,
             # Not the attempt alone. Exit 2 does not consume one (§4), so two
             # consecutive infrastructure failures are two records at the same
-            # attempt number written to the same filename - and a broken host
-            # saying so three times is precisely what an operator needs to see.
-            once=(task, record.attempt, _stamp(record)),
+            # attempt number - and a broken host saying so three times is
+            # precisely what an operator needs to see. `identity` is the
+            # record's own answer to "which testimony is this", written for the
+            # reconciler's guard (#203) and read here so the announcement and
+            # the decision cannot disagree about what counts as one verdict.
+            once=(task, record.identity),
             task=task,
             attempt=record.attempt,
             exit_code=record.exit_code,
@@ -379,17 +382,6 @@ def lifecycle_events(
             )
 
     return tuple(events)
-
-
-def _stamp(record: ResultRecord) -> str:
-    """What distinguishes two records that share an attempt number.
-
-    Both timestamps are optional on `ResultRecord` - a record synthesised from
-    a container log has neither - so for those the key degrades to the attempt
-    alone and a second infrastructure failure at that attempt is announced
-    once. The degraded case is the one the field cannot fix, not a bug in it.
-    """
-    return f"{record.started_at}/{record.finished_at}"
 
 
 def _landed_or_human(

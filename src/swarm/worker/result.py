@@ -226,13 +226,22 @@ class ResultRecord:
 
         So the identity is the record's whole content, digested. Two records
         agreeing in every field are the same testimony as far as anything
-        downstream can tell, and every record real code writes differs in
-        `finished_at`: `from_worker` and `synthesise` stamp it with
-        `datetime.now` when the caller does not. Digested rather than spelled
-        out because this is compared and never parsed, and a fixed-width key is
-        what a caller carrying it between cycles wants.
+        downstream can tell, and **what keeps two real verdicts apart is
+        `finished_at`**: `from_worker` and `synthesise` stamp it with
+        `datetime.now` when the caller does not, so every record written by a
+        worker or synthesised from a container carries one. Digested rather
+        than spelled out because this is compared and never parsed, and a
+        fixed-width key is what a caller carrying it between cycles wants.
+
+        The degraded case is a record with neither timestamp - reachable only
+        by hand-writing the JSON - repeated byte for byte. Two of those count
+        as one, which under-counts rather than escalating on a streak the host
+        did not have. `lifecycle._stamp` used to be a weaker spelling of this
+        (attempt plus timestamps, degrading to the attempt alone); it reads
+        this instead now, so there is one answer to "which record is this" and
+        not two.
         """
-        canonical = json.dumps(self.to_dict(), sort_keys=True, default=str)
+        canonical = json.dumps(self.to_dict(), sort_keys=True)
         return hashlib.blake2s(canonical.encode(), digest_size=16).hexdigest()
 
     @property

@@ -32,6 +32,7 @@ the request count is the client's own and not a stub's.
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -63,7 +64,7 @@ from swarm.orchestrator.reconcile import (
     INFRASTRUCTURE_CAP_ENV,
     InfrastructurePolicy,
     infrastructure_streaks,
-    observed_results,
+    observed_records,
     COMMENT_METHOD,
     PULLS_METHOD,
     DONE,
@@ -1905,6 +1906,41 @@ def test_a_cycle_that_moved_nothing_counts_nothing():
     assert infrastructure_streaks({4: 2}, []) == {4: 2}
 
 
+def test_a_record_that_moved_nothing_is_not_retired():
+    """`observed_records` folds from what landed, not from what was planned -
+    `fold`'s rule and `infrastructure_streaks`' rule, for the same reason. A
+    label write GitHub refused leaves the task where it was, and retiring its
+    record would lose the only evidence the retry never happened."""
+    moved_nothing = Transition(ref(4), CLAIMED, READY, "no record caused this")
+
+    assert observed_records({}, []) == {}
+    assert observed_records({ref(4): "kept"}, [moved_nothing]) == {ref(4): "kept"}
+
+
+def test_two_verdicts_from_one_host_are_two_identities():
+    """What actually keeps a genuine second infrastructure failure countable.
+
+    Two mechanical failures in a row say the same thing for the same reason at
+    the same attempt number, so the *only* field that separates them is when
+    they finished - and `from_worker` and `synthesise` stamp that with
+    `datetime.now` on every record real code writes. Asserted here rather than
+    left to the loop test below, because it is the whole basis of the guard
+    being safe to key on content.
+    """
+    moment = dt.datetime(2026, 8, 14, 14, 10, tzinfo=dt.timezone.utc)
+    host_died = ResultRecord(
+        run_id=RUN_ID, issue=4, attempt=0, exit_code=2, reason="docker: no such image"
+    )
+    first = replace(host_died, finished_at=moment)
+    again = replace(host_died, finished_at=moment)
+    later = replace(host_died, finished_at=moment + dt.timedelta(minutes=10))
+
+    # One file read twice is one verdict, and that is the whole point.
+    assert first.identity == again.identity
+    # Two failures of the same host, indistinguishable in every other field.
+    assert first.identity != later.identity
+
+
 def test_the_cap_is_configurable_and_loud_on_garbage(monkeypatch):
     monkeypatch.delenv(INFRASTRUCTURE_CAP_ENV, raising=False)
     assert InfrastructurePolicy.from_env().cap == DEFAULT_INFRASTRUCTURE_CAP
@@ -2651,6 +2687,30 @@ def test_a_second_infrastructure_failure_at_the_same_attempt_is_announced(tmp_pa
 # 2 had just spawned disposed out from under the retry.
 
 
+#: The two moments this section's records finished at. Distinct, because that
+#: is the one field two mechanical failures of the same host do not share.
+_FIRST = dt.datetime(2026, 8, 14, 14, 10, tzinfo=dt.timezone.utc)
+_LATER = dt.datetime(2026, 8, 14, 14, 20, tzinfo=dt.timezone.utc)
+
+
+def dead_host() -> ResultRecord:
+    """A worker's exit 2: the host failed, so the task never really ran.
+
+    Timestamped, unlike the `record` helper at the top of this file, because
+    the guard under test is keyed on the record's content and `from_worker`
+    stamps `finished_at` on every record a real worker writes.
+    """
+    return ResultRecord(
+        run_id=RUN_ID,
+        issue=TASK_ISSUE,
+        attempt=0,
+        exit_code=2,
+        reason="docker: no such image",
+        started_at=_FIRST,
+        finished_at=_FIRST,
+    )
+
+
 def alive(fleet: FakeFleet) -> None:
     """What `docker ps` says about a container the fleet just spawned.
 
@@ -2678,7 +2738,7 @@ def test_one_exit_2_increments_the_infrastructure_streak_exactly_once(tmp_path):
     loop.artifacts = tmp_path
 
     loop.cycle()
-    write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
+    write_result(dead_host(), tmp_path)
     loop.cycle()
     alive(fleet)
     loop.cycle()
@@ -2706,41 +2766,19 @@ def test_the_retrys_own_failure_is_a_second_verdict_and_counts(tmp_path):
     loop.artifacts = tmp_path
 
     loop.cycle()
-    write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
+    write_result(dead_host(), tmp_path)
     loop.cycle()
     alive(fleet)
     loop.cycle()
-    # The retry dies the same way and writes its own testimony. Same attempt,
-    # different record: `write_result` bumps the filename rather than replacing
-    # the evidence of the attempt before it.
-    write_result(
-        record(TASK_ISSUE, 2, attempt=0, reason="docker: daemon not running"), tmp_path
-    )
+    # The retry dies the same way and writes its own testimony: same attempt,
+    # same reason, same everything a human would read - and a later
+    # `finished_at`, which is what `from_worker` stamps and the only thing that
+    # separates two failures of one host. `write_result` bumps the filename
+    # rather than replacing the evidence of the attempt before it.
+    write_result(replace(dead_host(), finished_at=_LATER), tmp_path)
     loop.cycle()
 
     assert loop._infrastructure == {ref(TASK_ISSUE): 2}
-
-
-def test_a_record_that_moved_nothing_is_not_retired():
-    """Folded from what landed, not from what was planned - `fold`'s rule and
-    `infrastructure_streaks`' rule, for the same reason. A label write GitHub
-    refused leaves the task where it was, and retiring its record would lose
-    the only evidence the retry never happened."""
-    moved_nothing = Transition(ref(4), CLAIMED, READY, "no record caused this")
-
-    assert observed_results({}, []) == {}
-    assert observed_results({ref(4): "kept"}, [moved_nothing]) == {ref(4): "kept"}
-
-
-def test_the_guard_is_the_records_own_identity():
-    """`ResultRecord.identity` is content, so two records that differ only in
-    when they finished are two verdicts, and re-reading one file is one."""
-    first = record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image")
-    again = record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image")
-    later = record(TASK_ISSUE, 2, attempt=0, reason="docker: daemon not running")
-
-    assert first.identity == again.identity
-    assert first.identity != later.identity
 
 
 # --- announcement only -----------------------------------------------------
