@@ -98,9 +98,16 @@ from ..nodes.planner import (
     revive,
     write_plan,
 )
-from ..run import TERMINAL_LABELS
 from ..state import ObjectiveAssessment, Plan
 from ..taskref import TaskRef
+from .authority import Belief, state_of
+from .derived import LANDED, NEEDS_HUMAN
+
+#: `run.TERMINAL_LABELS` in the vocabulary the authority answers in, and the
+#: same two facts: the work landed, or a human has to decide. Spelled out rather
+#: than translated from that set so a reader of `live` can see both halves of
+#: the branch without following an import into the label table.
+TERMINAL_STATES = frozenset({LANDED, NEEDS_HUMAN})
 
 #: How many follow-up rounds one run may plan for itself. See the docstring;
 #: this is `replan.MAX_REPLANS`'s bound applied to the other end of the loop,
@@ -201,28 +208,45 @@ class Assessment:
         return f"{', '.join(parts)}: {self.reason}"
 
 
-def shipped(ledger: Ledger) -> tuple[LedgerEntry, ...]:
-    """The tasks that reached `swarm:done`, in issue order.
+def shipped(ledger: Ledger, believed: Belief | None = None) -> tuple[LedgerEntry, ...]:
+    """The tasks that landed, in issue order.
 
-    `swarm:done` and nothing else. An issue a human closed by hand is read as
-    done by the reconciler and carries the label by the time this runs, so the
-    two agree; an issue that is merely closed and never relabelled is not
-    evidence that its work landed.
+    Landing and nothing else. An issue a human closed by hand is read as done by
+    the reconciler and carries the label by the time this runs, so the two
+    agree; an issue that is merely closed and never relabelled is not evidence
+    that its work landed.
+
+    `believed` is the cycle's authority on state (#147), and `None` reads the
+    label - the `__main__` dry run and `APIARY_STATE_SOURCE=labels`. This is the
+    partition the whole gate is computed from, so a label edited mid-run put a
+    task on the wrong side of the objective assessment: `swarm:done` typed onto
+    unfinished work catalogued it to the model as shipped, and a `swarm:failed`
+    typed onto merged work ended the run asking for a human about a task that
+    had landed.
     """
-    entries = (entry for entry in ledger.entries.values() if entry.state_label == "swarm:done")
-    return tuple(sorted(entries, key=lambda entry: entry.ref))
-
-
-def abandoned(ledger: Ledger) -> tuple[LedgerEntry, ...]:
-    """The tasks the swarm gave up on, in issue order."""
-    entries = (entry for entry in ledger.entries.values() if entry.state_label == "swarm:failed")
-    return tuple(sorted(entries, key=lambda entry: entry.ref))
-
-
-def live(ledger: Ledger) -> tuple[LedgerEntry, ...]:
-    """Anything not terminal. `run.TERMINAL_LABELS` decides, as it does for resume."""
     entries = (
-        entry for entry in ledger.entries.values() if entry.state_label not in TERMINAL_LABELS
+        entry for entry in ledger.entries.values() if state_of(entry, believed) == LANDED
+    )
+    return tuple(sorted(entries, key=lambda entry: entry.ref))
+
+
+def abandoned(ledger: Ledger, believed: Belief | None = None) -> tuple[LedgerEntry, ...]:
+    """The tasks the swarm gave up on, in issue order. See `shipped` for `believed`."""
+    entries = (
+        entry for entry in ledger.entries.values() if state_of(entry, believed) == NEEDS_HUMAN
+    )
+    return tuple(sorted(entries, key=lambda entry: entry.ref))
+
+
+def live(ledger: Ledger, believed: Belief | None = None) -> tuple[LedgerEntry, ...]:
+    """Anything not terminal. `TERMINAL_STATES` decides, as `run.TERMINAL_LABELS`
+    does for resume - the same two facts, and `believed=None` still reaches the
+    labels through `authority.state_of`. See `shipped`.
+    """
+    entries = (
+        entry
+        for entry in ledger.entries.values()
+        if state_of(entry, believed) not in TERMINAL_STATES
     )
     return tuple(sorted(entries, key=lambda entry: entry.ref))
 
@@ -246,6 +270,7 @@ def assess(
     ledger: Ledger,
     *,
     oracle: Oracle | None = None,
+    believed: Belief | None = None,
 ) -> Assessment:
     """Has this objective been delivered? Arithmetic first, then one model call.
 
@@ -253,18 +278,24 @@ def assess(
     order that costs least: a ledger with nothing in it, a ledger with work
     still running, and a ledger carrying a task the swarm abandoned. Only a run
     that finished everything it planned, cleanly, is worth a model swap.
+
+    All three partition the ledger through `believed` (#147), and `None` reads
+    the label. The three refusals are the reason it matters here: each of them
+    ends or extends a *run*, and a task on the wrong side of one is a run that
+    stops early, resigns over work that landed, or asks a model to assess a
+    catalogue that does not describe what shipped.
     """
     if not ledger.entries:
         return Assessment(met=False, reason=EMPTY)
 
-    running = live(ledger)
+    running = live(ledger, believed)
     if running:
         return Assessment(
             met=False,
             reason=f"{IN_FLIGHT}: {', '.join(f'#{entry.number}' for entry in running)}",
         )
 
-    gave_up = abandoned(ledger)
+    gave_up = abandoned(ledger, believed)
     if gave_up:
         return Assessment(
             met=False,
@@ -273,7 +304,7 @@ def assess(
             abandoned=tuple(entry.ref for entry in gave_up),
         )
 
-    landed = shipped(ledger)
+    landed = shipped(ledger, believed)
     try:
         llm = oracle if oracle is not None else structured(orchestrator_llm(), ObjectiveAssessment)
         answer = llm.invoke(
@@ -401,6 +432,7 @@ def _revive_abandoned(
     *,
     max_attempts: int,
     max_total_attempts: int,
+    believed: Belief | None = None,
 ) -> tuple[IssueAction, ...]:
     """Revive every abandoned task the orchestrator may safely retry. See
     `close_the_loop` for the rule; this is only its per-issue application.
@@ -424,7 +456,11 @@ def _revive_abandoned(
     and no writes, which this function simply does not count as a revival.
     """
     wanted = set(assessment.abandoned)
-    entries = [entry for entry in abandoned(ledger) if entry.ref in wanted]
+    # The same `believed` `assess` partitioned on, because this is the other
+    # half of one join: an assessment built under the resolver against a set
+    # rebuilt from the labels matches on whatever the two happen to agree
+    # about, which is the silent-miss shape this function's docstring is about.
+    entries = [entry for entry in abandoned(ledger, believed) if entry.ref in wanted]
     states = resolve_states(client, [entry.ref for entry in entries])
     actions: list[IssueAction] = []
     for entry in entries:
@@ -446,7 +482,9 @@ def _revive_abandoned(
     return tuple(actions)
 
 
-def _retire_superseded(client: Any, ledger: Ledger) -> tuple[IssueAction, ...]:
+def _retire_superseded(
+    client: Any, ledger: Ledger, believed: Belief | None = None
+) -> tuple[IssueAction, ...]:
     """Close every failed, still-open task of a met objective as superseded.
 
     The user's rule, verbatim: "at the end having failed ticket is wrong". A
@@ -460,7 +498,7 @@ def _retire_superseded(client: Any, ledger: Ledger) -> tuple[IssueAction, ...]:
     failed tasks only: ready or blocked leftovers on a met objective are a
     different question, deliberately not answered here.
     """
-    entries = abandoned(ledger)
+    entries = abandoned(ledger, believed)
     if not entries:
         return ()
     states = resolve_states(client, [entry.ref for entry in entries])
@@ -493,6 +531,7 @@ def close_the_loop(
     writer: Callable[..., PlanReport] = write_plan,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
+    believed: Belief | None = None,
 ) -> GoalReport:
     """Assess, then revive what is revivable, then extend if a gap remains.
 
@@ -500,6 +539,15 @@ def close_the_loop(
     `replan.replan`'s reason: re-listing the issues here would double the
     rate-limit cost of the one cycle that is otherwise entirely free, and the
     caller's copy is the one the loop decided to stop on.
+
+    `believed` is the same cycle's authority over that ledger (#147), and it is
+    passed rather than re-derived for exactly the same reason: it is the belief
+    the loop decided to stop on, already folded by everything this cycle wrote.
+    One value threads the whole gate - the assessment, the revival join, the
+    settled re-assessment and the supersession - because they are four readings
+    of one partition and a second source anywhere in that chain would revive a
+    task the assessment never named. `None` reads the label, which is the
+    `__main__` dry run and `APIARY_STATE_SOURCE=labels`.
 
     `writer` and the two model seams exist so the whole path is exercised
     without an Ollama and without a tracker; `write_plan` is the default and is
@@ -532,7 +580,7 @@ def close_the_loop(
     follow-up is planned on top of a repository whose last known state is
     broken.
     """
-    assessment = assess(objective, ledger, oracle=oracle)
+    assessment = assess(objective, ledger, oracle=oracle, believed=believed)
     if assessment.abandoned:
         revived = _revive_abandoned(
             client,
@@ -540,6 +588,7 @@ def close_the_loop(
             assessment,
             max_attempts=max_attempts,
             max_total_attempts=max_total_attempts,
+            believed=believed,
         )
         if revived:
             names = ", ".join(f"#{action.number}" for action in revived)
@@ -561,7 +610,7 @@ def close_the_loop(
         # unmet or unresolved one changes nothing, because planning follow-ups
         # on top of a repository whose last known state is broken is exactly
         # what the arithmetic refusal exists to prevent.
-        gave_up = {entry.task_id for entry in abandoned(ledger)}
+        gave_up = {entry.task_id for entry in abandoned(ledger, believed)}
         settled = replace(
             ledger,
             entries={
@@ -571,11 +620,11 @@ def close_the_loop(
             },
         )
         if settled.entries:
-            final = assess(objective, settled, oracle=oracle)
+            final = assess(objective, settled, oracle=oracle, believed=believed)
             if final.met:
                 assessment = final
     if assessment.met:
-        superseded = _retire_superseded(client, ledger)
+        superseded = _retire_superseded(client, ledger, believed)
         reason = assessment.reason or MET
         if superseded:
             names = ", ".join(f"#{action.number}" for action in superseded)

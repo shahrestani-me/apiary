@@ -151,6 +151,8 @@ from ..github.readiness import READY, IssueState
 from ..github.refs import task_ref
 from ..run import Run, RunError, validate_run_id
 from ..taskref import TaskRef
+from .authority import Belief, state_of
+from .derived import CLAIMED as CLAIMED_STATE
 from .dispatcher import CLAIMED, REVIEW
 from ..store import TaskStore
 from .reconcile import FAILED, ReconcilePlan, ReconcileReport, Snapshot, Transition, apply_plan
@@ -367,13 +369,50 @@ def plan_recovery(
     states: Mapping[TaskRef, IssueState] | None = None,
     open_branches: Collection[str] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
+    believed: Belief | None = None,
 ) -> RecoveryPlan:
-    """Decide what each `swarm:claimed` issue's claim is worth. Pure.
+    """Decide what each claimed issue's claim is worth. Pure.
 
     `containers` is **every** apiary container on the daemon, not one run's:
     the question each claim asks is whether *anybody* is running it, and a
     listing narrowed to this run answers a different one and would release a
     sibling's work. `live_run_ids` then decides which of those count.
+
+    `believed` is the cycle's authority on state (#147), and this loop is one of
+    the places that criterion is about rather than a nicety: a released claim
+    **consumes an attempt** (`_release`), so a `swarm:claimed` somebody typed
+    onto a ready issue mid-run burned a retry off a task that had never run.
+    The resolver reads a claim off a running container, so a label with no
+    worker behind it selects nothing here and nothing is spent.
+
+    **Under the resolver this sweep stops writing in the live cycle, and that
+    is the finding rather than a regression.** `derived._claiming_container`
+    says `claimed` only for a *running* container of a live run, and `holders`
+    above answers for that same container and more - it keeps the exited one
+    too - so every entry the authority calls claimed is one rule 2 holds. The
+    three cases the label used to bring here are each answered better
+    elsewhere, and none of them costs an attempt any more:
+
+    - **the claim-then-spawn gap**, no container ever started. Under the labels
+      this was undispatchable forever, because the *dispatcher* believed the
+      label too. It now reads the same authority this does, sees `eligible`,
+      and simply dispatches the task again - `plan_reconcile`'s rule 3 does not
+      fire, because no worker wrote a result.
+    - **a worker that died after publishing.** The resolver reads `review` off
+      the open pull request, and the merge gate asks `authority.in_review`, so
+      the label being behind stops mattering; moving it was all rule 3 here did.
+    - **a worker that finished.** `plan_reconcile`'s rule 3 observes the result
+      it wrote, which is the accounting `_release` was approximating from a
+      missing container.
+
+    `Recovery.startup` keeps every one of them, and deliberately: it runs before
+    there is a cycle, on labels a *dead* orchestrator left behind, where the
+    label is the only record of what was claimed. That is the same seam
+    `authority.Belief.previous` argues for, one process earlier.
+
+    `believed=None` reads the label, which is every caller outside
+    `Reconciler.cycle`: `Recovery.startup`, the `__main__` dry run, and
+    `APIARY_STATE_SOURCE=labels`.
 
     Nothing here is written, no API is called and no daemon is touched, which
     is what lets the rules be asserted as data.
@@ -390,7 +429,7 @@ def plan_recovery(
     held: list[Held] = []
 
     for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
-        if entry.state_label != CLAIMED:
+        if state_of(entry, believed) != CLAIMED_STATE:
             continue
 
         # 1. GitHub wins, and a closed issue is out of the run whatever its
@@ -557,6 +596,7 @@ class Recovery:
         containers: Iterable[Handle] | None = None,
         states: Mapping[TaskRef, IssueState] | None = None,
         open_branches: Collection[str] | None = None,
+        believed: Belief | None = None,
     ) -> RecoveryPlan:
         """What this pass would do, without doing any of it."""
         return plan_recovery(
@@ -566,6 +606,7 @@ class Recovery:
             states=states,
             open_branches=open_branches,
             max_attempts=self.max_attempts,
+            believed=believed,
         )
 
     def sweep(
@@ -575,18 +616,25 @@ class Recovery:
         containers: Iterable[Handle] | None = None,
         states: Mapping[TaskRef, IssueState] | None = None,
         open_branches: Collection[str] | None = None,
+        believed: Belief | None = None,
     ) -> RecoveryReport:
         """Plan and write. The mid-cycle entry point.
 
         Every fact is a parameter because a cycle has already read all of them
         (`reconcile.Snapshot`), and re-reading them here would spend the
-        polling budget to learn what the caller is holding. The writes go
-        through `reconcile.apply_plan`, which owns the ordering §5 requires -
-        counter, then add, then remove - so there is one implementation of it
-        rather than two that can drift.
+        polling budget to learn what the caller is holding. `believed` is one
+        more of them, and the one that decides which claims are this pass's to
+        speak about - see `plan_recovery`. The writes go through
+        `reconcile.apply_plan`, which owns the ordering §5 requires - counter,
+        then add, then remove - so there is one implementation of it rather
+        than two that can drift.
         """
         plan = self.plan(
-            ledger, containers=containers, states=states, open_branches=open_branches
+            ledger,
+            containers=containers,
+            states=states,
+            open_branches=open_branches,
+            believed=believed,
         )
         result = apply_plan(
             self.client,

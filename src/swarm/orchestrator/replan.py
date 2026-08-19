@@ -74,6 +74,7 @@ from ..nodes.planner import (
     write_plan,
 )
 from ..state import Plan
+from .authority import Belief
 
 #: How many times one run may rewrite its own plan. Two, because the second
 #: replan is where the evidence changes character: a decomposition that stalled,
@@ -151,7 +152,9 @@ def decide(
 # --------------------------------------------------------------------------
 
 
-def brief(ledger: Ledger, verdict: Verdict) -> tuple[str, str]:
+def brief(
+    ledger: Ledger, verdict: Verdict, believed: Belief | None = None
+) -> tuple[str, str]:
     """The two blocks `planner.REPLAN_SUFFIX` interpolates: failures, then ids.
 
     The failures come from what the workers actually wrote down - the judge's
@@ -164,6 +167,20 @@ def brief(ledger: Ledger, verdict: Verdict) -> tuple[str, str]:
     the model to re-emit unchanged work under its exact existing id, and an id
     it never sees is an id it invents a replacement for - which is the second
     set of issues §2 exists to prevent.
+
+    **What each id is annotated with is `believed`, the cycle's authority on
+    state (#147), and this call site is the one that is not a decision.**
+    Nothing branches on the annotation; it is a word in a prompt. It is here for
+    the other half of that epic: `swarm:*` is a storage detail #141 and #140 are
+    deleting, and a prompt is the worst place to leave one, because the model
+    reads the vocabulary as the run's own and re-emits it. The authority answers
+    in the internal words (`landed`, `needs-human`, `eligible`), which is what
+    `lifecycle.scrub` already rewrites the event log into, so a replan brief and
+    an `events.jsonl` line now describe a task the same way.
+
+    `believed=None` prints the label verbatim, which is every caller outside
+    `Reconciler.cycle` - the `__main__` dry run and `APIARY_STATE_SOURCE=labels`
+    - and keeps the prompt they send byte-identical.
     """
     observation = verdict.observation
     signals = dict(observation.signals) if observation is not None else {}
@@ -183,8 +200,12 @@ def brief(ledger: Ledger, verdict: Verdict) -> tuple[str, str]:
         )
     failures = "\n".join(lines) or f"- no task recorded an error; {verdict.reason}"
 
+    # `entry.state_label` under `None` rather than `authority.state_of`, which
+    # would translate it: this is a string in a prompt, so "unchanged" has to
+    # mean the same characters, not the same fact.
     tracked = "\n".join(
-        f"- {task_id} ({entry.state_label}): {entry.goal[:120]}"
+        f"- {task_id} ({entry.state_label if believed is None else believed.state(task_id)}): "
+        f"{entry.goal[:120]}"
         for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref)
     ) or "- none"
     return failures, tracked
@@ -197,6 +218,7 @@ def propose(
     *,
     proposer: Proposer | None = None,
     files: Sequence[str] | None = None,
+    believed: Belief | None = None,
 ) -> Plan:
     """Ask for a different decomposition of the same objective.
 
@@ -208,7 +230,7 @@ def propose(
     same reason: `files` is the repository listing when the caller could get
     one, and None sends the turn exactly as it always was.
     """
-    failures, tracked = brief(ledger, verdict)
+    failures, tracked = brief(ledger, verdict, believed)
     prompt = SYSTEM + REPLAN_SUFFIX.format(failures=failures, existing=tracked)
     llm = proposer if proposer is not None else structured(orchestrator_llm(), Plan)
     return llm.invoke([("system", prompt), ("human", human_prompt(objective, files))])
@@ -293,6 +315,7 @@ def replan(
     verify: str | None = None,
     proposer: Proposer | None = None,
     writer: Callable[..., PlanReport] = write_plan,
+    believed: Belief | None = None,
 ) -> ReplanReport:
     """Decide, propose, write. Nothing is written unless all three succeed.
 
@@ -338,7 +361,12 @@ def replan(
         # read fails plans exactly as it did before listings existed, because
         # a stalled run must never be made unfixable by a 502.
         plan = propose(
-            objective, ledger, verdict, proposer=proposer, files=repository_files(client)
+            objective,
+            ledger,
+            verdict,
+            proposer=proposer,
+            files=repository_files(client),
+            believed=believed,
         )
     except Exception as exc:  # noqa: BLE001 - any transport failure reads the same
         # Same reading as an unresolved judgement: the model is unreachable, the
