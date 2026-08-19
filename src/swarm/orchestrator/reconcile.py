@@ -489,10 +489,10 @@ def infrastructure_streaks(
 
     (The *files* can tell them apart, and #177 is why: `write_result` never
     replaces an existing record, bumping the filename on collision instead. An
-    older reading of this docstring said the artifacts could not, and several
-    comments elsewhere still repeat it - the conclusion above survives either
-    way, because it is the reconciler's one-record-per-task view that loses the
-    ordering, not the directory.)
+    older reading of this docstring said the artifacts could not, and every
+    other copy of the claim repeated it until #217 corrected them - the
+    conclusion above survives either way, because it is the reconciler's
+    one-record-per-task view that loses the count, not the directory.)
 
     That last clause is what `observed_records` below exists to keep true. It
     was not: exit 2 leaves `entry.attempt` alone, so the dead attempt's record
@@ -538,10 +538,11 @@ def observed_records(
 
     That the second verdict is *reachable* at all is inherited rather than
     arranged here: `RunSummary.latest` keeps the newest record per issue on
-    `record.attempt >= current.attempt`, so between two records sharing an
-    attempt the later file wins on the stable sort. Retiring the first is what
-    lets the second through; nothing here would help if `latest` handed back
-    the older one.
+    `record_order`, so between two records sharing an attempt the later
+    timestamp wins (#218 - it used to be the later file in a sorted glob, which
+    is not the same thing once an issue has eleven of them). Retiring the first
+    is what lets the second through; nothing here would help if `latest` handed
+    back the older one.
     """
     seen = dict(previous)
     for transition in transitions:
