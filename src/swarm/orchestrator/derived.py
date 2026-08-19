@@ -279,10 +279,13 @@ class PullFact:
     """One pull request, joined to a task the way #144 says to join one.
 
     **By the ref inside the head branch, never by `Closes #<n>` and never by
-    `LedgerEntry.branch`.** `mergeability.py`'s rule - a task is a ref; an API
-    address is a number - is why `number` is an `int` and `ref` is a `TaskRef`,
-    and they are not the same fact in two spellings: the number addresses the
-    API and the ref identifies the work. Comparing against a rebuilt
+    `LedgerEntry.branch`.** `number` is an `int` and `ref` is a `TaskRef` because they
+    are not the same fact in two spellings: the number addresses the API and
+    the ref identifies the work. **`number` should be a `PullRef` and is not
+    yet** - #185 retyped the orchestrator's pull-request numbers and stopped at
+    the resolver's edge, so this field is the follow-up rather than an exception
+    to `mergeability.py`'s rule. Retyping it needs `PullRef` to sort first; see
+    `taskref.py`. Comparing against a rebuilt
     `entry.branch` is right until the counter moves, and the cycle where it
     moves is the cycle a crash happened, which is the only cycle any of this
     matters in.
