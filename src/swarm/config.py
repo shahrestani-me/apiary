@@ -38,6 +38,7 @@ __all__ = [
     "OLLAMA_HOST_ENV",
     "OllamaTarget",
     "SETTINGS",
+    "TRACKER_CONFIG_ENV",
     "Settings",
     "client_target",
     "container_evidence",
@@ -96,6 +97,14 @@ OLLAMA_HOST_ENV = "OLLAMA_HOST"
 #: Needed because container detection is evidence, not proof, and an operator
 #: who knows the answer should not have to argue with a heuristic.
 IN_CONTAINER_ENV = "APIARY_IN_CONTAINER"
+
+#: Where the tracker capability contract is (#150). An environment variable
+#: rather than a flag because the orchestrator is unattended and the file is a
+#: deployment fact, not a per-run decision - and because naming it is how an
+#: operator says "I meant to configure a tracker": `mcp/contract.py` treats an
+#: absent *default* path as "no tracker on this installation" and an absent
+#: *named* one as a mistake worth reporting.
+TRACKER_CONFIG_ENV = "APIARY_TRACKER_CONFIG"
 
 DEFAULT_OLLAMA_PORT = 11434
 
@@ -482,6 +491,21 @@ class Settings:
     # being written down together rather than tuned one at a time.
     worker_timeout_s: int = int(_env("SWARM_WORKER_TIMEOUT", "1200"))
     verify_timeout_s: int = int(_env("SWARM_VERIFY_TIMEOUT", "300"))
+
+    # --- The task system ------------------------------------------------
+    # Which file names the customer's MCP server and which tool fulfils each
+    # capability (ADR 0001, #150). A path and nothing more: this module holds
+    # *where* the block is, and `mcp/contract.py` holds what a valid one is,
+    # so a config module that every other module imports never grows a YAML
+    # parser or an opinion about a tracker.
+    #
+    # The default is a path that usually does not exist, and that is the
+    # intended answer today - apiary still runs on the label control plane
+    # until #152, so "no tracker configured" is a normal installation rather
+    # than a broken one.
+    tracker_config: str = field(
+        default_factory=lambda: _env(TRACKER_CONFIG_ENV, ".swarm/tracker.yaml")
+    )
 
     # --- Persistence ----------------------------------------------------
     checkpoint_db: str = field(default_factory=lambda: _env("SWARM_CHECKPOINTS", ".swarm/checkpoints.sqlite"))
