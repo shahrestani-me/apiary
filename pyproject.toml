@@ -43,8 +43,23 @@ Issues = "https://github.com/shahrestani-me/apiary/issues"
 swarm = "swarm.cli:main"
 
 [project.optional-dependencies]
+# Remote model providers, one extra each (ADR 0006). Extras rather than
+# dependencies because `pip install apiary` promises a local-first system and
+# the default path needs no remote SDK at all: `llm.py` imports these inside
+# the constructors, and a missing one is a `ConfigError` naming the install
+# command rather than an ImportError that would take `swarm --help` with it.
+openai = ["langchain-openai>=1.6.0"]
+bedrock = ["langchain-aws>=1.7.0"]
+
 dev = [
     "pytest>=8.0",
+    # Both provider extras, so the suite covers every registered path rather
+    # than the one the default install happens to have. `tests/test_llm.py`
+    # asserts that a schema violation is *raised* on each of them, which is the
+    # guarantee the whole orchestrator rests on, and a path nobody runs is a
+    # guarantee nobody holds.
+    "langchain-openai>=1.6.0",
+    "langchain-aws>=1.7.0",
     # Pinned to a minor series on purpose: an unpinned checker turns
     # "mypy shipped a release" into "every open pull request is red",
     # which is how a ratchet gets switched off (#168).
