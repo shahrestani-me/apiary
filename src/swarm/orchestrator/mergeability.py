@@ -119,7 +119,6 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
-from ..github.readiness import READY
 from ..github.refs import issue_number, pull_number, pull_ref, task_ref
 from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
@@ -135,13 +134,15 @@ from .checks import (
 )
 from ..store import StoreError, TaskStore, record_judgement
 from .authority import Belief, in_review
+from .derived import ELIGIBLE, NEEDS_HUMAN
+from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
-    FAILED,
     Transition,
     post_comment,
     rewrite_marker,
+    write_labels,
 )
 
 #: The client methods this module probes for. Named because the probe and the
@@ -769,8 +770,8 @@ def _decide_conflicted(
             ),
             transition=Transition(
                 ref=entry.ref,
-                from_label=REVIEW,
-                to_label=FAILED,
+                from_state=REVIEW_STATE,
+                to_state=NEEDS_HUMAN,
                 reason=(
                     f"the branch conflicts with {facts.base_name} and {attempt} attempt(s) "
                     f"have been made against a cap of {cap}"
@@ -794,8 +795,8 @@ def _decide_conflicted(
         detail=f"conflicts with {facts.base_name}; re-dispatching as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_label=REVIEW,
-            to_label=READY,
+            from_state=REVIEW_STATE,
+            to_state=ELIGIBLE,
             reason=(
                 f"the branch conflicts with {facts.base_name}; re-dispatching from a fresh "
                 f"base commit rather than retrying the same diff"
@@ -837,8 +838,8 @@ def _decide_behind(
             detail=reason,
             transition=Transition(
                 ref=entry.ref,
-                from_label=REVIEW,
-                to_label=FAILED,
+                from_state=REVIEW_STATE,
+                to_state=NEEDS_HUMAN,
                 reason=reason,
                 task_id=entry.task_id,
                 # The attempt budget is untouched: nothing about the work was
@@ -1233,14 +1234,13 @@ def apply_mergeability(
                 )
             if transition.attempt is not None or decision.context:
                 _patch_body(client, transition, decision.context)
-            # `Transition` is keyed on the task; these calls address the
-            # GitHub API, which takes issue numbers.
-            number = issue_number(transition.ref)
-            client.add_labels(number, [transition.to_label])
-            if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(number, transition.from_label)
+            # One writer for the whole transition path (#152): the label names
+            # are `reconcile.write_labels`'s business and not this module's, and
+            # three copies of add-before-remove were three places to find when
+            # the labels go.
+            write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
-            failures.append(Failure(decision.ref, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(decision.ref, f"{transition.to_state}: {exc}"))
             continue
         applied.append(transition)
         # The pull request this issue was being counted for is finished with -

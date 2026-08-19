@@ -142,7 +142,7 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
 
     Deliberately not the label-write log. The writes differ between two runs
     that decided identically, because a hand-edited issue is relabelled *from*
-    the label it is wearing - which is the point of `Transition.from_label`
+    the label it is wearing - which is the point of `Transition.from_state`
     staying the real label. What has to match is the containers, the merges and
     the state the issue ends the cycle in.
 
@@ -1070,7 +1070,7 @@ def test_readiness_speaks_about_the_entries_the_authority_says_are_waiting():
     assert derived.verdicts[0].current_label == CLAIMED
 
 
-def test_reconcile_reads_terminal_from_the_authority_and_from_label():
+def test_reconcile_reads_terminal_from_the_authority_and_from_state():
     """A human marks a running task done. The container's fate is the decision.
 
     Under the labels `swarm:done` is terminal and the worker is disposed
@@ -1105,7 +1105,7 @@ def test_a_belief_advances_by_the_writes_that_landed_and_by_nothing_else():
 
     class Applied:
         task_id = "task-4"
-        to_label = CLAIMED
+        to_state = CLAIMED_STATE
 
     assert held.fold([Applied()]).state("task-4") == CLAIMED_STATE
     assert held.fold([]).state("task-4") == ELIGIBLE
@@ -1175,7 +1175,7 @@ def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():
 
     obeyed = plan_recovery(book, containers=(), believed=labels)
     assert [str(one) for one in obeyed.transitions] == [
-        "#4: swarm:claimed -> swarm:ready, attempt 1 "
+        "#4: claimed -> eligible, attempt 1 "
         "(claimed with no live container behind it)"
     ]
     # The budget, which is the half a transition's `str` does not show and the
@@ -1333,8 +1333,8 @@ def test_the_merge_gates_own_transition_seeds_the_ratchet():
         [
             Transition(
                 ref=ref(4),
-                from_label=REVIEW,
-                to_label=DONE,
+                from_state=REVIEW_STATE,
+                to_state=LANDED,
                 reason="its pull request merged",
                 task_id="task-4",
             )

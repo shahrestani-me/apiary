@@ -322,6 +322,7 @@ class Spawner(Protocol):
         *,
         issue: int | None = None,
         image: str | None = None,
+        attempt: int | None = None,
     ) -> Handle: ...
 
     #: The safe-release probe. A spawn that raised may still have left a
@@ -746,11 +747,16 @@ def dispatch(
             failed.append(DispatchFailure(entry.number, f"claim failed: {exc}", fatal=True))
             break
         try:
-            # Both, and they are not the same fact: the container is labelled
-            # and named by task, and the worker is handed the issue number it
-            # needs to read a contract and open a pull request against it.
+            # Three, and none of them is the same fact as another: the container
+            # is labelled and named by task, the worker is handed the issue
+            # number it needs to read a contract and open a pull request against
+            # it, and it is told which attempt it is so it can name its own
+            # branch without reading the counter back out of the customer's issue
+            # body (`containers.manager.ATTEMPT_ENV`). The counter comes off the
+            # entry this cycle already resolved, so nothing is re-read for it.
             handle = manager.spawn(
-                entry.ref, base_commit, issue=entry.number, image=image
+                entry.ref, base_commit, issue=entry.number, image=image,
+                attempt=entry.attempt,
             )
         except ContainerError as exc:
             fatal = daemon_is_down(exc)

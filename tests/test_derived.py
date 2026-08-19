@@ -71,7 +71,7 @@ from swarm.orchestrator.derived import (
     report,
     resolve,
 )
-from swarm.orchestrator.lifecycle import INTERNAL_STATE
+from swarm.orchestrator.lifecycle import INTERNAL_STATE, internal_state
 
 RUNS = corpus_runs()
 
@@ -424,6 +424,43 @@ def test_every_state_the_resolver_can_return_is_in_the_precedence_table() -> Non
     """`STATES` is the design decision written down; this keeps it honest."""
     assert set(STATES) == {ELIGIBLE, BLOCKED, CLAIMED, REVIEW, LANDED, NEEDS_HUMAN}
     assert set(STATES) == set(INTERNAL_STATE.values())
+
+
+def test_the_label_and_state_vocabularies_round_trip() -> None:
+    """The property #152's `Transition` retype rests on, in both directions.
+
+    A `Transition` carries states and the label is looked up only at the moment
+    one is written, which is safe **only** because the mapping is a bijection: a
+    transition built from the label an issue is carrying has to translate back to
+    that same label, or `write_labels` removes the wrong one and the issue ends
+    up wearing two.
+
+    Written as a round trip rather than as "the tables are inverses" because that
+    is the claim the code makes, and because a seventh state - one with no label
+    to store it - would break this line rather than surfacing as a `KeyError` in
+    the middle of a cycle.
+    """
+    from swarm.orchestrator.lifecycle import STATE_LABEL, state_label
+
+    assert set(STATE_LABEL) == set(STATES)
+    for label, state in INTERNAL_STATE.items():
+        assert state_label(state) == label
+    for state in STATES:
+        assert internal_state(state_label(state)) == state
+
+
+def test_a_state_no_label_stores_is_refused_rather_than_invented() -> None:
+    """`internal_state` guesses; `state_label` must not, and the asymmetry is the point.
+
+    One is reading labels somebody else's repository may carry, where a guess is
+    better than a crash. The other is about to *write* one, and a made-up name is
+    a label GitHub creates with a random colour and no description - the exact
+    failure `github/labels.py` provisions the six to prevent.
+    """
+    from swarm.orchestrator.lifecycle import state_label
+
+    with pytest.raises(KeyError, match="no swarm:. label stores"):
+        state_label("unresolved")
 
 
 def test_the_observation_type_cannot_carry_a_label_or_a_state() -> None:

@@ -143,21 +143,23 @@ from .authority import (
     state_of,
     state_source,
 )
-# **Bare `CLAIMED` and `REVIEW` here are `swarm:*` labels; the `_STATE` pair are
-# ADR 0001's internal states.** `shadow.py`'s convention, imported for its
-# reason: the one time the two were confused, every classification in that file
-# stopped matching and nothing failed.
+# **The `_STATE` suffix is ADR 0001's internal vocabulary.** `shadow.py`'s
+# convention, kept for its reason: the one time a state and the label storing it
+# were confused, every classification in that file stopped matching and nothing
+# failed. The suffix is now the *only* spelling this module decides on - the bare
+# labels it used to carry alongside them went with #152's `Transition` retype,
+# which is why `CLAIMED` and `REVIEW` are no longer imported here at all.
 from .derived import CLAIMED as CLAIMED_STATE
 from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN, Budget
 from .derived import REVIEW as REVIEW_STATE
-from .dispatcher import CLAIMED, REVIEW, Capacity, DispatchReport, Spawner, dispatch
+from .dispatcher import Capacity, DispatchReport, Spawner, dispatch
 
 #: The two labels no other module owns, and therefore the only two spelled out
-#: here: `READY` comes from readiness (#11) and `CLAIMED`/`REVIEW` from the
-#: dispatcher (#21), imported rather than respelled so a rename cannot leave
-#: two modules disagreeing about what a state is called. `TERMINAL_LABELS` is
-#: imported for the same reason and not rebuilt from these two - `run.py`
-#: decides what "finished" means, and resumption depends on that answer.
+#: here. Nothing in this module decides on them any more - transitions carry
+#: states, and `write_labels` looks a name up at the one moment it writes - but
+#: `lifecycle.INTERNAL_STATE` needs all six labels in one place to map them, and
+#: `run.py` needs `TERMINAL_LABELS`, which decides what "finished" means and
+#: which resumption depends on. #152 deletes them along with the storage.
 DONE = "swarm:done"
 FAILED = "swarm:failed"
 
@@ -366,7 +368,26 @@ class Fleet(Spawner, Protocol):
 
 @dataclass(frozen=True)
 class Transition:
-    """One issue's label move, with the counter write that must precede it.
+    """One task's state change, with the counter write that must precede it.
+
+    **A state change, not a label move** (#152). Since #147 every decision in a
+    cycle is made on ADR 0001's internal states, and the labels are only where
+    the answer is *stored* - so this type says `eligible` and `needs-human`, and
+    the one place a `swarm:*` name is needed looks it up at the moment it writes
+    (`write_labels`). That is what lets the storage go without touching anything
+    that decides: `fold`, `lifecycle_events`, `shadow`, `recovery` and
+    `authority` all read these two fields, and none of them will notice.
+
+    **Why `from_state` is derived from the label the issue carries, not from what
+    the cycle believes.** It looks like a state and it is really an answer to
+    "which label does this write have to remove", which is not the same question
+    once a human has hand-edited an issue: a task the resolver believes `claimed`
+    while the issue carries `swarm:done` must have `swarm:done` taken off it, or
+    it ends up wearing two. The construction sites therefore pass
+    `label_state(entry.state_label)` rather than the belief, and `write_labels`
+    translates it back - losslessly, because `INTERNAL_STATE` is a bijection over
+    the six labels and `tests/test_reconcile.py` pins that. The distinction dies
+    with the labels; the field does not.
 
     `attempt=None` means "leave the counter alone", which is not the same as
     writing the value it already has: `docs/issue-contract.md` §5 makes the
@@ -375,8 +396,8 @@ class Transition:
     """
 
     ref: TaskRef
-    from_label: str
-    to_label: str
+    from_state: str
+    to_state: str
     reason: str
     task_id: str = ""
     attempt: int | None = None
@@ -424,7 +445,7 @@ class Transition:
 
     def __str__(self) -> str:
         counter = "" if self.attempt is None else f", attempt {self.attempt}"
-        return f"{self.ref}: {self.from_label} -> {self.to_label}{counter} ({self.reason})"
+        return f"{self.ref}: {self.from_state} -> {self.to_state}{counter} ({self.reason})"
 
 
 @dataclass(frozen=True)
@@ -612,11 +633,16 @@ def _closed_verdict(state: IssueState) -> tuple[str, str]:
     because the two modules must agree about what "closed" means: a dependency
     that counts as met and an issue that counts as done are the same judgement,
     and a `not_planned` closure satisfies neither.
+
+    The verdict is an internal state (#152), not a label. Nothing about the
+    decision changed: `landed` is where `swarm:done` was and `needs-human` is
+    where `swarm:failed` was, and the two are the same six-to-six mapping every
+    other transition now speaks.
     """
     if state.state_reason in SATISFYING_STATE_REASONS:
-        return DONE, "closed as completed on GitHub"
+        return LANDED, "closed as completed on GitHub"
     reason = (state.state_reason or "unknown").replace("_", " ")
-    return FAILED, f"closed as {reason} on GitHub"
+    return NEEDS_HUMAN, f"closed as {reason} on GitHub"
 
 
 #: How much of a failed attempt's verify output travels into the retry comment.
@@ -882,8 +908,8 @@ def _retry_or_give_up(
     if attempt >= total_cap:
         return Transition(
             ref=entry.ref,
-            from_label=entry.state_label,
-            to_label=FAILED,
+            from_state=label_state(entry.state_label),
+            to_state=NEEDS_HUMAN,
             reason=f"{reason}; {attempt} attempt(s) made against a total cap of {total_cap}",
             task_id=entry.task_id,
             attempt=attempt,
@@ -905,8 +931,8 @@ def _retry_or_give_up(
     if streak >= cap:
         return Transition(
             ref=entry.ref,
-            from_label=entry.state_label,
-            to_label=FAILED,
+            from_state=label_state(entry.state_label),
+            to_state=NEEDS_HUMAN,
             reason=(
                 f"{reason}; {attempt} attempt(s) made, the last {streak} failing the "
                 f"same way against a cap of {cap}"
@@ -933,8 +959,8 @@ def _retry_or_give_up(
         )
     return Transition(
         ref=entry.ref,
-        from_label=entry.state_label,
-        to_label=READY,
+        from_state=label_state(entry.state_label),
+        to_state=ELIGIBLE,
         reason=reason,
         task_id=entry.task_id,
         attempt=attempt,
@@ -1024,10 +1050,11 @@ def plan_reconcile(
     `believed=None` reads the labels for both, which is `APIARY_STATE_SOURCE=labels`
     and is exactly what this function did before #147.
 
-    `from_label` on every transition below stays `entry.state_label` whatever
-    the source, and that is not an oversight: it is the label the write has to
-    *remove*, so a hand-edited issue is relabelled correctly rather than left
-    carrying two.
+    `from_state` on every transition below is `label_state(entry.state_label)`
+    whatever the source, and that is not an oversight: it names the label the
+    write has to *remove*, so a hand-edited issue is relabelled correctly rather
+    than left carrying two. `Transition` says the same thing at more length and
+    says what happens to the distinction when the labels go.
     """
     states = states or {}
     results = results or {}
@@ -1062,12 +1089,12 @@ def plan_reconcile(
         #    the merge, because `Closes #<n>` closes the issue as completed, so
         #    "the PR merged" and "a human ticked it off" are one fact here.
         if state is not None and state.closed and not terminal:
-            label, reason = _closed_verdict(state)
+            verdict, reason = _closed_verdict(state)
             transitions.append(
                 Transition(
                     ref=entry.ref,
-                    from_label=entry.state_label,
-                    to_label=label,
+                    from_state=label_state(entry.state_label),
+                    to_state=verdict,
                     reason=reason,
                     task_id=entry.task_id,
                 )
@@ -1158,8 +1185,8 @@ def plan_reconcile(
         transitions.append(
             Transition(
                 ref=error_ref,
-                from_label=current,
-                to_label=FAILED,
+                from_state=label_state(current),
+                to_state=NEEDS_HUMAN,
                 reason=f"malformed contract: {error.reason}",
                 comment=f"apiary: this issue does not satisfy `docs/issue-contract.md`.\n\n{error}",
             )
@@ -1241,8 +1268,8 @@ def _verdict(
         return (
             Transition(
                 ref=entry.ref,
-                from_label=entry.state_label,
-                to_label=REVIEW,
+                from_state=label_state(entry.state_label),
+                to_state=REVIEW_STATE,
                 reason="the worker published its pull request",
                 task_id=entry.task_id,
             ),
@@ -1281,8 +1308,8 @@ def _verdict(
         return (
             Transition(
                 ref=entry.ref,
-                from_label=entry.state_label,
-                to_label=FAILED,
+                from_state=label_state(entry.state_label),
+                to_state=NEEDS_HUMAN,
                 # The counter is deliberately left alone. The attempts were
                 # never consumed and saying otherwise now would rewrite history
                 # to make the escalation look like an exhausted budget.
@@ -1307,8 +1334,8 @@ def _verdict(
     return (
         Transition(
             ref=entry.ref,
-            from_label=entry.state_label,
-            to_label=READY,
+            from_state=label_state(entry.state_label),
+            to_state=ELIGIBLE,
             reason=f"infrastructure failure: {detail}; the attempt was not consumed",
             task_id=entry.task_id,
             infrastructure=True,
@@ -1337,7 +1364,7 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
             continue
         entries[task_id] = replace(
             entry,
-            state_label=transition.to_label,
+            state_label=state_label_for(transition.to_state),
             attempt=entry.attempt if transition.attempt is None else transition.attempt,
             # The signature record mirrors the store write exactly: a
             # transition that wrote the counter wrote (or cleared) the
@@ -1348,7 +1375,11 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
             blocker=entry.blocker if transition.attempt is None else transition.blocker,
             streak=entry.streak if transition.attempt is None else transition.streak,
             renewals=entry.renewals if transition.attempt is None else transition.renewals,
-            labels=frozenset(entry.labels - {transition.from_label} | {transition.to_label}),
+            labels=frozenset(
+                entry.labels
+                - {state_label_for(transition.from_state)}
+                | {state_label_for(transition.to_state)}
+            ),
         )
     return replace(ledger, entries=entries)
 
@@ -1477,6 +1508,46 @@ class ReconcileReport:
         return ", ".join(parts)
 
 
+def state_label_for(state: str) -> str:
+    """`lifecycle.state_label`, reached through a local import.
+
+    `authority._internal`'s shape and its exact reason, in the other direction:
+    `lifecycle` imports this module, so a module-level import here is a cycle.
+    The indirection is one line and the alternative is a second copy of the
+    six-row table, which is the thing `STATE_LABEL` is inverted rather than
+    written out to avoid.
+    """
+    from .lifecycle import state_label
+
+    return state_label(state)
+
+
+def write_labels(client: Any, transition: Transition) -> None:
+    """Store one transition's state as the `swarm:*` labels. **The only writer.**
+
+    Three call sites had this same five lines - here, `checks._apply` and
+    `mergeability._apply` - and they are now one, which is most of what #152 has
+    left to delete: the transition path stops writing labels when this function
+    goes, rather than when three copies of it are each found and removed.
+
+    **Add before remove.** `readiness._relabel`'s rule, and load-bearing for its
+    reason: GitHub has no transaction across two label calls, and a crash between
+    them leaves either two state labels or none. Two is repairable - §3's
+    precedence puts the furthest-along first - while none puts the issue outside
+    the ledger entirely, where nothing looks at it again.
+
+    Raises whatever the client raises. Every caller already wraps this in a
+    `try` that lands one issue's failure in `Failure` and carries on with the
+    other nineteen, and swallowing here would take that decision away from them.
+    """
+    number = issue_number(transition.ref)
+    to_label = state_label_for(transition.to_state)
+    client.add_labels(number, [to_label])
+    from_label = state_label_for(transition.from_state) if transition.from_state else ""
+    if from_label and from_label != to_label:
+        client.remove_label(number, from_label)
+
+
 def post_comment(client: Any, number: int, text: str) -> bool:
     """Post one comment, or print it and say it did not land.
 
@@ -1574,15 +1645,13 @@ def apply_plan(
                     renewals=transition.renewals,
                 )
                 bump_attempt(client, number, transition.task_id, transition.attempt)
-            client.add_labels(number, [transition.to_label])
-            if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(number, transition.from_label)
+            write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
             # A human deleting or relabelling this issue between the read and
             # the write lands here, and so does a store that will not take the
             # judgment. Either is a fact about one issue, not a reason to
             # abandon the cycle - the next read sees whatever they did.
-            failures.append(Failure(transition.ref, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(transition.ref, f"{transition.to_state}: {exc}"))
             continue
         applied.append(transition)
         if transition.comment and not post_comment(client, number, transition.comment):

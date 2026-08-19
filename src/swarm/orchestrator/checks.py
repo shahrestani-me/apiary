@@ -91,27 +91,27 @@ from typing import Any, Iterable, Mapping
 from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
-from ..github.readiness import READY
 from ..github.refs import issue_number, pull_number, pull_ref, task_ref
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
 from .authority import Belief, in_review
+from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN
+from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
     COMMENT_METHOD,
-    DONE,
-    FAILED,
     PULLS_METHOD,
     Transition,
     post_comment,
     rewrite_marker,
+    write_labels,
 )
 
 #: The client methods this module probes for. Named because the probe and the
 #: sentence explaining what is missing must not drift, and because grepping for
-#: either name should land on this line. `PULLS_METHOD` is imported from #22 for
-#: the same reason it spells `READY` rather than restating it.
+#: either name should land on this line. `PULLS_METHOD` is imported from #22
+#: rather than restated, so a rename cannot leave two modules disagreeing.
 BRANCH_METHODS: tuple[str, ...] = ("delete_branch", "delete_ref")
 
 #: The four answers a check set has. Strings rather than an enum because they
@@ -904,8 +904,8 @@ def _decide(
             detail=f"CI failed in {names}, outside this issue's ## Files",
             transition=Transition(
                 ref=entry.ref,
-                from_label=REVIEW,
-                to_label=FAILED,
+                from_state=REVIEW_STATE,
+                to_state=NEEDS_HUMAN,
                 reason=(
                     f"CI failed in {names}, which is outside this issue's ## Files - "
                     f"no attempt of this issue could fix it"
@@ -951,8 +951,8 @@ def _decide_empty(
         detail=reason,
         transition=Transition(
             ref=entry.ref,
-            from_label=REVIEW,
-            to_label=FAILED,
+            from_state=REVIEW_STATE,
+            to_state=NEEDS_HUMAN,
             reason=reason,
             task_id=entry.task_id,
             comment=(
@@ -990,8 +990,8 @@ def _decide_passed(
         detail=f"{checks.summary()}; merging PR {pull.number}",
         transition=Transition(
             ref=entry.ref,
-            from_label=REVIEW,
-            to_label=DONE,
+            from_state=REVIEW_STATE,
+            to_state=LANDED,
             reason=f"PR {pull.number} merged: {checks.summary()}",
             task_id=entry.task_id,
         ),
@@ -1031,8 +1031,8 @@ def _retry_or_give_up(
             detail=f"{named} failed; {attempt} attempt(s) against a cap of {cap}",
             transition=Transition(
                 ref=entry.ref,
-                from_label=REVIEW,
-                to_label=FAILED,
+                from_state=REVIEW_STATE,
+                to_state=NEEDS_HUMAN,
                 reason=f"{named} failed; {attempt} attempt(s) made against a cap of {cap}",
                 task_id=entry.task_id,
                 attempt=attempt,
@@ -1049,8 +1049,8 @@ def _retry_or_give_up(
         detail=f"{named} failed; retrying as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_label=REVIEW,
-            to_label=READY,
+            from_state=REVIEW_STATE,
+            to_state=ELIGIBLE,
             reason=f"{named} failed on the pull request",
             task_id=entry.task_id,
             attempt=attempt,
@@ -1376,14 +1376,13 @@ def apply_checks(
                 )
             if transition.attempt is not None or outcome.feedback:
                 _patch_body(client, transition, outcome.feedback)
-            # `Transition` is keyed on the task, and every call here addresses
-            # the GitHub API, which takes issue numbers.
-            number = issue_number(transition.ref)
-            client.add_labels(number, [transition.to_label])
-            if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(number, transition.from_label)
+            # One writer for the whole transition path (#152): the label names
+            # are `reconcile.write_labels`'s business and not this module's, and
+            # three copies of add-before-remove were three places to find when
+            # the labels go.
+            write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
-            failures.append(Failure(outcome.number, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(outcome.number, f"{transition.to_state}: {exc}"))
             continue
         applied.append(transition)
         if transition.comment and not post_comment(client, outcome.number, transition.comment):

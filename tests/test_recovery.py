@@ -64,6 +64,9 @@ from swarm.orchestrator.recovery import (
     unrecognised,
 )
 from swarm.run import RUN_LABEL, Run
+from swarm.orchestrator.derived import ELIGIBLE, NEEDS_HUMAN
+from swarm.orchestrator.derived import CLAIMED as CLAIMED_STATE
+from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 
 REPO = "shahrestani-me/apiary"
 OBJECTIVE = "recover the claims a killed orchestrator left on the tracker"
@@ -294,7 +297,7 @@ def test_a_claim_with_no_container_behind_it_returns_to_the_pool():
     # The ticket. Nothing else in the system takes this label off, so an issue
     # left here is undispatchable forever while looking perfectly healthy.
     transition = plan.transitions[0]
-    assert (transition.from_label, transition.to_label) == (CLAIMED, READY)
+    assert (transition.from_state, transition.to_state) == (CLAIMED_STATE, ELIGIBLE)
     assert transition.attempt == 1
     assert plan.held == ()
 
@@ -307,8 +310,8 @@ def test_the_release_consumes_an_attempt_so_a_second_crash_gives_up():
     # not loop." §5's counter is an upper bound on attempts made: over-counting
     # puts a human in front of the problem, under-counting loops while looking
     # healthy.
-    assert (first.transitions[0].to_label, first.transitions[0].attempt) == (READY, 1)
-    assert (second.transitions[0].to_label, second.transitions[0].attempt) == (FAILED, 2)
+    assert (first.transitions[0].to_state, first.transitions[0].attempt) == (ELIGIBLE, 1)
+    assert (second.transitions[0].to_state, second.transitions[0].attempt) == (NEEDS_HUMAN, 2)
     assert "cap of 2" in second.transitions[0].reason
     assert second.transitions[0].comment
 
@@ -497,7 +500,7 @@ def test_a_claim_is_matched_to_its_pull_request_by_ref_not_by_current_attempt():
     )
 
     assert plan.published == plan.transitions
-    assert plan.transitions[0].to_label == REVIEW
+    assert plan.transitions[0].to_state == REVIEW_STATE
     # The name in the reason is the one on the remote, not the entry's, because
     # that is the branch a human goes and looks at.
     assert branch(4, attempt=1) in plan.transitions[0].reason
@@ -516,7 +519,7 @@ def test_a_claim_with_an_open_pull_request_moves_forward_to_review():
     # worker that died in between leaves exactly this. The work is done: moving
     # the label forward is all that is left, and the attempt is not consumed
     # because charging one would give up on a task that succeeded.
-    assert (transition.to_label, transition.attempt) == (REVIEW, None)
+    assert (transition.to_state, transition.attempt) == (REVIEW_STATE, None)
     assert plan.published == plan.transitions
     assert plan.released == ()
 
@@ -547,7 +550,7 @@ def test_an_unreadable_pull_request_list_does_not_leave_the_claim_unreachable():
     # at all; releasing costs at most one redundant attempt, because the branch
     # is derived from the issue number and GitHub refuses a second PR for it.
     assert plan.blind is True
-    assert (plan.transitions[0].to_label, plan.transitions[0].attempt) == (READY, 1)
+    assert (plan.transitions[0].to_state, plan.transitions[0].attempt) == (ELIGIBLE, 1)
 
 
 def test_the_review_path_is_taken_once_pull_requests_can_be_listed():
@@ -685,7 +688,7 @@ def test_a_mid_cycle_sweep_recovers_the_claims_a_spawn_never_reached():
 
     assert [item.ref for item in plan.held] == [ref(4)]
     assert plan.refs == (ref(5), ref(6))
-    assert {transition.to_label for transition in plan.transitions} == {READY}
+    assert {transition.to_state for transition in plan.transitions} == {ELIGIBLE}
 
 
 def test_a_sweep_that_frees_nothing_says_which_claims_it_left_and_why():

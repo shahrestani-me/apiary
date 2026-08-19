@@ -42,6 +42,7 @@ from swarm.worker.result import (
     write_result,
 )
 from swarm.worker.entrypoint import (
+    ATTEMPT_ENV,
     EXIT_INFRASTRUCTURE,
     EXIT_OK,
     EXIT_TASK_FAILED,
@@ -54,6 +55,7 @@ from swarm.worker.entrypoint import (
     InfrastructureError,
     WorkerResult,
     commit_edits,
+    dispatched_attempt,
     stageable,
     classify_verify,
     main,
@@ -229,6 +231,40 @@ def test_a_retry_branches_under_its_own_attempt_number(
     )
 
     assert result.branch == task_branch(task_ref(ISSUE), 2)
+    assert checkout(workspace, scratch_repo).current_branch() == result.branch
+
+
+@pytest.mark.usefixtures("worker_env")
+def test_a_retry_branches_under_the_attempt_it_was_told_not_the_marked_one(
+    fake_github, scratch_repo, workspace, monkeypatch
+):
+    """The consequence that matters: the *branch* follows what it was told.
+
+    Same test as the one above, with the two sources deliberately disagreeing -
+    the marker says 2, the orchestrator says 4. The branch has to be 4, because
+    the orchestrator is what counted the attempts and what will go looking for
+    the branch afterwards. A worker that believed the body here would push a name
+    the reconciler cannot find, and derived state would read the task as having
+    spent less budget than it has.
+    """
+    monkeypatch.setenv(ATTEMPT_ENV, "4")
+    gh, _, _ = fake_github(
+        issue(attempt=2, verify=ALWAYS_FAILS), response(200, feedback_comments())
+    )
+    editor = FakeEditor(edits({"calc.py": GOOD_CALC}))
+
+    result = run_worker(
+        repo=gh.repo,
+        issue=ISSUE,
+        base_commit=scratch_repo.head(),
+        workspace=workspace,
+        clone_url=str(scratch_repo.remote),
+        client=gh,
+        editor=editor,
+    )
+
+    assert result.branch == task_branch(task_ref(ISSUE), 4)
+    assert result.attempt == 4
     assert checkout(workspace, scratch_repo).current_branch() == result.branch
 
 
@@ -2222,3 +2258,59 @@ def test_a_generated_directory_is_not_a_generated_file(tmp_path):
     (root / "package-lock.json").mkdir(parents=True)
 
     assert stageable(root, ["package-lock.json"]) == ()
+
+
+# --------------------------------------------------------------------------
+# Which attempt is this?
+# --------------------------------------------------------------------------
+#
+# The counter names the branch (`apiary/<ref>-attempt-N`), which is the
+# substrate derived state is built on (#144, #145). Before #152 it reached this
+# process one way only - out of the customer's issue body - and these are the
+# four answers to "what if it comes the other way instead".
+
+
+def test_what_the_orchestrator_said_beats_what_the_body_says():
+    """The orchestrator owns the counter; the marker is a copy of it.
+
+    A container told `2` by the process that decided to run it must not be
+    talked out of that by a body somebody edited in the meantime.
+    """
+    assert dispatched_attempt(0, {ATTEMPT_ENV: "2"}) == 2
+
+
+def test_a_worker_that_was_told_nothing_reads_the_marker():
+    """The fallback, and the reason this change lands on its own.
+
+    Until #152 the marker is still written and still correct, so an older image
+    under a newer orchestrator - or a container started by hand - behaves exactly
+    as every worker did before.
+    """
+    assert dispatched_attempt(3, {}) == 3
+    assert dispatched_attempt(3, {ATTEMPT_ENV: "  "}) == 3
+
+
+def test_attempt_zero_is_honoured_and_not_mistaken_for_absent():
+    """`"0"` is a number the orchestrator chose, not a missing value.
+
+    The distinction matters because the marker it would otherwise fall back to
+    can say something else, and the two produce different branch names.
+    """
+    assert dispatched_attempt(5, {ATTEMPT_ENV: "0"}) == 0
+
+
+@pytest.mark.parametrize("value", ["two", "1.5", "-1", ""])
+def test_an_attempt_that_is_not_a_counter_is_refused_rather_than_rounded(value: str):
+    """Exit 2, which costs no attempt - the right price for a wiring fault.
+
+    Guessing would name a branch that either collides with a previous attempt's
+    or claims budget nobody granted, and both are silent: the push succeeds and
+    the reconciler goes looking for a branch that means something else. The empty
+    string is the exception and falls back, because "set but blank" is how a
+    shell passes "unset".
+    """
+    if value == "":
+        assert dispatched_attempt(4, {ATTEMPT_ENV: value}) == 4
+        return
+    with pytest.raises(InfrastructureError, match=ATTEMPT_ENV):
+        dispatched_attempt(4, {ATTEMPT_ENV: value})
