@@ -219,10 +219,24 @@ def mis_sourcing_findings(tmp_path_factory: pytest.TempPathFactory) -> str:
     return result.stdout
 
 
-def _lines_with_errors(findings: str) -> set[int]:
+def _lines_with_errors(findings: str, *, naming: str | None = None) -> set[int]:
+    """Lines mypy reported an error on; optionally only errors naming a type.
+
+    `naming` exists because "an error on this line" is not what the assertion
+    below means. Rename `Merge.number` and mypy reports `call-arg: unexpected
+    keyword argument` on every tagged line - the test would stay green while
+    proving nothing at all about the two numberings, which is the one thing it
+    is here to prove. Requiring the message to name the type makes the finding
+    evidence rather than a coincidence of line numbers.
+
+    The control passes no `naming`, deliberately: a correctly-sourced
+    construction must produce no error of *any* kind, and narrowing that would
+    weaken it.
+    """
     return {
         int(match.group(1))
-        for match in re.finditer(r"^[^:]+:(\d+): error:", findings, flags=re.MULTILINE)
+        for match in re.finditer(r"^[^:]+:(\d+): error:(.*)$", findings, flags=re.MULTILINE)
+        if naming is None or naming in match.group(2)
     }
 
 
@@ -240,7 +254,7 @@ def test_a_pull_requests_number_in_the_issues_place_is_an_error(
     """
     wrong = _tagged("WRONG")
     assert wrong, "the reproduction lost its tags"
-    flagged = _lines_with_errors(mis_sourcing_findings)
+    flagged = _lines_with_errors(mis_sourcing_findings, naming="PullRef")
     missed = [number for number in wrong if number not in flagged]
     assert not missed, (
         "a pull request's number was accepted where an issue's belongs, on line(s) "
