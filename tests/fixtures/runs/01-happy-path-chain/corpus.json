@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "Two tasks, one edge. Every state reached the way ADR 0001 says it is: eligible from a discharged graph, claimed from a running container, review from an open pull request, landed from that pull request merging.",
+  "exercises": [
+    "eligible",
+    "blocked",
+    "claimed",
+    "review",
+    "landed",
+    "a dependency edge"
+  ],
+  "expected_divergences": []
+}

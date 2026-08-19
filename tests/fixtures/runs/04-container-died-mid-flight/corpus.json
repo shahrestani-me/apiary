@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "The container was spawned and then vanished - OOM-killed and removed, or a daemon restart - so there is no container, no result record and no branch. Distinct from run 03: there the spawn never happened, here it happened and left nothing. Both look identical from the code host, which is the point.",
+  "exercises": [
+    "a container that died between claim and result",
+    "no result record at all",
+    "the recovery sweep charging an attempt with nothing to read"
+  ],
+  "expected_divergences": [
+    {
+      "cycle": 3,
+      "task": "indexer",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "The container is gone and wrote no testimony, so nothing on the code host or in the artifacts distinguishes this from a claim that was never spawned. Derived state says eligible and is right; the label is the stale one, until recovery sweeps it next cycle."
+    }
+  ]
+}

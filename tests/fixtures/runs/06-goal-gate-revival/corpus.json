@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "Three verify failures spend the budget and the task reaches a human - the one needs-human path derived state reproduces exactly. Then the goal gate revives it (nodes/planner.revive) and 'deliberately resets nothing', so the counter still reads spent while the label reads ready.",
+  "exercises": [
+    "the attempt budget spent",
+    "needs-human agreeing on the common path",
+    "a goal-gate revival",
+    "landed outranking needs-human"
+  ],
+  "expected_divergences": [
+    {
+      "cycle": 8,
+      "task": "cli",
+      "derived": "needs-human",
+      "control": "eligible",
+      "why": "nodes/planner.revive takes the task out of swarm:failed and resets nothing - the marker keeps its counter, deliberately, so that the failure-signature arithmetic still guards the retry. The revival is apiary's own decision about its own execution, so by ADR 0002 it lives in the store and not on the code host. Nothing in the branches, the containers or the artifacts records it."
+    },
+    {
+      "cycle": 9,
+      "task": "cli",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "The same revival, one cycle on. Worth recording separately rather than folding into cycle 8: a divergence that persists across a state change is a different fact from one that appears for a single cycle, and #146's shadow window has to be able to tell a stale label it should repair from a judgment it simply cannot see."
+    },
+    {
+      "cycle": 10,
+      "task": "cli",
+      "derived": "needs-human",
+      "control": "review",
+      "why": "The same revival, still. The retry pushed apiary/%2361-attempt-3, so attempts_spent now reads 3 from the code host as well as from the artifacts - which rules out the hope that a second source would have resolved it. No amount of looking at branches, containers or results recovers a decision that was never written to any of them."
+    }
+  ]
+}

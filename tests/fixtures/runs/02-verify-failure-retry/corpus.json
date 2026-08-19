@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "One task fails its gate, spends an attempt and is re-dispatched. The failing attempt writes a record and no branch, so the counter is visible only in the artifacts until the retry pushes one.",
+  "exercises": [
+    "a verify failure",
+    "an attempt consumed",
+    "a retry that lands",
+    "attempts_spent from a result before any branch exists"
+  ],
+  "expected_divergences": []
+}

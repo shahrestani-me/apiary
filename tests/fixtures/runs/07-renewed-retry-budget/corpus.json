@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "Two failures on one blocker, then a third with a different signature. reconcile._retry_or_give_up renews the per-blocker budget and restarts the streak at 1, so the task keeps running at attempt 3 against a cap of 3. The renewal is a judgment in apiary's own store (ADR 0002) and no fact on the code host records it.",
+  "exercises": [
+    "a renewed per-blocker budget",
+    "streak diverging from attempt",
+    "a task running past the cap the resolver can see"
+  ],
+  "expected_divergences": [
+    {
+      "cycle": 7,
+      "task": "importer",
+      "derived": "needs-human",
+      "control": "eligible",
+      "why": "The third failure carried a different blocker signature, so reconcile._retry_or_give_up renewed the budget and reset streak to 1 while attempt went to 3. The give-up test runs on streak; this resolver can only see attempt. ADR 0002 says exactly why the signature is not derivable: deriving a judgment from its own log makes every consumer re-run the classifier, and a signature that changes when the classifier changes is not a signature."
+    },
+    {
+      "cycle": 8,
+      "task": "importer",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "The same renewal, one cycle on. Recorded separately because the control state moved while the derived one did not: a shadow report that collapsed a run of divergences into one entry would hide that the resolver is stuck rather than merely early."
+    },
+    {
+      "cycle": 9,
+      "task": "importer",
+      "derived": "needs-human",
+      "control": "review",
+      "why": "The same renewal, with apiary/%2371-attempt-3 and its pull request now confirming attempt 3 from the code host as well. The counter was never the missing fact - streak was - so a second source agreeing about attempt changes nothing, which is the clearest single demonstration in this corpus of what ADR 0002 is for."
+    }
+  ]
+}

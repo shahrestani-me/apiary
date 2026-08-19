@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "origin": "synthesised",
+  "describes": "recovery.py's own scenario: two issues claimed, one spawned, the process interrupted before the second reached manager.spawn. The label survives the crash and the container never existed, so for one cycle the control plane holds a claim that nothing is behind.",
+  "exercises": [
+    "an interrupted orchestrator",
+    "a stale claim with no container",
+    "the recovery sweep releasing it"
+  ],
+  "expected_divergences": [
+    {
+      "cycle": 2,
+      "task": "api",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "The dispatcher writes swarm:claimed before it spawns (the reverse loses issues to crashes outright) and the process died in that window, so the label is a claim with nothing behind it. Derived state is *right* here and the control plane is wrong: this is the exact fault orchestrator/recovery.py exists to repair, and it is recorded as a divergence rather than hidden because it is the strongest single piece of evidence for ADR 0001 in this corpus."
+    }
+  ]
+}
