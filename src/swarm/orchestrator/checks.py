@@ -85,7 +85,7 @@ import datetime as dt
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from ..config import SETTINGS
@@ -1025,13 +1025,23 @@ class ChecksReport:
     #: Comments this client had no method to post. `reconcile.post_comment`
     #: printed them instead.
     uncommented: tuple[int, ...] = ()
-    #: The commit each merge produced, by issue number - GitHub's answer to the
-    #: `PUT .../merge`, which this module previously threw away. Announcement
-    #: only: nothing here reads it, and `pr.merged` (#141) is the only consumer,
-    #: because "which commit is this task now" is the one fact about a landed
-    #: task that the run directory could not otherwise recover. Absent for a
-    #: client whose merge returns no `sha`, which the tests' doubles do.
-    merge_commits: Mapping[int, str] = field(default_factory=dict)
+    #: The commit each merge produced, as (issue number, sha) - GitHub's answer
+    #: to the `PUT .../merge`, which this module previously threw away.
+    #: Announcement only: nothing here reads it, and `pr.merged` (#141) is the
+    #: only consumer, because "which commit is this task now" is the one fact
+    #: about a landed task that the run directory could not otherwise recover.
+    #:
+    #: A tuple, like every other collection on this frozen record and for the
+    #: same reason: a `dict` field makes the generated `__hash__` raise, and a
+    #: frozen dataclass that cannot be hashed is frozen in name only. Absent for
+    #: a merge whose response carried no `sha` - `merge_pull_request` is typed
+    #: `Any` and a body-less 200 is a real answer.
+    merge_commits: tuple[tuple[int, str], ...] = ()
+
+    @property
+    def commit_by_issue(self) -> dict[int, str]:
+        """`merge_commits` as a lookup, for the one caller that wants one."""
+        return dict(self.merge_commits)
 
     @property
     def ok(self) -> bool:
@@ -1131,9 +1141,10 @@ def apply_checks(
             continue
         merged.append(merge.number)
         # Whatever the merge answered, if it answered anything with a `sha`.
-        # Guarded rather than indexed: the doubles in the tests return `None`,
-        # and a merge that landed must not be reported as a failure because the
-        # commit it produced could not be read back.
+        # Guarded rather than indexed: `merge_pull_request` is typed `Any`, a
+        # body-less response is a real answer, and a merge that *landed* must
+        # not be reported as a failure because the commit it produced could not
+        # be read back.
         if isinstance(answer, Mapping):
             commit = str(answer.get("sha") or "")
             if commit:
@@ -1170,7 +1181,7 @@ def apply_checks(
         failures=tuple(failures),
         undeleted=tuple(dict.fromkeys(undeleted)),
         uncommented=tuple(dict.fromkeys(uncommented)),
-        merge_commits=merge_commits,
+        merge_commits=tuple(merge_commits.items()),
     )
 
 

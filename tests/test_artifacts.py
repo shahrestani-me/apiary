@@ -833,7 +833,10 @@ def _recorded_before_this_ticket(root: Path) -> Path:
     (directory / EVENT_LOG_NAME).write_text(
         "".join(json.dumps(event) + "\n" for event in PRE_LIFECYCLE_EVENTS), encoding="utf-8"
     )
-    write_result(a_record(issue=7, exit_code=1, reason="the verify command failed"), directory / RESULTS_DIR_NAME)
+    write_result(
+        a_record(issue=7, exit_code=1, reason="the verify command failed"),
+        directory / RESULTS_DIR_NAME,
+    )
     return directory
 
 
@@ -874,7 +877,8 @@ def test_show_is_unchanged_for_a_run_recorded_before_the_lifecycle_existed(root)
             "      gate: python -m pytest -q",
             "      | 1 passed",
             "",
-            f"{len(PRE_LIFECYCLE_EVENTS)} event(s) in {EVENT_LOG_NAME}, 0 container log(s) in logs/",
+            f"{len(PRE_LIFECYCLE_EVENTS)} event(s) in {EVENT_LOG_NAME}, "
+            "0 container log(s) in logs/",
             f"at {directory}",
         ]
     )
