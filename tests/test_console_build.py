@@ -849,7 +849,7 @@ def test_a_repository_that_was_created_is_named_even_when_its_issues_are_not():
     assert "issues: write" in job["error"]["fix"]
     # Not a traceback dump: the fix is the point, and it says what to do with
     # the repository that now exists rather than "try again".
-    assert "delete it" in job["error"]["fix"]
+    assert "delete shahrestani-me/expense-tracker and start over" in job["error"]["fix"]
 
 
 # --------------------------------------------------------------------------
@@ -1188,3 +1188,133 @@ def test_the_page_follows_the_run_a_build_started():
     assert "job.result && job.result.run" in script          # the chain is read
     assert "pollSwarm(started.id, swarmView(started, runBox))" in script
     assert "r.run_error" in script                           # ...and its failure is drawn
+
+
+# --------------------------------------------------------------------------
+# Naming the cause an operator will actually hit (#237)
+# --------------------------------------------------------------------------
+
+
+class HTTPRefusal(RuntimeError):
+    """What `GitHubHTTPError` looks like to this module: a status, and a message."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"GET /repos/... -> {status}")
+        self.status = status
+
+
+def refusing(status: int | None):
+    """A work client whose first read fails the way GitHub failed it."""
+
+    class Refuses:
+        repo = "shahrestani-me/expense-tracker"
+
+        def list_issues(self, **_):
+            raise HTTPRefusal(status) if status else RuntimeError("something else")
+
+    return lambda repo: Refuses()
+
+
+def test_a_404_names_the_repository_scope_wall_rather_than_a_permission():
+    """The defect. `docs/security.md` §1 requires a fine-grained work key naming
+    selected repositories, and that selection is fixed when the token is minted
+    - so the repository this button created a second ago is one the work key
+    cannot see, and `docs/demo-run.md` §4 measured exactly that: 404 on the
+    repository, 404 on its issues. The old text sent the operator to add
+    `issues: write` to a token that already had it; they press again and get a
+    second empty repository."""
+    console, _, _ = console_with(client_for=refusing(404))
+
+    _, job = build(console, planned(console))
+
+    fix = job["error"]["fix"]
+    assert "selected repositories" in fix
+    assert "https://github.com/settings/personal-access-tokens" in fix
+    assert "issues: write" not in fix          # not the cause, and not offered as one
+
+
+def test_a_403_names_the_permission_because_that_is_what_github_said():
+    """The other half: the status decides. A token that *can* see the
+    repository and may not write to it is the `issues: write` case, and naming
+    the scope wall there would be the same defect pointing the other way."""
+    console, _, _ = console_with(client_for=refusing(403))
+
+    fix = build(console, planned(console))[1]["error"]["fix"]
+
+    assert "`issues: write`" in fix
+    assert "selected repositories" not in fix
+
+
+def test_a_failure_with_no_status_names_both_causes_scope_first():
+    """A transport error, a rate limit, or a client that raises something with
+    no status at all. Both causes, in the order of likelihood - which is the
+    order the ticket asks for."""
+    console, _, _ = console_with(client_for=refusing(None))
+
+    fix = build(console, planned(console))[1]["error"]["fix"]
+
+    assert fix.index("selected repositories") < fix.index("issues: write")
+
+
+def test_the_recovery_command_says_it_is_blocked_by_the_same_wall():
+    """`swarm run --repo ... ` uses the same work key against the same
+    unseeable repository, so on the 404 path it fails identically. Offering it
+    bare is the second wrong instruction in one message."""
+    console, _, _ = console_with(client_for=refusing(404))
+
+    fix = build(console, planned(console))[1]["error"]["fix"]
+
+    assert "swarm run --repo shahrestani-me/expense-tracker" in fix
+    assert "fails the same way until you do" in fix
+
+
+def test_the_wall_is_stated_before_anything_is_created():
+    """The third criterion, implemented rather than deferred: the operator
+    reads it on the form, before a repository exists. Not a refusal - a
+    fine-grained token set to *all* repositories does see new ones, and
+    refusing every fine-grained work key would refuse the configuration
+    security.md asks for."""
+    from swarm.console_build import BUILD_SITE
+
+    blurb = BUILD_SITE["blurb"]
+
+    assert "fine-grained GITHUB_TOKEN" in blurb
+    assert "settings/personal-access-tokens" in blurb
+
+
+def test_the_decision_not_to_refuse_before_provisioning_is_written_down():
+    """The criterion is "implemented, or written down with the reason it is
+    not". Half of it is implemented above; the half that is a judgment - why
+    this is stated rather than refused - is recorded where the next person
+    reading this module will meet it."""
+    import pathlib
+
+    from swarm import console_build
+
+    doc = pathlib.Path(console_build.__file__).read_text()
+
+    assert "Why the work key's blindness is *stated* rather than refused (#237)" in doc
+
+
+def test_a_rate_limited_write_is_not_reported_as_a_missing_permission():
+    """GitHub answers a secondary rate limit with 403, which the status branch
+    alone would read as `issues: write`. That is this ticket's own defect
+    arriving through the one status with two meanings - and the token is not
+    the problem, so nothing about it should be edited."""
+    from swarm.github.client import RateLimitError
+
+    class Throttled:
+        repo = "shahrestani-me/expense-tracker"
+
+        def list_issues(self, **_):
+            raise RateLimitError(403, "GET", "https://api.github.com/repos/x/y/issues",
+                                 b'{"message": "You have exceeded a secondary rate limit"}',
+                                 60.0)
+
+    console, _, _ = console_with(client_for=lambda repo: Throttled())
+
+    fix = build(console, planned(console))[1]["error"]["fix"]
+
+    assert "rate-limited" in fix
+    assert "issues: write" not in fix
+    assert "selected repositories" not in fix

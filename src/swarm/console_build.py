@@ -72,6 +72,25 @@ No model is asked either way: `Bootstrap.for_prompt` consults `choose_stack`
 only when the stack is blank, and the stack is a required field here precisely
 because there is nothing to ask.
 
+## Why the work key's blindness is *stated* rather than refused (#237)
+
+The work key cannot see a repository created after it was minted, so the first
+press of this button ends with a real repository and no issues in it. That is
+worth saying before anything is created - the blurb says it - and it is worth
+naming exactly when it happens - `_write_failure_fix` does.
+
+It is deliberately not a refusal, because nothing this module can ask before
+the repository exists gives a true answer. A fine-grained token set to *all*
+repositories does see new ones, and the API offers no way to tell that from a
+selected-repositories token except by listing what each key can see and
+comparing - two paginated listings on the one path whose whole design is that
+refusals are free, to produce a verdict that would still be a guess about a
+token the operator may be one browser tab away from editing. And a check that
+refused every fine-grained work key would refuse the configuration
+`docs/security.md` §1 asks for, on this button alone.
+
+So: said in advance, named precisely when it lands, and never guessed at.
+
 ## What this module does not do
 
 It does not run anything, and after #130 that is a statement about this module
@@ -253,7 +272,15 @@ BUILD_SITE: dict[str, Any] = {
         "The model is not asked to plan again. Nothing is created until the token and "
         "image checks pass, and any task that cannot become an issue is listed here rather "
         "than dropped. The only issue written that is not on this screen is the project "
-        "scaffold, and only while the box below is ticked."
+        "scaffold, and only while the box below is ticked. "
+        # #237's "a sentence before anything is created". A fine-grained work
+        # key naming selected repositories cannot see one that did not exist
+        # when it was minted, which is the failure every operator of this
+        # button hits once - and it is cheaper to read here than to diagnose
+        # from an empty repository afterwards.
+        "One thing to know before pressing it: a fine-grained GITHUB_TOKEN can only see the "
+        "repositories it was minted for, so a repository created here has to be added to it "
+        "at github.com/settings/personal-access-tokens before its issues can be written."
     ),
     "fields": [
         {"name": "owner", "label": "Owner — the GitHub account or organisation to create it under",
@@ -323,6 +350,89 @@ def plan_from_result(result: Any) -> Plan:
             f"that plan is not in a shape that can be written: {exc}",
             fix="run the planner again and press Start building on the fresh answer",
         ) from exc
+
+
+#: Where a fine-grained token's repository selection is edited. In one place
+#: because two strings that name a remedy drift, and this one is the remedy for
+#: the failure every operator of this button hits once.
+TOKEN_SETTINGS = "https://github.com/settings/personal-access-tokens"
+
+
+def _write_failure_fix(repo: str, exc: BaseException) -> str:
+    """What to do about issues that could not be written, by what GitHub said.
+
+    **The dominant cause is a 404 on the repository, not a 403 about
+    `issues: write`** (#237). `docs/security.md` §1 requires the work key to be
+    a fine-grained PAT naming selected repositories, and that selection is
+    fixed when the token is minted - so for an operator configured the way the
+    security model requires, the repository this button created one second ago
+    is one the work key cannot see. `docs/demo-run.md` §4 measured exactly
+    that pairing: 404 on the repository and 404 on its issues for the work key,
+    200 for the boot key.
+
+    Until #237 this fix named `issues: write` alone, which sends that operator
+    to add a permission their token already has; they press the button again
+    and get a second empty repository. A stated reason that is wrong is worse
+    than no reason, because somebody acts on it.
+
+    The status decides, because the client knows it: 404 is the scope wall,
+    403 is the permission. Anything with no status at all - a transport error,
+    a client that raises something else - gets both, scope first, because that
+    is the order of likelihood.
+
+    **A rate limit is checked before the status is read**, because GitHub
+    answers a secondary rate limit with 403 and this function would otherwise
+    tell an operator to grant a permission they already have and whose absence
+    was never the problem - the same defect this ticket is about, arriving
+    through the one status that has two meanings. `RateLimitError` is the
+    client's own verdict on that, made where the headers are still readable.
+
+    **The recovery command is annotated rather than offered bare.**
+    `swarm run --repo ...` uses the *same* work key against the *same*
+    unseeable repository, so on the 404 path it fails identically until the
+    token is edited. Offering it without saying so is the second wrong
+    instruction in one message.
+    """
+    from .github.client import RateLimitError
+
+    status = getattr(exc, "status", None)
+    resume = (
+        f"Then resume with `swarm run --repo {repo} --objective \"...\"` - `--new` has "
+        f"already done its job."
+    )
+    scope_cause = (
+        f"the work key cannot see {repo}: a fine-grained GITHUB_TOKEN's repository "
+        f"selection is fixed when the token is minted, so a repository created a moment "
+        f"ago is not in it."
+    )
+    scope_remedy = f"Add it to the work key's selected repositories at {TOKEN_SETTINGS}."
+    # Said out loud, because it is the same key against the same repository:
+    # offering the command without this is the second wrong instruction.
+    same_wall = (
+        f"Then resume with `swarm run --repo {repo} --objective \"...\"`, which uses the "
+        f"same key and fails the same way until you do."
+    )
+    if isinstance(exc, RateLimitError):
+        cause = (
+            f"GitHub rate-limited the write; the token is not the problem, so change "
+            f"nothing about it. Wait for the limit to clear, {resume[0].lower()}{resume[1:]}"
+        )
+    elif status == 404:
+        cause = f"{scope_cause} {scope_remedy} {same_wall}"
+    elif status == 403:
+        cause = (
+            f"the work key can reach {repo} but may not write issues to it. Grant "
+            f"GITHUB_TOKEN `issues: write` at {TOKEN_SETTINGS}. {resume}"
+        )
+    else:
+        cause = (
+            f"{scope_cause} {scope_remedy} If the token already names {repo}, the other "
+            f"cause is that it lacks `issues: write`. {same_wall}"
+        )
+    return (
+        f"{cause} Or delete {repo} and start over - pressing Start building again "
+        f"creates a second repository rather than filling this one."
+    )
 
 
 def _work_client(repo: str) -> Any:
@@ -484,10 +594,11 @@ class Builder:
             raise BuildError(
                 f"{report.repo} was created at {report.html_url}, but its issues "
                 f"could not be written: {type(exc).__name__}: {exc}",
-                fix=f"the repository exists and is empty of work - fix the cause and "
-                    f"run `swarm run --repo {report.repo} --objective ...`, or delete it "
-                    f"before pressing Start building again; a GITHUB_TOKEN without "
-                    f"`issues: write` fails exactly here",
+                # The cause named by what GitHub actually answered - see
+                # `_write_failure_fix`. Naming the wrong one here is #237: it
+                # sends the operator to fix a permission they already have, and
+                # the second press leaves a second empty repository.
+                fix=_write_failure_fix(report.repo, exc),
             ) from exc
         issues = tuple(
             WrittenIssue(
