@@ -52,7 +52,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 from ..config import SETTINGS
+from ..github.refs import issue_number
 from ..run import RUN_ID_ENV, RUN_LABEL, SUFFIX_ALPHABET, Run, validate_run_id
+from ..taskref import TaskRef
 
 #: The image #14 builds. Overridable per manager, because a locally built tag
 #: is how anyone tests a worker change before it is published anywhere.
@@ -799,9 +801,20 @@ class ContainerManager:
         """Capture, then destroy. Idempotent; see `dispose_container`."""
         return dispose_container(handle, self._cli)
 
-    def find(self, *, issue: int | None = None) -> list[Handle]:
-        """This run's containers, running or not."""
-        return find_containers(self._cli, run_id=self.run.id, issue=issue)
+    def find(self, *, ref: TaskRef | None = None) -> list[Handle]:
+        """This run's containers, running or not, optionally one task's only.
+
+        Takes a `TaskRef` because that is the identity the orchestrator holds
+        (`swarm/taskref.py`); the docker label it filters on is an issue
+        number, because a label value and a container name are written at
+        `docker create` and have to stay what they have always been. The
+        conversion is the GitHub adapter's, not this module's.
+        """
+        return find_containers(
+            self._cli,
+            run_id=self.run.id,
+            issue=None if ref is None else issue_number(ref),
+        )
 
     # --- plumbing -------------------------------------------------------
 

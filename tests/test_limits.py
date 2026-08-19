@@ -64,6 +64,7 @@ from swarm.containers.manager import (
     DockerCLI,
     Handle,
 )
+from swarm.github.refs import task_ref
 from swarm.run import Run
 
 REPO = "shahrestani-me/apiary"
@@ -565,7 +566,7 @@ def test_an_infinite_loop_is_killed_by_the_wall_clock_and_still_leaves_evidence(
 
         # Stopped, not removed: the run continues, this task is failed, and the
         # evidence is still readable.
-        assert [h.id for h in runaway.find(issue=19)] == [handle.id]
+        assert [h.id for h in runaway.find(ref=task_ref(19))] == [handle.id]
         assert "looping" in runaway.dispose(handle)
     finally:
         runaway.dispose(handle)

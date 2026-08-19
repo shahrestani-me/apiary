@@ -86,6 +86,7 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
+from ..github.refs import issue_number
 from ..worker.result import tail
 from .checks import (
     QUOTE_INDENT,
@@ -641,7 +642,7 @@ def _decide_conflicted(
             verdict=CONFLICTED,
             detail=f"conflicts with {facts.base_name}; {attempt} attempt(s) against a cap of {cap}",
             transition=Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=REVIEW,
                 to_label=FAILED,
                 reason=(
@@ -666,7 +667,7 @@ def _decide_conflicted(
         verdict=CONFLICTED,
         detail=f"conflicts with {facts.base_name}; re-dispatching as attempt {attempt} of {cap}",
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=READY,
             reason=(
@@ -709,7 +710,7 @@ def _decide_behind(
             verdict=BEHIND,
             detail=reason,
             transition=Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=REVIEW,
                 to_label=FAILED,
                 reason=reason,
@@ -1067,20 +1068,23 @@ def apply_mergeability(
         try:
             if transition.attempt is not None or decision.context:
                 _patch_body(client, transition, decision.context)
-            client.add_labels(transition.number, [transition.to_label])
+            # `Transition` is keyed on the task; these calls address the
+            # GitHub API, which takes issue numbers.
+            number = issue_number(transition.ref)
+            client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(transition.number, transition.from_label)
+                client.remove_label(number, transition.from_label)
         except GitHubError as exc:
-            failures.append(Failure(transition.number, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(decision.number, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
         # The pull request this issue was being counted for is finished with -
         # merged, abandoned or about to be replaced by a re-dispatch's - so the
         # rounds it spent must not be inherited by whatever opens next.
         if budget is not None:
-            budget.clear(transition.number)
-        if transition.comment and not post_comment(client, transition.number, transition.comment):
-            uncommented.append(transition.number)
+            budget.clear(decision.number)
+        if transition.comment and not post_comment(client, decision.number, transition.comment):
+            uncommented.append(decision.number)
 
     return MergeabilityReport(
         plan=plan,
@@ -1101,13 +1105,14 @@ def _patch_body(client: Any, transition: Transition, context: str) -> None:
     modules with their own idea of where the counter lives is how a counter stops
     bounding anything.
     """
-    issue = client.get_issue(transition.number)
+    number = issue_number(transition.ref)
+    issue = client.get_issue(number)
     body = issue.get("body") or ""
     if transition.attempt is not None and transition.task_id:
         body = rewrite_marker(body, transition.task_id, transition.attempt)
     if context:
         body = write_conflict(body, context, attempt=transition.attempt or 0)
-    client.update_issue(transition.number, body=body)
+    client.update_issue(number, body=body)
 
 
 # --------------------------------------------------------------------------

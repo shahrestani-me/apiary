@@ -57,6 +57,7 @@ from swarm.containers.manager import (
     find_containers,
     missing_image,
 )
+from swarm.github.refs import task_ref
 from swarm.run import RUN_LABEL, Run
 
 #: The repository root, for the one test that asserts a generated command names
@@ -531,7 +532,7 @@ def test_a_listing_reports_the_issue_each_container_belongs_to():
 def test_a_listing_can_be_narrowed_to_one_issue():
     manager, runner = make_manager()
 
-    manager.find(issue=7)
+    manager.find(ref=task_ref(7))
 
     assert f"label={ISSUE_LABEL}=7" in runner.argv_for("ps")
 
@@ -640,7 +641,7 @@ def test_the_logs_of_a_failed_container_survive_its_removal(live: ContainerManag
 def test_a_still_running_container_is_disposable_and_disposal_repeats(live: ContainerManager):
     handle = shell(live, 'echo "working"; sleep 300')
 
-    assert [h.id for h in live.find(issue=7)] == [handle.id]
+    assert [h.id for h in live.find(ref=task_ref(7))] == [handle.id]
     captured = live.dispose(handle)
     live.dispose(handle)
 

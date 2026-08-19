@@ -92,6 +92,7 @@ from ..config import SETTINGS
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
+from ..github.refs import issue_number
 from ..worker.result import tail
 from .dispatcher import REVIEW, normalise
 from .reconcile import (
@@ -738,7 +739,7 @@ def _decide(
             verdict=FAILING,
             detail=f"CI failed in {names}, outside this issue's ## Files",
             transition=Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=REVIEW,
                 to_label=FAILED,
                 reason=(
@@ -785,7 +786,7 @@ def _decide_empty(
         verdict=EMPTY,
         detail=reason,
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=FAILED,
             reason=reason,
@@ -824,7 +825,7 @@ def _decide_passed(
         verdict=PASSED,
         detail=f"{checks.summary()}; merging PR #{pull.number}",
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=DONE,
             reason=f"PR #{pull.number} merged: {checks.summary()}",
@@ -865,7 +866,7 @@ def _retry_or_give_up(
             verdict=FAILING,
             detail=f"{named} failed; {attempt} attempt(s) against a cap of {cap}",
             transition=Transition(
-                number=entry.number,
+                ref=entry.ref,
                 from_label=REVIEW,
                 to_label=FAILED,
                 reason=f"{named} failed; {attempt} attempt(s) made against a cap of {cap}",
@@ -883,7 +884,7 @@ def _retry_or_give_up(
         verdict=FAILING,
         detail=f"{named} failed; retrying as attempt {attempt} of {cap}",
         transition=Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=REVIEW,
             to_label=READY,
             reason=f"{named} failed on the pull request",
@@ -1125,15 +1126,18 @@ def apply_checks(
         try:
             if transition.attempt is not None or outcome.feedback:
                 _patch_body(client, transition, outcome.feedback)
-            client.add_labels(transition.number, [transition.to_label])
+            # `Transition` is keyed on the task, and every call here addresses
+            # the GitHub API, which takes issue numbers.
+            number = issue_number(transition.ref)
+            client.add_labels(number, [transition.to_label])
             if transition.from_label and transition.from_label != transition.to_label:
-                client.remove_label(transition.number, transition.from_label)
+                client.remove_label(number, transition.from_label)
         except GitHubError as exc:
-            failures.append(Failure(transition.number, f"{transition.to_label}: {exc}"))
+            failures.append(Failure(outcome.number, f"{transition.to_label}: {exc}"))
             continue
         applied.append(transition)
-        if transition.comment and not post_comment(client, transition.number, transition.comment):
-            uncommented.append(transition.number)
+        if transition.comment and not post_comment(client, outcome.number, transition.comment):
+            uncommented.append(outcome.number)
 
     return ChecksReport(
         plan=plan,
@@ -1159,13 +1163,14 @@ def _patch_body(client: Any, transition: Transition, feedback: str) -> None:
     with their own idea of where the counter lives is how a counter stops
     bounding anything.
     """
-    issue = client.get_issue(transition.number)
+    number = issue_number(transition.ref)
+    issue = client.get_issue(number)
     body = issue.get("body") or ""
     if transition.attempt is not None and transition.task_id:
         body = rewrite_marker(body, transition.task_id, transition.attempt)
     if feedback:
         body = write_feedback(body, feedback, attempt=transition.attempt or 0)
-    client.update_issue(transition.number, body=body)
+    client.update_issue(number, body=body)
 
 
 # --------------------------------------------------------------------------

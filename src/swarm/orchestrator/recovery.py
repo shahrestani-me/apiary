@@ -110,7 +110,9 @@ from ..containers.manager import DockerCLI, Handle, Redactor, find_containers
 from ..github.client import GitHubClient
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY, IssueState
+from ..github.refs import task_ref
 from ..run import Run, RunError, validate_run_id
+from ..taskref import TaskRef
 from .dispatcher import CLAIMED, REVIEW
 from .reconcile import FAILED, ReconcilePlan, ReconcileReport, Snapshot, Transition, apply_plan
 
@@ -134,8 +136,8 @@ def live_runs(run: Run | None = None, extra: Collection[str] = ()) -> frozenset[
     return frozenset(live)
 
 
-def holders(containers: Iterable[Handle], live: Collection[str]) -> dict[int, Handle]:
-    """Issue number -> a container that could plausibly be running it.
+def holders(containers: Iterable[Handle], live: Collection[str]) -> dict[TaskRef, Handle]:
+    """Task ref -> a container that could plausibly be running it.
 
     Two kinds of container answer for an issue, and both of them are "not ours
     to release":
@@ -154,12 +156,14 @@ def holders(containers: Iterable[Handle], live: Collection[str]) -> dict[int, Ha
     signal: its orchestrator is gone, nobody will ever read its exit code, and
     #20 is on its way to removing it.
     """
-    found: dict[int, Handle] = {}
+    found: dict[TaskRef, Handle] = {}
     for handle in containers:
         if handle.issue is None:
             continue
         if handle.run_id in live or not _is_run_id(handle.run_id):
-            found.setdefault(int(handle.issue), handle)
+            # The docker label is an issue number (`containers/manager.py`);
+            # minted here so this map keys on the same identity the ledger does.
+            found.setdefault(task_ref(int(handle.issue)), handle)
     return found
 
 
@@ -185,11 +189,11 @@ class Held:
     tracker, and this sentence is the only thing that tells them apart.
     """
 
-    number: int
+    ref: TaskRef
     reason: str
 
     def __str__(self) -> str:
-        return f"#{self.number}: held ({self.reason})"
+        return f"{self.ref}: held ({self.reason})"
 
 
 @dataclass(frozen=True)
@@ -223,8 +227,8 @@ class RecoveryPlan:
         return bool(self.transitions)
 
     @property
-    def numbers(self) -> tuple[int, ...]:
-        return tuple(transition.number for transition in self.transitions)
+    def refs(self) -> tuple[TaskRef, ...]:
+        return tuple(transition.ref for transition in self.transitions)
 
     def summary(self) -> str:
         parts = [
@@ -251,7 +255,7 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
     reason = "claimed with no live container behind it"
     if attempt >= cap:
         return Transition(
-            number=entry.number,
+            ref=entry.ref,
             from_label=entry.state_label,
             to_label=FAILED,
             reason=f"{reason}; {attempt} attempt(s) made against a cap of {cap}",
@@ -264,7 +268,7 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
             ),
         )
     return Transition(
-        number=entry.number,
+        ref=entry.ref,
         from_label=entry.state_label,
         to_label=READY,
         reason=reason,
@@ -278,7 +282,7 @@ def plan_recovery(
     *,
     containers: Iterable[Handle] = (),
     live_run_ids: Collection[str] = (),
-    states: Mapping[int, IssueState] | None = None,
+    states: Mapping[TaskRef, IssueState] | None = None,
     open_branches: Collection[str] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
 ) -> RecoveryPlan:
@@ -298,24 +302,24 @@ def plan_recovery(
     transitions: list[Transition] = []
     held: list[Held] = []
 
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         if entry.state_label != CLAIMED:
             continue
 
         # 1. GitHub wins, and a closed issue is out of the run whatever its
         #    labels say. What it becomes - `done` or `failed` - is #22's rule
         #    and reading it from here would be a second opinion on one fact.
-        state = states.get(entry.number)
+        state = states.get(entry.ref)
         if state is not None and state.closed:
             held.append(
-                Held(entry.number, "closed on GitHub; the reconciler decides what it becomes")
+                Held(entry.ref, "closed on GitHub; the reconciler decides what it becomes")
             )
             continue
 
         # 2. Somebody is running it. The claim is doing its job.
-        handle = live.get(entry.number)
+        handle = live.get(entry.ref)
         if handle is not None:
-            held.append(Held(entry.number, f"a container of run {handle.run_id!r} is holding it"))
+            held.append(Held(entry.ref, f"a container of run {handle.run_id!r} is holding it"))
             continue
 
         # 3. The worker got as far as a pull request and died before it could
@@ -324,7 +328,7 @@ def plan_recovery(
         if open_branches is not None and entry.branch in open_branches:
             transitions.append(
                 Transition(
-                    number=entry.number,
+                    ref=entry.ref,
                     from_label=entry.state_label,
                     to_label=REVIEW,
                     reason=(
@@ -370,8 +374,8 @@ class RecoveryReport:
         return self.result.applied
 
     @property
-    def numbers(self) -> tuple[int, ...]:
-        return tuple(transition.number for transition in self.applied)
+    def refs(self) -> tuple[TaskRef, ...]:
+        return tuple(transition.ref for transition in self.applied)
 
     @property
     def ok(self) -> bool:
@@ -442,7 +446,7 @@ class Recovery:
         ledger: Ledger,
         *,
         containers: Iterable[Handle] | None = None,
-        states: Mapping[int, IssueState] | None = None,
+        states: Mapping[TaskRef, IssueState] | None = None,
         open_branches: Collection[str] | None = None,
     ) -> RecoveryPlan:
         """What this pass would do, without doing any of it."""
@@ -460,7 +464,7 @@ class Recovery:
         ledger: Ledger,
         *,
         containers: Iterable[Handle] | None = None,
-        states: Mapping[int, IssueState] | None = None,
+        states: Mapping[TaskRef, IssueState] | None = None,
         open_branches: Collection[str] | None = None,
     ) -> RecoveryReport:
         """Plan and write. The mid-cycle entry point.

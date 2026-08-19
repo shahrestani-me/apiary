@@ -38,6 +38,13 @@ reported, because §4 gives `any -> failed` to the reconciler and not to this
 module. (Cross-repo refs never reach here - `ledger.parse_contract` rejects
 them at the parse.)
 
+**The graph is keyed on `TaskRef`, not on issue numbers.** Every mapping here -
+edges, resolved states, verdicts - is keyed on the opaque ref the adapter
+minted (`swarm/taskref.py`), and the two numeric spots left are the two that
+address the API: the `get_issue` fallback in `resolve_states` and the label
+write in `_relabel`. Nothing in the decision path can read a ref, which is what
+makes the same graph run over a tracker whose ids are `ENG-123`.
+
 **Only `ready` and `blocked` are ever written.** An issue that is claimed, in
 review, done or failed is somebody else's row in the state machine; relabelling
 one because its dependency graph changed would yank an issue out from under a
@@ -50,8 +57,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..taskref import TaskRef
 from .client import GitHubClient, GitHubHTTPError
 from .ledger import Ledger, load_ledger
+from .refs import issue_number, task_ref
 
 READY = "swarm:ready"
 BLOCKED = "swarm:blocked"
@@ -85,12 +94,12 @@ class DependencyCycleError(ReadinessError):
     legitimately blocked, and a run that dispatches the rest of the backlog and
     then waits forever on this is precisely the silent hang.
 
-    `cycle` is the ring as issue numbers, first node repeated at the end.
+    `cycle` is the ring as task refs, first node repeated at the end.
     """
 
-    def __init__(self, cycle: Sequence[int]) -> None:
+    def __init__(self, cycle: Sequence[TaskRef]) -> None:
         self.cycle = tuple(cycle)
-        path = " -> ".join(f"#{number}" for number in self.cycle)
+        path = " -> ".join(str(ref) for ref in self.cycle)
         super().__init__(f"dependency cycle in ## Blocked by: {path}")
 
 
@@ -98,16 +107,16 @@ class UnresolvableReferenceError(ReadinessError):
     """A `## Blocked by` ref that cannot be resolved to an issue in this repo.
 
     Collected rather than raised: one issue naming a dead number must not stop
-    the other twenty from running. Carries the dependant's number because the
+    the other twenty from running. Carries the dependant's ref because the
     reconciler posts this back as a comment on that issue and labels it
     `swarm:failed` (`docs/issue-contract.md` §1.4, §4).
     """
 
-    def __init__(self, number: int, ref: int, reason: str) -> None:
-        self.number = number
+    def __init__(self, task: TaskRef, ref: TaskRef, reason: str) -> None:
+        self.task = task
         self.ref = ref
         self.reason = reason
-        super().__init__(f"issue #{number}: [Blocked by] {reason}")
+        super().__init__(f"issue {task}: [Blocked by] {reason}")
 
 
 # --------------------------------------------------------------------------
@@ -125,7 +134,7 @@ class IssueState:
     to be open or closed.
     """
 
-    number: int
+    ref: TaskRef
     state: str = "open"                  # "open" | "closed"
     state_reason: str | None = None
     exists: bool = True
@@ -134,15 +143,15 @@ class IssueState:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> IssueState:
         return cls(
-            number=int(payload["number"]),
+            ref=task_ref(int(payload["number"])),
             state=str(payload.get("state") or "open"),
             state_reason=payload.get("state_reason"),
             is_pull_request="pull_request" in payload,
         )
 
     @classmethod
-    def missing(cls, number: int) -> IssueState:
-        return cls(number=number, exists=False)
+    def missing(cls, ref: TaskRef) -> IssueState:
+        return cls(ref=ref, exists=False)
 
     @property
     def closed(self) -> bool:
@@ -165,15 +174,15 @@ class IssueState:
     def reason(self) -> str:
         """Why this reference is unmet, in words a human reads on the issue."""
         if not self.exists:
-            return f"#{self.number} does not exist"
+            return f"{self.ref} does not exist"
         if self.is_pull_request:
-            return f"#{self.number} is a pull request, not an issue"
+            return f"{self.ref} is a pull request, not an issue"
         if self.state != "closed":
-            return f"#{self.number} is open"
+            return f"{self.ref} is open"
         # `not_planned` reads as "not planned": this string ends up in a comment
         # on somebody's issue, not in a log line.
         reason = (self.state_reason or "unknown").replace("_", " ")
-        return f"#{self.number} was closed as {reason}"
+        return f"{self.ref} was closed as {reason}"
 
 
 @dataclass(frozen=True)
@@ -184,7 +193,7 @@ class UnmetRef:
     the system working, and a reference to an issue that does not exist is not.
     """
 
-    number: int
+    ref: TaskRef
     reason: str
     error: bool = False
 
@@ -198,7 +207,7 @@ class UnmetRef:
 class Verdict:
     """What one issue's label should be, and what it currently is."""
 
-    number: int
+    ref: TaskRef
     task_id: str
     current_label: str
     label: str
@@ -218,8 +227,8 @@ class Verdict:
 
     def __str__(self) -> str:
         if not self.unmet:
-            return f"#{self.number} {self.task_id}: ready"
-        return f"#{self.number} {self.task_id}: blocked - " + "; ".join(
+            return f"{self.ref} {self.task_id}: ready"
+        return f"{self.ref} {self.task_id}: blocked - " + "; ".join(
             ref.reason for ref in self.unmet
         )
 
@@ -242,13 +251,13 @@ class ReadinessPlan:
         return tuple(verdict for verdict in self.verdicts if verdict.changed)
 
     @property
-    def ready(self) -> tuple[int, ...]:
-        """Issue numbers the dispatcher (#21) may pick up."""
-        return tuple(verdict.number for verdict in self.verdicts if verdict.ready)
+    def ready(self) -> tuple[TaskRef, ...]:
+        """The tasks the dispatcher (#21) may pick up."""
+        return tuple(verdict.ref for verdict in self.verdicts if verdict.ready)
 
     @property
-    def blocked(self) -> tuple[int, ...]:
-        return tuple(verdict.number for verdict in self.verdicts if not verdict.ready)
+    def blocked(self) -> tuple[TaskRef, ...]:
+        return tuple(verdict.ref for verdict in self.verdicts if not verdict.ready)
 
     def summary(self) -> str:
         return (
@@ -264,16 +273,18 @@ class ReadinessPlan:
 _WHITE, _GREY, _BLACK = 0, 1, 2
 
 
-def find_cycle(edges: Mapping[int, Sequence[int]]) -> tuple[int, ...] | None:
+def find_cycle(edges: Mapping[TaskRef, Sequence[TaskRef]]) -> tuple[TaskRef, ...] | None:
     """Return one cycle as `(a, b, …, a)`, or None if the graph is acyclic.
 
     An explicit stack rather than recursion: a backlog is a fine place for a
     long chain, and blowing the interpreter's stack on one would report a
     dependency problem as a `RecursionError`. Nodes and successors are walked
     in ascending order so the same graph always names the same ring - a cycle
-    that reports a different path every run is much harder to fix.
+    that reports a different path every run is much harder to fix. `TaskRef`
+    carries that order itself, so this walk never has to know what it is
+    sorting.
     """
-    colour: dict[int, int] = {}
+    colour: dict[TaskRef, int] = {}
     for root in sorted(edges):
         if colour.get(root, _WHITE) != _WHITE:
             continue
@@ -306,8 +317,8 @@ def find_cycle(edges: Mapping[int, Sequence[int]]) -> tuple[int, ...] | None:
 
 
 def _live_edges(
-    ledger: Ledger, states: Mapping[int, IssueState]
-) -> dict[int, tuple[int, ...]]:
+    ledger: Ledger, states: Mapping[TaskRef, IssueState]
+) -> dict[TaskRef, tuple[TaskRef, ...]]:
     """The dependency graph restricted to edges that can still block something.
 
     Two prunings, and both are about not crying wolf. An edge onto a satisfied
@@ -317,20 +328,20 @@ def _live_edges(
     issue need not carry a contract at all), so it has no outgoing edges we are
     entitled to invent.
     """
-    numbers = {entry.number for entry in ledger.entries.values()}
+    known = {entry.ref for entry in ledger.entries.values()}
     return {
-        entry.number: tuple(
+        entry.ref: tuple(
             ref
             for ref in entry.blocked_by
-            if ref in numbers and not _state(states, ref).satisfied
+            if ref in known and not _state(states, ref).satisfied
         )
         for entry in ledger.entries.values()
     }
 
 
-def _state(states: Mapping[int, IssueState], number: int) -> IssueState:
+def _state(states: Mapping[TaskRef, IssueState], ref: TaskRef) -> IssueState:
     """A ref nobody resolved is missing, not satisfied - the safe default."""
-    return states.get(number) or IssueState.missing(number)
+    return states.get(ref) or IssueState.missing(ref)
 
 
 # --------------------------------------------------------------------------
@@ -338,7 +349,9 @@ def _state(states: Mapping[int, IssueState], number: int) -> IssueState:
 # --------------------------------------------------------------------------
 
 
-def compute_readiness(ledger: Ledger, states: Mapping[int, IssueState]) -> ReadinessPlan:
+def compute_readiness(
+    ledger: Ledger, states: Mapping[TaskRef, IssueState]
+) -> ReadinessPlan:
     """Decide each transitionable entry's label. Raises on a dependency cycle.
 
     Pure: `states` is every referenced issue's open/closed fact, already
@@ -354,7 +367,7 @@ def compute_readiness(ledger: Ledger, states: Mapping[int, IssueState]) -> Readi
 
     verdicts: list[Verdict] = []
     errors: list[UnresolvableReferenceError] = []
-    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.number):
+    for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         unmet: list[UnmetRef] = []
         for ref in entry.blocked_by:
             state = _state(states, ref)
@@ -363,8 +376,8 @@ def compute_readiness(ledger: Ledger, states: Mapping[int, IssueState]) -> Readi
             unresolvable = not state.resolvable
             unmet.append(UnmetRef(ref, state.reason, error=unresolvable))
             if unresolvable:
-                errors.append(UnresolvableReferenceError(entry.number, ref, state.reason))
-        if entry.state_label not in TRANSITIONABLE or _state(states, entry.number).closed:
+                errors.append(UnresolvableReferenceError(entry.ref, ref, state.reason))
+        if entry.state_label not in TRANSITIONABLE or _state(states, entry.ref).closed:
             # Claimed, in review, done or failed - somebody else's row of §4.
             # Or closed: `docs/architecture-v2.md` makes "a human can close a
             # task mid-run and have the swarm respect it" a feature of putting
@@ -375,7 +388,7 @@ def compute_readiness(ledger: Ledger, states: Mapping[int, IssueState]) -> Readi
             continue
         verdicts.append(
             Verdict(
-                number=entry.number,
+                ref=entry.ref,
                 task_id=entry.task_id,
                 current_label=entry.state_label,
                 label=BLOCKED if unmet else READY,
@@ -396,19 +409,19 @@ def _as_client(source: GitHubClient | str) -> GitHubClient:
     return GitHubClient.from_env(source) if isinstance(source, str) else source
 
 
-def referenced_numbers(ledger: Ledger) -> tuple[int, ...]:
-    """Every issue number the ledger waits on, ascending and deduplicated."""
+def referenced_refs(ledger: Ledger) -> tuple[TaskRef, ...]:
+    """Every task the ledger waits on, ascending and deduplicated."""
     refs = {ref for entry in ledger.entries.values() for ref in entry.blocked_by}
     return tuple(sorted(refs))
 
 
 def resolve_states(
     source: GitHubClient | str,
-    numbers: Iterable[int],
+    refs: Iterable[TaskRef],
     *,
     issues: Iterable[Mapping[str, Any]] | None = None,
-) -> dict[int, IssueState]:
-    """Resolve each referenced number to an `IssueState`, missing ones included.
+) -> dict[TaskRef, IssueState]:
+    """Resolve each referenced task to an `IssueState`, missing ones included.
 
     One list call covers almost every ref, because the things a ledger waits on
     are overwhelmingly its own siblings; `get_issue` is the fallback for the
@@ -421,7 +434,7 @@ def resolve_states(
     the read.
     """
     client = _as_client(source)
-    wanted = sorted(set(numbers))
+    wanted = sorted(set(refs))
     if not wanted:
         return {}
 
@@ -429,23 +442,24 @@ def resolve_states(
     # read that only saw open issues would report every met dependency as unmet
     # and block the entire backlog.
     listing = issues if issues is not None else client.list_issues(state="all")
-    known = {int(payload["number"]): payload for payload in listing}
+    known = {task_ref(int(payload["number"])): payload for payload in listing}
 
-    states: dict[int, IssueState] = {}
-    for number in wanted:
-        payload = known.get(number)
+    states: dict[TaskRef, IssueState] = {}
+    for ref in wanted:
+        payload = known.get(ref)
         if payload is None:
             try:
                 # `list_issues` drops pull requests, so a ref that names one
                 # arrives here and is identified by the fetch, not mistaken for
-                # a missing issue.
-                payload = client.get_issue(number)
+                # a missing issue. This is an API call, so the ref becomes a
+                # number here and nowhere above.
+                payload = client.get_issue(issue_number(ref))
             except GitHubHTTPError as exc:
                 if exc.status != 404:
                     raise
-                states[number] = IssueState.missing(number)
+                states[ref] = IssueState.missing(ref)
                 continue
-        states[number] = IssueState.from_payload(payload)
+        states[ref] = IssueState.from_payload(payload)
     return states
 
 
@@ -474,8 +488,8 @@ def apply_readiness(
     # The entries' own numbers as well as the ones they reference: a task a
     # human closed mid-run must not be relabelled ready, and that fact lives on
     # the issue rather than in the ledger.
-    entries = tuple(entry.number for entry in ledger.entries.values())
-    states = resolve_states(client, (*referenced_numbers(ledger), *entries))
+    entries = tuple(entry.ref for entry in ledger.entries.values())
+    states = resolve_states(client, (*referenced_refs(ledger), *entries))
     plan = compute_readiness(ledger, states)
 
     if not dry_run:
@@ -493,8 +507,9 @@ def _relabel(client: GitHubClient, verdict: Verdict) -> None:
     conservative reading wins and the reconciler cleans it up. None puts the
     issue outside the ledger entirely, where nothing ever looks at it again.
     """
-    client.add_labels(verdict.number, [verdict.label])
-    client.remove_label(verdict.number, verdict.current_label)
+    number = issue_number(verdict.ref)
+    client.add_labels(number, [verdict.label])
+    client.remove_label(number, verdict.current_label)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke test

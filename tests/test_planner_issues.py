@@ -231,7 +231,7 @@ def test_a_plan_becomes_issues_the_loader_reads_back_identically(github):
     assert entry.attempt == 0
     # The dependency is written as an issue *number* and read back as one, and
     # the ledger turns it into a task id: identity and addressing, both intact.
-    assert entry.blocked_by == (ledger.entries["parse-headers"].number,)
+    assert entry.blocked_by == (ledger.entries["parse-headers"].ref,)
     assert entry.depends_on == ("parse-headers",)
     assert ledger.errors == () and ledger.repairs == ()
 
@@ -292,7 +292,7 @@ def test_a_goal_quoting_a_section_heading_round_trips(github):
 
     ledger = load_ledger(client)
     assert ledger.entries["readiness"].goal == goal
-    assert ledger.entries["later"].blocked_by == (ledger.entries["readiness"].number,)
+    assert ledger.entries["later"].blocked_by == (ledger.entries["readiness"].ref,)
 
 
 def test_a_heading_inside_a_goal_cannot_open_a_section(github):

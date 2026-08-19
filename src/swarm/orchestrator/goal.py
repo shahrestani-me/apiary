@@ -408,10 +408,10 @@ def _revive_abandoned(
     """
     wanted = set(assessment.abandoned)
     entries = [entry for entry in abandoned(ledger) if entry.number in wanted]
-    states = resolve_states(client, [entry.number for entry in entries])
+    states = resolve_states(client, [entry.ref for entry in entries])
     actions: list[IssueAction] = []
     for entry in entries:
-        state = states.get(entry.number)
+        state = states.get(entry.ref)
         if state is None or not state.exists or state.closed:
             continue
         action = revive(
@@ -446,10 +446,10 @@ def _retire_superseded(client: Any, ledger: Ledger) -> tuple[IssueAction, ...]:
     entries = abandoned(ledger)
     if not entries:
         return ()
-    states = resolve_states(client, [entry.number for entry in entries])
+    states = resolve_states(client, [entry.ref for entry in entries])
     actions: list[IssueAction] = []
     for entry in entries:
-        state = states.get(entry.number)
+        state = states.get(entry.ref)
         if state is None or not state.exists or state.closed:
             continue
         actions.append(

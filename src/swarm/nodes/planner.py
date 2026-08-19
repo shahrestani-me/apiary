@@ -131,6 +131,8 @@ from ..github.ledger import (
     slugify,
 )
 from ..github.readiness import BLOCKED, READY, IssueState, resolve_states
+from ..github.refs import task_ref
+from ..taskref import TaskRef
 from ..llm import orchestrator_llm, structured
 from ..state import Plan, PlannedTask, SwarmState, TaskRecord
 
@@ -480,7 +482,7 @@ def render_body(
     goal: str,
     files: Sequence[str],
     verify: str,
-    blocked_by: Sequence[int] = (),
+    blocked_by: Sequence[TaskRef] = (),
     attempt: int = 0,
     stack: str | None = None,
 ) -> str:
@@ -521,7 +523,9 @@ def render_body(
         verify,
         "",
         "## Blocked by",
-        *([f"- #{number}" for number in blocked_by] or [NO_DEPENDENCIES]),
+        # The ref *is* GitHub's `#N` spelling, so this renders exactly what it
+        # always did; `github/refs.py` is what makes that true, not this line.
+        *([f"- {ref}" for ref in blocked_by] or [NO_DEPENDENCIES]),
     ]
     if stack:
         lines += ["", "## Stack", stack]
@@ -702,7 +706,7 @@ class Draft:
     def title(self) -> str:
         return issue_title(self.goal, self.task_id)
 
-    def body(self, *, blocked_by: Sequence[int] = (), attempt: int = 0) -> str:
+    def body(self, *, blocked_by: Sequence[TaskRef] = (), attempt: int = 0) -> str:
         return render_body(
             self.task_id,
             goal=self.goal,
@@ -713,7 +717,7 @@ class Draft:
             stack=self.stack,
         )
 
-    def matches(self, entry: LedgerEntry, blocked_by: Sequence[int]) -> bool:
+    def matches(self, entry: LedgerEntry, blocked_by: Sequence[TaskRef]) -> bool:
         """True when the issue already says exactly this.
 
         Compared through the *parsed* fields rather than by rendering the old
@@ -994,19 +998,19 @@ def _self_check(draft: Draft, body: str) -> str | None:
     return None
 
 
-def _met(states: Mapping[int, IssueState], number: int) -> bool:
+def _met(states: Mapping[TaskRef, IssueState], ref: TaskRef) -> bool:
     """Whether a dependency is discharged. Unknown reads as unmet, never as met.
 
     An issue created moments ago is unknown here, and is also open, so the two
     agree. Erring the other way would label a task ready on the strength of not
     having looked.
     """
-    state = states.get(number)
+    state = states.get(ref)
     return state is not None and state.satisfied
 
 
-def _closed(states: Mapping[int, IssueState], number: int) -> bool:
-    return bool((state := states.get(number)) and state.closed)
+def _closed(states: Mapping[TaskRef, IssueState], ref: TaskRef) -> bool:
+    return bool((state := states.get(ref)) and state.closed)
 
 
 def write_plan(
@@ -1064,28 +1068,29 @@ def write_plan(
     # Every entry's own state, so a closed issue is recognised as one: the
     # ledger reads issues in any state and `LedgerEntry` records the label, not
     # whether GitHub has the issue open.
-    states = resolve_states(client, [entry.number for entry in ledger.entries.values()])
-    numbers = {task_id: entry.number for task_id, entry in ledger.entries.items()}
+    states = resolve_states(client, [entry.ref for entry in ledger.entries.values()])
+    known = {task_id: entry.ref for task_id, entry in ledger.entries.items()}
 
     for draft in ordered:
-        refs: list[int] = []
+        refs: list[TaskRef] = []
         for dep in draft.depends_on:
-            number = numbers.get(dep)
-            if number is None:
+            dependency = known.get(dep)
+            if dependency is None:
                 # The dependency was rejected, or the model named a task it did
-                # not emit. Either way there is no number to write, and the
-                # contract has no way to express a ref that is not `#N`.
+                # not emit. Either way there is no issue to reference, and the
+                # contract has no way to express a ref to work that does not
+                # exist yet.
                 warnings.append(
                     f"{draft.task_id}: dropped dependency on {dep!r} - no issue for it"
                 )
-            elif number not in refs:
-                refs.append(number)
+            elif dependency not in refs:
+                refs.append(dependency)
 
         entry = ledger.entries.get(draft.task_id)
         if entry is None:
             actions.append(_create(client, draft, refs, states))
             if actions[-1].number is not None:
-                numbers[draft.task_id] = actions[-1].number
+                known[draft.task_id] = task_ref(actions[-1].number)
             continue
         actions.append(
             _update(
@@ -1110,8 +1115,8 @@ def write_plan(
 def _create(
     client: GitHubClient,
     draft: Draft,
-    refs: Sequence[int],
-    states: Mapping[int, IssueState],
+    refs: Sequence[TaskRef],
+    states: Mapping[TaskRef, IssueState],
 ) -> IssueAction:
     """One new issue, with its body and every label, in a single POST.
 
@@ -1134,8 +1139,8 @@ def _update(
     client: GitHubClient,
     draft: Draft,
     entry: LedgerEntry,
-    refs: Sequence[int],
-    states: Mapping[int, IssueState],
+    refs: Sequence[TaskRef],
+    states: Mapping[TaskRef, IssueState],
     *,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
@@ -1152,7 +1157,7 @@ def _update(
     so a human can retitle mid-run, and re-asserting a generated title every
     replan takes that back.
     """
-    if _closed(states, entry.number):
+    if _closed(states, entry.ref):
         return IssueAction(
             "retained",
             draft.task_id,
@@ -1316,7 +1321,7 @@ def retire_superseded(client: GitHubClient, entry: LedgerEntry, *, because: str,
 def _drop(
     client: GitHubClient,
     entry: LedgerEntry,
-    states: Mapping[int, IssueState],
+    states: Mapping[TaskRef, IssueState],
     *,
     retire: bool,
 ) -> IssueAction:
@@ -1338,7 +1343,7 @@ def _drop(
         # retained like it used to be - see the module docstring for the
         # rewritten rationale. Human-closed stays untouched (GitHub wins), and
         # `retire=False` keeps the promise the flag makes everywhere else.
-        if _closed(states, entry.number):
+        if _closed(states, entry.ref):
             return IssueAction(
                 "retained", entry.task_id, entry.number, reason="dropped, already closed"
             )
@@ -1356,7 +1361,7 @@ def _drop(
         return IssueAction(
             "retained", entry.task_id, entry.number, reason=f"dropped, {entry.state_label}"
         )
-    if _closed(states, entry.number):
+    if _closed(states, entry.ref):
         return IssueAction(
             "retained", entry.task_id, entry.number, reason="dropped, already closed"
         )

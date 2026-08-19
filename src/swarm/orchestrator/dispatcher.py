@@ -80,6 +80,7 @@ from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
 from ..run import TERMINAL_LABELS
+from ..taskref import TaskRef
 
 #: The label this module writes, and the one it writes it over. `READY` is
 #: imported rather than respelled because readiness (#11) owns that string; no
@@ -285,7 +286,7 @@ class Spawner(Protocol):
     #: a second worker next cycle. So the claim is only given back when the
     #: daemon says there is nothing there. This is the same question #35's
     #: recovery asks before it releases anything, asked one cycle earlier.
-    def find(self, *, issue: int | None = None) -> list[Handle]: ...
+    def find(self, *, ref: TaskRef | None = None) -> list[Handle]: ...
 
 
 # --------------------------------------------------------------------------
@@ -369,7 +370,7 @@ def plan_dispatch(
     ledger: Ledger,
     *,
     capacity: Capacity | None = None,
-    ready: Iterable[int] | None = None,
+    ready: Iterable[TaskRef] | None = None,
 ) -> DispatchPlan:
     """Choose this cycle's issues. Pure - no API call, no daemon, no model.
 
@@ -401,7 +402,7 @@ def plan_dispatch(
         if allowed is None:
             if entry.state_label != READY:
                 continue
-        elif entry.number not in allowed or entry.state_label != READY:
+        elif entry.ref not in allowed or entry.state_label != READY:
             continue
         candidates.append(entry)
 
@@ -549,7 +550,7 @@ def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
     issue as still claimed, which is exactly what #35 was built to sweep.
     """
     try:
-        if manager.find(issue=entry.number):
+        if manager.find(ref=entry.ref):
             return False
     except ContainerError:
         # The probe itself could not answer. "Do not release" is the reading

@@ -44,6 +44,7 @@ import pytest
 
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
+from swarm.github.refs import task_ref
 from swarm.orchestrator.checks import (
     CheckSet,
     Merge,
@@ -417,7 +418,7 @@ def test_two_green_pull_requests_merge_one_at_a_time():
     assert plan.held == (24,)
     # Held is not failed: #24 is fine and goes next cycle.
     assert plan.transitions == ()
-    assert 24 not in [t.number for t in plan.admitted.transitions]
+    assert task_ref(24) not in [t.ref for t in plan.admitted.transitions]
 
 
 def test_the_pull_request_closest_to_starving_gets_the_merge_slot():
