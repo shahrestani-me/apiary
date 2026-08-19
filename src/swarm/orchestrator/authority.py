@@ -143,13 +143,25 @@ did: once the reconciler has acted, the belief it carries forward is the state
 it moved the task to, so the rule cannot fire twice on one attempt.
 
 A task this process has never seen has no previous belief, and there the label
-**is** seeded - see `Belief.seed`. It is the only durable record of the last
+**is** seeded - see `Belief.previous`. It is the only durable record of the last
 belief this system held, epic #140 has not removed it yet, and the alternative
-is that every restart forgives one rejected pull request and one unaccounted
-result. It is a seed for the two edge-triggered rules and nothing else; a task
-already in the map is never re-seeded, which is precisely why a label edited
-*mid-run* changes nothing. When #152 deletes the labels, this seam becomes the
-store's and the docstring above it says so.
+is that every restart forgives one rejected pull request, one unaccounted
+result, and - the worst of the three - every merge whose issue is no longer
+closed. A task already in the map is never re-seeded, which is precisely why a
+label edited *mid-run* changes nothing: #147's criterion is about a run in
+progress, and a label edited before the process started is the only record
+there is. When #152 deletes the labels this seam becomes the store's, and the
+docstring on `Belief.previous` says so.
+
+**`landed` is the third thing `previous` decides, and it is a ratchet rather
+than a trigger.** A merge is terminal within a run (`docs/issue-contract.md`
+§4) and the world stops showing it: a merged pull request leaves the open
+listing, so the only remaining evidence is the work item being closed as
+completed. Two ordinary things take that evidence away - `checks._decide_passed`
+writes `swarm:done` *before* GitHub has honoured `Closes #<n>`, and a human can
+reopen a finished issue - and in both the resolver reads `eligible` and the
+dispatcher puts a worker back on code that is already on the default branch.
+So once this run has believed a task landed, it stays landed.
 """
 
 from __future__ import annotations
@@ -179,6 +191,7 @@ __all__ = [
     "DERIVED",
     "INFRASTRUCTURE_CEILING",
     "LABELS",
+    "LANDED_STANDS",
     "REVIVED",
     "SOURCES",
     "STATE_SOURCE_ENV",
@@ -224,7 +237,17 @@ REVIVED = "revived"
 #: resolver the store has to, which is the half of ADR 0002 that is not about
 #: renewals.
 BUDGET_SPENT = "budget-spent"
-#: The fourth is not one of ADR 0001's: it is a task the resolver had no verdict
+#: `landed` is terminal **within a run** - `docs/issue-contract.md` §4 says so in
+#: as many words, and a merge is the one thing on the code host that cannot be
+#: taken back. It is a kind rather than an assumption because the world stops
+#: showing it: a merged pull request is not in `Snapshot`'s open listing, so once
+#: `Closes #<n>` has been honoured the *only* evidence left is the closed issue -
+#: and a human who reopens that issue, or a pull request merged without the
+#: keyword, takes that evidence away. The resolver then reads `eligible` and the
+#: dispatcher spawns a worker over work that is already on main.
+LANDED_STANDS = "landed-stands"
+
+#: The last is not one of ADR 0001's: it is a task the resolver had no verdict
 #: for at all, which `Resolution.state` reports as `""` rather than as a state
 #: because "nothing was said" is not an opinion. The label stands, and the
 #: fallback is counted rather than silent - a cutover that silently fell back to
@@ -359,6 +382,12 @@ class Belief:
     #: the end of the cycle, where the shadow window takes it.
     stored: Mapping[str, str] = field(default_factory=dict)
     overrides: tuple[Override, ...] = ()
+    #: task id -> what the orchestrator believed **last** cycle, with the label
+    #: standing in for a task this process has never seen. `plan_reconcile`'s
+    #: two edge-triggered rules read it; see this module's docstring for why no
+    #: absolute reading of the world can replace it, and why seeding from the
+    #: label is the honest answer until #152 moves the seam to the store.
+    previous: Mapping[str, str] = field(default_factory=dict)
     #: The resolution the belief was built from, or `None` under `labels`.
     #: Retained for a caller that wants the verdict's own sentence; nothing
     #: here decides on it a second time.
@@ -381,19 +410,6 @@ class Belief:
     def holds(self, task_id: str, *states: str) -> bool:
         """Is this task believed to be in any of `states`? The readers' idiom."""
         return self.states.get(task_id, "") in states
-
-    def seed(self, previous: Mapping[str, str]) -> dict[str, str]:
-        """The previous belief, seeded from the labels for tasks never seen.
-
-        The module docstring argues this at length and it is the one place a
-        label reaches a decision under the cutover, deliberately: reconcile's
-        two edge-triggered rules need the *previous* state and no absolute
-        reading of the world carries one. A task already in `previous` is never
-        re-seeded, which is exactly why a label edited mid-run changes nothing.
-        """
-        seeded = dict(self.stored)
-        seeded.update(previous)
-        return seeded
 
     def fold(self, transitions: Iterable[Any]) -> Belief:
         """Advance the belief by the label writes that landed. `fold`'s rule.
@@ -466,6 +482,7 @@ def believe(
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_cap: int = 3,
     revived: Mapping[TaskRef, int] | None = None,
+    remembered: Mapping[str, str] | None = None,
     max_attempts: int = 3,
     max_total_attempts: int = 9,
 ) -> Belief:
@@ -481,14 +498,24 @@ def believe(
     open pull request's file set**. So a blind cycle falls back to the labels
     wholesale and says so, which is the same answer `plan_reconcile` already
     gives its own blind rules: they did not run; they did not fail.
+
+    `remembered` is what this process believed last cycle. It becomes
+    `Belief.previous`, seeded from the labels for a task never seen - the one
+    place a label still reaches a decision, argued in the module docstring - and
+    it is read here for one rule: `landed` is terminal within a run, so a task
+    already believed landed stays landed.
     """
     infrastructure = infrastructure or {}
     revived = revived or {}
     entries = sorted(ledger.entries.values(), key=lambda entry: entry.ref)
 
+    by_label = {entry.task_id: _internal(entry.state_label) for entry in entries}
+    previous = {**by_label, **(remembered or {})}
+
     if source != DERIVED or observation is None:
-        by_label = {entry.task_id: _internal(entry.state_label) for entry in entries}
-        return Belief(source=LABELS, states=dict(by_label), stored=by_label)
+        return Belief(
+            source=LABELS, states=dict(by_label), stored=by_label, previous=previous
+        )
 
     resolution = resolve(observation)
     # The same observation with the budget rule suppressed, so a task whose
@@ -544,7 +571,22 @@ def believe(
             max_total_attempts=max_total_attempts,
         )
 
-        if cap and believed != LANDED and infrastructure.get(entry.ref, 0) >= cap:
+        if believed != LANDED and previous.get(entry.task_id) == LANDED:
+            # Ahead of every other overlay, because it is the only one that is
+            # about a fact nothing can undo. It also removes a transient the
+            # merge gate would otherwise produce every time it lands a task:
+            # `swarm:done` is written *before* GitHub has honoured `Closes #<n>`
+            # (`checks._decide_passed` says why), so the merged pull request has
+            # already left the open listing while the issue still reads open.
+            believed, kind = LANDED, LANDED_STANDS
+            why = (
+                "this run has already seen this task land, and a merge is terminal "
+                "within a run (`docs/issue-contract.md` §4). The merged pull request "
+                "is not in the open listing and the work item is not closed as "
+                f"completed, so the resolver reads {verdict.state} - which would put a "
+                "worker back on work that is already on the default branch."
+            )
+        elif cap and believed != LANDED and infrastructure.get(entry.ref, 0) >= cap:
             streak = infrastructure.get(entry.ref, 0)
             believed, kind = NEEDS_HUMAN, INFRASTRUCTURE_CEILING
             why = (
@@ -604,6 +646,7 @@ def believe(
         source=DERIVED,
         states=states,
         stored=stored,
+        previous=previous,
         overrides=tuple(overrides),
         resolution=resolution,
     )

@@ -233,6 +233,16 @@ orchestrator therefore carries its previous belief, in the register
 never seen is seeded from the label, which is the one place a label still
 reaches a decision and is documented as such; #152 moves that seam to the store.
 
+**`landed` is terminal within a run, and the world stops showing it.** A merged
+pull request leaves the open listing, so once `Closes #<n>` has been honoured
+the only remaining evidence is the work item being closed as completed — and two
+ordinary things take that evidence away. `checks._decide_passed` writes
+`swarm:done` *before* GitHub has processed the closing keyword, and a human can
+reopen a finished issue. In both the resolver reads `eligible` and the
+dispatcher would put a worker back on code that is already on the default
+branch. So the belief ratchets: once a run has seen a task land it stays landed,
+and a fresh process seeds that from the label along with the previous belief.
+
 **`claimed` is liveness, and a dispatcher has to read existence.** The resolver
 reads `docker ps --format {{.State}}` and is right to — that is what "a live
 worker container" means, and #187 exists because reading existence held every

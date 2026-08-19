@@ -49,6 +49,7 @@ from swarm.orchestrator.authority import (
     DERIVED,
     INFRASTRUCTURE_CEILING,
     LABELS,
+    LANDED_STANDS,
     REVIVED,
     STATE_SOURCE_ENV,
     UNRESOLVED,
@@ -138,7 +139,7 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
 def a_run(label: str, source: str, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any]:
     """One cycle the orchestrator has already seen, then a human edits a label.
 
-    Two cycles, and the first one matters: `authority.Belief.seed` falls back to
+    Two cycles, and the first one matters: `authority.believe`'s `remembered` falls back to
     the label for a task this process has never seen, so an edit made before the
     first cycle would be seeding rather than overriding. #147's criterion is
     about a label edited **mid-run**, and this is what mid-run means.
@@ -575,6 +576,63 @@ def record_fact(issue: int, *, attempt: int, exit_code: int = 1) -> Any:
     return AttemptFact(ref=ref(issue), attempt=attempt, exit_code=exit_code)
 
 
+def test_a_task_this_run_has_seen_land_is_never_dispatched_again():
+    """`landed` is terminal within a run, and the world stops showing it.
+
+    A merged pull request is not in `Snapshot`'s open listing, so once the merge
+    has happened the only remaining evidence is the issue being closed as
+    completed - and there are two ordinary ways for that evidence not to be
+    there. `checks._decide_passed` writes `swarm:done` *before* GitHub has
+    honoured `Closes #<n>`, so on the landing cycle the pull request has already
+    left the listing while the issue still reads open; and a human who reopens a
+    finished issue takes the evidence away for good.
+
+    Under the labels `swarm:done` was terminal and neither mattered. Under the
+    resolver alone both read `eligible`, and the dispatcher puts a worker back
+    on work that is already on the default branch.
+    """
+    merged = entry(4, label=DONE)
+    world_after_the_merge = world(merged)  # no open pull request, issue not closed
+
+    # Both routes to the same answer, because they are different failures. The
+    # first is this run remembering its own merge; the second is a fresh process
+    # with nothing but the label, which is the restart case and the reason the
+    # seed exists at all.
+    held = believe(ledger(merged), world_after_the_merge, remembered={"task-4": LANDED})
+    resumed = believe(ledger(merged), world_after_the_merge)
+
+    assert held.state("task-4") == LANDED
+    assert resumed.state("task-4") == LANDED
+    assert [one.kind for one in held.overrides] == [LANDED_STANDS]
+    # The resolver's own verdict is recorded on the override, which is what
+    # makes this assertion about a *rescue* rather than about agreement.
+    assert held.overrides[0].derived == ELIGIBLE
+
+    plan = plan_dispatch(
+        ledger(merged),
+        capacity=Capacity(slots=3, configured=2),
+        ready=(ref(4),),
+        believed=held,
+    )
+    assert plan.numbers == ()
+
+
+def test_the_previous_belief_is_seeded_from_the_label_only_for_a_task_never_seen():
+    """The seed is the one place a label still reaches a decision, and it is
+    bounded to tasks this process has no memory of.
+
+    That bound is what makes #147's criterion hold: a label edited mid-run
+    belongs to a task the orchestrator has already seen, so it is never seeded
+    and the edit changes nothing.
+    """
+    task = entry(4, label=REVIEW)
+    fresh = believe(ledger(task), world(task))
+    assert fresh.previous == {"task-4": REVIEW_STATE}
+
+    remembered = believe(ledger(task), world(task), remembered={"task-4": CLAIMED_STATE})
+    assert remembered.previous == {"task-4": CLAIMED_STATE}
+
+
 # --------------------------------------------------------------------------
 # 5. A cycle that cannot see
 # --------------------------------------------------------------------------
@@ -693,16 +751,18 @@ def test_reconcile_reads_terminal_from_the_authority_and_from_label():
     closure.
     """
     task = entry(4, label=DONE)
+    live = world(task, containers=(ContainerFact(id="c", run_id="", ref=ref(4), running=True),))
 
     labelled = plan_reconcile(ledger(task), running=[ref(4)])
     assert [one.ref for one in labelled.disposals] == [ref(4)]
 
-    held = belief(
-        task,
-        observation=world(
-            task, containers=(ContainerFact(id="c", run_id="", ref=ref(4), running=True),)
-        ),
-    )
+    # `remembered`, because this is the mid-run case: the orchestrator has seen
+    # this task claimed and a human has since typed `swarm:done` on it. Without
+    # a memory the label is the only record there is and the seed reads it -
+    # which is the restart case and a different question (see the `landed`
+    # ratchet above).
+    held = believe(ledger(task), live, remembered={"task-4": CLAIMED_STATE})
+    assert held.state("task-4") == CLAIMED_STATE
     assert plan_reconcile(ledger(task), running=[ref(4)], believed=held).disposals == ()
 
 

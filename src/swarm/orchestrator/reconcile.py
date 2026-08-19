@@ -894,7 +894,7 @@ def _was(
     Falls back to `_now` when nothing remembers this task, which under the
     labels is the same answer and under the resolver is the first cycle of a
     process. `Reconciler` seeds `previous` from the labels for exactly that
-    case - see `authority.Belief.seed`, which is where the argument for it is.
+    case - see `authority.Belief.previous`, which is where the argument is.
     """
     if previous is None:
         return _now(entry, believed)
@@ -1766,7 +1766,7 @@ class Reconciler:
     #: `plan_reconcile` is incremental and the resolver is absolute; this is the
     #: "was" the label used to carry. Run-scoped, like `_infrastructure` and
     #: `update_budget`, and seeded from the labels for a task never seen - see
-    #: `authority.Belief.seed`.
+    #: `authority.Belief.previous`.
     _believed: dict[str, str] = field(default_factory=dict, repr=False)
     #: Tasks `planner.revive` returned to the run, and the attempt counter each
     #: was at. A revival grants exactly one attempt and lapses when it is spent
@@ -1856,10 +1856,10 @@ class Reconciler:
             infrastructure=self._infrastructure,
             infrastructure_cap=self.infrastructure_policy.cap,
             revived=self._revived,
+            remembered=self._believed,
             max_attempts=self.max_attempts,
             max_total_attempts=self.max_total_attempts,
         )
-        previous = belief.seed(self._believed)
         self._announce_overrides(index, belief)
         plan = plan_reconcile(
             ledger,
@@ -1869,7 +1869,7 @@ class Reconciler:
             running=tuple(handles),
             labels=snapshot.labels(),
             believed=belief,
-            previous=previous,
+            previous=belief.previous,
             max_attempts=self.max_attempts,
             max_total_attempts=self.max_total_attempts,
             infrastructure=self._infrastructure,
