@@ -613,7 +613,12 @@ def test_the_built_repository_becomes_a_project_the_operator_can_return_to(tmp_p
     from swarm.console_projects import ProjectStore
 
     console, _, _ = console_with()
-    console.projects = ProjectStore(path=tmp_path / "projects.sqlite")
+    # Both seams, not just the database: `ProjectStore` seeds itself from the
+    # runs under `runs_root`, so a store given only `path` reads the
+    # developer's real run history and this assertion counts their projects
+    # alongside the built one.
+    console.projects = ProjectStore(path=tmp_path / "projects.sqlite",
+                                    runs_root=tmp_path / "runs")
 
     _, job = build(console, planned(console))
 
