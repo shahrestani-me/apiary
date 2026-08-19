@@ -412,6 +412,14 @@ class Transition:
     #: counts these and a counter keyed on prose is a counter that stops
     #: counting the day somebody rewords a sentence.
     infrastructure: bool = False
+    #: `ResultRecord.identity` of the worker testimony this move was made from;
+    #: empty for a move no result caused. Named for the record rather than
+    #: `observed`, because `Observation` is already this package's word for
+    #: `derived.py`'s reading of the world and a bare `observed` reads as a
+    #: flag where this holds a digest. Carried so the next cycle can tell "the
+    #: record I already acted on" from "a second failure that looks like the
+    #: first" - `observed_records` folds it forward. See #203.
+    observed_record: str = ""
 
     def __str__(self) -> str:
         counter = "" if self.attempt is None else f", attempt {self.attempt}"
@@ -472,11 +480,25 @@ def infrastructure_streaks(
 
     **Counting transitions rather than results is what makes this correct.** A
     result file is one per *attempt*, and an infrastructure verdict does not
-    bump the attempt - so two mechanical failures in a row write the same
-    filename and the artifacts cannot tell them apart. A transition, by
+    bump the attempt - so the reconciler, which is handed one record per task
+    (`summarise_dir(...).latest`), sees the second mechanical failure displace
+    the first in a map the attempt number cannot order. A transition, by
     contrast, only fires when a claimed issue has a finished container to
     account for, so one infrastructure transition is exactly one infrastructure
     verdict, and re-reading an unchanged results directory produces none.
+
+    (The *files* can tell them apart, and #177 is why: `write_result` never
+    replaces an existing record, bumping the filename on collision instead. An
+    older reading of this docstring said the artifacts could not, and several
+    comments elsewhere still repeat it - the conclusion above survives either
+    way, because it is the reconciler's one-record-per-task view that loses the
+    ordering, not the directory.)
+
+    That last clause is what `observed_records` below exists to keep true. It
+    was not: exit 2 leaves `entry.attempt` alone, so the dead attempt's record
+    still satisfied `record.attempt >= entry.attempt` while its own retry was
+    in flight, `_observe` ran on it a second time, and one host failure counted
+    twice against `APIARY_MAX_INFRASTRUCTURE` (#203).
 
     Any other transition on an issue clears its streak: a real task failure
     after a mechanical one means the machine recovered and the run is back to
@@ -489,6 +511,43 @@ def infrastructure_streaks(
         else:
             streaks.pop(transition.ref, None)
     return streaks
+
+
+def observed_records(
+    previous: Mapping[TaskRef, str], transitions: Iterable[Transition]
+) -> dict[TaskRef, str]:
+    """Which result record each task's last landed move was made from (#203).
+
+    Pure arithmetic, folded forward from the cycle before, and folded from what
+    **landed** rather than what was planned - `infrastructure_streaks`' rule,
+    for its reason: a label write GitHub refused left the task where it was, and
+    marking its record spent would retire the only evidence the retry never
+    happened.
+
+    `entry.attempt` is what normally retires a record, and for an exit 1 it
+    does. Exit 2 is the hole: `docs/issue-contract.md` §4 does not consume an
+    attempt for a mechanical failure, so attempt N's record still reads as
+    current after attempt N's retry is dispatched, and the cycle after the
+    re-dispatch found a claimed issue with a "finished" record and acted on it
+    again - a second infrastructure transition, a second increment of the
+    streak, and the freshly-spawned container disposed out from under the retry.
+
+    The identity is the record's content rather than `(issue, attempt)`, because
+    two mechanical failures in a row at the same attempt are two verdicts and
+    both must count. `ResultRecord.identity` says why content is enough.
+
+    That the second verdict is *reachable* at all is inherited rather than
+    arranged here: `RunSummary.latest` keeps the newest record per issue on
+    `record.attempt >= current.attempt`, so between two records sharing an
+    attempt the later file wins on the stable sort. Retiring the first is what
+    lets the second through; nothing here would help if `latest` handed back
+    the older one.
+    """
+    seen = dict(previous)
+    for transition in transitions:
+        if transition.observed_record:
+            seen[transition.ref] = transition.observed_record
+    return seen
 
 
 @dataclass(frozen=True)
@@ -928,6 +987,7 @@ def plan_reconcile(
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
+    observed: Mapping[TaskRef, str] | None = None,
 ) -> ReconcilePlan:
     """Compare desired state with actual state. Pure - no API call, no daemon.
 
@@ -976,6 +1036,14 @@ def plan_reconcile(
     # because this function stays pure. `infrastructure_streaks` folds the
     # answer forward and `Reconciler` carries it between cycles.
     infrastructure = infrastructure or {}
+    # Which result record this run has already acted on, per task. Passed in
+    # for `infrastructure`'s reason - this function stays pure - and read only
+    # by rule 3, which is the one rule that can be handed the same record
+    # twice. `observed_records` folds it forward. See #203.
+    # Named `observed` rather than `observed_records`: the module-level
+    # `observed_records` is a function, and a parameter shadowing it inside this
+    # body would make a later call to it read as "Mapping not callable".
+    seen_records = observed or {}
     live = set(running)
 
     transitions: list[Transition] = []
@@ -1018,9 +1086,16 @@ def plan_reconcile(
         #    container is done; `attempt >= entry.attempt` is what stops a
         #    record being acted on twice, since the counter moves and the file
         #    does not.
+        #
+        #    Except after an exit 2, where §4 deliberately does not move the
+        #    counter - so the identity of the record this run already acted on
+        #    is what closes that hole, and only that hole: every other verdict
+        #    is retired by the attempt guard one line up before it is reached
+        #    (#203).
         record = results.get(entry.ref)
         finished = record is not None and record.attempt >= entry.attempt
-        if was == CLAIMED_STATE and finished and record is not None:
+        fresh = record is not None and record.identity != seen_records.get(entry.ref)
+        if was == CLAIMED_STATE and finished and fresh and record is not None:
             transition, disposal = _observe(
                 entry,
                 record,
@@ -1121,7 +1196,36 @@ def _observe(
     writes it at the instant the PR exists; an exit 0 whose label did not stick
     leaves a claimed issue with an open PR, and that is #35's row, not this
     one's. Taking it here would race the worker for the same write.
+
+    Every transition this returns names the record it was made from, so a cycle
+    that lands one can retire that record (`observed_records`). Stamped at this
+    function's one return rather than inside `_verdict`'s branches: a branch
+    added later cannot forget it, and a branch that forgot it would silently
+    count its verdict twice.
     """
+    transition, disposal = _verdict(
+        entry,
+        record,
+        max_attempts,
+        max_total_attempts=max_total_attempts,
+        infrastructure_streak=infrastructure_streak,
+        policy=policy,
+    )
+    if transition is not None:
+        transition = replace(transition, observed_record=record.identity)
+    return transition, disposal
+
+
+def _verdict(
+    entry: LedgerEntry,
+    record: ResultRecord,
+    max_attempts: int,
+    *,
+    max_total_attempts: int | None = None,
+    infrastructure_streak: int = 0,
+    policy: InfrastructurePolicy = InfrastructurePolicy(),
+) -> tuple[Transition | None, Disposal]:
+    """§4's three rows, and nothing about which record said so. `_observe`'s body."""
     if record.exit_code == EXIT_OK:
         return None, Disposal(entry.ref, "the worker published its pull request")
 
@@ -1792,6 +1896,13 @@ class Reconciler:
     #: granting a clean slate is the safe direction for a counter whose job is
     #: bounding one run.
     _infrastructure: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: The result record each task's last landed move was made from (#203).
+    #: Run-scoped for `_infrastructure`'s reason, and failing the same safe
+    #: way: a restart forgets which record it acted on, and the worst that buys
+    #: is one duplicate observation of a record whose retry is still in flight -
+    #: where carrying it across a restart would risk retiring a verdict this
+    #: process never acted on at all.
+    _observed_records: dict[TaskRef, str] = field(default_factory=dict, repr=False)
     #: Which task events have already been announced (#141). Run-scoped for the
     #: same reason, and holding nothing a decision reads. Typed loosely and
     #: built through a local import, for `merge_policy`'s reason: `lifecycle`
@@ -1927,6 +2038,7 @@ class Reconciler:
             max_total_attempts=self.max_total_attempts,
             infrastructure=self._infrastructure,
             infrastructure_policy=self.infrastructure_policy,
+            observed=self._observed_records,
         )
         result = apply_plan(
             snapshot,
@@ -1948,6 +2060,10 @@ class Reconciler:
         # it would escalate a task on the strength of a move that never
         # happened. Same rule `fold` follows one line up, for the same reason.
         self._infrastructure = infrastructure_streaks(self._infrastructure, result.applied)
+        # Same input, same rule, same reason: a record whose move landed has
+        # been accounted for and must not be accounted for again while its
+        # retry - which §4 runs at the *same* attempt number - is in flight.
+        self._observed_records = observed_records(self._observed_records, result.applied)
 
         # Containers this cycle actually removed. Read from what `apply_plan`
         # and the recovery sweep report rather than from what they planned, for

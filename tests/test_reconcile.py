@@ -32,7 +32,8 @@ the request count is the client's own and not a stub's.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import datetime as dt
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -41,7 +42,7 @@ from types import SimpleNamespace
 import pytest
 
 from fixtures.github import SentRequest, not_modified, page, response
-from swarm.containers.manager import DockerError, Handle
+from swarm.containers.manager import RUNNING_STATE, DockerError, Handle
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import (
@@ -63,6 +64,7 @@ from swarm.orchestrator.reconcile import (
     INFRASTRUCTURE_CAP_ENV,
     InfrastructurePolicy,
     infrastructure_streaks,
+    observed_records,
     COMMENT_METHOD,
     PULLS_METHOD,
     DONE,
@@ -1904,6 +1906,41 @@ def test_a_cycle_that_moved_nothing_counts_nothing():
     assert infrastructure_streaks({4: 2}, []) == {4: 2}
 
 
+def test_a_record_that_moved_nothing_is_not_retired():
+    """`observed_records` folds from what landed, not from what was planned -
+    `fold`'s rule and `infrastructure_streaks`' rule, for the same reason. A
+    label write GitHub refused leaves the task where it was, and retiring its
+    record would lose the only evidence the retry never happened."""
+    moved_nothing = Transition(ref(4), CLAIMED, READY, "no record caused this")
+
+    assert observed_records({}, []) == {}
+    assert observed_records({ref(4): "kept"}, [moved_nothing]) == {ref(4): "kept"}
+
+
+def test_two_verdicts_from_one_host_are_two_identities():
+    """What actually keeps a genuine second infrastructure failure countable.
+
+    Two mechanical failures in a row say the same thing for the same reason at
+    the same attempt number, so the *only* field that separates them is when
+    they finished - and `from_worker` and `synthesise` stamp that with
+    `datetime.now` on every record real code writes. Asserted here rather than
+    left to the loop test below, because it is the whole basis of the guard
+    being safe to key on content.
+    """
+    moment = dt.datetime(2026, 8, 14, 14, 10, tzinfo=dt.timezone.utc)
+    host_died = ResultRecord(
+        run_id=RUN_ID, issue=4, attempt=0, exit_code=2, reason="docker: no such image"
+    )
+    first = replace(host_died, finished_at=moment)
+    again = replace(host_died, finished_at=moment)
+    later = replace(host_died, finished_at=moment + dt.timedelta(minutes=10))
+
+    # One file read twice is one verdict, and that is the whole point.
+    assert first.identity == again.identity
+    # Two failures of the same host, indistinguishable in every other field.
+    assert first.identity != later.identity
+
+
 def test_the_cap_is_configurable_and_loud_on_garbage(monkeypatch):
     monkeypatch.delenv(INFRASTRUCTURE_CAP_ENV, raising=False)
     assert InfrastructurePolicy.from_env().cap == DEFAULT_INFRASTRUCTURE_CAP
@@ -2605,9 +2642,10 @@ def test_a_retry_pushing_a_new_head_gets_its_own_check_announcements(tmp_path):
 
 def test_a_second_infrastructure_failure_at_the_same_attempt_is_announced(tmp_path):
     """Exit 2 does not consume an attempt (§4), so the re-dispatch runs as the
-    same attempt and overwrites the same result file. A host that is broken
-    three times over is exactly what an operator needs to see, and a key on the
-    attempt alone would report it once."""
+    *same* attempt - and since #177 it writes a **new** record file beside the
+    first rather than replacing it. A host that is broken three times over is
+    exactly what an operator needs to see, and a key on the attempt alone
+    reports it once because every failure of that attempt shares the number."""
     import datetime as dt
 
     client, fleet, loop, seen = a_lifecycle_run()
@@ -2631,6 +2669,117 @@ def test_a_second_infrastructure_failure_at_the_same_attempt_is_announced(tmp_pa
     loop.cycle()
 
     assert names(seen).count("task.result") == 2
+
+
+# --------------------------------------------------------------------------
+# One exit 2 is one infrastructure verdict (#203)
+# --------------------------------------------------------------------------
+#
+# The count, not the labels. A cycle that reads the previous attempt's record a
+# second time produces the *same* `swarm:claimed -> swarm:ready`, on the same
+# issue, at the same attempt number - so a fixture asserting on labels or on
+# the plan's prose passes either way, which is how this survived a rewrite of
+# everything around it.
+#
+# It takes three cycles to see. Cycle 1 dispatches, cycle 2 observes the exit 2
+# and re-dispatches at the same attempt (§4 consumes none), and cycle 3 is the
+# one that used to read the dead attempt's record again: a second
+# `infrastructure=True` transition, a second increment, and the container cycle
+# 2 had just spawned disposed out from under the retry.
+
+
+#: The two moments this section's records finished at. Distinct, because that
+#: is the one field two mechanical failures of the same host do not share.
+_FIRST = dt.datetime(2026, 8, 14, 14, 10, tzinfo=dt.timezone.utc)
+_LATER = dt.datetime(2026, 8, 14, 14, 20, tzinfo=dt.timezone.utc)
+
+
+def dead_host() -> ResultRecord:
+    """A worker's exit 2: the host failed, so the task never really ran.
+
+    Timestamped, unlike the `record` helper at the top of this file, because
+    the guard under test is keyed on the record's content and `from_worker`
+    stamps `finished_at` on every record a real worker writes.
+    """
+    return ResultRecord(
+        run_id=RUN_ID,
+        issue=TASK_ISSUE,
+        attempt=0,
+        exit_code=2,
+        reason="docker: no such image",
+        started_at=_FIRST,
+        finished_at=_FIRST,
+    )
+
+
+def alive(fleet: FakeFleet) -> None:
+    """What `docker ps` says about a container the fleet just spawned.
+
+    `FakeFleet.spawn` leaves `state` empty, exactly as the real `spawn` does -
+    "a container that started and exited in the same breath is the ordinary
+    case for a worker". The daemon fills it in on the *next* listing, and a
+    retry that is genuinely in flight is listed `running`; without this the
+    resolver reads every one of this harness's containers as finished and
+    believes a claimed task eligible, which is a different bug's fixture.
+    """
+    fleet.handles = {
+        issue: replace(handle, state=RUNNING_STATE) for issue, handle in fleet.handles.items()
+    }
+
+
+def test_one_exit_2_increments_the_infrastructure_streak_exactly_once(tmp_path):
+    """One host failure, one verdict - across the cycle that re-dispatches it.
+
+    `APIARY_MAX_INFRASTRUCTURE` is a ceiling on *consecutive mechanical
+    failures*, and #197 made it authoritative for `needs-human`. Counting one
+    failure twice halves the ceiling and escalates naming a streak the host
+    never had.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    write_result(dead_host(), tmp_path)
+    loop.cycle()
+    alive(fleet)
+    loop.cycle()
+
+    assert loop._infrastructure == {ref(TASK_ISSUE): 1}
+    # And the second half of it: the retry cycle 2 spawned is still running.
+    # The double count and the disposal are the same read of the same record.
+    assert fleet.spawned == [TASK_ISSUE, TASK_ISSUE]
+    assert fleet.disposed == [TASK_ISSUE]
+    # §4 is untouched: a mechanical failure still costs no attempt, so the
+    # retry was announced ready at the number the first attempt already had.
+    assert [f["attempt"] for n, f in seen if n == "task.eligible"] == [0, 0]
+
+
+def test_the_retrys_own_failure_is_a_second_verdict_and_counts(tmp_path):
+    """The other direction, and the reason the guard is keyed on the record's
+    content rather than on `(issue, attempt)`.
+
+    A retry that fails mechanically too is a second verdict about the host, and
+    it writes a record at the *same* attempt number - so a guard that retired
+    an attempt would stop counting a host that is broken three times over,
+    which is precisely the run the ceiling exists for.
+    """
+    client, fleet, loop, seen = a_lifecycle_run()
+    loop.artifacts = tmp_path
+
+    loop.cycle()
+    write_result(dead_host(), tmp_path)
+    loop.cycle()
+    alive(fleet)
+    loop.cycle()
+    # The retry dies the same way and writes its own testimony: same attempt,
+    # same reason, same everything a human would read - and a later
+    # `finished_at`, which is what `from_worker` stamps and the only thing that
+    # separates two failures of one host. `write_result` bumps the filename
+    # rather than replacing the evidence of the attempt before it.
+    write_result(replace(dead_host(), finished_at=_LATER), tmp_path)
+    loop.cycle()
+
+    assert loop._infrastructure == {ref(TASK_ISSUE): 2}
 
 
 # --- announcement only -----------------------------------------------------
