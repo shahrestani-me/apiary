@@ -20,7 +20,7 @@ from typing import Sequence
 from swarm.containers.manager import ISSUE_LABEL
 from swarm.run import RUN_LABEL
 
-__all__ = ["Container", "Daemon", "matches"]
+__all__ = ["Container", "Daemon"]
 
 
 @dataclass

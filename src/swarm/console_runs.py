@@ -4,7 +4,11 @@ The console's three sites each fire *one model call* - that is their whole
 point, and it is also why the operator who fired the planner from the page saw
 a plan and then nothing: no repository, no issues, no workers, no pull
 requests. Those only ever existed behind `swarm run` in a terminal. This
-module puts the real thing behind a fourth tab.
+module puts the real thing behind a fourth tab - and, since #130, behind the
+planner tab's Start building too: a build hands the repository it has just
+provisioned straight to `SwarmRuns.start`. That second caller is why `start`
+takes `known_to_exist` and why `live()` exists at all; both are about a run
+begun by something other than the form below.
 
 **A subprocess, not an import.** The run loop in `cli._loop` owns signal
 handlers (the reaper), installs a capture recorder for its artifacts
@@ -91,10 +95,30 @@ _REPO_LINE = re.compile(r"\brepo ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
 #: without it the external-run view would show every console run twice.
 _RUN_ID_LINE = re.compile(r"»\s*run\s+([a-z0-9][a-z0-9-]*)\s")
 _CYCLE_LINE = re.compile(r"\bcycle (\d+):")
-#: `_report_outcome`'s cap verdict, and the *only* line that tells a run which
-#: ran out of cycles apart from one that finished its work: both exit 0, and a
-#: page calling them the same thing reports an unfinished project as a done one.
-_CAPPED_LINE = re.compile(r"stopped after \d+ cycle\(s\)")
+#: The three lines an ending is read from, and the only three whose drift
+#: would make this module *wrong* rather than merely silent.
+#:
+#: Everything else parsed here degrades to "no summary" when `cli.py` rewords
+#: it. These do not: all three endings below exit 0, so a miss does not lose a
+#: detail, it reports an unfinished project as a finished one. That is why
+#: `tests/test_console_run.py` pins each of them against the line
+#: `_report_outcome` and `_loop` actually print, rather than against a literal
+#: copied into a test.
+#:
+#: Anchored on the `»` prefix, deliberately. `» objective met:` is the run's
+#: own verdict; `objective met` unanchored also matches the goal judge quoting
+#: a model's prose ("not the objective met by this task"), which latched a met
+#: verdict onto runs that had none.
+_MET_LINE = re.compile(r"^\s*»\s*objective met\b")
+#: `_report_outcome`'s verdict when the ledger did not decide the run - which
+#: is the cap, and is *also* a plan that simply ran out with the goal gate
+#: switched off. The two are one line in `cli.py` and two different things to
+#: an operator, so `_GATE_OFF_LINE` below tells them apart.
+_CAPPED_LINE = re.compile(r"^\s*»\s*stopped after \d+ cycle\(s\)")
+#: `_loop`'s announcement that `--no-goal-check` is in force. Without it a run
+#: that did exactly the work that was planned is pilled "cycle cap reached"
+#: when no cap was ever reached or even set.
+_GATE_OFF_LINE = re.compile(r"^\s*»\s*goal gate: off")
 _PR_REF = re.compile(r"\bPR #(\d+)")
 _ISSUE_LINE = re.compile(r"^\s*#(\d+): ")
 
@@ -283,6 +307,16 @@ def child_env(
     """
     env = dict(os.environ if base is None else base)
     assert_tokens(env, greenfield=greenfield)
+    if not greenfield:
+        # `docs/security.md` gives the boot key a lifetime of "the seconds it
+        # takes to create the repo", and this child is the opposite of that: it
+        # supervises containers and model output for hours. A run against a
+        # repository that already exists reaches `provision` nowhere, so the
+        # only reader of this variable in the tree is unreachable from here -
+        # which makes handing it over a widening with no purchase at all. It
+        # never reached a worker (`INHERITED_ENV` excludes it and
+        # `assert_no_provision_token` enforces that); this is the layer above.
+        env.pop(PROVISION_TOKEN_ENV, None)
     # The checkbox is authoritative per run, whatever the shell said: a policy
     # the page shows and the child inherits differently would be the lie.
     env[MERGE_OVERRIDE_ENV] = "1" if values.get("auto_merge") == "1" else "0"
@@ -311,22 +345,31 @@ class RunJob:
     progress: dict[str, Any] = field(default_factory=lambda: {
         "repo": "", "repo_url": "", "run_id": "", "cycle": None,
         "issues": [], "prs": [], "note": "", "met": False, "capped": False,
-        # Empty while the run lives, and one of `met`/`capped`/`stopped`/
-        # `failed`/`done` after. `state` alone cannot answer this: a run that
-        # met its objective and one that ran out of cycles both end `done` with
-        # exit 0, and #130 asks the console to say *which*.
+        "gate_off": False,
+        # Empty while the run lives, and one of `met`/`capped`/`exhausted`/
+        # `stopped`/`failed`/`done` after. `state` alone cannot answer this:
+        # a run that met its objective and one that ran out of cycles both end
+        # `done` with exit 0, and #130 asks the console to say *which*.
         "outcome": "",
     })
     stop_requested: bool = False
 
     def absorb(self, line: str) -> None:
-        """File one output line and fold it into the summary strip."""
-        if len(self.lines) >= MAX_LINES:
-            if len(self.lines) == MAX_LINES:
-                self.lines.append("… output truncated: the run printed "
-                                  f"more than {MAX_LINES} lines …")
-            return
-        self.lines.append(line[:MAX_LINE_CHARS])
+        """File one output line and fold it into the summary strip.
+
+        The cap bounds *storage*, and nothing else. Returning early from the
+        whole method - which is what this used to do - throws away the parsing
+        too, and the lines that matter most are the last ones: a run verbose
+        enough to hit the cap ends with `» objective met:` or `» stopped after
+        N cycle(s)` at line 10 001, and the page pilled every one of them
+        "done". A run's ending must not depend on how much it printed on the
+        way there.
+        """
+        if len(self.lines) < MAX_LINES:
+            self.lines.append(line[:MAX_LINE_CHARS])
+        elif len(self.lines) == MAX_LINES:
+            self.lines.append("… output truncated: the run printed "
+                              f"more than {MAX_LINES} lines …")
 
         p = self.progress
         if not p["run_id"] and (m := _RUN_ID_LINE.search(line)):
@@ -347,10 +390,12 @@ class RunJob:
         stripped = line.strip()
         if stripped.startswith(("»", "!")):
             p["note"] = stripped.lstrip("»! ").strip()
-        if "objective met" in line:
+        if _MET_LINE.search(line):
             p["met"] = True
         if _CAPPED_LINE.search(line):
             p["capped"] = True
+        if _GATE_OFF_LINE.search(line):
+            p["gate_off"] = True
 
     def conclude(self, returncode: int) -> None:
         """The ending, in both the words the page needs.
@@ -372,20 +417,52 @@ class RunJob:
             self.state, p["outcome"] = "stopped", "stopped"
         elif returncode == 0:
             self.state = "done"
-            p["outcome"] = "met" if p["met"] else ("capped" if p["capped"] else "done")
+            p["outcome"] = "met" if p["met"] else self._no_verdict() if p["capped"] else "done"
         else:
             self.state, p["outcome"] = "failed", "failed"
 
+    def _no_verdict(self) -> str:
+        """Which of the two endings `cli.py` prints one line for.
+
+        `_report_outcome` says "stopped after N cycle(s)" whenever the ledger
+        did not decide the run, and that is true of two different things: the
+        cap ran out, or the goal gate was switched off and the plan simply
+        finished. Calling the second one "cycle cap reached" tells an operator
+        a cap was reached when none was ever set - the same class of wrong
+        answer `outcome` exists to remove, only inverted. The run announces the
+        gate being off (`_loop`), so the two are separable here.
+        """
+        return "exhausted" if self.progress["gate_off"] else "capped"
+
+    def fail(self, reason: str) -> None:
+        """The ending of a run that never started, so no exit code exists.
+
+        Its own method rather than two assignments at the call site: `conclude`
+        is the one place that pairs `state` with `outcome`, and a second copy
+        of that pairing is the one that gets missed when a sixth ending is
+        added.
+        """
+        self.state = "failed"
+        self.progress["outcome"] = "failed"
+        self.absorb(f"! {reason}")
+
     def to_dict(self, *, since: int = 0, now: float | None = None) -> dict[str, Any]:
+        # `lines` is sliced before `next` is read, so both describe the same
+        # moment - and `progress` is copied rather than handed out live. The
+        # caller serialises this from the HTTP thread while `_watch` is still
+        # appending to `prs` and `issues` under the lock, and json.dumps over a
+        # dict somebody else is mutating raises rather than answering.
+        lines = self.lines[since:]
         return {
             "id": self.id,
             "state": self.state,
             "returncode": self.returncode,
             "elapsed_s": round((now or time.monotonic()) - self.started, 1),
             "command": self.command,
-            "lines": self.lines[since:],
-            "next": len(self.lines),
-            "progress": self.progress,
+            "lines": lines,
+            "next": since + len(lines),
+            "progress": {k: list(v) if isinstance(v, list) else v
+                         for k, v in self.progress.items()},
         }
 
 
@@ -430,10 +507,14 @@ class SwarmRuns:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _running: str = ""
 
-    def start(self, values: Mapping[str, str], *, exists: bool | None = None) -> RunJob:
-        """Start one run. `exists` is the caller's answer about the repository.
+    def start(self, values: Mapping[str, str], *, known_to_exist: bool | None = None) -> RunJob:
+        """Start one run. `known_to_exist` is the caller's answer about the repository.
 
         Passing it skips the GitHub probe, and #130 is the reason it exists.
+        Named apart from the `exists` seam it overrides, because the two mean
+        different things - a callable that asks, and an answer already known -
+        and one line reading `self.exists(...) if exists is None else exists`
+        was the whole cost of sharing a word.
         A build has *just* created the repository, so probing would be a wasted
         round trip at best - and at worst a wrong one: GitHub answers 404 for a
         repository it created seconds ago often enough that the run chained off
@@ -451,7 +532,7 @@ class SwarmRuns:
             # The one read this module does before exec'ing the real thing: is
             # the repository there? The answer picks the mode, so the operator
             # only ever says *where*, never *which command*.
-            found = self.exists(target(values)) if exists is None else exists
+            found = self.exists(target(values)) if known_to_exist is None else known_to_exist
             argv = build_argv(values, exists=found)
             env = child_env(values, greenfield=not found)
 
@@ -494,15 +575,22 @@ class SwarmRuns:
             )
         except Exception as exc:
             with self._lock:
-                job.state = "failed"
-                job.progress["outcome"] = "failed"
-                job.absorb(f"! could not start the run: {type(exc).__name__}: {exc}")
+                job.fail(f"could not start the run: {type(exc).__name__}: {exc}")
                 self._running = ""
             raise SwarmRunError(f"could not start the run: {exc}",
                                 fix="is this the venv the swarm is installed in?") from exc
 
         self._procs[job.id] = proc
         threading.Thread(target=self._watch, args=(job, proc), daemon=True).start()
+        # The other half of `stop`'s window: a Stop that arrived while `spawn`
+        # was still running found no process to signal and recorded its intent
+        # instead. Honour it now, or the run the operator stopped is the one
+        # that keeps going.
+        if job.stop_requested:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except (ProcessLookupError, OSError):
+                pass
         return job
 
     def _watch(self, job: RunJob, proc: Any) -> None:
@@ -524,12 +612,24 @@ class SwarmRuns:
         job = self.jobs.get(job_id)
         if job is None:
             raise SwarmRunError("no such run")
-        proc = self._procs.get(job_id)
         with self._lock:
-            if job.state != "running" or proc is None:
+            if job.state != "running":
                 return job
+            # Recorded before the process is looked up, and that ordering is
+            # the fix for a real window: `start` publishes the job and claims
+            # `_running` under the lock, but registers `_procs[id]` only after
+            # `spawn` returns. A second tab reading `/swarm/latest` in between
+            # gets a running job with no process, and a Stop that returned here
+            # answered 200 while doing nothing at all - the button greys out,
+            # the child spawns a moment later, and the run the operator stopped
+            # goes on holding its containers. `start` checks the flag after
+            # spawning, so a stop that lands early is honoured late rather than
+            # lost.
             job.stop_requested = True
             job.absorb("! stop requested from the console; containers are being disposed")
+            proc = self._procs.get(job_id)
+        if proc is None:
+            return job
         # SIGINT, precisely because it is what Ctrl-C sends: `cli._loop`
         # catches KeyboardInterrupt and disposes this run's containers on the
         # way out. SIGKILL would leave orphans for the next run's reaper.

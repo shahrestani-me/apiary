@@ -1,7 +1,7 @@
 """Shared test fixtures.
 
-Four doubles live here, and every test that needs one should import it rather
-than grow its own:
+The shared doubles live here, and every test that needs one should import it
+rather than grow its own:
 
 - `fixtures.github` - a fake `Transport` for `swarm.github.client`: canned
   responses, a record of every request, and constructors for the failures that

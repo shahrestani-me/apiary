@@ -393,7 +393,13 @@
       var runBox = el("div", "stack");
       show([buildCard(job.result), runBox]);
       var started = job.result && job.result.run;
-      if (started) pollSwarm(started.id, swarmView(started, runBox));
+      if (!started) { busyRun(false); return; }
+      //: The same latch a swarm-tab run takes. Without it the Fire button and
+      //: the project selector stay live under a run this page started, and
+      //: `absorb` calls `busyRun(false)` when the run ends - releasing a latch
+      //: nobody took.
+      busyRun(true);
+      pollSwarm(started.id, swarmView(started, runBox));
     });
   }
 
@@ -531,6 +537,17 @@
   // ---- the swarm tab: the board, and a whole run streamed ------------------
 
   var boardTimer = null, runTimer = null, runRepo = "";
+  //: The job id of the run the page is currently drawing a view for. One, not
+  //: a set: #130 lets a run view be drawn on the planner tab (under a finished
+  //: build) as well as in the swarm tab's run area, and until this existed the
+  //: page happily owned both at once. Switching tabs calls `show()`, which
+  //: detaches the planner's view, and `swarmShow` then adopts the same run
+  //: from /swarm/latest and starts a second `pollSwarm` - two chains assigning
+  //: the single `runTimer`, so `clearTimeout` could only ever cancel the
+  //: later one, and the earlier polled a node nobody could see or press Stop
+  //: on until the run ended. Whoever draws a view claims the run here and
+  //: cancels the poller that held it.
+  var followingRun = "";
   //: Runs this console process spawned, by their swarm run id (parsed from the
   //: log). The external view skips these - the same run must not appear twice,
   //: once from memory and once from its artifacts.
@@ -555,9 +572,15 @@
   //: `--max-cycles` ran out, so "done" answers the question wrongly half the
   //: time. Absent (an older backend, or a run still going) falls back to the
   //: state, which is what the pill always said.
+  //: Keyed by `RunJob.progress.outcome`; `tests/test_console_run.py` pins this
+  //: table against the vocabulary `conclude` can actually write, because a
+  //: sixth ending added on the server would otherwise fall through the
+  //: `|| j.state` below and read "done" - quietly, which is how the wrong
+  //: answer this table exists to prevent would come back.
   var OUTCOMES = {
     met: "objective met", capped: "cycle cap reached",
-    stopped: "stopped", failed: "failed", done: "done"
+    exhausted: "plan exhausted", stopped: "stopped",
+    failed: "failed", done: "done"
   };
 
   //: Lifecycle order, mirroring `console_board.COLUMNS` - the internal
@@ -593,6 +616,12 @@
     if (!panel().runBox.childNodes.length) {
       api("/swarm/latest").then(function (res) {
         if (!res.ok || panel().runBox.childNodes.length) { extTick(); return; }
+        //: Adoption is for a run this page is *not* already following - one
+        //: fired before a reload, or by another session. A run whose view was
+        //: just detached by `show()` on the way to this tab is still ours, and
+        //: re-adopting it is how the page came to poll one run twice. Drawing
+        //: it again is right (the operator is looking at an empty run area);
+        //: `swarmView` cancels the poller it replaces, so there is still one.
         //: The same rule the external view follows: a run still going is
         //: adopted whatever the selection, a finished one only beside its own
         //: selected project - otherwise the page opens looking like a project
@@ -1081,7 +1110,17 @@
 
     var box = into || panel().runBox;
     box.textContent = "";
-    extView = null;   // an own view owns the box now; the external card is gone
+    //: Whoever draws last owns the run. Cancelling here rather than at each
+    //: call site is what makes that true by construction: every path that
+    //: shows a run - swarmFire, adoption, a build's chained run - goes through
+    //: this function, and none of them can forget.
+    clearTimeout(runTimer);
+    runTimer = null;
+    followingRun = job.id;
+    //: Only when this view is taking over the swarm tab's run area. Nulling it
+    //: while drawing into a build card would drop the external view's handle
+    //: on a card still sitting in `panel().runBox`, which then stops updating.
+    if (!into) extView = null;
     box.appendChild(card("the run", head));
     box.appendChild(card("log — the run's own output, live", body));
 
@@ -1119,7 +1158,11 @@
           prs.textContent = (p.prs.length === 1 ? "PR #" : "PRs #") + p.prs.join(", #");
           prs.style.display = "";
         }
-        note.textContent = p.met ? "objective met" : (p.note || "");
+        //: The pill says which ending; this says what the run said about it.
+        //: Repeating "objective met" in both - which is what this did before
+        //: the pill could name an outcome - spends the one line that could
+        //: have carried the verdict's reason.
+        note.textContent = p.note || "";
         if (p.repo_url && !links.childNodes.length) {
           [["repository", ""], ["issues", "/issues"], ["pull requests", "/pulls"]]
             .forEach(function (pair) {

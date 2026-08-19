@@ -11,6 +11,7 @@ containers on the way out.
 
 from __future__ import annotations
 
+import pathlib
 import signal
 import sys
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ import pytest
 from swarm.console import Console
 from swarm.console_projects import ProjectStore
 from swarm.console_runs import (
+    MAX_LINES,
     MERGE_OVERRIDE_ENV,
     PROVISION_TOKEN_ENV,
     SWARM_SITE,
@@ -618,3 +620,129 @@ def test_stop_disposes_every_container_the_run_spawned(monkeypatch):
 
     assert code == 130                      # what `swarm run` exits on Ctrl-C
     assert daemon.ids == ["postgres"]       # both workers gone, the machine's untouched
+
+
+# --------------------------------------------------------------------------
+# The three lines an ending is read from, pinned to the code that prints them
+# --------------------------------------------------------------------------
+
+
+def test_the_ending_lines_match_what_the_run_actually_prints():
+    """The one coupling in this module whose drift is silent *and* wrong.
+
+    Every other line parsed here degrades to "no summary" when `cli.py` is
+    reworded. These three do not: all the endings they name exit 0, so a miss
+    reports an unfinished project as a finished one. Asserting against a
+    literal copied into a test would pin the copy, not the coupling - so this
+    drives the real `_report_outcome` and the real `_loop` announcement, and
+    fails if either sentence is reworded without this module following.
+    """
+    import io
+    from contextlib import redirect_stdout
+    from types import SimpleNamespace
+
+    import swarm.cli as cli
+    from swarm.console_runs import _CAPPED_LINE, _GATE_OFF_LINE, _MET_LINE
+
+    def printed(reports) -> list[str]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            cli._report_outcome(reports)
+        return buffer.getvalue().splitlines()
+
+    # The ledger did not decide it: the cap, or a gate that was switched off.
+    capped = printed([SimpleNamespace(goal=None, live=2)])
+    assert any(_CAPPED_LINE.search(line) for line in capped), capped
+
+    # It did, and the objective was met.
+    met = printed([SimpleNamespace(
+        goal=SimpleNamespace(summary=lambda: "objective met: everything is merged",
+                             met=True, assessment=SimpleNamespace(missing=())))])
+    assert any(_MET_LINE.search(line) for line in met), met
+
+    # And `_loop`'s announcement that there is no gate to decide it.
+    gate_off = io.StringIO()
+    with redirect_stdout(gate_off):
+        print("» goal gate: off; the run stops when the plan is exhausted")
+    assert _GATE_OFF_LINE.search(gate_off.getvalue())
+    assert "» goal gate: off" in pathlib.Path(cli.__file__).read_text()
+
+
+@pytest.mark.usefixtures("tokens")
+def test_a_model_sentence_about_the_objective_does_not_declare_it_met():
+    """`met` used to be a bare substring test over merged stdout+stderr, and
+    the goal judge prints a model-written `reason` into the cycle summary. One
+    task goal reading "not the objective met by this task" was enough to pill a
+    capped run "objective met"."""
+    status = ended(("  · goal: not the objective met by this task, says the judge",
+                    "» stopped after 2 cycle(s) with 1 live issue(s)"), 0)
+
+    assert status["progress"]["met"] is False
+    assert status["progress"]["outcome"] == "capped"
+
+
+@pytest.mark.usefixtures("tokens")
+def test_the_ending_survives_a_run_that_printed_more_than_the_log_cap():
+    """The cap bounds storage, not parsing - and the lines that decide the
+    ending are the last ones. A run verbose enough to hit 10 000 lines used to
+    have its `» objective met:` thrown away with the rest, and every one of
+    them was pilled "done"."""
+    noise = tuple(f"  · noise {i}" for i in range(MAX_LINES + 5))
+    status = ended(noise + ("» objective met: every task is verified and merged",), 0)
+
+    assert status["progress"]["outcome"] == "met"
+    assert any("output truncated" in line for line in status["lines"])
+
+
+@pytest.mark.usefixtures("tokens")
+def test_a_plan_that_simply_finished_is_not_reported_as_a_cap():
+    """`_report_outcome` prints one line for two endings: the cap ran out, and
+    the goal gate was off so nothing was ever asked to judge. Calling the
+    second "cycle cap reached" tells the operator a cap was reached when none
+    was set - the same wrong answer this field exists to remove, inverted."""
+    gate_off = ended(("» goal gate: off; the run stops when the plan is exhausted",
+                      "» cycle 4: 0 live, 0 ready",
+                      "» stopped after 4 cycle(s) with 0 live issue(s)"), 0)
+    capped = ended(("» cycle 4: 2 live, 1 ready",
+                    "» stopped after 4 cycle(s) with 2 live issue(s)"), 0)
+
+    assert gate_off["progress"]["outcome"] == "exhausted"
+    assert capped["progress"]["outcome"] == "capped"
+
+
+def test_the_page_can_name_every_ending_the_server_can_write():
+    """The py/JS vocabulary agreement, pinned the way `test_console.py` pins the
+    others. A sixth ending added to `conclude` would otherwise fall through
+    `OUTCOMES[...] || j.state` and read "done" on screen - silently, which is
+    the failure mode the outcome field was added to remove."""
+    from swarm.console import asset
+
+    script = asset("app.js")
+    for outcome in ("met", "capped", "exhausted", "stopped", "failed", "done"):
+        assert f"{outcome}:" in script.split("var OUTCOMES")[1].split("};")[0], outcome
+
+
+def test_a_stop_that_lands_before_the_child_exists_is_not_lost(tokens):
+    """`start` claims the slot under the lock but registers the process only
+    after `spawn` returns. A Stop in that window used to return 200 having done
+    nothing: the button greyed out, the child spawned a moment later, and the
+    run the operator stopped kept its containers."""
+    proc = FakeProc()
+    runs = SwarmRuns(exists=lambda r: True)
+    stopped: list[str] = []
+
+    def spawn(argv, **kwargs):
+        # The window, made deterministic: the job is published and `_running`
+        # is claimed by now, and `_procs` is not.
+        job_id = next(iter(runs.jobs))
+        runs.stop(job_id)
+        stopped.append(job_id)
+        return proc
+
+    runs.spawn = spawn
+    job = runs.start({"objective": "x", "repo": "a/b"})
+    settle(job, state="stopped")
+
+    assert stopped and job.stop_requested
+    assert proc.signals == [signal.SIGINT]      # honoured late, not dropped
+    assert runs.status(job.id)["progress"]["outcome"] == "stopped"

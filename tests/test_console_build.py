@@ -175,6 +175,20 @@ def console_with(*, runs: SwarmRuns | None = None, **overrides):
     )
 
 
+#: Every scripted process this module hands to a `SwarmRuns`. Finished at
+#: teardown, because `_watch` blocks on `readline` forever otherwise: they are
+#: daemon threads so pytest still exits, but a module that parks one per test
+#: is a module that will eventually park a hundred.
+_PROCS: list[FakeProc] = []
+
+
+@pytest.fixture(autouse=True)
+def finish_the_children():
+    yield
+    while _PROCS:
+        _PROCS.pop().finish(0)
+
+
 def swarm_runs(proc: FakeProc) -> SwarmRuns:
     """`SwarmRuns` with a scripted child and no question asked of GitHub.
 
@@ -187,6 +201,7 @@ def swarm_runs(proc: FakeProc) -> SwarmRuns:
     def never(repo: str) -> bool:
         raise AssertionError(f"the chained run asked GitHub whether {repo} exists")
 
+    _PROCS.append(proc)
     return SwarmRuns(spawn=spawner(proc), exists=never)
 
 
@@ -984,13 +999,105 @@ def test_the_cap_and_the_merge_policy_travel_from_the_form_to_the_run():
     runs = swarm_runs(proc)
     console, _, _ = console_with(runs=runs)
 
-    build(console, planned(console), dict(FORM, max_cycles="3", auto_merge=""))
+    build(console, planned(console), dict(FORM, max_cycles="3", auto_merge="1"))
 
     argv = runs.spawn.argv                              # type: ignore[attr-defined]
     assert argv[argv.index("--max-cycles") + 1] == "3"
-    assert runs.spawn.env["APIARY_MERGE_ADMIN_OVERRIDE"] == "0"   # type: ignore[attr-defined]
+    assert runs.spawn.env["APIARY_MERGE_ADMIN_OVERRIDE"] == "1"   # type: ignore[attr-defined]
     names = [f["name"] for f in BUILD_SITE["fields"]]
     assert "max_cycles" in names and "auto_merge" in names
+
+
+def test_nothing_merges_itself_into_main_unless_the_operator_ticked_it():
+    """The one default this form does not take from the swarm tab.
+
+    A build's verify field is optional and blank is the common case, so the
+    required check is `test -f README.md` - and it stays that way for the life
+    of the repository, because rewriting `.github/workflows` needs the
+    `workflows` permission and `security.FORBIDDEN_PERMISSIONS` denies the work
+    key exactly that. Shipping this ticked would make one press of Start
+    building merge model-written code into a protected `main` behind a check
+    that asserts a README exists, without the operator having chosen it.
+    """
+    from swarm.greenfield.provision import PLACEHOLDER_VERIFY
+    from swarm.security import FORBIDDEN_PERMISSIONS
+
+    merge = next(f for f in BUILD_SITE["fields"] if f["name"] == "auto_merge")
+    assert merge["value"] == ""                     # unticked, unlike the swarm tab's
+
+    proc = FakeProc()
+    runs = swarm_runs(proc)
+    console, _, _ = console_with(runs=runs)
+
+    _, job = build(console, planned(console))       # the form exactly as served
+
+    assert runs.spawn.env["APIARY_MERGE_ADMIN_OVERRIDE"] == "0"   # type: ignore[attr-defined]
+    # ...and the reason it matters: this is the gate that run is verifying at.
+    assert job["result"]["verify_command"] == PLACEHOLDER_VERIFY
+    assert "workflows" in FORBIDDEN_PERMISSIONS
+
+
+def test_the_cap_and_the_merge_labels_cannot_drift_from_the_swarm_tab():
+    """Copied from `SWARM_SITE` rather than retyped, so "the swarm tab's own
+    two, verbatim" is a property of the code and not a comment that ages."""
+    from swarm.console_runs import SWARM_SITE
+
+    theirs = {f["name"]: f for f in SWARM_SITE["fields"]}
+    ours = {f["name"]: f for f in BUILD_SITE["fields"]}
+
+    assert ours["max_cycles"] == theirs["max_cycles"]
+    # Same label and kind; only the default differs, deliberately.
+    assert ours["auto_merge"]["label"] == theirs["auto_merge"]["label"]
+    assert (ours["auto_merge"]["value"], theirs["auto_merge"]["value"]) == ("", "1")
+
+
+def test_the_verify_label_does_not_promise_a_gate_that_can_be_replaced():
+    """It used to say the placeholder is "replaced by the first pull request".
+    No worker can replace it - `workflows` is forbidden to the work key - so an
+    operator who left the field blank on that promise got a repository whose
+    required check asserts a README exists, permanently."""
+    field = next(f for f in BUILD_SITE["fields"] if f["name"] == "verify")
+
+    assert "replaces" not in field["label"]
+    assert "test -f README.md" in field["label"]
+    assert "workflows" in field["label"]
+
+
+@pytest.mark.parametrize("values, expected", [
+    (dict(FORM, objective=""), "needs an objective"),
+    (dict(FORM, max_cycles="ten"), "must be a number"),
+])
+def test_the_runs_own_fields_are_refused_before_a_repository_exists(values, expected):
+    """`console_build`'s ordering rule, applied to the two fields the *run*
+    reads. Both were first parsed inside `_start_run`, minutes later and after
+    provisioning - so a blank objective or a cap reading "ten" bought a
+    repository and a backlog and then failed to run."""
+    console, provisioner, _ = console_with(
+        runs=SwarmRuns(spawn=_never_spawn, exists=lambda r: True))
+
+    refused, _ = build(console, planned(console), values)
+
+    assert refused.status == 400
+    assert expected in json.loads(refused.body)["error"]
+    assert provisioner.calls == []
+
+
+def test_a_swarm_tab_run_cannot_steal_the_slot_a_build_is_about_to_need():
+    """The other direction of the gate. A build spends minutes provisioning
+    before it asks for the single run slot; a Fire pressed in that window took
+    it, and the build's own run was then refused into `run_error` - leaving a
+    repository and a written backlog with no swarm on it."""
+    console, _, _ = console_with(runs=swarm_runs(FakeProc()))
+    console._claim("build")                          # a build, mid-flight
+
+    refused = console.render(
+        "POST", "/swarm/start", HOST,
+        json.dumps({"values": {"objective": "x", "repo": "a/b"}}).encode())
+
+    assert refused.status == 409
+    body = json.loads(refused.body)
+    assert "a build is in flight" in body["error"]
+    assert "starts its own run" in body["fix"]
 
 
 def test_a_second_build_is_refused_while_the_swarm_it_started_is_live():
@@ -1062,3 +1169,17 @@ def test_a_build_that_refuses_starts_no_run_at_all():
 
 def _never_spawn(argv, **kwargs):
     raise AssertionError(f"a refused build spawned a run: {argv}")
+
+
+def test_the_page_follows_the_run_a_build_started():
+    """The other half of criterion 1, which lives in `app.js` and which the
+    Python tests cannot reach: deleting the one line that hands `report.run` to
+    the swarm view leaves a page that provisions a repository, starts a swarm
+    on it, and shows the operator nothing at all."""
+    from swarm.console import asset
+
+    script = asset("app.js")
+
+    assert "job.result && job.result.run" in script          # the chain is read
+    assert "pollSwarm(started.id, swarmView(started, runBox))" in script
+    assert "r.run_error" in script                           # ...and its failure is drawn

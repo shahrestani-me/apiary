@@ -40,6 +40,16 @@ stopped helping. The `swarm` tab (`console_runs.py`) execs the real CLI as a
 subprocess and streams its log to the page - repository, issues, workers,
 pull requests, merges, the goal verdict - without this module gaining any
 pipeline logic of its own.
+
+**And one decision that is this module's, deliberately.** #129 gave the planner
+tab a Start building button that provisions a repository and writes the plan
+into it as issues; #130 made that button go on to *run* it. The provisioning
+half lives in `console_build`, the supervision half in `console_runs`, and the
+line joining them is `_start_run` here - because it is the only place that
+holds both a finished `BuildReport` and the `SwarmRuns` that will watch the
+child. What it decides is small and worth finding: which repository the run
+attaches to, that it must not be asked to provision a second one, and that a
+run which will not start leaves the build finished rather than failed.
 """
 
 from __future__ import annotations
@@ -112,6 +122,11 @@ class ConsoleBusy(ConsoleError):
     Its own type because two routes raise it now - a model call and a build -
     and the alternative was each of them re-deriving "is something running,
     and what do I say if it is" from `_running`. See `Console._claim`.
+
+    Not every busy refusal on this page is one of these: the two #130 added
+    (`_swarm_build` refusing while a run is live, `_swarm_start` refusing while
+    a build is) are about `SwarmRuns`' latch rather than this one, and answer
+    in the same `{error, fix}` shape without borrowing this type's meaning.
     """
 
     def __init__(self, message: str, *, fix: str = "") -> None:
@@ -593,6 +608,23 @@ class Console:
     # `{error, fix}` shape every other refusal on this page uses.
 
     def _swarm_start(self, body: bytes) -> Response:
+        # The other direction of `_swarm_build`'s gate, and it is not symmetry
+        # for its own sake. A build spends minutes provisioning before it asks
+        # for the single run slot; a Fire pressed on the swarm tab in that
+        # window takes the slot, and the build's own `_start_run` is then
+        # refused into `run_error` - leaving a repository and a written backlog
+        # with no swarm on it, which is exactly the "a human has to go and
+        # delete it" cost the build-side gate was added to avoid.
+        with self._lock:
+            building = self._running and getattr(
+                self.jobs.get(self._running), "site", "") == BUILD_SITE_KEY
+        if building:
+            return Response.error(
+                "a build is in flight, and the run it is about to start needs the "
+                "slot this one would take", 409,
+                fix="wait for it to finish - it starts its own run when the "
+                    "issues are written",
+            )
         try:
             values = {k: str(v) for k, v in (json.loads(body or b"{}").get("values") or {}).items()}
             job = self.runs.start(values)
@@ -647,6 +679,24 @@ class Console:
             return Response.error(f"bad request body: {exc}", 400)
 
         values = {k: str(v) for k, v in (data.get("values") or {}).items()}
+        # Free here, expensive afterwards - `console_build`'s own ordering rule,
+        # applied to the two fields the *run* needs. Both are only read by
+        # `_start_run`, minutes later and after a repository exists, so a blank
+        # objective or a cap reading "ten" bought a repository and a backlog
+        # and then failed to run. `Builder` cannot check either: it derives its
+        # prompt from the plan's reasoning when the objective is blank, so it
+        # succeeds precisely where the run cannot.
+        if not (values.get("objective") or "").strip():
+            return Response.error(
+                "a run needs an objective, and this build starts one", 400,
+                fix="type the objective on the planner tab before pressing Start building",
+            )
+        cycles = (values.get("max_cycles") or "").strip()
+        if cycles and not cycles.isdigit():
+            return Response.error(
+                f"max cycles must be a number, got {cycles!r}", 400,
+                fix="a whole number, or leave it empty",
+            )
         try:
             source = self.jobs.get(validate_capture_id(str(data.get("plan", ""))))
         except ConsoleError as exc:
@@ -760,7 +810,7 @@ class Console:
                     "max_cycles": values.get("max_cycles", ""),
                     "auto_merge": values.get("auto_merge", ""),
                 },
-                exists=True,
+                known_to_exist=True,
             )
         except Exception as exc:  # noqa: BLE001 - a build that worked must not read as failed
             # Both halves, always. The exception's own fix names the cause -
@@ -780,8 +830,12 @@ class Console:
                   file=sys.stderr)
             return
         # The page follows this exactly as it follows a run fired from the
-        # swarm tab - same `/swarm/status`, same Stop button, same view.
-        report["run"] = job.to_dict()
+        # swarm tab - same `/swarm/status`, same Stop button, same view. Read
+        # back through `status`, which takes `SwarmRuns`' lock: the watcher
+        # thread is already appending log lines, and a snapshot taken beside it
+        # can pair a `lines` slice with a `next` cursor past its end - which
+        # costs the page the run's first lines, silently.
+        report["run"] = self.runs.status(job.id)
 
     def _record(self, report: Mapping[str, Any], values: Mapping[str, str]) -> None:
         """File the new repository as a project, before the verdict is published.
