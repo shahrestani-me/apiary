@@ -814,7 +814,14 @@ def _normalise(line: str) -> str:
     return line.strip()
 
 
-def retry_comment(attempt: int, reason: str, verify_output: str = "", *, renewal: str = "") -> str:
+def retry_comment(
+    attempt: int,
+    reason: str,
+    verify_output: str = "",
+    *,
+    renewal: str = "",
+    detail: str = "",
+) -> str:
     """The feedback a retry leaves behind, structured so a worker can find it.
 
     The first line is the contract: it begins `apiary: attempt N failed`, which
@@ -825,10 +832,23 @@ def retry_comment(attempt: int, reason: str, verify_output: str = "", *, renewal
     tail of the verify output in a fence - the same tail discipline the result
     record follows, tightened to `COMMENT_TAIL_CHARS` because this text is
     destined for a prompt rather than a directory.
+
+    **`detail` is apiary's own prose, and that is why it is not the fence**
+    (#248). `verify_output` is foreign text - a worker's log, a CI run's output -
+    so it is clipped and fenced, because a line of it reading `## Verify` at
+    column 0 would corrupt the issue contract while reporting a failure. A
+    caller whose explanation is a sentence apiary wrote has no such hazard and
+    no tail to take: `mergeability.conflict_context` is markdown this repository
+    authored, and fencing it would render its own file list as literal text to
+    the human who has to read it. One formatter with two kinds of paragraph
+    beats two formatters, because the first line is a contract and a second
+    speller of it is how that contract drifts.
     """
     parts = [f"apiary: attempt {attempt} failed. {reason}"]
     if renewal:
         parts.append(renewal)
+    if detail:
+        parts.append(detail)
     finding = diagnose(verify_output)
     if finding:
         parts.append(f"Diagnosis: {finding}")
