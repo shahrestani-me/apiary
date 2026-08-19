@@ -443,6 +443,28 @@ def test_python_sets_up_the_gates_tool_before_the_gate():
     assert "run" in steps[-1]
 
 
+def test_python_ci_installs_the_declared_dependencies_before_the_gate():
+    """Workers may declare dependencies - `worker.entrypoint` installs
+    `requirements.txt` before its gate - so CI must honour the same manifest.
+    Observed live in a generated repo: `requirements.txt` said sqlalchemy, the
+    workflow installed only pytest, and no DB test could ever run in CI.
+    Guarded with a shell conditional, because a fresh scaffold has no manifest
+    and pip errors loudly on a missing file."""
+    yaml = pytest.importorskip("yaml")
+
+    steps = yaml.safe_load(plan_for().files()[CI_WORKFLOW_PATH])["jobs"][CHECK_NAME]["steps"]
+
+    runs = [step.get("run", "") for step in steps]
+    manifest = next(run for run in runs if "requirements.txt" in run)
+    assert "if [ -f requirements.txt ]" in manifest
+    assert "pip install --quiet -r requirements.txt" in manifest
+    # After the gate's tool, before the gate itself - the last step.
+    assert runs.index(manifest) < len(steps) - 1
+    assert runs.index(manifest) > runs.index(
+        next(run for run in runs if "pip install" in run and "pytest" in run)
+    )
+
+
 def test_node_sets_up_a_pinned_toolchain():
     """Not because `ubuntu-latest` lacks Node, but because it lacks a *pinned*
     Node - and an unpinned runtime is a gate that changes under the repo."""

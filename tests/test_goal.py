@@ -33,6 +33,7 @@ or planning follow-ups from a verdict nobody gave.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
@@ -550,6 +551,53 @@ def test_the_shipped_work_is_shown_to_the_planner() -> None:
     assert "core" in prompt
     assert "implement the core library" in prompt
     assert "there is no CLI" in prompt
+
+
+def test_the_follow_up_shows_the_model_the_repositorys_tree() -> None:
+    """The round where the listing earns the most: by now the tree holds
+    everything the shipped tasks built, which is exactly what a gap-closing
+    plan must extend rather than re-implement beside."""
+    proposer = Says(follow_up("add-cli"))
+    client = SimpleNamespace(list_tree=lambda ref=None: ["src/core.py", "README.md"])
+
+    report = close_the_loop(
+        client,
+        ledger(entry(1, task_id="core", goal="implement the core library")),
+        OBJECTIVE,
+        verify=VERIFY,
+        oracle=Says(unmet("there is no CLI")),
+        proposer=proposer,
+        writer=Writer(),
+    )
+
+    assert report.extended
+    human = dict(proposer.asked[0])["human"]
+    assert "The repository currently contains these files" in human
+    assert "src/core.py" in human
+
+
+def test_a_tree_read_failure_does_not_fail_the_follow_up() -> None:
+    """Pinned: the listing degrades to the prompt as it always was. A gate that
+    could not extend a run because a tree read 502'd would turn a transient
+    read error into an unmet objective."""
+
+    def boom(ref: str | None = None) -> list[str]:
+        raise RuntimeError("GET /git/trees/main -> 502")
+
+    proposer = Says(follow_up("add-cli"))
+
+    report = close_the_loop(
+        SimpleNamespace(list_tree=boom),
+        ledger(entry(1, task_id="core")),
+        OBJECTIVE,
+        verify=VERIFY,
+        oracle=Says(unmet("there is no CLI")),
+        proposer=proposer,
+        writer=Writer(),
+    )
+
+    assert report.extended
+    assert dict(proposer.asked[0])["human"] == f"Objective:\n{OBJECTIVE}"
 
 
 def test_a_met_objective_extends_nothing() -> None:

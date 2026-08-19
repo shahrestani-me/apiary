@@ -236,6 +236,24 @@ def test_the_planner_is_told_a_task_must_pass_the_gate_alone():
     assert "depends_on" in prompt
 
 
+def test_the_plan_must_end_by_exercising_the_real_wiring():
+    """Observed on a real generated repo: a controller and a service built by
+    different workers against imagined interfaces, both merged green because
+    each task's tests mocked the boundary - the controller called
+    `service.add_expense(expense, date)` and the real service took one
+    argument. Nothing in any plan ever exercised the real wiring, so the rule
+    now demands a final integration task: real objects at the boundaries under
+    test, tests that fail if the interfaces do not meet. Conditional, because
+    forcing one onto a single-module plan would be a pointless issue."""
+    # Collapsed, so the assertions pin the words and not the line wrapping.
+    prompt = " ".join(system_prompt(verify="pytest -q").split())
+
+    assert "must end with an integration task" in prompt
+    assert "no mocks or stubs at those boundaries" in prompt
+    assert "tests that fail if the interfaces do not actually meet" in prompt
+    assert "needs no integration task; do not invent one" in prompt
+
+
 def test_plan_node_passes_its_gate_and_stack_to_the_model(monkeypatch):
     """Both were already parameters, used only to stamp the issues *after* the
     model answered. This is the wiring that puts them in front of it instead."""

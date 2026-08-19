@@ -520,16 +520,29 @@ COMMENT_TAIL_CHARS = 2_000
 _MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _IMPORT_NAME_RE = re.compile(r"ImportError: cannot import name '[^']+' from '([^']+)'")
 
+#: The worker's own pinned syntax-failure line, exactly as
+#: `worker.edit.syntax_failure` writes it. This is not a guess at CPython's
+#: traceback formatting - the honesty rule holds because the worker authored
+#: the sentence being matched, so recognising it is certain. Raw
+#: `SyntaxError:` tracebacks from a suite's own output stay unrecognised:
+#: attributing one to a file would mean parsing pytest's surrounding lines,
+#: which is a guess. The line number is matched but deliberately left out of
+#: the diagnosis: `signature` uses the diagnosis as the failure's identity,
+#: and a syntax error that moved lines in the same file is the same blocker,
+#: not budget-renewing progress.
+_SYNTAX_FAILURE_RE = re.compile(r"python syntax error in ([^\s,:]+)")
+
 
 def diagnose(verify_output: str) -> str:
     """Classify a failed verify output into one actionable sentence, or say nothing.
 
     The retry comment already carries the raw tail; this is the line above it
     that tells the next attempt what to *do* about it. Only failures whose fix
-    is mechanical and certain are recognised - today that is a missing Python
-    module, the failure observed to burn three identical attempts on one issue
-    - and anything else returns the empty string, because a guessed diagnosis
-    would be repeated to the model as truth.
+    is mechanical and certain are recognised - a missing Python module, the
+    failure observed to burn three identical attempts on one issue, and the
+    worker's own pinned syntax-failure line, whose shape is certain because
+    the worker wrote it - and anything else returns the empty string, because
+    a guessed diagnosis would be repeated to the model as truth.
 
     Pure, like the rest of the planning half of this module, so every
     classification is testable as a string in and a string out.
@@ -545,6 +558,15 @@ def diagnose(verify_output: str) -> str:
                 "(installed before the verify runs), or use the standard library "
                 "instead"
             )
+    broken = _SYNTAX_FAILURE_RE.findall(verify_output or "")
+    if broken:
+        # `dict.fromkeys` deduplicates while keeping the worker's order; one
+        # file can carry several findings and should be named once.
+        files = ", ".join(dict.fromkeys(broken))
+        return (
+            f"syntax error in {files}: the file must parse before any test can "
+            "run - rewrite the exact line quoted in the verify output"
+        )
     return ""
 
 

@@ -702,6 +702,15 @@ CI_SETUP: dict[str, tuple[str, ...]] = {
         "    python-version: '3.12'",
         "- name: the gate's tool",
         "  run: python -m pip install --quiet pytest",
+        # Workers may legitimately declare dependencies: `worker.entrypoint`
+        # installs `requirements.txt` before its gate runs, so a runner that
+        # installs only pytest grades the same code against a poorer
+        # interpreter - observed live as a repo whose sqlalchemy tests could
+        # never run in CI. Guarded with a shell conditional rather than a
+        # separate `if:` step because a fresh scaffold has no manifest and pip
+        # errors loudly on a missing file.
+        "- name: declared dependencies",
+        "  run: if [ -f requirements.txt ]; then python -m pip install --quiet -r requirements.txt; fi",
     ),
     "node": (
         "- uses: actions/setup-node@v4",

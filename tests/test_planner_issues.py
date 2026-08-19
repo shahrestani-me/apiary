@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import urllib.parse
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
 
 from fixtures.github import REPO, response
 from swarm.config import SETTINGS
+from swarm.github.client import GitHubError
 from swarm.github.ledger import (
     DEFAULT_STACK,
     LedgerEntry,
@@ -43,10 +45,14 @@ from swarm.nodes.planner import (
     Draft,
     PlanError,
     area_label,
+    format_listing,
+    human_prompt,
     normalise,
     order_drafts,
     plan_node,
+    prompt_for,
     render_body,
+    repository_files,
     size_label,
     write_plan,
 )
@@ -793,6 +799,87 @@ def test_order_drafts_puts_dependencies_first():
 
 
 # --------------------------------------------------------------------------
+# The repository listing
+# --------------------------------------------------------------------------
+
+
+def test_the_planner_is_shown_the_repositorys_files():
+    """The defect the listing exists for: planned from the objective alone, a
+    real run implemented the same domain three times because the model had no
+    way to know the first implementation existed. The listing is a fact about
+    this run, so it rides in the *human* turn, next to the objective."""
+    system, human = prompt_for(
+        "an objective", files=["src/wallet.py", "src/expense.py"], verify=VERIFY
+    )
+
+    assert "The repository currently contains these files" in human
+    assert "src/wallet.py" in human and "src/expense.py" in human
+    assert "parallel implementation" in human
+    assert "src/wallet.py" not in system
+
+
+def test_an_absent_listing_reproduces_the_prompt_byte_for_byte():
+    """Pinned: the listing is advisory, and the callers that cannot obtain one
+    (the console has no repository; a tree read may 502) must send exactly the
+    prompt that has been working all along - not a variant of it."""
+    plain = prompt_for("an objective", verify=VERIFY)
+
+    assert prompt_for("an objective", verify=VERIFY, files=None) == plain
+    assert prompt_for("an objective", verify=VERIFY, files=()) == plain
+    # A listing of nothing but machinery filters down to nothing and must not
+    # leave a header announcing no files.
+    assert prompt_for("an objective", verify=VERIFY, files=[".git/HEAD"]) == plain
+    assert plain[1] == "Objective:\nan objective"
+
+
+def test_the_listing_is_sorted_filtered_and_capped():
+    """A big repository must not drown the objective under its own tree: the
+    machinery is filtered out, the rest is sorted so siblings sit together, and
+    everything past the cap is summarised as an honest count."""
+    files = [f"src/module_{index:03}.py" for index in range(250)] + [
+        ".git/config",
+        "node_modules/left-pad/index.js",
+        "assets/logo.png",
+        "package-lock.json",
+        "poetry.lock",
+        "dist/app.whl",
+    ]
+
+    text = format_listing(files)
+
+    for machinery in (".git/", "node_modules", "logo.png", "-lock", "poetry", "dist/"):
+        assert machinery not in text, f"machinery survived the filter: {machinery}"
+    assert text.count("src/module_") == 200
+    assert "… and 50 more files" in text
+    lines = text.splitlines()
+    assert lines[-1] == "… and 50 more files"
+    shown = [line for line in lines if line.startswith("src/")]
+    assert shown == sorted(shown)
+
+
+def test_the_local_checkout_is_listed_from_the_filesystem(tmp_path, monkeypatch):
+    """`swarm local` has no GitHub to ask, so the walk is the source - pruned,
+    because the point of skipping node_modules is also not to enumerate it."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# r\n", encoding="utf-8")
+    (tmp_path / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "node_modules" / "pkg" / "index.js").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(planner, "SETTINGS", SimpleNamespace(repo_path=str(tmp_path)))
+
+    assert repository_files(None) == ("README.md", "src/app.py")
+
+
+def test_a_directory_that_is_not_a_checkout_yields_no_listing(tmp_path, monkeypatch):
+    # `repo_path` defaults to the working directory, and presenting whatever
+    # happens to be there as "the project" would be worse than saying nothing.
+    monkeypatch.setattr(planner, "SETTINGS", SimpleNamespace(repo_path=str(tmp_path)))
+
+    assert repository_files(None) is None
+
+
+# --------------------------------------------------------------------------
 # The node
 # --------------------------------------------------------------------------
 
@@ -879,6 +966,50 @@ def test_plan_node_takes_its_target_from_the_run_state(github, monkeypatch):
 
     assert set(result["tasks"]) == {"root"}
     assert numbers_of(store) == [1]
+
+
+def _recording_model(monkeypatch, produced: Plan) -> list[str]:
+    """Like `_stub_model`, but hands back the human turns the model was shown."""
+    humans: list[str] = []
+
+    class Stub:
+        def invoke(self, messages):
+            humans.append(dict(messages)["human"])
+            return produced
+
+    monkeypatch.setattr(planner, "orchestrator_llm", lambda: None)
+    monkeypatch.setattr(planner, "structured", lambda _llm, _schema: Stub())
+    return humans
+
+
+def test_plan_node_shows_the_model_the_targets_tree(github, monkeypatch):
+    client, store, _ = github()
+    client.list_tree = lambda ref=None: ["src/wallet.py", "README.md"]
+    humans = _recording_model(monkeypatch, plan(task("root")))
+
+    result = plan_node({"objective": "make it work"}, source=client)
+
+    assert set(result["tasks"]) == {"root"}
+    assert "src/wallet.py" in humans[0] and "README.md" in humans[0]
+
+
+def test_a_failed_tree_read_does_not_fail_the_plan(github, monkeypatch):
+    """Pinned: the listing is advisory context, never a blocker. A 502 from the
+    trees API costs the prompt its listing - nothing else - because a planner
+    that refused to plan over a transient read error would be a regression."""
+    client, store, _ = github()
+
+    def boom(ref=None):
+        raise GitHubError("GET /git/trees/main -> 502")
+
+    client.list_tree = boom
+    humans = _recording_model(monkeypatch, plan(task("root")))
+
+    result = plan_node({"objective": "make it work"}, source=client)
+
+    assert set(result["tasks"]) == {"root"}
+    assert numbers_of(store) == [1]
+    assert humans[0] == "Objective:\nmake it work"
 
 
 # --------------------------------------------------------------------------

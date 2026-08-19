@@ -37,6 +37,7 @@ from typing import Any, Sequence
 import pytest
 
 from fixtures.github import REPO, response
+from swarm.github.client import GitHubError
 from swarm.github.ledger import Ledger, LedgerEntry, load_ledger, render_marker
 from swarm.nodes.judge import (
     Observation,
@@ -828,6 +829,48 @@ def test_the_prompt_carries_the_failures_and_every_existing_id():
     # Every id, not only the failing one: an id the model never sees is an id
     # it invents a replacement for.
     assert "broken" in tracked and "waiting" in tracked
+
+
+def test_the_replan_shows_the_model_the_repositorys_tree(tracker):
+    """A replan is asked for a *different* decomposition, and the strongest
+    grounding for one is what the repository actually contains by now - the
+    stalled attempt's own half-landed files included."""
+    client, store = tracker()
+    store.add(
+        body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY)
+    )
+    before = load_ledger(client, adopt=False)
+    client.list_tree = lambda ref=None: ["src/swarm/a.py", "README.md"]
+    proposer = Proposal(Plan(tasks=[task("existing", files=["src/swarm/a.py"])]))
+
+    report = replan(client, before, OBJECTIVE, stalled(), proposer=proposer, verify=VERIFY)
+
+    assert report.replanned
+    human = dict(proposer.asked[0])["human"]
+    assert "The repository currently contains these files" in human
+    assert "README.md" in human
+
+
+def test_a_tree_read_failure_does_not_fail_the_replan(tracker):
+    """Pinned: the listing is advisory, never a blocker. A 502 from the trees
+    API sends the replan prompt exactly as it was before listings existed,
+    because a stalled run must never be made unfixable by a transient read."""
+    client, store = tracker()
+    store.add(
+        body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY)
+    )
+    before = load_ledger(client, adopt=False)
+
+    def boom(ref=None):
+        raise GitHubError("GET /git/trees/main -> 502")
+
+    client.list_tree = boom
+    proposer = Proposal(Plan(tasks=[task("existing", files=["src/swarm/a.py"])]))
+
+    report = replan(client, before, OBJECTIVE, stalled(), proposer=proposer, verify=VERIFY)
+
+    assert report.replanned
+    assert dict(proposer.asked[0])["human"] == f"Objective:\n{OBJECTIVE}"
 
 
 # --------------------------------------------------------------------------

@@ -91,7 +91,9 @@ from ..nodes.planner import (
     IssueAction,
     PlanError,
     PlanReport,
+    human_prompt,
     normalise,
+    repository_files,
     retire_superseded,
     revive,
     write_plan,
@@ -307,20 +309,25 @@ def propose(
     assessment: Assessment,
     *,
     proposer: Proposer | None = None,
+    files: Sequence[str] | None = None,
 ) -> Plan:
     """Ask for the tasks that close the named gap. The planner's own prompt.
 
     `SYSTEM` plus `FOLLOWUP_SUFFIX`, imported rather than rewritten, for
     `replan.propose`'s reason: the hard rules in the planner's prompt are what
     make a plan writable at all, and a second copy of them here would drift from
-    the one `_self_check` holds every draft to.
+    the one `_self_check` holds every draft to. The human turn is
+    `planner.human_prompt`'s: `files` is the repository's listing when the
+    caller could get one - and a follow-up round is where it earns the most,
+    because by now the tree holds everything the shipped tasks built - while
+    None sends the turn exactly as it always was.
     """
     prompt = SYSTEM + FOLLOWUP_SUFFIX.format(
         shipped=_catalogue(shipped(ledger)),
         missing="\n".join(f"- {line}" for line in assessment.missing) or "- not stated",
     )
     llm = proposer if proposer is not None else structured(orchestrator_llm(), Plan)
-    return llm.invoke([("system", prompt), ("human", f"Objective:\n{objective}")])
+    return llm.invoke([("system", prompt), ("human", human_prompt(objective, files))])
 
 
 @dataclass(frozen=True)
@@ -568,7 +575,11 @@ def close_the_loop(
         return GoalReport(assessment, reason=f"{EXHAUSTED} after {rounds} round(s)", rounds=rounds)
 
     try:
-        plan = propose(objective, ledger, assessment, proposer=proposer)
+        # Best-effort by `repository_files`'s contract: a follow-up whose tree
+        # read fails is planned exactly as it was before listings existed.
+        plan = propose(
+            objective, ledger, assessment, proposer=proposer, files=repository_files(client)
+        )
     except Exception as exc:  # noqa: BLE001 - any transport failure reads the same
         # The stall's reading again: the model is unreachable, the run is not
         # wrong, and the round is not spent so a later caller may try again.
