@@ -61,6 +61,9 @@ from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity
 from swarm.orchestrator.reconcile import (
     COMMENT_TAIL_CHARS,
     DEFAULT_INFRASTRUCTURE_CAP,
+    DEFAULT_INTERVAL_S,
+    INTERVAL_ENV,
+    cycle_interval,
     EMPTY_SIGNATURE,
     INFRASTRUCTURE_CAP_ENV,
     InfrastructurePolicy,
@@ -1515,6 +1518,55 @@ def test_the_interval_is_a_floor_between_cycle_starts_not_a_delay_after_each():
     # sleeps after the last cycle - the only thing that would wait for is the
     # caller's return.
     assert slept == [6.0]
+
+
+# --------------------------------------------------------------------------
+# The pacing override
+# --------------------------------------------------------------------------
+
+
+def test_the_interval_defaults_to_the_constant_when_the_variable_is_unset():
+    assert cycle_interval({}) == DEFAULT_INTERVAL_S
+    assert cycle_interval({INTERVAL_ENV: "   "}) == DEFAULT_INTERVAL_S
+
+
+def test_the_interval_reads_the_environment_when_it_is_set():
+    assert cycle_interval({INTERVAL_ENV: "5"}) == 5.0
+    assert cycle_interval({INTERVAL_ENV: "2.5"}) == 2.5
+
+
+@pytest.mark.parametrize("raw", ["5s", "abc", ""])
+def test_a_mistyped_interval_raises_rather_than_reading_as_the_default(raw):
+    """`authority.state_source`'s rule: the variable decides how the loop runs.
+
+    An operator exporting `5s` to make a batch finish before morning must find
+    out at startup, not from a run that took exactly as long as it would have.
+    The empty string is the one exception and is the "unset" spelling, so it is
+    checked separately below rather than here.
+    """
+    if raw == "":
+        assert cycle_interval({INTERVAL_ENV: raw}) == DEFAULT_INTERVAL_S
+        return
+    with pytest.raises(ValueError, match=INTERVAL_ENV):
+        cycle_interval({INTERVAL_ENV: raw})
+
+
+def test_an_interval_under_the_floor_is_refused_rather_than_clamped():
+    """Silently substituting the floor is how a setting stops meaning what it says."""
+    with pytest.raises(ValueError, match="floor"):
+        cycle_interval({INTERVAL_ENV: "0.1"})
+
+
+def test_the_reconciler_picks_the_interval_up_from_the_environment(monkeypatch):
+    """The field is a `default_factory`, so the variable reaches the loop.
+
+    The property that matters is not that the reader works - the tests above
+    cover that - but that nothing between it and `_pace` re-hardcodes the
+    constant. An explicit argument still wins, because the tests pass one.
+    """
+    monkeypatch.setenv(INTERVAL_ENV, "3")
+    assert reconciler(FakeClient(issues={}), FakeFleet()).interval_s == 3.0
+    assert reconciler(FakeClient(issues={}), FakeFleet(), interval_s=9.0).interval_s == 9.0
 
 
 # --------------------------------------------------------------------------
