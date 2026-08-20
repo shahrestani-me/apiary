@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-12-20260820-081647-7gje3y",
+  "issue": 5,
+  "attempt": 1,
+  "task_id": "mapping-loader",
+  "repo": "shahrestani-me/apiary-corpus-12",
+  "branch": "apiary/%235-attempt-1",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "loaders/mapping_loader.py",
+    "tests/test_mapping_loader.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T08:38:40.623589+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

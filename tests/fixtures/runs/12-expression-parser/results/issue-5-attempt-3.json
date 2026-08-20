@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "issue": 5,
+  "attempt": 3,
+  "task_id": "parser",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "branch": "apiary/%235-attempt-3",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK",
+  "written": [
+    "parser.py",
+    "test_parser.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": "d83138fe4a4b551bca00edb5e6d11b0be82300dc",
+  "started_at": null,
+  "finished_at": "2026-08-20T02:13:20.108670+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

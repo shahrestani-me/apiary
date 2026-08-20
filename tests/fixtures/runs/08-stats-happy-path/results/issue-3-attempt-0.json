@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-01-20260819-230751-p96im6",
+  "issue": 3,
+  "attempt": 0,
+  "task_id": "format-summary-text",
+  "repo": "shahrestani-me/apiary-corpus-01",
+  "branch": "apiary/%233-attempt-0",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -f README.md",
+  "verify_output": "",
+  "written": [
+    "cli.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": "c92cc1d31d640672d57fa01728c7489423e7ce11",
+  "started_at": null,
+  "finished_at": "2026-08-19T23:20:32.890853+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

@@ -1,0 +1,169 @@
+{
+  "schema": 1,
+  "origin": "recorded",
+  "describes": "a lexer, parser and evaluator",
+  "exercises": [],
+  "expected_divergences": [
+    {
+      "cycle": 0,
+      "task": "ast-nodes",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 5,
+      "task": "ast-nodes",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 8,
+      "task": "ast-nodes",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 19,
+      "task": "lexer",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 29,
+      "task": "lexer",
+      "derived": "review",
+      "control": "landed",
+      "why": "merged-this-cycle: the merge gate landed the pull request after the world was read, so the resolver still saw it open."
+    },
+    {
+      "cycle": 30,
+      "task": "parser",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 40,
+      "task": "parser",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 52,
+      "task": "parser",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 65,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 66,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 67,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 68,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 69,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 70,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 71,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 72,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 73,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 74,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "review",
+      "why": "revived/budget-renewed on a task whose pull request was still open: the resolver reads the spent budget, the control plane the open review."
+    },
+    {
+      "cycle": 75,
+      "task": "parser",
+      "derived": "needs-human",
+      "control": "landed",
+      "why": "the same, on a task the gate had already merged."
+    },
+    {
+      "cycle": 76,
+      "task": "evaluator",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 83,
+      "task": "evaluator",
+      "derived": "review",
+      "control": "landed",
+      "why": "merged-this-cycle: the merge gate landed the pull request after the world was read, so the resolver still saw it open."
+    },
+    {
+      "cycle": 83,
+      "task": "formatter",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 97,
+      "task": "formatter",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "issue": 3,
+  "attempt": 0,
+  "task_id": "formatter",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "branch": "apiary/%233-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "python syntax error in formatter.py, line 65: invalid syntax\n    def is_left_associative( -> bool: return False\n\nThe verify command was not run: a file that does not parse fails every test that imports it, and proves nothing in a suite that never collects it. Rewrite the file so the quoted line parses.",
+  "written": [
+    "formatter.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T02:19:14.680537+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

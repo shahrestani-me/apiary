@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "objective": "A Python library that parses and evaluates simple arithmetic expressions.\n\nIt should provide: a lexer producing tokens for numbers, operators and\nparentheses; a recursive descent parser building an expression tree with the\nusual precedence for plus, minus, times, divide and exponent; an evaluator that\ncomputes a result and reports division by zero as a typed error; named\nvariables supplied through an environment mapping; and a formatter that renders\nan expression tree back to a canonical string with minimal parentheses.\n\nPure standard library.",
+  "started_at": "2026-08-20T01:46:29.652533+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q"
+}

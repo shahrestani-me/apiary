@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "issue": 1,
+  "attempt": 1,
+  "task_id": "ast-nodes",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "branch": "apiary/%231-attempt-1",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "ast_nodes.py",
+    "tests/test_ast.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T01:48:17.777782+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

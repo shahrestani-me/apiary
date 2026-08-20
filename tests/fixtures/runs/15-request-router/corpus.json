@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "origin": "recorded",
+  "describes": "a request router with middleware",
+  "exercises": [],
+  "expected_divergences": [
+    {
+      "cycle": 0,
+      "task": "conflict-detection",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 14,
+      "task": "conflict-detection",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 37,
+      "task": "conflict-detection",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 49,
+      "task": "define-models",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 52,
+      "task": "define-models",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 54,
+      "task": "define-models",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 56,
+      "task": "middleware-chain",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 66,
+      "task": "middleware-chain",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 74,
+      "task": "middleware-chain",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 83,
+      "task": "path-matcher",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 90,
+      "task": "path-matcher",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 117,
+      "task": "path-matcher",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    }
+  ]
+}

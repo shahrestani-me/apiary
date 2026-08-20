@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-11-20260820-073625-oyrm2j",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "alias-store",
+  "repo": "shahrestani-me/apiary-corpus-11",
+  "branch": "swarm/issue-1",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: AliasStore\n    # Subtest: can store and retrieve aliases\n    ok 1 - can store and retrieve aliases\n      ---\n      duration_ms: 0.361209\n      type: 'test'\n      ...\n    # Subtest: identifies reserved words\n    ok 2 - identifies reserved words\n      ---\n      duration_ms: 0.063208\n      type: 'test'\n      ...\n    1..2\nok 1 - AliasStore\n  ---\n  duration_ms: 0.947834\n  type: 'test'\n  ...\n1..1\n# tests 3\n# suites 0\n# pass 3\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 40.896792",
+  "written": [
+    "lib/alias-store.js",
+    "test/alias-store.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "50e0322df1f0f99637462c8d0250ce37f48667b5",
+  "started_at": null,
+  "finished_at": "2026-08-20T07:37:51.975493+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

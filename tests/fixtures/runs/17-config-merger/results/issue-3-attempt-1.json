@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-12-20260820-081647-7gje3y",
+  "issue": 3,
+  "attempt": 1,
+  "task_id": "json-loader",
+  "repo": "shahrestani-me/apiary-corpus-12",
+  "branch": "apiary/%233-attempt-1",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "loaders/json_loader.py",
+    "tests/test_json_loader.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T08:30:53.449312+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-01-20260819-230751-p96im6",
+  "repo": "shahrestani-me/apiary-corpus-01",
+  "objective": "A small Python library that reads delimited data files and reports summary\nstatistics over their columns.\n\nIt should provide: a reader that handles comma and tab delimited files with a\nheader row; type inference per column (integer, float, string); summary\nstatistics for numeric columns (count, min, max, mean, median); a frequency\ntable for string columns; and a command line entry point that prints the\nsummary as aligned text.\n\nPure standard library. No third-party dependencies.",
+  "started_at": "2026-08-19T23:07:51.850635+00:00",
+  "finished_at": "2026-08-19T23:22:39.230479+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q",
+  "note": "",
+  "outcome": {
+    "kind": "capped",
+    "reason": "stopped after 60 cycle(s) with 3 live issue(s)",
+    "cycles": 60,
+    "cap": 60,
+    "live": 3,
+    "merged": [
+      1,
+      2,
+      3
+    ],
+    "abandoned": []
+  },
+  "metrics": {
+    "api_calls": 0,
+    "inference_calls": 0,
+    "inference_s": 0,
+    "model_swaps": 0,
+    "swap_s": 0,
+    "peak_queue_depth": 0,
+    "swap_share": null,
+    "cycles": []
+  },
+  "results": {
+    "attempts": 3,
+    "consumed": 3,
+    "counts": {
+      "pr-open": 3
+    },
+    "issues": {
+      "1": "pr-open",
+      "2": "pr-open",
+      "3": "pr-open"
+    }
+  }
+}

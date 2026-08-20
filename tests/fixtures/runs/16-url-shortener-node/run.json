@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-11-20260820-073625-oyrm2j",
+  "repo": "shahrestani-me/apiary-corpus-11",
+  "objective": "A Node.js library that turns long URLs into short codes and back.\n\nIt should provide: a deterministic base62 encoder and decoder over integers; a\nstore mapping short codes to target URLs with collision handling; validation\nthat rejects URLs without a scheme or host; optional custom aliases with a\nreserved-word list; and hit counting per code.\n\nPure Node standard library, tested with the built-in test runner. No\nthird-party dependencies.",
+  "started_at": "2026-08-20T07:36:25.558260+00:00",
+  "stack": "python",
+  "verify": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test"
+}

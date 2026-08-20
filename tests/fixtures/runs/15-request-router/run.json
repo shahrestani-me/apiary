@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-10-20260820-060518-m2epcy",
+  "repo": "shahrestani-me/apiary-corpus-10",
+  "objective": "A Python request router with middleware, independent of any HTTP server.\n\nIt should provide: route registration by method and path pattern with typed\npath parameters such as integer and string segments; a matcher returning the\nhandler and the extracted parameters, or a not-found result; a middleware chain\nthat wraps handlers and can short-circuit before the handler runs; route groups\nsharing a path prefix and a middleware list; a reverse lookup building a path\nfrom a route name and parameters; and clear errors for duplicate route names\nand for conflicting patterns.\n\nPure standard library.",
+  "started_at": "2026-08-20T06:05:18.154383+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q"
+}

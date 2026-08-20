@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-12-20260820-081647-7gje3y",
+  "issue": 6,
+  "attempt": 0,
+  "task_id": "provenance-tracker",
+  "repo": "shahrestani-me/apiary-corpus-12",
+  "branch": "apiary/%236-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "python syntax error in tests/test_provenance.py, line 30: cannot assign to comparison\n    layer<0xA0>layer2 = {\"a\": 2}\n\nThe verify command was not run: a file that does not parse fails every test that imports it, and proves nothing in a suite that never collects it. Rewrite the file so the quoted line parses.",
+  "written": [
+    "core/provenance.py",
+    "tests/test_provenance.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T08:43:01.267920+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-11-20260820-073625-oyrm2j",
+  "issue": 2,
+  "attempt": 0,
+  "task_id": "",
+  "repo": "shahrestani-me/apiary-corpus-11",
+  "branch": "swarm/issue-2",
+  "exit_code": 2,
+  "outcome": "infrastructure",
+  "consumes_attempt": false,
+  "reason": "no edit landed inside the declared file set",
+  "verify_command": "",
+  "verify_output": "model call failed: Invalid json output: \nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langchain/errors/OUTPUT_PARSING_FAILURE ",
+  "written": [],
+  "image": "apiary-worker-node",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T07:50:07.046430+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

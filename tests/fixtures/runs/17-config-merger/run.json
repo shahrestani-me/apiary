@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-12-20260820-081647-7gje3y",
+  "repo": "shahrestani-me/apiary-corpus-12",
+  "objective": "A Python library that merges layered configuration from several sources.\n\nIt should provide: loaders for JSON files, for environment variables with a\nconfigurable prefix, and for a mapping supplied directly; deep merging where\nlater layers override earlier ones and nested mappings merge key by key rather\nthan being replaced wholesale; list handling with an explicit choice between\nreplace and append; a report saying which layer supplied each final value; and\nlookup of nested keys through a dotted path.\n\nPure standard library.",
+  "started_at": "2026-08-20T08:16:47.414972+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q"
+}

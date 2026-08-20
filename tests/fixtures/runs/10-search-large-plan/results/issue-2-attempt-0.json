@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-03-20260819-235926-cqg7hf",
+  "issue": 2,
+  "attempt": 0,
+  "task_id": "inverted-index",
+  "repo": "shahrestani-me/apiary-corpus-03",
+  "branch": "apiary/%232-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "inverted_index.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T00:07:23.969733+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

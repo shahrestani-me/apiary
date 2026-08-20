@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-08-20260820-032118-qx8dab",
+  "issue": 2,
+  "attempt": 4,
+  "task_id": "constraints",
+  "repo": "shahrestani-me/apiary-corpus-08",
+  "branch": "swarm/issue-2",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: checkConstraints - numbers\n    # Subtest: min constraint\n    ok 1 - min constraint\n      ---\n      duration_ms: 0.640625\n      type: 'test'\n      ...\n    # Subtest: max constraint\n    ok 2 - max constraint\n      ---\n      duration_ms: 0.114417\n      type: 'test'\n      ...\n    # Subtest: min and max constraints\n    ok 3 - min and max constraints\n      ---\n      duration_ms: 0.116416\n      type: 'test'\n      ...\n    1..3\nok 1 - checkConstraints - numbers\n  ---\n  duration_ms: 1.329333\n  type: 'test'\n  ...\n# Subtest: checkConstraints - strings\n    # Subtest: min length constraint\n    ok 1 - min length constraint\n      ---\n      duration_ms: 0.075125\n      type: 'test'\n      ...\n    # Subtest: max length constraint\n    ok 2 - max length constraint\n      ---\n      duration_ms: 0.053333\n      type: 'test'\n      ...\n    # Subtest: pattern constraint\n    ok 3 - pattern constraint\n      ---\n      duration_ms: 0.089333\n      type: 'test'\n      ...\n    # Subtest: multiple constraints\n    ok 4 - multiple constraints\n      ---\n      duration_ms: 0.206958\n      type: 'test'\n      ...\n    1..4\nok 2 - checkConstraints - strings\n  ---\n  duration_ms: 1.774334\n  type: 'test'\n  ...\n1..2\n# tests 9\n# suites 0\n# pass 9\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 41.952583",
+  "written": [
+    "src/constraints.js",
+    "test/constraints.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "c9e48e3cb596fd5d85d23ed280931a3bd1e2da8a",
+  "started_at": null,
+  "finished_at": "2026-08-20T03:37:29.558283+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-12-20260820-081647-7gje3y",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "dotted-lookup",
+  "repo": "shahrestani-me/apiary-corpus-12",
+  "branch": "apiary/%231-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "core/lookup.py",
+    "tests/test_lookup.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T08:17:31.423578+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

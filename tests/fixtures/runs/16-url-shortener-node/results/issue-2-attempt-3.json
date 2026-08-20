@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-11-20260820-073625-oyrm2j",
+  "issue": 2,
+  "attempt": 3,
+  "task_id": "base62-codec",
+  "repo": "shahrestani-me/apiary-corpus-11",
+  "branch": "swarm/issue-2",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: base62 encoder/decoder\n    # Subtest: encodes and decodes 0 correctly\n    ok 1 - encodes and decodes 0 correctly\n      ---\n      duration_ms: 0.521833\n      type: 'test'\n      ...\n    # Subtest: encodes and decodes small integers correctly\n    ok 2 - encodes and decodes small integers correctly\n      ---\n      duration_ms: 0.154542\n      type: 'test'\n      ...\n    # Subtest: encodes and decodes large integers correctly\n    ok 3 - encodes and decodes large integers correctly\n      ---\n      duration_ms: 0.080833\n      type: 'test'\n      ...\n    # Subtest: throws error for negative numbers\n    ok 4 - throws error for negative numbers\n      ---\n      duration_ms: 0.242541\n      type: 'test'\n      ...\n    # Subtest: throws error for non-integer input in encode\n    ok 5 - throws error for non-integer input in encode\n      ---\n      duration_ms: 0.115417\n      type: 'test'\n      ...\n    # Subtest: throws error for invalid characters in decode\n    ok 6 - throws error for invalid characters in decode\n      ---\n      duration_ms: 0.122708\n      type: 'test'\n      ...\n    1..6\nok 1 - base62 encoder/decoder\n  ---\n  duration_ms: 1.901375\n  type: 'test'\n  ...\n1..1\n# tests 7\n# suites 0\n# pass 7\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 35.887375",
+  "written": [
+    "lib/base62.js",
+    "test/base62.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "74a62c457f816233782b2be2961c751f9ce6f27c",
+  "started_at": null,
+  "finished_at": "2026-08-20T07:49:15.551258+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

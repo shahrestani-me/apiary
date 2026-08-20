@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-02-20260819-233441-q6vks7",
+  "repo": "shahrestani-me/apiary-corpus-02",
+  "objective": "A small Python key-value store that keeps entries in memory and expires them.\n\nIt should provide: get, set and delete with an optional per-entry time to live;\nexpiry evaluated lazily on read and also by an explicit sweep; a bounded size\nwith least-recently-used eviction when the bound is reached; snapshot and\nrestore of the live entries to and from a JSON file; and statistics reporting\nhits, misses and evictions.\n\nPure standard library. Time must be injectable so expiry is testable without\nsleeping.",
+  "started_at": "2026-08-19T23:34:41.852924+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q"
+}

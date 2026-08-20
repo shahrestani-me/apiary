@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-05-20260820-064540-kvund5",
+  "issue": 2,
+  "attempt": 0,
+  "task_id": "task-definition",
+  "repo": "shahrestani-me/apiary-corpus-05",
+  "branch": "apiary/%232-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "scheduler/models.py",
+    "tests/test_models.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T06:49:53.605614+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

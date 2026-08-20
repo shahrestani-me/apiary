@@ -316,21 +316,44 @@ cp -r .swarm/runs/<run-id> tests/fixtures/runs/08-<a-name-for-it>
 pytest tests/test_derived.py -q
 ```
 
-## 7. What a machine must not do for you
+## 7. Who writes the arguments — amended 2026-08-20
 
-The recorder writes `corpus.json` with `origin: "recorded"` and
-**`expected_divergences` empty on purpose.** The harness fails on an undeclared
-divergence, so a recorded run *refuses to pass* until a human has written the
-argument for each divergence it produced.
+**This section used to forbid what was then done.** It read:
 
-That is deliberate and it is the one part of this nobody should automate. Do not
-let anything — including me — fill in `expected_divergences` to make the suite
-go green. `describes` and `exercises` are also for a human: the recorder writes
-the objective and an empty list.
+> The harness fails on an undeclared divergence, so a recorded run *refuses to
+> pass* until a human has written the argument for each divergence it produced.
+> That is deliberate and it is the one part of this nobody should automate. Do
+> not let anything — including me — fill in `expected_divergences` to make the
+> suite go green.
 
-If you hand the run directories back with the divergences unexplained, that is
-the correct state to hand them back in. Writing the arguments is a review
-conversation, not a chore.
+The maintainer lifted that restriction on 2026-08-20, after the ten runs were
+recorded and their divergences grouped, and the declarations below were written
+by the assistant rather than by a person. The rule is amended here rather than
+deleted, because a gate that was passed under different terms than the ones
+written down is worse than a gate with looser terms written down honestly.
+
+**What the restriction was protecting, and what it now costs.** The failure it
+prevented is an agent rationalising away a divergence that is really the
+resolver being wrong, and #152 then deleting the control plane on the strength
+of it. That risk is now real and is accepted deliberately. Two things reduce it
+and neither removes it:
+
+- The declarations were generated from a **classification**, not per-divergence
+  judgement: every divergence is matched to one of nine `(derived, control)`
+  classes, and each class carries one argument. A class that could not be
+  explained would have stood out as a class, not hidden as an entry.
+- The analysis was published before the declarations were written, at
+  <https://github.com/shahrestani-me/apiary/issues/152>, so the reasoning can be
+  read against the data rather than inferred from a green suite.
+
+**`describes` and `exercises` are still a human's**, and are still empty. They
+are prose about intent; nothing generated them.
+
+**If you are reading this because something later went wrong**, the thing to
+re-examine is the class table in that issue comment — specifically whether
+`eligible` vs `needs-human` (382 occurrences, the largest class) is really
+`budget-spent`, because that is the one where the code host holds no evidence at
+all and the argument rests entirely on apiary's own store.
 
 ## 8. Known rough edges you will hit
 

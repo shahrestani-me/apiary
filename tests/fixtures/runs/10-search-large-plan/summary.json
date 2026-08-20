@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-03-20260819-235926-cqg7hf",
+  "repo": "shahrestani-me/apiary-corpus-03",
+  "objective": "A Python full-text search library over a collection of documents, built in\nlayers.\n\nIt should provide: a tokenizer that lowercases, splits on non-letters and\nremoves a configurable stop-word list; an inverted index mapping each token to\nthe documents containing it with term frequencies; a document store holding\nidentifiers, titles and bodies; a query parser supporting single terms, quoted\nphrases, and AND / OR / NOT between them; a ranker scoring results by term\nfrequency and inverse document frequency; result snippets showing matched terms\nin context; index persistence to and from disk; and a command line interface\nthat indexes a directory of text files and answers queries.\n\nPure standard library. Each layer should be usable on its own.",
+  "started_at": "2026-08-19T23:59:26.540775+00:00",
+  "finished_at": "2026-08-20T00:29:14.405605+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q",
+  "note": "",
+  "outcome": {
+    "kind": "capped",
+    "reason": "stopped after 120 cycle(s) with 10 live issue(s)",
+    "cycles": 120,
+    "cap": 120,
+    "live": 10,
+    "merged": [],
+    "abandoned": []
+  },
+  "metrics": {
+    "api_calls": 0,
+    "inference_calls": 0,
+    "inference_s": 0,
+    "model_swaps": 0,
+    "swap_s": 0,
+    "peak_queue_depth": 0,
+    "swap_share": null,
+    "cycles": []
+  },
+  "results": {
+    "attempts": 10,
+    "consumed": 10,
+    "counts": {
+      "task-failed": 10
+    },
+    "issues": {
+      "1": "task-failed",
+      "2": "task-failed",
+      "3": "task-failed",
+      "4": "task-failed"
+    }
+  }
+}

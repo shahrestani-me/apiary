@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-08-20260820-032118-qx8dab",
+  "issue": 3,
+  "attempt": 0,
+  "task_id": "types",
+  "repo": "shahrestani-me/apiary-corpus-08",
+  "branch": "swarm/issue-3",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: checkType\n    # Subtest: string type\n    ok 1 - string type\n      ---\n      duration_ms: 0.3115\n      type: 'test'\n      ...\n    # Subtest: number type\n    ok 2 - number type\n      ---\n      duration_ms: 0.053084\n      type: 'test'\n      ...\n    # Subtest: boolean type\n    ok 3 - boolean type\n      ---\n      duration_ms: 0.080958\n      type: 'test'\n      ...\n    # Subtest: array type\n    ok 4 - array type\n      ---\n      duration_ms: 0.044958\n      type: 'test'\n      ...\n    # Subtest: object type\n    ok 5 - object type\n      ---\n      duration_ms: 0.044667\n      type: 'test'\n      ...\n    # Subtest: edge cases\n    ok 6 - edge cases\n      ---\n      duration_ms: 0.080459\n      type: 'test'\n      ...\n    1..6\nok 1 - checkType\n  ---\n  duration_ms: 1.282417\n  type: 'test'\n  ...\n1..1\n# tests 7\n# suites 0\n# pass 7\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 32.336125",
+  "written": [
+    "src/types.js",
+    "test/types.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "3ba377f0e8edb472fb5312b8044d50f5f0ebe755",
+  "started_at": null,
+  "finished_at": "2026-08-20T03:43:44.667693+00:00",
+  "duration_s": null,
+  "synthesised": false
+}
