@@ -5,3 +5,10 @@ __pycache__/
 *.egg-info/
 .swarm/
 .pytest_cache/
+
+# Local Bedrock/remote-model wiring. Machine-specific by nature - an AWS
+# account, a role, a region - and therefore never committed. docs/remote-models.md
+# describes what these do so a new machine can recreate them.
+run-local-bedrock.sh
+compose.override.yaml
+compose.override.yml

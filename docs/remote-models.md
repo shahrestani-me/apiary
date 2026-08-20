@@ -220,7 +220,85 @@ that would most change the picture. The second needs no credential at all, and i
 worth doing first: if a larger local window recovers much of the gap, the
 cheapest fix is one environment variable and no provider at all.
 
-## 7. Bedrock gotchas worth knowing before you file a ticket
+## 7. Running a remote *worker*, which is a different thing
+
+Sections 1-6 point a role at Bedrock and compare models from the console. Every
+one of those calls runs **on the host**. A `swarm run` is different: the worker
+executes model-generated code inside a container, and three things have to be
+true of that container which are not true of the host.
+
+Getting this wrong produced three failures in a row, each of which reads like a
+broken model rather than missing wiring. They are listed with their symptoms
+because the error text points elsewhere in all three cases.
+
+**1. The container needs the provider's client library.** `Dockerfile.worker`
+takes a `WORKER_EXTRAS` build argument and installs nothing extra by default, so
+the shipped image is local-only exactly as `README.md` promises:
+
+```bash
+docker build --build-arg WORKER_EXTRAS=bedrock -f Dockerfile.worker -t apiary-worker .
+```
+
+*Symptom without it:* `model call failed: ResponseError: invalid model name
+(status code: 400)`. `ResponseError` is Ollama's type - a container with no
+provider registry falls back to the local path and hands Ollama the whole
+`bedrock:...` string as a model name. **A stale image looks identical**, and
+`doctor`'s `docker.image.*` checks report presence, not whether the image matches
+the source, so they pass while shipping this.
+
+**2. The container must be allowed to reach the provider.** The egress proxy
+denies by default and its allowlist is a compose config generated from
+`security.EGRESS_ALLOWLIST` - GitHub, Ollama and MCP hosts. **No model provider
+is in it**, and `security.model_egress_hosts()` computes the right name but is
+not wired into the filter file. Until it is, add the regional host to the
+`egress-allowlist` config through a local `compose.override.yaml` and recreate
+the proxy:
+
+```yaml
+configs:
+  egress-allowlist:
+    content: |
+      # ... the five committed lines, unchanged ...
+      ^bedrock-runtime\.eu-west-1\.amazonaws\.com$
+```
+
+*Symptom without it:* `model call failed: ProxyConnectionError: Failed to
+connect to proxy URL: "http://egress-proxy:8888"`. The proxy is reachable and
+answering; botocore is mistranslating tinyproxy's `403 Filtered`. The proxy's
+own log is unambiguous where the exception is not - `Proxying refused on
+filtered domain`.
+
+**3. The credential must be a session, and it must be opted into.**
+`APIARY_WORKER_MODEL_CREDENTIAL=1` plus `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` in the environment. Not
+`AWS_PROFILE`: a profile name is useless in a container with no `~/.aws`, and an
+`AKIA...` key is refused even under the opt-in because it never expires. Mint
+the session with `sts assume-role` rather than `configure export-credentials` -
+the latter returns a *cached* session, so a run started late in its life dies
+mid-flight.
+
+Unset, the worker is refused before the container starts, which is the intended
+default: only the worker executes generated code, so the orchestrator may be
+remote with none of this.
+
+### A local runner
+
+All of the above is machine-specific - an account, a role, a region - so it
+belongs in a script that is **not** committed. `.gitignore` carries
+`run-local-bedrock.sh` and `compose.override.yaml` for exactly this. A runner
+worth having does, in order: source the token file, `sts assume-role` for a full
+session, export the two model variables and the credential opt-in, optionally
+rebuild the worker image with `WORKER_EXTRAS`, bring the two proxies up, **assert
+the running proxy's allowlist actually carries the provider host**, and only then
+start the console. The assertion matters more than it looks: the proxy silently
+serves a stale config after a `compose down`, and the failure it causes arrives
+several minutes and one container later.
+
+Run `swarm doctor` through the same script before a real run. `model.schema`
+proves the host can call the model; it says nothing about the container, which is
+what sections 1-3 above are for.
+
+## 8. Bedrock gotchas worth knowing before you file a ticket
 
 **The OpenAI models have no EU-resident path.** On the `bedrock-runtime`
 endpoint, for every EU region, the GPT-5.6 model cards show In-Region

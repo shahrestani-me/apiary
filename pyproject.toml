@@ -64,9 +64,14 @@ dev = [
     # "mypy shipped a release" into "every open pull request is red",
     # which is how a ratchet gets switched off (#168).
     "mypy~=2.3.1",
-    # `ignore_missing_imports` is false, so the one untyped dependency
-    # needs its stubs named rather than waved through.
+    # `ignore_missing_imports` is false, so an untyped dependency needs its
+    # stubs named rather than waved through.
     "types-PyYAML>=6.0",
+    # botocore ships no `py.typed`, and `llm.py` imports `botocore.config` to
+    # give the Bedrock client a read timeout longer than 60s. Named here rather
+    # than silenced with an override, because an override would also hide the
+    # next botocore import somebody adds.
+    "botocore-stubs>=1.34",
 ]
 
 [build-system]

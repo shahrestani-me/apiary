@@ -84,6 +84,14 @@ OLLAMA = "ollama"
 OPENAI = "openai"
 BEDROCK = "bedrock"
 
+#: How long a Bedrock call may take before botocore gives up. The default is
+#: 60s and a whole-file generation exceeds it, so it is named here rather than
+#: left implicit - `worker/edit.py` asks for entire file bodies, and the reply
+#: is proportional to the files. Generous on purpose: the failure this replaces
+#: is a run that loops without progressing, which costs far more than waiting.
+BEDROCK_READ_TIMEOUT_S = 300
+BEDROCK_CONNECT_TIMEOUT_S = 60
+
 
 # --------------------------------------------------------------------------
 # What a model is, written down
@@ -470,6 +478,16 @@ def _build_bedrock(spec: ModelSpec, callbacks: list | None) -> Any:
         )
     profile = spec.option("profile") or _required_env(AWS_PROFILE_ENV)
 
+    # botocore's default read timeout is 60s, which is shorter than a
+    # whole-file `WorkerOutput` takes on a real task - measured live against
+    # `claude-haiku-4-5`, a two-file edit with four context files timed out at
+    # exactly 61s, three times, and surfaced as `ReadTimeoutError`. That lands
+    # as an `infrastructure` outcome, which does *not* consume an attempt, so
+    # the dispatcher re-dispatches the same task forever: a run that never
+    # progresses and never fails. A console `Ping` never sees this because it
+    # answers in seconds, which is why it survived the seam's tests.
+    from botocore.config import Config as BotoConfig  # noqa: PLC0415 - lazy with the extra
+
     try:
         return ChatBedrockConverse(
             model=spec.model,
@@ -477,6 +495,11 @@ def _build_bedrock(spec: ModelSpec, callbacks: list | None) -> Any:
             region_name=region,
             credentials_profile_name=profile or None,
             callbacks=callbacks,
+            config=BotoConfig(
+                read_timeout=BEDROCK_READ_TIMEOUT_S,
+                connect_timeout=BEDROCK_CONNECT_TIMEOUT_S,
+                retries={"max_attempts": 3},
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - see below; every failure here is config
         # Bedrock resolves its credentials *at construction*, unlike the other

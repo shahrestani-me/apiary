@@ -80,7 +80,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN pip install .
+# Provider extras are opt-in, so the default image stays local-only exactly as
+# `README.md` promises. A remote worker needs its provider's client library
+# *inside the container* - the credential gate (#269) and the model passed
+# through `INHERITED_ENV` are both useless without it, which is how a Bedrock
+# worker came to fail with Ollama's "invalid model name".
+#   docker build --build-arg WORKER_EXTRAS=bedrock -f Dockerfile.worker -t apiary-worker .
+ARG WORKER_EXTRAS=
+RUN pip install ".${WORKER_EXTRAS:+[$WORKER_EXTRAS]}"
 
 
 FROM python:3.12-slim AS runtime

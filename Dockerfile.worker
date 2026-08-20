@@ -43,7 +43,14 @@ COPY src ./src
 # The whole dependency set, langgraph included - the worker does not need the
 # graph, but `apiary` declares one flat dependency list and splitting it into
 # extras is a pyproject change, not a Dockerfile one.
-RUN pip install .
+# Provider extras are opt-in, so the default image stays local-only exactly as
+# `README.md` promises. A remote worker needs its provider's client library
+# *inside the container* - the credential gate (#269) and the model passed
+# through `INHERITED_ENV` are both useless without it, which is how a Bedrock
+# worker came to fail with Ollama's "invalid model name".
+#   docker build --build-arg WORKER_EXTRAS=bedrock -f Dockerfile.worker -t apiary-worker .
+ARG WORKER_EXTRAS=
+RUN pip install ".${WORKER_EXTRAS:+[$WORKER_EXTRAS]}"
 # The default verify gate is `python -m pytest -q` (SWARM_VERIFY's fallback),
 # and this image ships the gate, so it ships the gate's tool. Without it a
 # greenfield repository - which has no pyproject of its own to install pytest
