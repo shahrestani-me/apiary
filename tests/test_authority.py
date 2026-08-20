@@ -106,6 +106,23 @@ from test_reconcile import (  # the doubles that drive a real cycle
     record,
 )
 from test_replan import stalled  # a verdict that has already refused to be one
+from fixtures.belief import fixture_belief
+
+
+# The cycle's belief, supplied from what each fixture declares (see
+# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def _plan_recovery_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_recovery(book, *args, **kwargs)
+
+def _plan_dispatch_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_dispatch(book, *args, **kwargs)
+
+def _compute_readiness_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return compute_readiness(book, *args, **kwargs)
+
 
 
 @pytest.fixture(autouse=True)
@@ -814,7 +831,7 @@ def test_a_task_this_run_has_seen_land_is_never_dispatched_again():
     # makes this assertion about a *rescue* rather than about agreement.
     assert held.overrides[0].derived == ELIGIBLE
 
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(merged),
         capacity=Capacity(slots=3, configured=2),
         ready=(ref(4),),
@@ -878,7 +895,7 @@ def test_a_container_that_exists_but_has_exited_still_blocks_a_dispatch():
     held = belief(task)
     assert held.state("task-4") == ELIGIBLE
 
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(task),
         capacity=Capacity(slots=3, configured=2),
         ready=(ref(4),),
@@ -902,7 +919,7 @@ def test_a_live_container_is_a_claim_and_reserves_its_files():
     )
 
     assert held.state("task-4") == CLAIMED_STATE
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(task), capacity=Capacity(slots=3, configured=2), believed=held
     )
     assert plan.numbers == ()
@@ -919,8 +936,8 @@ def test_readiness_speaks_about_the_entries_the_authority_says_are_waiting():
     question about the code host and is untouched."""
     task = entry(4, label=CLAIMED)  # the world says eligible; a human said claimed
 
-    labelled = compute_readiness(ledger(task), {})
-    derived = compute_readiness(ledger(task), {}, transitionable={"task-4"})
+    labelled = _compute_readiness_(ledger(task), {})
+    derived = _compute_readiness_(ledger(task), {}, transitionable={"task-4"})
 
     assert labelled.verdicts == ()
     assert [verdict.label for verdict in derived.verdicts] == [READY]
@@ -1026,14 +1043,14 @@ def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():
     """
     book, derived, labels = a_hand_edited(CLAIMED, ELIGIBLE)
 
-    swept = plan_recovery(book, containers=(), believed=derived)
+    swept = _plan_recovery_(book, containers=(), believed=derived)
     assert swept.transitions == ()
     # Not silently ignored either: nothing here holds it, because nothing here
     # selected it. The task is `eligible`, and the dispatcher picks it up.
     assert swept.held == ()
     assert derived.state("task-4") == ELIGIBLE
 
-    obeyed = plan_recovery(book, containers=(), believed=labels)
+    obeyed = _plan_recovery_(book, containers=(), believed=labels)
     assert [str(one) for one in obeyed.transitions] == [
         "#4: claimed -> eligible, attempt 1 "
         "(claimed with no live container behind it)"
@@ -1046,7 +1063,7 @@ def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():
     # labels arm exactly, which is what "every existing caller is unchanged"
     # has to mean for a module whose other entry point runs before any belief
     # exists.
-    assert plan_recovery(book, containers=()).transitions == obeyed.transitions
+    assert _plan_recovery_(book, containers=()).transitions == obeyed.transitions
 
 
 def test_a_failed_label_typed_onto_merged_work_no_longer_resigns_the_run():
@@ -1270,7 +1287,7 @@ def dispatchable(book: Any, held: Belief, *refs: Any) -> tuple[int, ...]:
     being pinned down here is a worker spawned over merged code, or a task that
     silently never runs again, and only the plan says which happened.
     """
-    return plan_dispatch(
+    return _plan_dispatch_(
         book,
         capacity=Capacity(slots=3, configured=3),
         ready=refs,
@@ -1401,7 +1418,7 @@ def test_an_adopted_id_minted_for_another_issue_does_not_inherit_landed():
     first = adopted_issue(7, title="Add a retry", label=DONE)
     second = adopted_issue(9, title="Add a retry")
 
-    before = load_ledger(Tracker(first, second), adopt=False)
+    before = load_ledger(Tracker(first, second))
     assert sorted(before.entries) == ["add-a-retry", "add-a-retry-9"]
     assert before.entries["add-a-retry"].ref == ref(7)
 
@@ -1409,7 +1426,7 @@ def test_an_adopted_id_minted_for_another_issue_does_not_inherit_landed():
     # issue lands in `Ledger.errors` and never in `entries` - so the lease on
     # the bare slug is up, and #9 takes it.
     broken = dict(first, body="## Goal\nDo the thing.\n")
-    after = load_ledger(Tracker(broken, second), adopt=False)
+    after = load_ledger(Tracker(broken, second))
     assert after.entries["add-a-retry"].ref == ref(9)
 
     # What the previous cycle carried: #7, believed landed, under the id it held

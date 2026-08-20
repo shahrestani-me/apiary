@@ -245,7 +245,7 @@ def test_an_in_memory_backend_satisfies_the_seam_and_no_caller_notices():
     memory.write(TaskJudgement(ref=ref(4), attempt=2, blocker="ab12cd34ef", streak=2))
     client = FakeClient({4: issue(4, label=READY, task_id="task-4", marker=render_marker("task-4", 2))})
 
-    ledger = load_ledger(client, adopt=False, store=memory)
+    ledger = load_ledger(client, store=memory)
 
     entry = ledger.entries["task-4"]
     assert (entry.attempt, entry.blocker, entry.streak) == (2, "ab12cd34ef", 2)
@@ -459,7 +459,7 @@ def test_a_task_the_store_has_never_judged_keeps_the_legacy_marker_record():
     )
 
     with SqliteTaskStore.open(REPO) as store:
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     entry = ledger.entries["task-4"]
     assert (entry.attempt, entry.blocker, entry.streak) == (2, "ab12cd34ef", 2)
@@ -482,7 +482,7 @@ def test_a_judgment_about_this_attempt_wins_over_the_body():
 
     with SqliteTaskStore.open(REPO) as store:
         store.write(TaskJudgement(ref=ref(4), attempt=2, blocker="ffffffffff", streak=1, renewals=1))
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     entry = ledger.entries["task-4"]
     assert (entry.blocker, entry.streak, entry.renewals) == ("ffffffffff", 1, 1)
@@ -507,7 +507,7 @@ def test_the_stored_counter_wins_over_a_marker_that_still_carries_one():
 
     with SqliteTaskStore.open(REPO) as store:
         store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab12cd34ef", streak=3, renewals=2))
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     entry = ledger.entries["task-4"]
     assert (entry.attempt, entry.blocker, entry.streak, entry.renewals) == (
@@ -532,7 +532,7 @@ def test_a_loader_with_no_store_reads_exactly_what_it_read_before():
         }
     )
 
-    ledger = load_ledger(client, adopt=False)
+    ledger = load_ledger(client)
 
     assert ledger.entries["task-4"].blocker == "ab12cd34ef"
 
@@ -553,7 +553,7 @@ def cycle(client: FakeClient, store: SqliteTaskStore, verify_output: str) -> Led
     `Reconciler`, so what is exercised is the counter-and-judgment path and not
     a container, a pull request or a model.
     """
-    ledger = load_ledger(client, adopt=False, store=store)
+    ledger = load_ledger(client, store=store)
     entry = next(iter(ledger.entries.values()))
     plan = plan_reconcile(
         ledger,
@@ -729,7 +729,7 @@ def test_a_seeded_floor_is_what_the_ledger_then_reads_as_the_counter():
 
     with SqliteTaskStore.open(REPO) as store:
         seed_attempt_floor(store, [task_branch(ref(4), 3)])
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     assert ledger.entries["task-4"].attempt == 3
 

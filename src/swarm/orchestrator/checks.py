@@ -889,7 +889,7 @@ def plan_checks(
                 f"which escalates this issue to swarm:failed. Keys held: "
                 f"{render_keys(str(key) for key in checks)}"
             ) from None
-        outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment))
+        outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment, believed=believed))
 
     return ChecksPlan(outcomes=tuple(outcomes), blind=pulls is None, policy=rules)
 
@@ -901,6 +901,8 @@ def _decide(
     policy: MergePolicy,
     max_attempts: int,
     now: dt.datetime,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """One issue's verdict. The order of the branches is the priority."""
     verdict = checks.verdict
@@ -912,10 +914,10 @@ def _decide(
         return Outcome(entry.number, PENDING, checks.summary())
 
     if verdict == EMPTY:
-        return _decide_empty(entry, pull, policy, now)
+        return _decide_empty(entry, pull, policy, now, believed=believed)
 
     if verdict == PASSED:
-        return _decide_passed(entry, pull, checks, policy)
+        return _decide_passed(entry, pull, checks, policy, believed=believed)
 
     outside = foreign_failure(entry, checks.output)
     feedback = tail(checks.output, FEEDBACK_CHARS)
@@ -949,11 +951,13 @@ def _decide(
             escalated=True,
         )
 
-    return _retry_or_give_up(entry, checks, max_attempts, feedback)
+    return _retry_or_give_up(entry, checks, max_attempts, feedback, believed=believed)
 
 
 def _decide_empty(
-    entry: LedgerEntry, pull: PullState, policy: MergePolicy, now: dt.datetime
+    entry: LedgerEntry, pull: PullState, policy: MergePolicy, now: dt.datetime,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """No checks at all: pending until the grace runs out, then a human's.
 
@@ -994,7 +998,9 @@ def _decide_empty(
 
 
 def _decide_passed(
-    entry: LedgerEntry, pull: PullState, checks: CheckSet, policy: MergePolicy
+    entry: LedgerEntry, pull: PullState, checks: CheckSet, policy: MergePolicy,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """Green. Merge it, unless a human was asked to be the one who does.
 
@@ -1039,7 +1045,9 @@ def _decide_passed(
 
 
 def _retry_or_give_up(
-    entry: LedgerEntry, checks: CheckSet, max_attempts: int, feedback: str
+    entry: LedgerEntry, checks: CheckSet, max_attempts: int, feedback: str,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """Consume an attempt, and decide whether any remain.
 

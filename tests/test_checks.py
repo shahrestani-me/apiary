@@ -82,6 +82,15 @@ from swarm.taskref import TaskRef
 from swarm.orchestrator.authority import Belief
 from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
+from fixtures.belief import fixture_belief
+
+
+# The cycle's belief, supplied from what each fixture declares (see
+# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def _plan_checks_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_checks(book, *args, **kwargs)
+
 
 NOW = dt.datetime(2026, 8, 14, 14, 25, 30, tzinfo=dt.timezone.utc)
 
@@ -126,7 +135,6 @@ def entry(
         files=files or (f"src/mod{number}.py", f"tests/test_mod{number}.py"),
         verify="python -m pytest -q",
         blocked_by=(),
-        state_label=label,
         labels=frozenset({label}),
     )
 
@@ -432,7 +440,7 @@ def test_a_failure_entirely_outside_the_declared_files_is_nobodys_to_retry():
 
 
 def test_a_green_pull_request_is_merged_and_its_issue_marked_done():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -447,7 +455,7 @@ def test_a_green_pull_request_is_merged_and_its_issue_marked_done():
 
 
 def test_the_merge_deletes_the_branch_because_a_long_run_leaves_one_per_task():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -459,7 +467,7 @@ def test_the_merge_deletes_the_branch_because_a_long_run_leaves_one_per_task():
 
 
 def test_with_the_override_off_a_green_pull_request_waits_for_a_human():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -477,7 +485,7 @@ def test_with_the_override_off_a_green_pull_request_waits_for_a_human():
 
 
 def test_a_draft_pull_request_is_not_merged_however_green_it_is():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23, draft=True)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -511,7 +519,7 @@ def test_the_override_is_configurable_and_loud_about_a_value_it_cannot_read(monk
 
 
 def test_a_failing_check_retries_and_the_transition_carries_the_failure():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, attempt=0)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -529,7 +537,7 @@ def test_a_failing_check_retries_and_the_transition_carries_the_failure():
 
 
 def test_the_last_attempt_gives_up_rather_than_retrying_forever():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -544,7 +552,7 @@ def test_the_last_attempt_gives_up_rather_than_retrying_forever():
 
 
 def test_a_failure_outside_the_declared_files_goes_to_a_human_not_to_a_retry():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py")),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): failing("tests/test_somebody_else.py")},
@@ -571,7 +579,7 @@ def test_a_failure_outside_the_declared_files_goes_to_a_human_not_to_a_retry():
 
 
 def test_an_empty_check_set_is_pending_while_the_grace_period_runs():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23, age_s=30)),
         checks={task_ref(23): CheckSet()},
@@ -587,7 +595,7 @@ def test_an_empty_check_set_is_pending_while_the_grace_period_runs():
 
 
 def test_an_empty_check_set_past_its_grace_goes_to_a_human_and_is_never_merged():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23, age_s=3600)),
         checks={task_ref(23): CheckSet()},
@@ -645,7 +653,7 @@ def test_a_check_set_that_cannot_be_looked_up_raises_rather_than_escalating():
     comes back with one escalated outcome and a `swarm:review -> swarm:failed`
     transition for an issue whose pull request nobody looked at."""
     with pytest.raises(UnresolvedJoin) as raised:
-        plan_checks(
+        _plan_checks_(
             ledger(entry(23)),
             pulls=aged_pull_past_the_grace(),
             checks={},
@@ -672,7 +680,7 @@ def test_an_issue_number_is_not_a_ref_and_does_not_resolve_a_check_set():
     wrong_key = cast(Mapping[TaskRef, CheckSet], {23: green})
 
     with pytest.raises(UnresolvedJoin):
-        plan_checks(
+        _plan_checks_(
             ledger(entry(23)),
             pulls=aged_pull_past_the_grace(),
             checks=wrong_key,
@@ -687,7 +695,7 @@ def test_a_check_set_read_for_another_task_never_answers_for_this_one():
     walks. #24's checks must not decide #23, and a non-empty map must not read
     as "the lookup worked"."""
     with pytest.raises(UnresolvedJoin):
-        plan_checks(
+        _plan_checks_(
             ledger(entry(23)),
             pulls=aged_pull_past_the_grace(),
             checks={task_ref(24): summarise_checks([run("test", "success")])},
@@ -705,7 +713,7 @@ def test_a_genuinely_empty_check_set_still_escalates_after_its_grace():
     harmless would delete this module's zero-check rule, so the miss and the
     empty answer are pinned apart on purpose - same ledger, same clock, same
     grace, one raising and one escalating."""
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=aged_pull_past_the_grace(),
         checks={task_ref(23): CheckSet()},
@@ -741,7 +749,7 @@ def test_the_check_sets_a_run_reads_are_keyed_the_way_the_plan_looks_them_up():
 
 
 def test_a_client_that_cannot_list_pull_requests_decides_nothing():
-    plan = plan_checks(ledger(entry(23)), pulls=None, checks={}, now=NOW)
+    plan = _plan_checks_(ledger(entry(23)), pulls=None, checks={}, now=NOW)
 
     # "We could not look" must never read as "the checks are not there".
     assert plan.blind
@@ -759,7 +767,7 @@ def test_the_pull_request_listing_is_probed_for_rather_than_assumed():
 
 
 def test_check_runs_that_could_not_be_read_are_pending_not_failed():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): CheckSet(unreadable=True)},
@@ -771,7 +779,7 @@ def test_check_runs_that_could_not_be_read_are_pending_not_failed():
 
 
 def test_only_review_issues_with_an_open_pull_request_are_decided():
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23), entry(24, label=CLAIMED), entry(25)),
         # #25 is in review with no open PR - that is #22's row, and two modules
         # writing one transition is how a label moves twice in a cycle.
@@ -802,7 +810,7 @@ def issue_payload(number: int, *, label: str = REVIEW, attempt: int = 0) -> dict
 
 def test_a_green_pull_request_merges_and_only_then_moves_the_label():
     client = DeletingClient(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -826,7 +834,7 @@ def test_a_refused_merge_leaves_the_issue_in_review_for_the_next_cycle():
     client.merge_error = GitHubHTTPError(
         405, "PUT", "/pulls/101/merge", b'{"message":"not mergeable"}'
     )
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -845,7 +853,7 @@ def test_a_refused_merge_leaves_the_issue_in_review_for_the_next_cycle():
 
 def green_plan(*numbers: int) -> ChecksPlan:
     """A plan that would merge every `numbers` on green. The refusal tests' input."""
-    return plan_checks(
+    return _plan_checks_(
         ledger(*(entry(n) for n in numbers)),
         pulls=pulls(*(pull(100 + n, issue=n) for n in numbers)),
         checks={task_ref(n): summarise_checks([run("test", "success")]) for n in numbers},
@@ -958,7 +966,7 @@ def test_a_refusal_is_matched_to_its_own_issue_and_not_to_the_others():
 
 def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
     client = client_with(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -976,7 +984,7 @@ def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
 
 def test_a_retry_persists_the_counter_before_the_label_moves():
     client = client_with(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1001,7 +1009,7 @@ def test_a_retry_persists_the_counter_before_the_label_moves():
 
 def test_giving_up_comments_the_failure_where_a_human_will_find_it():
     client = CommentingClient(issues={23: issue_payload(23, attempt=2)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py", attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1021,7 +1029,7 @@ def test_giving_up_comments_the_failure_where_a_human_will_find_it():
 
 def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
     client = client_with(issues={23: issue_payload(23, attempt=2)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1037,7 +1045,7 @@ def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
 
 def test_a_dry_run_writes_nothing_at_all():
     client = client_with(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -1053,7 +1061,7 @@ def test_a_dry_run_writes_nothing_at_all():
 
 def test_one_issue_github_will_not_relabel_does_not_cost_the_others():
     client = client_with(issues={23: issue_payload(23), 24: issue_payload(24)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23), entry(24)),
         pulls=pulls(pull(101, issue=23), pull(102, issue=24)),
         checks={
@@ -1242,7 +1250,7 @@ def test_the_merge_commit_is_kept_because_nothing_else_records_it():
     fact about a landed task the run directory could not otherwise recover -
     the answer to `PUT .../merge` used to be discarded on the line that made it."""
     client = FakeClient(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -1267,7 +1275,7 @@ def test_a_merge_that_answered_with_no_body_is_still_a_merge():
             return None
 
     client = SilentClient(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23)),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -1311,7 +1319,7 @@ def test_a_worker_re_dispatched_by_a_red_check_is_told_what_failed():
     from swarm.worker.entrypoint import fetch_feedback
 
     client = CommentingClient(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1332,7 +1340,7 @@ def test_the_retrys_comment_is_the_one_the_worker_greps_for():
     from swarm.worker.entrypoint import FEEDBACK_PREFIX
 
     client = CommentingClient(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1356,7 +1364,7 @@ def test_a_give_up_is_not_offered_to_the_next_attempt():
     from swarm.worker.entrypoint import fetch_feedback
 
     client = CommentingClient(issues={23: issue_payload(23, attempt=2)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py", attempt=2)),
         pulls=pulls(pull(101, issue=23, attempt=2)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1378,7 +1386,7 @@ def test_the_ci_output_is_fenced_because_it_is_foreign_text():
     is asserted rather than assumed.
     """
     client = CommentingClient(issues={23: issue_payload(23)})
-    plan = plan_checks(
+    plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
         pulls=pulls(pull(101, issue=23)),
         checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1401,7 +1409,7 @@ CARRIED = (DONE, "swarm:blocked")
 CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = (
     (
         "CI failed outside this issue's files",
-        lambda label: plan_checks(
+        lambda label: _plan_checks_(
             relabelled(label),
             pulls=pulls(pull(101, issue=23)),
             checks={task_ref(23): failing("tests/test_other.py")},
@@ -1412,7 +1420,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = 
     ),
     (
         "no check run was ever created",
-        lambda label: plan_checks(
+        lambda label: _plan_checks_(
             relabelled(label),
             pulls=pulls(pull(101, issue=23, age_s=3600)),
             checks={task_ref(23): CheckSet()},
@@ -1424,7 +1432,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = 
     ),
     (
         "the checks passed and it merges",
-        lambda label: plan_checks(
+        lambda label: _plan_checks_(
             relabelled(label),
             pulls=pulls(pull(101, issue=23)),
             checks={task_ref(23): summarise_checks([run("test", "success")])},
@@ -1435,7 +1443,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = 
     ),
     (
         "CI failed and the budget holds",
-        lambda label: plan_checks(
+        lambda label: _plan_checks_(
             relabelled(label),
             pulls=pulls(pull(101, issue=23)),
             checks={task_ref(23): failing("tests/test_mod23.py")},
@@ -1447,7 +1455,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = 
     ),
     (
         "CI failed and the attempts are spent",
-        lambda label: plan_checks(
+        lambda label: _plan_checks_(
             relabelled(label, attempt=2),
             pulls=pulls(pull(101, issue=23, attempt=2)),
             checks={task_ref(23): failing("tests/test_mod23.py")},

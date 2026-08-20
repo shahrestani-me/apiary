@@ -40,6 +40,15 @@ from swarm.github.readiness import (
 from swarm.github.refs import issue_number
 from swarm.github.refs import task_ref as ref
 from swarm.taskref import TaskRef
+from fixtures.belief import fixture_belief
+
+
+# The cycle's belief, supplied from what each fixture declares (see
+# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def _compute_readiness_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return compute_readiness(book, *args, **kwargs)
+
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +139,7 @@ def done(number: int, refs: Sequence[int] = (), **kwargs: Any) -> dict[str, Any]
 
 def plan_for(client: FakeClient):
     """The whole path - parse, resolve, decide - stopping short of the writes."""
-    return apply_readiness(client, dry_run=True)
+    return apply_readiness(client)
 
 
 def verdicts_by_number(plan) -> dict[int, str]:
@@ -451,7 +460,7 @@ def test_a_cycle_is_detected_before_anything_is_written():
 def test_dry_run_computes_the_same_plan_and_writes_nothing():
     client = FakeClient([done(40), task(41, [40])])
 
-    plan = apply_readiness(client, dry_run=True)
+    plan = apply_readiness(client)
 
     assert plan.ready == refs([41])
     assert plan.transitions[0].changed is True
@@ -461,10 +470,10 @@ def test_dry_run_computes_the_same_plan_and_writes_nothing():
 def test_a_prebuilt_ledger_is_not_re_read():
     """The reconcile loop (#22) already holds a ledger; readiness reuses it."""
     client = FakeClient([done(40), task(41, [40])])
-    ledger = load_ledger(client, adopt=False)
+    ledger = load_ledger(client)
     client.listed.clear()
 
-    apply_readiness(client, ledger=ledger, dry_run=True)
+    apply_readiness(client, ledger=ledger)
 
     # One list call, for resolving the referenced issues' open/closed state.
     assert client.listed == ["all"]
@@ -497,7 +506,7 @@ def test_a_reference_outside_the_listing_is_fetched_once():
 def test_a_404_becomes_a_missing_issue_rather_than_an_exception():
     client = FakeClient([task(60, [999])])
 
-    states = resolve_states(client, referenced_refs(load_ledger(client, adopt=False)))
+    states = resolve_states(client, referenced_refs(load_ledger(client)))
 
     assert states[ref(999)].exists is False
 
@@ -532,9 +541,9 @@ def test_a_reference_nobody_resolved_blocks_rather_than_passes():
     the reading that survives one is the one where the issue does not run.
     """
     client = FakeClient([task(41, [40])])
-    ledger = load_ledger(client, adopt=False)
+    ledger = load_ledger(client)
 
-    plan = compute_readiness(ledger, {})
+    plan = _compute_readiness_(ledger, {})
 
     assert plan.blocked == refs([41])
     assert plan.errors[0].ref == ref(40)
@@ -655,7 +664,7 @@ def test_a_non_numeric_ref_survives_the_readiness_graph():
         TaskRef("ENG-11"): IssueState(TaskRef("ENG-11")),
     }
 
-    plan = compute_readiness(linear_ledger(), states)
+    plan = _compute_readiness_(linear_ledger(), states)
 
     assert plan.ready == (TaskRef("ENG-10"),)
     assert plan.blocked == (TaskRef("ENG-11"),)
@@ -674,7 +683,7 @@ def test_a_cycle_of_non_numeric_refs_is_still_a_cycle():
     ledger = Ledger(entries={entry.task_id: entry for entry in entries})
 
     with pytest.raises(DependencyCycleError) as caught:
-        compute_readiness(ledger, {})
+        _compute_readiness_(ledger, {})
 
     assert caught.value.cycle == (TaskRef("ENG-1"), TaskRef("ENG-2"), TaskRef("ENG-1"))
     assert "ENG-1 -> ENG-2 -> ENG-1" in str(caught.value)

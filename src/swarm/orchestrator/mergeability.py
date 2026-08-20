@@ -605,6 +605,7 @@ def plan_mergeability(
     checks: ChecksPlan,
     *,
     states: Mapping[TaskRef, Mergeability] | None,
+    believed: Belief | None = None,
     budget: UpdateBudget | None = None,
     policy: UpdatePolicy | None = None,
     files: Mapping[TaskRef, Sequence[str]] | None = None,
@@ -726,9 +727,9 @@ def _decide(
     pull = outcome.merge.pull if outcome.merge is not None else facts.number
 
     if verdict == CONFLICTED:
-        decision = _decide_conflicted(entry, pull, facts, files, max_attempts)
+        decision = _decide_conflicted(entry, pull, facts, files, max_attempts, believed=believed)
     elif verdict == BEHIND:
-        decision = _decide_behind(entry, pull, facts, budget)
+        decision = _decide_behind(entry, pull, facts, budget, believed=believed)
     elif verdict == COMPUTING:
         detail = facts.summary() if state is not None else "mergeability was not read this cycle"
         # Never merged on a maybe. GitHub computes mergeability lazily and a
@@ -755,6 +756,8 @@ def _decide_conflicted(
     facts: Mergeability,
     files: tuple[str, ...],
     max_attempts: int,
+    *,
+    believed: Belief | None = None,
 ) -> Decision:
     """A branch git cannot merge. Re-dispatch it, or hand it over.
 
@@ -831,6 +834,8 @@ def _decide_behind(
     pull: PullRef,
     facts: Mergeability,
     budget: UpdateBudget,
+    *,
+    believed: Belief | None = None,
 ) -> Decision:
     """A branch whose checks passed against a base that has since moved.
 

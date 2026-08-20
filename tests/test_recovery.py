@@ -74,6 +74,15 @@ from swarm.orchestrator.authority import Belief
 from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import CLAIMED as CLAIMED_STATE
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
+from fixtures.belief import fixture_belief
+
+
+# The cycle's belief, supplied from what each fixture declares (see
+# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def _plan_recovery_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_recovery(book, *args, **kwargs)
+
 
 REPO = "shahrestani-me/apiary"
 OBJECTIVE = "recover the claims a killed orchestrator left on the tracker"
@@ -100,7 +109,6 @@ def entry(number: int, *, label: str = CLAIMED, attempt: int = 0) -> LedgerEntry
         files=(f"src/mod{number}.py",),
         verify="python -m pytest -q",
         blocked_by=(),
-        state_label=label,
         labels=frozenset({label}),
     )
 
@@ -319,7 +327,7 @@ def recovery(client: Any, daemon: Daemon | None = None, **kwargs: Any) -> Recove
 
 
 def test_a_claim_with_no_container_behind_it_returns_to_the_pool():
-    plan = plan_recovery(ledger(entry(4, attempt=0)), max_attempts=3)
+    plan = _plan_recovery_(ledger(entry(4, attempt=0)), max_attempts=3)
 
     # The ticket. Nothing else in the system takes this label off, so an issue
     # left here is undispatchable forever while looking perfectly healthy.
@@ -330,8 +338,8 @@ def test_a_claim_with_no_container_behind_it_returns_to_the_pool():
 
 
 def test_the_release_consumes_an_attempt_so_a_second_crash_gives_up():
-    first = plan_recovery(ledger(entry(4, attempt=0)), max_attempts=2)
-    second = plan_recovery(ledger(entry(4, attempt=1)), max_attempts=2)
+    first = _plan_recovery_(ledger(entry(4, attempt=0)), max_attempts=2)
+    second = _plan_recovery_(ledger(entry(4, attempt=1)), max_attempts=2)
 
     # "An issue that crashes the orchestrator twice should reach swarm:failed,
     # not loop." §5's counter is an upper bound on attempts made: over-counting
@@ -352,7 +360,7 @@ def test_only_claimed_issues_are_considered_at_all():
         entry(6, label=FAILED),
     )
 
-    plan = plan_recovery(entries)
+    plan = _plan_recovery_(entries)
 
     # Every other label is somebody else's row of §4, and none of them means
     # "a container should be running this". Relabelling one because no
@@ -361,7 +369,7 @@ def test_only_claimed_issues_are_considered_at_all():
 
 
 def test_an_issue_closed_by_hand_is_left_to_the_reconciler():
-    plan = plan_recovery(ledger(entry(4)), states={ref(4): closed(4)})
+    plan = _plan_recovery_(ledger(entry(4)), states={ref(4): closed(4)})
 
     # GitHub wins, but what a closed issue becomes - `done` or `failed` - is
     # #22's judgement, and answering it from here would be a second opinion on
@@ -379,7 +387,7 @@ def test_an_issue_closed_by_hand_is_left_to_the_reconciler():
 def test_a_claim_a_live_container_is_holding_is_never_touched():
     run = make_run()
 
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4)),
         containers=[handle(4, run.id)],
         live_run_ids=live_runs(run),
@@ -412,7 +420,7 @@ def test_a_container_that_exited_still_holds_the_claim_of_a_live_run():
 def test_a_sibling_run_the_caller_declared_live_does_not_lose_its_claim():
     run = make_run()
 
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4), entry(5)),
         containers=[handle(4, SIBLING_RUN), handle(5, DEAD_RUN)],
         live_run_ids=live_runs(run, {SIBLING_RUN}),
@@ -439,7 +447,7 @@ def test_a_container_of_a_dead_run_speaks_for_nothing_and_is_not_removed():
 
 
 def test_a_container_wearing_an_id_this_system_could_not_have_minted_keeps_its_claim():
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4)),
         containers=[Handle(id="foreign", run_id="Not A Run Id", issue=4)],
         live_run_ids=live_runs(make_run()),
@@ -498,7 +506,7 @@ def test_branches_from_before_this_ticket_are_reported_rather_than_parsed():
 
 
 def test_a_sweep_says_how_many_branch_names_it_could_not_read():
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4)), open_branches=frozenset({"swarm/issue-4"})
     )
 
@@ -521,7 +529,7 @@ def test_a_claim_is_matched_to_its_pull_request_by_ref_not_by_current_attempt():
     Matching by name would leave a claim looking abandoned while its finished
     work sits in an open pull request, and release it: a second container over
     the top of a PR somebody may already be reading."""
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4, attempt=2)),
         open_branches=frozenset({branch(4, attempt=1)}),
     )
@@ -536,7 +544,7 @@ def test_a_claim_is_matched_to_its_pull_request_by_ref_not_by_current_attempt():
 
 
 def test_a_claim_with_an_open_pull_request_moves_forward_to_review():
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4, attempt=1)),
         open_branches=frozenset({branch(4, attempt=1)}),
     )
@@ -554,7 +562,7 @@ def test_a_claim_with_an_open_pull_request_moves_forward_to_review():
 def test_a_live_container_outranks_an_open_pull_request():
     run = make_run()
 
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4)),
         containers=[handle(4, run.id)],
         live_run_ids=live_runs(run),
@@ -568,7 +576,7 @@ def test_a_live_container_outranks_an_open_pull_request():
 
 
 def test_an_unreadable_pull_request_list_does_not_leave_the_claim_unreachable():
-    plan = plan_recovery(ledger(entry(4)), open_branches=None, max_attempts=3)
+    plan = _plan_recovery_(ledger(entry(4)), open_branches=None, max_attempts=3)
 
     # The asymmetry with #22, which refuses to act while blind: there the
     # subject is a `swarm:review` issue whose state is already correct, here it
@@ -717,7 +725,7 @@ def test_a_mid_cycle_sweep_recovers_the_claims_a_spawn_never_reached():
         claim(client, item)
     spawned = handle(4, run.id)
 
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(*(entry(item.number) for item in entries)),
         containers=[spawned],
         live_run_ids=live_runs(run),
@@ -732,7 +740,7 @@ def test_a_mid_cycle_sweep_recovers_the_claims_a_spawn_never_reached():
 def test_a_sweep_that_frees_nothing_says_which_claims_it_left_and_why():
     run = make_run()
 
-    plan = plan_recovery(
+    plan = _plan_recovery_(
         ledger(entry(4), entry(5)),
         containers=[handle(4, run.id), handle(5, SIBLING_RUN)],
         live_run_ids=live_runs(run, {SIBLING_RUN}),
@@ -859,7 +867,7 @@ CARRIED = (DONE, "swarm:blocked")
 CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
     (
         "the claim is released with budget left",
-        lambda label: plan_recovery(
+        lambda label: _plan_recovery_(
             ledger(entry(4, label=label, attempt=0)),
             believed=Belief(states={"task-4": CLAIMED_STATE}),
             max_attempts=3,
@@ -868,7 +876,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
     ),
     (
         "the claim is released at the cap",
-        lambda label: plan_recovery(
+        lambda label: _plan_recovery_(
             ledger(entry(4, label=label, attempt=1)),
             believed=Belief(states={"task-4": CLAIMED_STATE}),
             max_attempts=2,
@@ -877,7 +885,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
     ),
     (
         "a pull request was pushed and no cycle saw it",
-        lambda label: plan_recovery(
+        lambda label: _plan_recovery_(
             ledger(entry(4, label=label, attempt=1)),
             believed=Belief(states={"task-4": CLAIMED_STATE}),
             open_branches=(branch(4, attempt=1),),

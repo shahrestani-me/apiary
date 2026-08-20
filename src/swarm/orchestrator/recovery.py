@@ -327,7 +327,10 @@ class RecoveryPlan:
         return ", ".join(parts)
 
 
-def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
+def _release(entry: LedgerEntry, max_attempts: int,
+    *,
+    believed: Belief | None = None,
+) -> Transition:
     """Consume an attempt for a claim nothing was running, and decide the label.
 
     The increment rides on the transition so `apply_plan` persists it *before*
@@ -481,7 +484,7 @@ def plan_recovery(
             continue
 
         # 4. A claim with nothing behind it at all. This is the ticket.
-        transitions.append(_release(entry, max_attempts))
+        transitions.append(_release(entry, max_attempts, believed=believed))
 
     return RecoveryPlan(
         transitions=tuple(transitions),

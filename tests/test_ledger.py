@@ -639,7 +639,7 @@ def test_an_issue_without_a_marker_is_adopted():
 def test_adoption_can_be_suppressed_for_a_read_only_caller():
     client = FakeClient([issue(41, contract_body(marker=None), labels=["swarm:ready"])])
 
-    ledger = load_ledger(client, adopt=False)
+    ledger = load_ledger(client)
 
     assert list(ledger.entries) == ["a-task"]
     assert client.patched == []
