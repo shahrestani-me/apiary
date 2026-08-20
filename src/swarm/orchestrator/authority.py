@@ -762,7 +762,6 @@ def believe(
     ledger: Ledger,
     observation: Observation | None,
     *,
-    source: str = DERIVED,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_cap: int = 3,
     revived: Mapping[TaskRef, Grant] | None = None,
@@ -1120,7 +1119,6 @@ def believe(
             )
 
     return Belief(
-        source=DERIVED,
         states=states,
         stored=stored,
         previous=previous,

@@ -102,7 +102,6 @@ def entry(
         files=tuple(files) or (f"src/swarm/mod{number}.py",),
         verify=VERIFY,
         blocked_by=(),
-        state_label=label,
         labels=frozenset({label}),
     )
 
@@ -786,7 +785,7 @@ def test_a_stalled_run_rewrites_its_issues_without_duplicating_them(tracker):
         body=render_body("drop-me", goal="Drop me", files=["src/swarm/b.py"], verify=VERIFY),
         labels=[READY],
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
     report = replan(
         client,
@@ -804,7 +803,7 @@ def test_a_stalled_run_rewrites_its_issues_without_duplicating_them(tracker):
     )
 
     assert report.replanned
-    after = load_ledger(client, adopt=False)
+    after = load_ledger(client)
     # The surviving id kept its issue - a second issue for work that already
     # has one is the failure §2 exists to prevent.
     assert after.entries["keep-me"].number == keep
@@ -822,7 +821,7 @@ def test_a_dropped_task_with_a_worker_on_it_is_left_alone_and_reported(tracker):
         body=render_body("in-flight", goal="Being worked on", files=["src/swarm/d.py"], verify=VERIFY),
         labels=[CLAIMED],
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
     report = replan(
         client,
@@ -854,7 +853,7 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
         render_marker("stuck", 3), legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
     )
     number = store.add(body=body, labels=[FAILED])
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
     report = replan(
         client,
@@ -879,7 +878,7 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
 
 def test_a_replan_resets_the_stall_count_and_counts_itself(tracker):
     client, _ = tracker()
-    client_ledger = load_ledger(client, adopt=False)
+    client_ledger = load_ledger(client)
 
     report = replan(
         client,
@@ -927,7 +926,7 @@ def test_the_replan_shows_the_model_the_repositorys_tree(tracker):
     store.add(
         body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY)
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
     client.list_tree = lambda ref=None: ["src/swarm/a.py", "README.md"]
     proposer = Proposal(Plan(tasks=[task("existing", files=["src/swarm/a.py"])]))
 
@@ -947,7 +946,7 @@ def test_a_tree_read_failure_does_not_fail_the_replan(tracker):
     store.add(
         body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY)
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
     def boom(ref=None):
         raise GitHubError("GET /git/trees/main -> 502")
@@ -1022,7 +1021,7 @@ def test_a_planner_that_cannot_be_reached_leaves_the_stall_standing():
 def test_a_ring_in_the_proposed_plan_leaves_the_tracker_alone(tracker):
     client, store = tracker()
     store.add(body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY))
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
     report = replan(
         client,
@@ -1059,7 +1058,7 @@ def test_a_rewritten_issue_keeps_the_runs_own_verify_command(tracker):
 
     report = replan(
         client,
-        load_ledger(client, adopt=False),
+        load_ledger(client),
         OBJECTIVE,
         stalled(),
         verify=scaffolded,
@@ -1067,7 +1066,7 @@ def test_a_rewritten_issue_keeps_the_runs_own_verify_command(tracker):
     )
 
     assert report.replanned
-    after = load_ledger(client, adopt=False)
+    after = load_ledger(client)
     assert {entry.verify for entry in after.entries.values()} == {scaffolded}
 
 
@@ -1122,7 +1121,7 @@ def test_a_repeatedly_failing_run_replans_instead_of_retrying_forever(tracker):
 
     report = replan(
         client,
-        load_ledger(client, adopt=False),
+        load_ledger(client),
         OBJECTIVE,
         verdict,
         proposer=Proposal(
@@ -1136,7 +1135,7 @@ def test_a_repeatedly_failing_run_replans_instead_of_retrying_forever(tracker):
     )
 
     assert report.replanned
-    after = load_ledger(client, adopt=False)
+    after = load_ledger(client)
     assert set(after.entries) == {"parse-headers", "header-fixtures"}
     # The attempt counter survives the rewrite: a replan is not a free retry.
     assert after.entries["parse-headers"].number == 1

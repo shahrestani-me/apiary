@@ -755,7 +755,7 @@ def a_task(github: Any, label: str, *, was: str = LANDED, **facts: Any) -> Simpl
             remembered={ref: was},
             landed=frozenset({ref}) if was == LANDED else frozenset(),
         ),
-        obeyed=believe(book, seen, source=LABELS),
+        obeyed=believe(book, seen),
         mark=len(transport.sent),
     )
 
@@ -1213,14 +1213,13 @@ def test_plan_node_writes_the_verify_command_it_was_given(github, monkeypatch):
 
     result = plan_node(
         {"objective": "make it work"},
-        source=client,
         verify="python3 -m unittest discover -q",
     )
 
     assert result["tasks"]["root"]["status"] == "pending"
     # Read back through the loader, which is the only thing that says what an
     # issue means.
-    entry = load_ledger(client, adopt=False).entries["root"]
+    entry = load_ledger(client).entries["root"]
     assert entry.verify == "python3 -m unittest discover -q"
     assert store.issues[1]["body"].count("## Verify") == 1
 
@@ -1233,7 +1232,7 @@ def test_plan_node_falls_back_to_the_setting_when_nobody_says(github, monkeypatc
 
     plan_node({"objective": "make it work"}, source=client)
 
-    assert load_ledger(client, adopt=False).entries["root"].verify == SETTINGS.verify_command
+    assert load_ledger(client).entries["root"].verify == SETTINGS.verify_command
 
 
 def test_plan_node_without_a_target_keeps_the_v1_in_memory_ledger(monkeypatch):

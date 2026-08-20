@@ -385,8 +385,8 @@ def test_reinvoking_mints_a_new_id_and_adopts_the_same_ledger():
         issue(2, marker="task-two", labels=("swarm:ready",)),
     ])
 
-    first = start_run(REPO, OBJECTIVE, source=client, now=NOW)
-    second = start_run(REPO, OBJECTIVE, source=client, now=NOW + dt.timedelta(seconds=90))
+    first = start_run(REPO, OBJECTIVE, now=NOW)
+    second = start_run(REPO, OBJECTIVE, now=NOW + dt.timedelta(seconds=90))
 
     # A new id, because the containers and artifacts of the dead process must
     # stay distinguishable from this one's (#20, #29).
@@ -404,7 +404,7 @@ def test_a_dry_run_does_not_even_adopt_a_hand_written_issue():
     # promised to change nothing must not make that one either.
     client = FakeClient([issue(1, marker=None, title="Add retry logic")])
 
-    attachment = start_run(REPO, OBJECTIVE, source=client, now=NOW, adopt=False)
+    attachment = start_run(REPO, OBJECTIVE, now=NOW)
 
     assert attachment.mode == "attach"
     assert client.writes == []
@@ -413,8 +413,8 @@ def test_a_dry_run_does_not_even_adopt_a_hand_written_issue():
 def test_attaching_adopts_a_hand_written_issue_under_a_stable_id():
     client = FakeClient([issue(1, marker=None, title="Add retry logic")])
 
-    first = start_run(REPO, OBJECTIVE, source=client, now=NOW)
-    second = start_run(REPO, OBJECTIVE, source=client, now=NOW + dt.timedelta(seconds=90))
+    first = start_run(REPO, OBJECTIVE, now=NOW)
+    second = start_run(REPO, OBJECTIVE, now=NOW + dt.timedelta(seconds=90))
 
     assert [entry.task_id for entry in first.live] == ["add-retry-logic"]
     # The marker was persisted on the first pass, so the second reads it back

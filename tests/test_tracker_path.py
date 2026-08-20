@@ -280,7 +280,7 @@ def test_the_ledger_is_read_through_mcp_and_the_code_host_is_not_asked():
     server = github_server(list_issues=[issue(4), issue(7)])
     view = TrackerView(Refuser(), tracker(server))
 
-    ledger = load_ledger(Snapshot(view), adopt=False)  # type: ignore[arg-type]
+    ledger = load_ledger(Snapshot(view))  # type: ignore[arg-type]
 
     assert sorted(str(entry.ref) for entry in ledger.entries.values()) == ["#4", "#7"]
     # The call that left apiary, and its whole argument dict: the scope constants
@@ -301,7 +301,7 @@ def test_a_cycles_readers_share_one_intake_call():
     server = github_server(list_issues=[issue(4), issue(7)])
     snapshot = Snapshot(TrackerView(Refuser(), tracker(server)))  # type: ignore[arg-type]
 
-    ledger = load_ledger(snapshot, adopt=False)  # type: ignore[arg-type]
+    ledger = load_ledger(snapshot)  # type: ignore[arg-type]
     resolve_states(snapshot, [entry.ref for entry in ledger.entries.values()])  # type: ignore[arg-type]
     snapshot.states()
 

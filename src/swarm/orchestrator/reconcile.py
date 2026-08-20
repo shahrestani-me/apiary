@@ -906,6 +906,7 @@ def _retry_or_give_up(
     reason: str,
     max_attempts: int,
     *,
+    believed: Belief | None = None,
     verify_output: str = "",
     max_total_attempts: int | None = None,
 ) -> Transition:
@@ -1193,6 +1194,7 @@ def plan_reconcile(
                 entry,
                 record,
                 max_attempts,
+                believed=believed,
                 max_total_attempts=max_total_attempts,
                 infrastructure_streak=infrastructure.get(entry.ref, 0),
                 policy=infrastructure_policy,
@@ -1221,6 +1223,7 @@ def plan_reconcile(
                     entry,
                     "its pull request was closed without merging",
                     max_attempts,
+                    believed=believed,
                     max_total_attempts=max_total_attempts,
                 )
             )
@@ -1287,6 +1290,7 @@ def _observe(
     record: ResultRecord,
     max_attempts: int,
     *,
+    believed: Belief | None = None,
     max_total_attempts: int | None = None,
     infrastructure_streak: int = 0,
     policy: InfrastructurePolicy = InfrastructurePolicy(),
@@ -1314,6 +1318,7 @@ def _observe(
         entry,
         record,
         max_attempts,
+        believed=believed,
         max_total_attempts=max_total_attempts,
         infrastructure_streak=infrastructure_streak,
         policy=policy,
@@ -1328,6 +1333,7 @@ def _verdict(
     record: ResultRecord,
     max_attempts: int,
     *,
+    believed: Belief | None = None,
     max_total_attempts: int | None = None,
     infrastructure_streak: int = 0,
     policy: InfrastructurePolicy = InfrastructurePolicy(),
@@ -1355,6 +1361,7 @@ def _verdict(
                 entry,
                 f"worker exit {record.exit_code}: {detail}",
                 max_attempts,
+                believed=believed,
                 # The record is the only place the gate's own words survive the
                 # container, and they are what the retry comment - and through
                 # it, the next attempt's prompt - is made of. The failure
@@ -2049,11 +2056,13 @@ class Reconciler:
         self._cycles += 1
 
         snapshot = Snapshot(self.client)
-        # `adopt` writes a marker onto every hand-written issue (§2), which a
-        # dry run promised not to do.
+        # No `adopt=`: the loader wrote a marker onto every hand-written issue
+        # that carried a `swarm:*` label, and #152 removed both the label that
+        # selected them and the write. Membership is the marker itself now, so
+        # there is nothing to adopt - and nothing for a dry run to promise not
+        # to do either.
         ledger = load_ledger(
             snapshot,  # type: ignore[arg-type]
-            adopt=not self.dry_run,
             store=self.store,
         )
 
@@ -2284,11 +2293,12 @@ class Reconciler:
                 readiness = apply_readiness(
                     snapshot,  # type: ignore[arg-type]
                     ledger=ledger,
-                    dry_run=self.dry_run,
-                    # The one thing readiness used a label for: which entries
-                    # are its to speak about. Everything else it decides is a
-                    # question about the code host and is untouched (#147).
+                    # Which entries are readiness's to speak about, and what it
+                    # believes they are waiting in. Both were read off the
+                    # label until #152; the pass writes nothing now, so there is
+                    # no `dry_run` to pass either.
                     transitionable=belief.waiting(),
+                    current=belief.states,
                 )
             except DependencyCycleError as exc:
                 # Nothing was written - readiness detects the ring before its

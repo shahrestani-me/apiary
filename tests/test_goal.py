@@ -96,7 +96,6 @@ def entry(
         files=tuple(files) or (f"src/mod{number}.py",),
         verify=VERIFY,
         blocked_by=(),
-        state_label=label,
         labels=frozenset({label}),
     )
 

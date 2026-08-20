@@ -58,6 +58,15 @@ from swarm.orchestrator.dispatcher import (
     plan_dispatch,
 )
 from swarm.taskref import TaskRef
+from fixtures.belief import fixture_belief
+
+
+# The cycle's belief, supplied from what each fixture declares (see
+# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def _plan_dispatch_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_dispatch(book, *args, **kwargs)
+
 
 READY = "swarm:ready"
 BLOCKED = "swarm:blocked"
@@ -88,7 +97,6 @@ def entry(number: int, *files: str, label: str = READY, attempt: int = 0) -> Led
         files=files or (f"src/mod{number}.py",),
         verify="python -m pytest -q",
         blocked_by=(),
-        state_label=label,
         labels=frozenset({label}),
     )
 
@@ -302,7 +310,7 @@ def test_the_capacity_summary_names_the_constraint_a_human_would_change():
 
 
 def test_more_ready_issues_than_the_cap_dispatches_exactly_the_cap():
-    plan = plan_dispatch(ledger(entry(4), entry(5), entry(6), entry(7)), capacity=capacity(2))
+    plan = _plan_dispatch_(ledger(entry(4), entry(5), entry(6), entry(7)), capacity=capacity(2))
 
     # #21's acceptance criterion, and the oldest-first rule with it: issue
     # numbers ascend with creation, so this is arrival order.
@@ -312,7 +320,7 @@ def test_more_ready_issues_than_the_cap_dispatches_exactly_the_cap():
 
 
 def test_containers_already_running_spend_the_same_cap():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, label=CLAIMED), entry(5), entry(6)),
         capacity=capacity(2),
     )
@@ -324,7 +332,7 @@ def test_containers_already_running_spend_the_same_cap():
 
 
 def test_a_cap_already_full_dispatches_nothing_and_says_why():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, label=CLAIMED), entry(5, label=CLAIMED), entry(6)),
         capacity=capacity(2),
     )
@@ -334,7 +342,7 @@ def test_a_cap_already_full_dispatches_nothing_and_says_why():
 
 
 def test_only_ready_issues_are_candidates():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(
             entry(1, label=BLOCKED),
             entry(2, label=DONE),
@@ -353,7 +361,7 @@ def test_only_ready_issues_are_candidates():
 def test_a_readiness_verdict_narrows_the_candidates_but_never_promotes_one():
     entries = ledger(entry(4), entry(5), entry(6, label=BLOCKED))
 
-    plan = plan_dispatch(entries, capacity=capacity(4), ready=[task_ref(5), task_ref(6)])
+    plan = _plan_dispatch_(entries, capacity=capacity(4), ready=[task_ref(5), task_ref(6)])
 
     # The readiness pass just wrote these labels, so passing its verdict saves
     # reading them back. It is a filter, not an authority: §3 makes the label
@@ -367,7 +375,7 @@ def test_a_readiness_verdict_narrows_the_candidates_but_never_promotes_one():
 
 
 def test_two_ready_issues_over_one_file_serialize():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(
             entry(4, "src/swarm/graph.py", "tests/test_graph.py"),
             entry(5, "src/swarm/graph.py", "docs/graph.md"),
@@ -383,7 +391,7 @@ def test_two_ready_issues_over_one_file_serialize():
 
 
 def test_a_running_container_holds_its_files_against_the_whole_backlog():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(
             entry(4, "src/swarm/graph.py", label=CLAIMED),
             entry(5, "src/swarm/graph.py"),
@@ -397,7 +405,7 @@ def test_a_running_container_holds_its_files_against_the_whole_backlog():
 
 
 def test_an_open_pr_holds_its_files_too():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, "src/swarm/graph.py", label=REVIEW), entry(5, "src/swarm/graph.py")),
         capacity=capacity(4),
     )
@@ -410,7 +418,7 @@ def test_an_open_pr_holds_its_files_too():
 
 
 def test_overlap_is_case_insensitive_because_this_filesystem_is():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, "src/Thing.py"), entry(5, "src/thing.py")),
         capacity=capacity(4),
     )
@@ -422,7 +430,7 @@ def test_overlap_is_case_insensitive_because_this_filesystem_is():
 
 
 def test_disjoint_issues_run_together_up_to_the_cap():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, "src/a.py"), entry(5, "src/b.py"), entry(6, "src/c.py")),
         capacity=capacity(3),
     )
