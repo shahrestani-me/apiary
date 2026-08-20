@@ -1436,8 +1436,12 @@
     strip.appendChild(state);
     var cycle = el("span", "pill", "");
     var prs = el("span", "pill", "");
+    //: #270. Hidden on a local run, which spends nothing and prints no spend
+    //: line - the pill appearing at all is itself the signal that this run is
+    //: costing money.
+    var spend = el("span", "pill", "");
     var elapsed = el("span", "pill", "");
-    [cycle, prs, elapsed].forEach(function (p) { p.style.display = "none"; strip.appendChild(p); });
+    [cycle, prs, spend, elapsed].forEach(function (p) { p.style.display = "none"; strip.appendChild(p); });
 
     var links = el("p", "links");
     var note = el("p", "blurb", "");
@@ -1514,6 +1518,20 @@
         if ((p.prs || []).length) {
           prs.textContent = (p.prs.length === 1 ? "PR #" : "PRs #") + p.prs.join(", #");
           prs.style.display = "";
+        }
+        //: While the run is in flight, not only afterwards - which is the half
+        //: of #270 an operator actually watches. The `+` is kept: it means a
+        //: model with no known price contributed tokens, so the figure is a
+        //: floor and rounding it away would report a confident number that is
+        //: too small.
+        if (p.spend) {
+          spend.textContent = "$" + p.spend.usd.toFixed(2) + (p.spend.floor ? "+" : "")
+                            + " · " + p.spend.tokens.toLocaleString() + " tokens";
+          spend.title = p.spend.floor
+            ? "A model with no known price contributed tokens, so this is a floor. "
+              + "The token ceiling is what is holding the run."
+            : "Spent so far this run, against SWARM_SPEND_CEILING_USD.";
+          spend.style.display = "";
         }
         //: The pill says which ending; this says what the run said about it.
         //: Repeating "objective met" in both - which is what this did before

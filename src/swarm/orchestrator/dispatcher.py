@@ -229,6 +229,22 @@ def container_memory_cap(host: HostBudget, *, ceiling: int) -> int:
     return max(fitting) if fitting else MIN_WORKERS
 
 
+def _worker_provider() -> str:
+    """Which provider the worker role resolves to, for the bounds above.
+
+    Defaults to `ollama` on any failure rather than raising: this is called to
+    *describe* a cap, and a misconfigured model is reported by `swarm doctor`
+    and refused by `swarm run` - it must not also turn a capacity summary into
+    a traceback.
+    """
+    try:
+        from ..models import resolve  # noqa: PLC0415 - lazy, like every model import here
+
+        return resolve("worker").spec.provider
+    except Exception:  # noqa: BLE001 - see the docstring
+        return "ollama"
+
+
 @dataclass(frozen=True)
 class Capacity:
     """How many workers may run at once, and which constraint decided it.
@@ -244,6 +260,13 @@ class Capacity:
     configured: int = field(default_factory=lambda: SETTINGS.max_workers_parallel)
     #: `None` means the memory bound was not consulted - see `detect`.
     memory: int | None = None
+    #: Which provider the *worker* role resolves to (#270). It decides whether
+    #: the inference-slot bound applies at all: `OLLAMA_NUM_PARALLEL` and
+    #: `OLLAMA_MAX_LOADED_MODELS` describe a server this run may not be using,
+    #: and a cap derived from them would be a number nobody chose. Remote, the
+    #: binding constraints are the provider's quota and the spend ceiling, and
+    #: `SWARM_MAX_PARALLEL` is the knob that actually holds.
+    provider: str = "ollama"
 
     @classmethod
     def detect(
@@ -251,6 +274,7 @@ class Capacity:
         *,
         host: HostBudget | None = None,
         daemon_gb: float | None = None,
+        provider: str = "ollama",
     ) -> Capacity:
         """This machine's cap. `daemon_gb` is the Docker VM's own total.
 
@@ -260,7 +284,9 @@ class Capacity:
         the number that actually binds, so a caller that has a `DockerCLI` in
         hand should pass it.
         """
-        inference = cls(slots=_env_int(ENV_SLOTS, SETTINGS.max_workers_parallel))
+        inference = cls(
+            slots=_env_int(ENV_SLOTS, SETTINGS.max_workers_parallel), provider=provider
+        )
         machine = host if host is not None else HostBudget.detect(daemon_gb=daemon_gb)
         # The memory search is bounded by the cap the other two already imply:
         # asking whether 8 workers fit is wasted when 2 slots exist.
@@ -273,8 +299,19 @@ class Capacity:
 
     @property
     def bounds(self) -> dict[str, int]:
-        """Every bound in play, by the name a human would act on."""
-        bounds = {"inference slots": self.inference, "SWARM_MAX_PARALLEL": self.configured}
+        """Every bound in play, by the name a human would act on.
+
+        The inference-slot bound is dropped for a remote worker. It is not that
+        it becomes generous - it becomes *meaningless*: `OLLAMA_NUM_PARALLEL`
+        describes a server this run is not calling, and reporting a cap "bound
+        by inference slots" would send an operator to change a setting that
+        cannot affect anything. Container memory still binds either way,
+        because a worker is still a container on this host; only its model
+        stopped being.
+        """
+        bounds = {"SWARM_MAX_PARALLEL": self.configured}
+        if self.provider == "ollama":
+            bounds["inference slots"] = self.inference
         if self.memory is not None:
             bounds["container memory"] = self.memory
         return bounds
@@ -291,7 +328,16 @@ class Capacity:
 
     def summary(self) -> str:
         detail = ", ".join(f"{name} {value}" for name, value in self.bounds.items())
-        return f"cap {self.workers} worker(s), bound by {self.bound_by} ({detail})"
+        line = f"cap {self.workers} worker(s), bound by {self.bound_by} ({detail})"
+        if self.provider != "ollama":
+            # Said out loud rather than left to be inferred from a missing
+            # bound: the numbers that used to hold this run no longer do, and
+            # what replaces them is not visible from this host at all.
+            line += (
+                f"; the worker model is {self.provider}, so GPU memory and Ollama's own "
+                f"limits do not bind - quota and the spend ceiling do"
+            )
+        return line
 
 
 # --------------------------------------------------------------------------
@@ -464,7 +510,7 @@ def plan_dispatch(
     `swarm:claimed` until something releases it), so under `labels` this is not
     consulted and nothing changes.
     """
-    limit = capacity if capacity is not None else Capacity.detect()
+    limit = capacity if capacity is not None else Capacity.detect(provider=_worker_provider())
     allowed = None if ready is None else set(ready)
     derived = believed is not None and believed.derived
     startable = WAITING_STATES if allowed is not None else frozenset({ELIGIBLE})
@@ -788,7 +834,7 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
     # Read-only on every path: no adoption write, no label, no container.
     report = plan_dispatch(load_ledger(GitHubClient.from_env(repo), adopt=False))
-    print(Capacity.detect().summary())
+    print(Capacity.detect(provider=_worker_provider()).summary())
     for chosen in report.dispatch:
         print(f"dispatch #{chosen.number} {chosen.task_id}: {', '.join(chosen.files)}")
     for held_back in report.deferred:
