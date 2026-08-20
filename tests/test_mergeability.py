@@ -44,8 +44,6 @@ import pytest
 
 FAILED = "needs-human"
 
-DONE = "landed"
-
 from fixtures.store import RecordingStore
 from swarm.store import STORE_DIR_ENV
 from swarm.github.branches import task_branch
@@ -84,7 +82,6 @@ from swarm.orchestrator.mergeability import (
 from swarm.orchestrator.reconcile import READY
 from swarm.taskref import TaskRef
 from swarm.orchestrator.authority import Belief
-from swarm.orchestrator.lifecycle import internal_state
 from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 from fixtures.belief import fixture_belief
@@ -353,6 +350,11 @@ class CommentingClient(UpdatingClient):
     comments: list[tuple[int, str]] = field(default_factory=list)
 
     def create_issue_comment(self, number: int, text: str) -> dict[str, Any]:
+        # Narrated into `log` as well as collected, so the crash-ordering test
+        # still has a *client* event to compare the store write against. Until
+        # #152 that event was the label write; the re-dispatch context is what
+        # `apply_mergeability` sends after the judgment now.
+        self.log.append(f"comment #{number}")
         self.comments.append((number, text))
         return {"id": len(self.comments)}
 
@@ -865,7 +867,7 @@ def test_the_update_budget_is_keyed_on_the_ref_because_it_outlives_the_cycle():
 # The re-dispatch's context
 # --------------------------------------------------------------------------
 
-def test_the_branch_update_is_issued_and_the_issue_left_in_review():
+def test_the_branch_update_is_issued_and_the_task_left_in_review():
     client = UpdatingClient(issues={23: issue_payload(23)})
     tasks, checks = green(23, states={})
     plan = _plan_mergeability_(tasks, checks, states={task_ref(23): behind(101, issue=23)})
@@ -875,9 +877,13 @@ def test_the_branch_update_is_issued_and_the_issue_left_in_review():
 
     assert client.updated == [101]
     assert report.updated == (task_ref(23),)
-    # The pull request stays where it is: a fresh head means a fresh check run,
-    # and #23 reads it next cycle.
-    assert client.labels_on(23) == {REVIEW}
+    # The task stays where it is: a fresh head means a fresh check run, and #23
+    # reads it next cycle. Asserted as "no state change was written at all"
+    # rather than as a `swarm:review` still sitting on the issue - since #152
+    # there is no label to leave in place, and an unchanged label was always the
+    # weaker half of the claim anyway.
+    assert report.applied == ()
+    assert client.log == ["update_branch #101"]
     assert budget.spent(task_ref(23)) == 1
 
 
@@ -919,8 +925,8 @@ def test_a_refused_update_is_collected_rather_than_raised():
     assert "merge conflict" in str(report.failures[0])
 
 
-def test_a_conflict_persists_the_counter_before_the_label_moves():
-    client = UpdatingClient(issues={23: issue_payload(23)})
+def test_a_conflict_persists_the_counter_before_it_re_dispatches():
+    client = CommentingClient(issues={23: issue_payload(23)})
     tasks, checks = green(23, states={})
     plan = _plan_mergeability_(
         tasks,
@@ -930,16 +936,18 @@ def test_a_conflict_persists_the_counter_before_the_label_moves():
     )
 
     with RecordingStore(REPO, client.log) as store:
-        apply_mergeability(client, plan, store=store)
+        report = apply_mergeability(client, plan, store=store)
         held = store.read()[task_ref(23)]
 
     # `checks`' crash-ordering test's sibling, and the same surviving subject:
-    # the judgment lands before the label re-readies the task. The conflict
-    # detail used to ride a body `PATCH` and the counter used to ride it too;
-    # ADR 0005 took the last of it, and the conflict is on the pull request.
-    assert client.labels_on(23) == {READY}
+    # the judgment lands before anything invites the task to run again, so a
+    # crash between them costs an attempt rather than granting a free one. The
+    # counter used to ride a body `PATCH` and the label used to follow it; ADR
+    # 0005 took the first and #152 the second, so the write on the far side of
+    # the boundary is the re-dispatch context the worker reads.
+    assert [transition.to_state for transition in report.applied] == [READY]
     assert held.attempt == 1
-    assert client.log.index(f"store {task_ref(23)} attempt=1") < client.log.index(f"+{READY} #23")
+    assert client.log.index(f"store {task_ref(23)} attempt=1") < client.log.index("comment #23")
     assert not [line for line in client.log if "update_issue" in line or "get_issue" in line]
 
 
@@ -955,7 +963,7 @@ def test_starving_a_pull_request_says_so_where_a_human_will_find_it():
 
     report = apply_mergeability(client, plan)
 
-    assert client.labels_on(23) == {FAILED}
+    assert [transition.to_state for transition in report.applied] == [FAILED]
     assert report.uncommented == ()
     number, text = client.comments[0]
     assert number == 23
@@ -974,7 +982,7 @@ def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
 
     report = apply_mergeability(client, plan)
 
-    assert client.labels_on(23) == {FAILED}
+    assert [transition.to_state for transition in report.applied] == [FAILED]
     assert report.uncommented == (task_ref(23),)
 
 
@@ -1009,7 +1017,9 @@ def test_one_pass_updates_the_stale_one_and_lets_the_fresh_one_through():
     tasks = ledger(entry(23), entry(24))
     _, checks = green(23, 24, ledger_=tasks, states={})
 
-    report = run_mergeability(client, tasks, checks, budget=UpdateBudget(cap=3))
+    report = run_mergeability(
+        client, tasks, checks, budget=UpdateBudget(cap=3), believed=fixture_belief(tasks)
+    )
 
     # The issue's headline, end to end: one merge is admitted, the stale sibling
     # is not merged, and it is not updated either - this cycle's merge would
@@ -1028,7 +1038,13 @@ def test_one_pass_costs_one_pull_request_read_per_review_issue_and_nothing_else(
     tasks = ledger(entry(23), entry(24, label=CLAIMED))
     _, checks = green(23, ledger_=tasks, states={})
 
-    run_mergeability(client, tasks, checks, pulls=pulls(pull(101, issue=23)))
+    run_mergeability(
+        client,
+        tasks,
+        checks,
+        pulls=pulls(pull(101, issue=23)),
+        believed=fixture_belief(tasks),
+    )
 
     # The cost is the review queue, not the ledger: #24 is claimed, so nothing is
     # read about it, and the conflict-only file listing is not paid for either.
@@ -1045,12 +1061,16 @@ def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothin
     client = BlindClient(issues={23: issue_payload(23)})
     tasks, checks = green(23, states={})
 
-    report = run_mergeability(client, tasks, checks)
+    report = run_mergeability(client, tasks, checks, believed=fixture_belief(tasks))
 
     assert report.plan.blind
     assert report.plan.merges == ()
     assert client.log == []
-    assert client.labels_on(23) == {REVIEW}
+    # "We could not look" decides nothing, so nothing is recorded. Asserted on
+    # the report since #152 - an unchanged label could not distinguish "held its
+    # ground" from "was never written to at all".
+    assert report.applied == ()
+    assert report.plan.transitions == ()
 
 
 def test_a_conflicting_pass_re_dispatches_and_names_the_touched_files():
@@ -1062,9 +1082,9 @@ def test_a_conflicting_pass_re_dispatches_and_names_the_touched_files():
     )
     tasks, checks = green(23, states={})
 
-    report = run_mergeability(client, tasks, checks)
+    report = run_mergeability(client, tasks, checks, believed=fixture_belief(tasks))
 
-    assert client.labels_on(23) == {READY}
+    assert [transition.to_state for transition in report.applied] == [READY]
     assert report.applied[0].attempt == 1
     # Named on the decision rather than in the issue body since #152. The
     # identification is the part worth asserting - that this module works out
@@ -1216,7 +1236,7 @@ def test_a_conflict_at_the_cap_is_not_offered_to_the_next_attempt():
 
 
 # --------------------------------------------------------------------------
-# `from_state` is the label the issue carries (#243)
+# `from_state` is what the cycle believes, never the label (#243, #152)
 # --------------------------------------------------------------------------
 
 
@@ -1239,8 +1259,12 @@ def relabelled(label: str, attempt: int = 0):
     return tasks, checks
 
 
+#: The cycle's belief for every case below: #23 is in review, whatever the issue
+#: happens to be wearing. Spelled once because it is the fact under test.
+REVIEWED = Belief(states={"task-23": REVIEW_STATE})
+
 #: Two labels per rule, never one - see `tests/test_reconcile.py`.
-CARRIED = (DONE, "swarm:blocked")
+CARRIED = ("swarm:done", "swarm:blocked")
 
 CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
     (
@@ -1250,6 +1274,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
             states={task_ref(23): conflicted(101, issue=23)},
             files={task_ref(23): ("src/mod23.py",)},
             max_attempts=3,
+            believed=REVIEWED,
         ),
         ELIGIBLE,
     ),
@@ -1260,6 +1285,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
             states={task_ref(23): conflicted(101, issue=23)},
             files={task_ref(23): ("src/mod23.py",)},
             max_attempts=3,
+            believed=REVIEWED,
         ),
         NEEDS_HUMAN,
     ),
@@ -1269,6 +1295,7 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
             *relabelled(label),
             states={task_ref(23): behind(101, issue=23)},
             budget=UpdateBudget(cap=2, rounds={task_ref(23): 2}),
+            believed=REVIEWED,
         ),
         NEEDS_HUMAN,
     ),
@@ -1278,17 +1305,31 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
 @pytest.mark.parametrize(
     "rule, world, decides", CARRIED_LABEL_RULES, ids=[case[0] for case in CARRIED_LABEL_RULES]
 )
-def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides):
-    """#243, this module's half. These transitions named `review` as a constant
-    too, and the constant is wrong for the same reason: it names what the gate
-    believes rather than what the issue is wearing, so a task relabelled by
-    hand mid-review ends up with two state labels after the write.
+def test_no_rule_lets_the_label_the_issue_carries_change_what_it_writes(rule, world, decides):
+    """#243, this module's half, inverted by #152 - see `test_checks.py` for the
+    full argument.
+
+    While the labels were the control plane these transitions had to name the
+    label the issue was *wearing*, because `from_state` was the label a write
+    had to remove. `reconcile.write_labels` is deleted, so no write removes
+    anything and `from_state` is display-only, sourced from the belief through
+    `authority.state_of`.
+
+    What is left is the stronger half of what #243 protected: a label a human
+    types onto an issue mid-review changes nothing this gate decides or writes.
     """
+    written = set()
     for label in CARRIED:
         transition = world(label).transitions[0]
 
         assert transition.to_state == decides, f"{rule}: the rule stopped firing"
-        assert transition.from_state == internal_state(label), (
-            f"{rule} carrying {label}: removed the believed label"
+        # The belief, every time - never the label, and never a constant either:
+        # `REVIEWED` is what `state_of` is asked and `review` is what it answers.
+        assert transition.from_state == REVIEW_STATE, (
+            f"{rule} carrying {label}: read the label instead of the belief"
         )
-        assert transition.from_state != REVIEW_STATE
+        written.add((transition.from_state, transition.to_state, transition.reason))
+
+    # One outcome across both labels. A rule that had gone back to reading the
+    # issue would produce two.
+    assert len(written) == 1

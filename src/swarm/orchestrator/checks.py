@@ -1401,6 +1401,7 @@ def run_checks(
     now: dt.datetime | None = None,
     store: TaskStore | None = None,
     dry_run: bool = False,
+    believed: Belief | None = None,
 ) -> ChecksReport:
     """Read, decide, write. The whole module in one call.
 
@@ -1417,11 +1418,12 @@ def run_checks(
     checks: dict[TaskRef, CheckSet] = {}
     if pulls is not None:
         for entry in ledger.entries.values():
-            pull = pulls.get(entry.branch) if in_review(entry) else None
+            pull = pulls.get(entry.branch) if in_review(entry, believed) else None
             if pull is not None:
                 checks[entry.ref] = read_checks(client, pull.ref)
     plan = plan_checks(
         ledger,
+        believed=believed,
         pulls=pulls,
         checks=checks,
         policy=policy,
@@ -1437,7 +1439,7 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
     gh = GitHubClient.from_env(repo)
     rules = MergePolicy.from_env()
     print(rules.summary())
-    dry = run_checks(gh, load_ledger(gh, adopt=False), policy=rules, dry_run=True)
+    dry = run_checks(gh, load_ledger(gh), policy=rules, dry_run=True)
     for row in dry.plan.outcomes:
         print(f"  {row}")
     for planned in dry.plan.merges:

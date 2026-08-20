@@ -677,6 +677,7 @@ def plan_mergeability(
             continue
 
         decision = _decide(
+            believed=believed,
             entry=entry,
             outcome=outcome,
             state=seen.get(outcome.ref),
@@ -709,6 +710,7 @@ def plan_mergeability(
 
 def _decide(
     *,
+    believed: Belief | None = None,
     entry: LedgerEntry,
     outcome: Outcome,
     state: Mergeability | None,
@@ -1277,6 +1279,7 @@ def run_mergeability(
         ledger,
         checks,
         states=states,
+        believed=believed,
         budget=spent,
         policy=rules,
         files=files,

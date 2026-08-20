@@ -916,8 +916,8 @@ def test_a_whole_cycle_runs_with_the_code_hosts_issue_endpoints_refused():
     """The strongest form of the negative assertion available without a credential.
 
     Not a call into one collaborator: `Reconciler.cycle` end to end - the ledger
-    read, the reconcile rules, the belief, readiness, the label writes - against
-    a code host whose `list_issues`, `create_issue`, `create_issue_comment` and
+    read, the reconcile rules, the belief, readiness - against a code host whose
+    `list_issues`, `create_issue`, `create_issue_comment` and
     `list_issue_comments` all fail the test. If any rule anywhere in a cycle
     reaches past `mcp.TrackerView` for a work item, this is the test that says so,
     and it says which call it was.
@@ -932,9 +932,9 @@ def test_a_whole_cycle_runs_with_the_code_hosts_issue_endpoints_refused():
     trapped.
     """
     host = Refuser()
-    # One ready and one blocked-with-nothing-to-wait-for, so readiness has a
-    # relabel to write: a cycle that only read would not prove the label plane
-    # still reaches the code host from inside one.
+    # One eligible and one blocked-with-nothing-to-wait-for, so readiness has a
+    # verdict to change rather than only verdicts to confirm - the pass that
+    # used to reach the code host for two label calls.
     server = github_server(list_issues=[issue(4), issue(7, label=BLOCKED)])
     view = TrackerView(host, tracker(server))
 
@@ -947,9 +947,12 @@ def test_a_whole_cycle_runs_with_the_code_hosts_issue_endpoints_refused():
     # reads the ledger - so nothing in between declined to run.
     assert report.readiness is not None
     assert {str(verdict.ref) for verdict in report.readiness.verdicts} == {"#4", "#7"}
-    # And the label plane wrote, through the view, to the code host. #152 is the
-    # ticket that removes these two calls rather than routes them.
-    assert host.labels == {7: [READY]}
+    # And the two label calls that pass used to make are simply not made. #152
+    # removed them rather than routing them, which is what the test above said
+    # it would: apiary's own vocabulary is not written into a customer's tracker
+    # by either path.
+    assert host.labels == {}
+    assert host.patched == []
 
 
 def test_five_consecutive_cycles_stay_on_the_mcp_path():

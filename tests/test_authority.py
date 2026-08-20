@@ -2,17 +2,16 @@
 
 Seven things this suite exists to hold down, in the order they would hurt.
 
-1. **A label edited mid-run changes nothing.** The observable proof the cutover
-   happened, and #147's own acceptance criterion. Driven through
+1. **A label a human types mid-run changes nothing.** The observable proof the
+   cutover happened, and #147's own acceptance criterion. Since #152 it is
+   structural rather than obeyed-and-overruled: no `swarm:*` label is written
+   and none is read, so the edit never reaches a decision at all. Driven through
    `Reconciler.cycle` rather than asserted on a plan, because "what the
    orchestrator does" is containers and merges, not a dataclass.
-2. **`APIARY_STATE_SOURCE=labels` restores the old behaviour completely.** The
-   load-bearing criterion, and the reason this may ship before #146's
-   ten-clean-run gate was ever met. Asserted as the *inverse* of (1) over five
-   of the six labels, so a decision path that quietly stopped consulting the
-   authority fails here even if it looks right under the default. The merge gate
-   has its own arm, because "for the scheduler but not the merge gate" is the
-   shape an incomplete escape hatch takes.
+2. **The merge gate reads the same authority.** "For the scheduler but not the
+   merge gate" is the shape an incomplete cutover takes, and merging is the most
+   consequential thing the loop does - so the gate gets an arm of its own rather
+   than being taken on trust from (1).
 3. **The two edge-triggered rules survive.** A failed worker's result is still
    observed and a rejected pull request still costs an attempt. Both break
    silently under a naive flip - the resolver reads `eligible` in each case -
@@ -32,6 +31,16 @@ Seven things this suite exists to hold down, in the order they would hurt.
    hand-edited label by *spending a retry*, which is the one thing #147's
    acceptance criterion says in as many words must not happen.
 
+**The cutover pair is gone (#152).** Most of what follows used to be written
+twice - once under the resolver and once under `APIARY_STATE_SOURCE=labels` -
+because the flag was the way back from #147 and the pair was what proved the
+cutover complete. #152 deleted the flag, the label writes and
+`LedgerEntry.state_label` together, so the second arm has nothing left to read:
+`state_of` raises without a belief rather than falling back. Tests that were
+*only* that comparison are deleted, each with a note in place saying what stood
+there and why it can no longer fail. Tests that assert the resolver's own
+behaviour keep the one arm that still exists.
+
 The doubles come from `test_reconcile`, for `test_shadow`'s reason: they are
 what drive a real cycle end to end, and a second copy would be a second thing to
 keep in step with the loop.
@@ -46,14 +55,13 @@ from typing import Any
 
 import pytest
 
-DERIVED = "derived"
-
+#: ADR 0001's internal vocabulary, in the two spellings this file's fixtures
+#: still name states by. They were `swarm:done` and `swarm:failed` until #152
+#: turned a fixture's declared *label* into a declared *state*.
+DONE = "landed"
 FAILED = "needs-human"
 
-DONE = "landed"
-
 from swarm.artifacts import STATE_OVERRIDE, DivergenceTally
-from swarm.github.ledger import load_ledger
 from swarm.github.readiness import BLOCKED, READY, compute_readiness
 from swarm.github.refs import pull_ref, task_ref as ref
 from swarm.orchestrator.authority import (
@@ -83,12 +91,8 @@ from swarm.orchestrator.derived import (
 )
 from swarm.orchestrator.derived import PullFact
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity, plan_dispatch
-from swarm.orchestrator.goal import FAILED as GAVE_UP
 from swarm.orchestrator.goal import IN_FLIGHT, abandoned, assess, live, shipped
 from swarm.orchestrator.reconcile import Transition, plan_reconcile
-
-DONE = "landed"
-FAILED = "needs-human"
 from swarm.orchestrator.recovery import plan_recovery
 from swarm.orchestrator.replan import brief
 from swarm.store import STORE_DIR_ENV
@@ -119,10 +123,10 @@ def _plan_dispatch_(book, *args, **kwargs):
     kwargs.setdefault("believed", fixture_belief(book))
     return plan_dispatch(book, *args, **kwargs)
 
-def _compute_readiness_(book, *args, **kwargs):
-    kwargs.setdefault("believed", fixture_belief(book))
-    return compute_readiness(book, *args, **kwargs)
-
+# `compute_readiness` has no `believed` of its own: it is handed the task ids the
+# authority says are waiting and what it believes them to be waiting in, which is
+# the join `Belief` already did. There is no wrapper for it here for that reason
+# - the two arguments are the subject of the test below rather than plumbing.
 
 
 @pytest.fixture(autouse=True)
@@ -162,20 +166,18 @@ def belief(*entries: Any, observation: Any = None, **kwargs: Any) -> Belief:
 def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
     """What the orchestrator *did*, as a value two runs can be compared on.
 
-    Deliberately not the label-write log. The writes differ between two runs
-    that decided identically, because a hand-edited issue is relabelled *from*
-    the label it is wearing - which is the point of `Transition.from_state`
-    staying the real label. What has to match is the containers, the merges and
-    the state the issue ends the cycle in.
+    Containers spawned, containers disposed, pull requests merged - the three
+    things a user would notice, and deliberately nothing about labels. **The
+    fourth slot went with #152**: it was `sorted(client.labels_on(TASK_ISSUE))`,
+    which was the state the issue ended the cycle in, and it was worth comparing
+    only while the loop still wrote labels and could therefore repair one. It
+    writes none now, so that slot holds whatever the human typed and differs
+    between the arms by construction - a comparison that could only ever fail.
 
-    Two of the four are only live when the run has something to dispose and
+    Two of the three are live only when the run has something to dispose and
     something to merge, which is what `a_run(alongside=True)` is for: over a
-    one-task run `fleet.disposed` and `client.merges` are `[]` in every arm,
-    and a comparison of two dead slots is a comparison of dispatch and
-    readiness alone (#202). The first slot stays one issue's rather than the
-    run's - the other three already speak for every task, and the label a
-    second task ends on is asserted where it is edited rather than folded in
-    here, where it would read as `TASK_ISSUE`'s.
+    one-task run `fleet.disposed` and `client.merges` are `[]` in every arm, and
+    a comparison of two dead slots is a comparison of dispatch alone (#202).
 
     Making them live is necessary and was not sufficient (#228). Two of the
     arms that go red under a `plan_reconcile` regression only reach a disposal
@@ -184,7 +186,6 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
     artifacts=...)`'s world rather than any two-task one.
     """
     return (
-        sorted(client.labels_on(TASK_ISSUE)),
         list(fleet.spawned),
         list(fleet.disposed),
         list(client.merges),
@@ -200,10 +201,11 @@ def a_run(
 ) -> tuple[Any, Any, Any]:
     """One cycle the orchestrator has already seen, then a human edits a label.
 
-    Two cycles, and the first one matters: `authority.believe`'s `remembered` falls back to
-    the label for a task this process has never seen, so an edit made before the
-    first cycle would be seeding rather than overriding. #147's criterion is
-    about a label edited **mid-run**, and this is what mid-run means.
+    Two cycles, and the first one still matters, for a narrower reason than it
+    once did. `believe` no longer seeds anything from a label, so an edit made
+    before the first cycle cannot *seed* a belief - but a run that had never seen
+    the task would be starting on the edited world rather than carrying on
+    through it, and only the second is what #147 means by **mid-run**.
 
     `alongside` runs the same two cycles over `a_lifecycle_run`'s two-task
     world, and the edit moves **every** issue in the run onto `label` - one
@@ -254,21 +256,13 @@ def a_run(
     return client, fleet, seen
 
 
-#: Every label that disagrees with a world saying `eligible`. `swarm:blocked` is
-#: in here for (1) and out of (2), and the asymmetry is a finding rather than an
-#: exemption: it is the one wrong label the label machine already repaired
-#: itself, because readiness owns both waiting states and recomputes them from
-#: the dependency graph every cycle. The other four it obeyed.
+#: Every state a human could type onto an issue that disagrees with a world
+#: saying `eligible`, named by the internal state the old `swarm:*` label stored.
+#:
+#: `OBEYED_LABELS` stood beside it and is deleted with the flag (#152). It was
+#: the subset the *label* machine obeyed - the inverse arm's parameter list - and
+#: with one source of state there is no machine left to obey anything.
 WRONG_LABELS = (BLOCKED, CLAIMED, REVIEW, DONE, FAILED)
-#: `swarm:review` leaves this list for `swarm:blocked`'s reason - it is a fact
-#: about the old behaviour, not a hole in the flag. Pre-#147 rule 4 read
-#: `entry.state_label` directly and charged an attempt for a `swarm:review`
-#: whose branch was not in the open listing ("its pull request was closed
-#: without merging"). So the old machine did not *hold* a review label either;
-#: it read one with no pull request as a rejection and recycled the task. It
-#: cannot discriminate here, and the behaviour it does have is pinned by the
-#: dedicated test below.
-OBEYED_LABELS = (CLAIMED, DONE, FAILED)
 
 
 # --------------------------------------------------------------------------
@@ -292,26 +286,33 @@ def test_a_hand_edited_label_does_not_change_what_the_orchestrator_does(monkeypa
     assert client.labels_on(TASK_ISSUE) == {CLAIMED}
 
 
-def test_a_hand_edited_label_is_reported_even_when_the_cycle_repairs_it(monkeypatch):
-    """"...and the divergence is reported", which is the other half of the
-    criterion and the half that needs its own event.
+def test_a_hand_edited_label_is_not_even_an_event_any_more(monkeypatch):
+    """"...and the divergence is reported" - and #152 changes which half of the
+    criterion this test is.
 
-    The shadow window compares at the *end* of a cycle, and by then readiness
-    has relabelled this issue - so a run whose labels a human edited would show
-    zero `state.divergence` lines and look exactly like a run where nothing
-    happened. `state.override` is sampled before anything is decided, which is
-    the only sampling point at which "the label said claimed and we acted on
-    eligible" is still true.
+    Under the flag the edit was *seen* and overruled, so the second cycle
+    emitted a `state.override` saying "the label stores claimed, we acted on
+    eligible". There is no label plane left to disagree with: the second cycle
+    below runs against an issue a human moved to `swarm:claimed` and has nothing
+    at all to say about it, which is the strongest form the criterion can take
+    and the reason the assertion is now about cycle 0.
+
+    What is still worth an event is the run meeting a task it has no memory of.
+    `Belief.stored` is what this process believed **last** cycle, so on the
+    first cycle it is `""` rather than a label, and the override says the
+    authority moved rather than that the labels were wrong. `swarm show` counts
+    it either way, which is what keeps a run's own artifacts readable without
+    anybody opening the jsonl.
     """
     _, _, seen = a_run(CLAIMED, monkeypatch)
 
     overrides = [fields for name, fields in seen if name == STATE_OVERRIDE]
     assert overrides == [
         {
-            "cycle": 1,
+            "cycle": 0,
             "task": f"task-{TASK_ISSUE}",
             "believed": ELIGIBLE,
-            "stored": CLAIMED_STATE,
+            "stored": "",
             "derived": ELIGIBLE,
             "kind": "",
             "why": (
@@ -321,7 +322,7 @@ def test_a_hand_edited_label_is_reported_even_when_the_cycle_repairs_it(monkeypa
         }
     ]
     # And `swarm show` counts it, so a run's own artifacts say how often the
-    # labels were wrong without anybody reading the jsonl.
+    # authority moved without anybody reading the jsonl.
     tally = DivergenceTally.from_events(
         [{"event": name, **fields} for name, fields in seen]
     )
@@ -379,18 +380,18 @@ def test_no_wrong_label_changes_a_decision_under_the_resolver(
     and readiness is where `swarm:blocked` was always decided.
     """
     baseline = a_run(
-        READY, DERIVED, monkeypatch, alongside=True, artifacts=tmp_path / "baseline"
+        READY, monkeypatch, alongside=True, artifacts=tmp_path / "baseline"
     )
     edited = a_run(
-        label, DERIVED, monkeypatch, alongside=True, artifacts=tmp_path / "edited"
+        label, monkeypatch, alongside=True, artifacts=tmp_path / "edited"
     )
 
     assert outcome(*edited[:2]) == outcome(*baseline[:2])
     # And the three things that equality needed to mean anything, because each
     # of them is a line somebody could take out without a test going red and
     # leave #202 exactly where it started. Two live slots: a container was
-    # disposed and a pull request was merged, so the comparison ran over four
-    # components rather than two. And the edit reached the task carrying that
+    # disposed and a pull request was merged, so the comparison ran over three
+    # components rather than one. And the edit reached the task carrying that
     # container - relabelling `TASK_ISSUE` alone leaves the disposal rule
     # reading the same label in both arms, which is what made this blind.
     #
@@ -419,8 +420,11 @@ def test_the_merge_gate_follows_the_authority_too(monkeypatch):
     task somebody relabelled `swarm:ready` while its green pull request sat open
     was silently un-mergeable. They ask `authority.in_review` now.
 
-    Both directions are asserted, because a gate that merged under the flag as
-    well would mean the escape hatch does not reach it either.
+    The flag's arm went with #152 - it asserted the gate *refusing* to merge
+    when `APIARY_STATE_SOURCE=labels` made `swarm:ready` the answer, and there is
+    no second source to make it say that. What is left is the direction that
+    still has a subject: the pull request is open, so the world says review, and
+    the relabel in the last interval does not stop the merge.
     """
     from swarm.github.branches import task_branch
 
@@ -444,7 +448,7 @@ def test_the_merge_gate_follows_the_authority_too(monkeypatch):
     client.issues[TASK_ISSUE]["labels"] = [{"name": READY}]
     loop.cycle()
 
-    assert client.merges == merged
+    assert client.merges == [TASK_PULL]
 
 
 # --------------------------------------------------------------------------
@@ -517,8 +521,8 @@ def test_a_pull_request_closed_unmerged_still_costs_an_attempt(monkeypatch):
     assert loop.store.read()[ref(TASK_ISSUE)].attempt == 1
 
 
-def test_the_infrastructure_streak_counts_the_same_under_both_sources(
-    source, tmp_path, monkeypatch
+def test_the_infrastructure_streak_is_counted_once_and_costs_no_attempt(
+    tmp_path, monkeypatch
 ):
     """The self-clearing half, which is why `previous` rather than a container.
 
@@ -529,9 +533,13 @@ def test_the_infrastructure_streak_counts_the_same_under_both_sources(
     rule keyed on a leftover container instead would have escalated a task whose
     disposal the daemon happened to refuse.
 
-    Asserted as *the same number under both sources* rather than as a number,
-    because the number itself is `_observe`'s business and this test's subject is
-    only that the cutover did not change how often it is reached.
+    **This was a `source` pair and is now a number** (#152). It asserted the
+    streak reaching *the same value under both sources* rather than any
+    particular value, precisely so that it said nothing about `_observe`'s own
+    arithmetic - which was the right shape while there were two sources to
+    compare and is unwritable with one. What is left is the property the
+    comparison was standing in for: the rule is edge-triggered, so one result
+    file counts once and the attempt it did not spend stays unspent.
     """
     client, fleet, loop, _ = a_lifecycle_run(label=READY)
     loop.artifacts = tmp_path
@@ -539,10 +547,15 @@ def test_the_infrastructure_streak_counts_the_same_under_both_sources(
     loop.cycle()
     write_result(record(TASK_ISSUE, 2, attempt=0, reason="docker: no such image"), tmp_path)
     loop.cycle()
+    # A third cycle over the *same* record, which is what "edge-triggered" has to
+    # mean here: the arithmetic still cannot account for the attempt, so a rule
+    # reading the world alone would count it again.
+    loop.cycle()
 
     assert loop._infrastructure.get(ref(TASK_ISSUE), 0) == 1
-    assert FAILED not in client.labels_on(TASK_ISSUE)
-    assert "attempt=0" in client.issues[TASK_ISSUE]["body"]
+    # And the attempt an infrastructure failure does not consume is still
+    # unconsumed, which is the half a user feels.
+    assert loop.store.read().get(ref(TASK_ISSUE)) is None
 
 
 # --------------------------------------------------------------------------
@@ -802,30 +815,34 @@ def test_a_task_this_run_has_seen_land_is_never_dispatched_again():
     merged = entry(4, label=DONE)
     world_after_the_merge = world(merged)  # no open pull request, issue not closed
 
-    # Both routes to the same answer, because they are different failures. The
-    # first is this run remembering its own merge; the second is a fresh process
-    # with nothing but the label, which is the restart case and the reason the
-    # seed exists at all.
+
+    # **One route now, and the second is deleted rather than moved.** It was a
+    # fresh process with nothing but the label - `believe(ledger(merged),
+    # world_after_the_merge)` reading `swarm:done` off the entry and pinning the
+    # task on that alone - and #152 removed both the field and the seed. A
+    # restarted orchestrator has no memory of a merge it made in a previous
+    # process, which is the documented consequence rather than an oversight, and
+    # `test_the_first_sight_seed_is_the_label_and_the_contract_says_so` went the
+    # same way.
     #
-    # The memory is handed over as `landed` rather than as a `remembered`
-    # state, and that is not ceremony: since #201 only a state this process
-    # actually *believed*, about this very work item, seeds the ratchet, and
-    # since #214 that is a set of refs a label has no way into. A real cycle
-    # carries exactly this - `believe` fills it and `Belief.fold`/`hold` carry
-    # it through `Reconciler._carry_forward`. What the `UNRESOLVED` label
-    # fallback leaves behind is a *state* and nothing else, which deliberately
-    # does not count;
+    # What is left is the run remembering its own merge, which is what every
+    # cycle after a landing actually does. The memory is two arguments and not
+    # one: `remembered` is what the previous cycle believed about this work item
+    # and `landed` is the ratchet's own set of refs, which since #214 only a
+    # state this process genuinely believed can enter. `believe` fills both and
+    # `Reconciler._carry_forward` hands them on - `carry()` below is that pair.
+    # What the `UNRESOLVED` fallback leaves behind is a *state* and nothing else,
+    # which deliberately does not count;
     # `test_a_label_the_resolver_had_no_verdict_for_never_pins_a_task` is that
     # half.
     held = believe(
         ledger(merged),
         world_after_the_merge,
+        remembered={ref(4): LANDED},
         landed=frozenset({ref(4)}),
     )
-    resumed = believe(ledger(merged), world_after_the_merge)
 
     assert held.state("task-4") == LANDED
-    assert resumed.state("task-4") == LANDED
     assert [one.kind for one in held.overrides] == [LANDED_STANDS]
     # The resolver's own verdict is recorded on the override, which is what
     # makes this assertion about a *rescue* rather than about agreement.
@@ -840,17 +857,21 @@ def test_a_task_this_run_has_seen_land_is_never_dispatched_again():
     assert plan.numbers == ()
 
 
-def test_the_previous_belief_is_seeded_from_the_label_only_for_a_task_never_seen():
-    """The seed is the one place a label still reaches a decision, and it is
-    bounded to tasks this process has no memory of.
+def test_the_previous_belief_is_the_remembered_overlay_alone():
+    """The last place a label reached a decision, and #152 closed it.
 
-    That bound is what makes #147's criterion hold: a label edited mid-run
-    belongs to a task the orchestrator has already seen, so it is never seeded
-    and the edit changes nothing.
+    `previous` used to be `{**by_label, **seen}`: a task this process had never
+    carried was seeded from the `swarm:*` label its issue wore, so that
+    `plan_reconcile`'s two edge-triggered rules had a prior state on the first
+    cycle of a resumed run. There is no label to seed from, so a task apiary has
+    not seen this process is simply unknown to it - which is the safe direction
+    and ADR 0001's: an edge fires on a *change*, and an empty `previous` means no
+    edge fires on a first sight at all. The cycle after acts on a transition this
+    process watched rather than on one it inferred from something a human typed.
     """
     task = entry(4, label=REVIEW)
     fresh = believe(ledger(task), world(task))
-    assert fresh.previous == {"task-4": REVIEW_STATE}
+    assert fresh.previous == {}, "a label is not a memory"
 
     remembered = believe(ledger(task), world(task), remembered={ref(4): CLAIMED_STATE})
     assert remembered.previous == {"task-4": CLAIMED_STATE}
@@ -861,19 +882,29 @@ def test_the_previous_belief_is_seeded_from_the_label_only_for_a_task_never_seen
 # --------------------------------------------------------------------------
 
 
-def test_a_task_the_resolver_never_saw_keeps_its_label_and_is_counted():
+def test_a_task_the_resolver_never_saw_keeps_what_was_remembered_and_is_counted():
     """A fallback nobody can see is a cutover that looks clean by not happening.
 
     `Resolution.state` answers `""` for a task it has no verdict for, which is
-    "nothing was said" rather than a state. The label stands, and the fallback
-    is reported as an override of its own so that a run where the resolver saw
-    nothing does not read as a run where it agreed with everything.
+    "nothing was said" rather than a state. What stands in its place used to be
+    the label; since #152 it is what this process believed last cycle, which is
+    the only record left. Either way the fallback is reported as an override of
+    its own, so that a run where the resolver saw nothing does not read as a run
+    where it agreed with everything.
     """
     task = entry(4)
-    held = believe(ledger(task), world())  # an observation with no tasks in it
+    # An observation with no tasks in it, over a task this cycle *has* carried.
+    held = believe(ledger(task), world(), remembered={ref(4): CLAIMED_STATE})
 
-    assert held.state("task-4") == ELIGIBLE
+    assert held.state("task-4") == CLAIMED_STATE
     assert [one.kind for one in held.overrides] == [UNRESOLVED]
+
+    # And with nothing remembered either there is genuinely nothing to say, which
+    # is `Belief.state`'s own rule: a task nothing has an opinion about must not
+    # be handed one, and `eligible` would be an opinion.
+    blind = believe(ledger(task), world())
+    assert blind.state("task-4") == ""
+    assert [one.kind for one in blind.overrides] == [UNRESOLVED]
 
 
 # --------------------------------------------------------------------------
@@ -933,18 +964,28 @@ def test_a_live_container_is_a_claim_and_reserves_its_files():
 
 def test_readiness_speaks_about_the_entries_the_authority_says_are_waiting():
     """The one thing readiness used a label for. Everything else it decides is a
-    question about the code host and is untouched."""
-    task = entry(4, label=CLAIMED)  # the world says eligible; a human said claimed
+    question about the code host and is untouched.
 
-    labelled = _compute_readiness_(ledger(task), {})
-    derived = _compute_readiness_(ledger(task), {}, transitionable={"task-4"})
+    Both arguments come from the cycle's belief and neither has a fallback since
+    #152. `transitionable=None` speaks about **nothing** rather than about every
+    entry: it used to fall back to the issue's label, and a pass that fell back
+    to a label nobody writes would recompute readiness for tasks the authority
+    says are claimed, in review or landed.
+    """
+    task = entry(4, label=CLAIMED)  # the world says eligible; the belief says claimed
 
-    assert labelled.verdicts == ()
-    assert [verdict.label for verdict in derived.verdicts] == [READY]
-    # `current_label` is still the label really on the issue, because it is the
-    # one `_relabel` has to remove - a verdict built on the believed state would
-    # leave the issue carrying two.
-    assert derived.verdicts[0].current_label == CLAIMED
+    silent = compute_readiness(ledger(task), {})
+    spoken = compute_readiness(
+        ledger(task), {}, transitionable={"task-4"}, current={"task-4": CLAIMED}
+    )
+
+    assert silent.verdicts == ()
+    assert [verdict.state for verdict in spoken.verdicts] == [READY]
+    # `current_state` is what the belief holds rather than what an issue carries
+    # - there is nothing on an issue to carry it any more - so `changed` is "this
+    # pass moved the task" rather than "the label on GitHub is wrong".
+    assert spoken.verdicts[0].current_state == CLAIMED
+    assert spoken.verdicts[0].changed
 
 
 def test_reconcile_reads_terminal_from_the_authority_and_from_state():
@@ -959,14 +1000,20 @@ def test_reconcile_reads_terminal_from_the_authority_and_from_state():
     task = entry(4, label=DONE)
     live = world(task, containers=(ContainerFact(id="c", run_id="", ref=ref(4), running=True),))
 
-    labelled = plan_reconcile(ledger(task), running=[ref(4)])
-    assert [one.ref for one in labelled.disposals] == [ref(4)]
+    # A cycle that really does believe the task landed still takes its worker
+    # away. This was the `labels` arm - `plan_reconcile(book, running=[...])`
+    # with no belief at all, reading `swarm:done` off the entry - and it is
+    # rewritten rather than deleted because the rule it exercises is the
+    # reconciler's own and still exists. `state_of` raises without a belief now,
+    # so the fixture's declared state is supplied as one.
+    believed_landed = fixture_belief(ledger(task))
+    disposed = plan_reconcile(ledger(task), running=[ref(4)], believed=believed_landed)
+    assert [one.ref for one in disposed.disposals] == [ref(4)]
 
     # `remembered`, because this is the mid-run case: the orchestrator has seen
-    # this task claimed and a human has since typed `swarm:done` on it. Without
-    # a memory the label is the only record there is and the seed reads it -
-    # which is the restart case and a different question (see the `landed`
-    # ratchet above).
+    # this task claimed and a human has since typed `swarm:done` on it. The
+    # label reaches nothing, the live container is a claim, and the worker is
+    # left alone.
     held = believe(ledger(task), live, remembered={ref(4): CLAIMED_STATE})
     assert held.state("task-4") == CLAIMED_STATE
     assert plan_reconcile(ledger(task), running=[ref(4)], believed=held).disposals == ()
@@ -1001,11 +1048,16 @@ def test_a_belief_advances_by_the_writes_that_landed_and_by_nothing_else():
 # the orchestrator does*. Three modules were left reading `entry.state_label`
 # because the list did not name them, and each of them decides something the
 # criterion is plainly about - a retry budget, a run's exit code, and the words
-# a model is shown. Each gets the same pair below: the edit changes nothing
-# under `derived`, and changes the answer under `labels`.
+# a model is shown. Each used to get a pair here: the edit changes nothing under
+# `derived`, and changes the answer under `labels`. The second half is deleted
+# with the flag (#152) - `state_of` raises without a belief rather than reading a
+# label, so there is no arm left to compare against. What each test keeps is the
+# arm that still runs, and where the pair was carrying the only assertion about a
+# consequence a user feels - `recovery` spending an attempt - that assertion is
+# rewritten onto a belief rather than dropped.
 
 
-def a_hand_edited(label: str, was: str, **facts: Any) -> tuple[Any, Belief, Belief]:
+def a_hand_edited(label: str, was: str, **facts: Any) -> tuple[Any, Belief]:
     """One task wearing `label`, a world that disagrees, and both beliefs.
 
     The two beliefs come from **one** ledger and **one** observation, which is
@@ -1013,12 +1065,11 @@ def a_hand_edited(label: str, was: str, **facts: Any) -> tuple[Any, Belief, Beli
     two different runs - `shadow.py`'s rule, and `believe`'s own.
 
     `was` is what this process believed last cycle, and it is not decoration:
-    `believe` seeds `Belief.previous` from the label for a task it has never
-    seen, so an edit made without it is *seeding* rather than overriding. #147's
-    criterion is about a label edited **mid-run**, and this is what mid-run
-    means - the same point `a_run` makes one cycle at a time for the tests that
-    drive a whole loop. The `labels` arm ignores it deliberately (see
-    `believe`), which is the behaviour the hatch is restoring.
+    an edit made without it belongs to a task the run has never carried, and the
+    two edge-triggered rules that read `Belief.previous` would then be reading a
+    memory that does not exist. #147's criterion is about a label edited
+    **mid-run**, and this is what mid-run means - the same point `a_run` makes
+    one cycle at a time for the tests that drive a whole loop.
     """
     task = entry(4, label=label)
     book = ledger(task)
@@ -1041,7 +1092,7 @@ def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():
     Under the resolver a claim is a *running container*, there is none, and the
     entry is not the sweep's to speak about at all.
     """
-    book, derived, labels = a_hand_edited(CLAIMED, ELIGIBLE)
+    book, derived = a_hand_edited(CLAIMED, ELIGIBLE)
 
     swept = _plan_recovery_(book, containers=(), believed=derived)
     assert swept.transitions == ()
@@ -1050,20 +1101,24 @@ def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():
     assert swept.held == ()
     assert derived.state("task-4") == ELIGIBLE
 
-    obeyed = _plan_recovery_(book, containers=(), believed=labels)
-    assert [str(one) for one in obeyed.transitions] == [
+    # The counterfactual, and what the `labels` arm was carrying that no other
+    # test does: the sweep really can spend an attempt, so the equality above is
+    # about *this* task not being selected rather than about a sweep that never
+    # transitions anything. It runs on a belief now - the fixture's declared
+    # `claimed` - rather than on the label the arm used to read.
+    #
+    # The third assertion the pair had is gone with it: `believed=None` was
+    # "`Recovery.startup` and the `__main__` dry run are the labels arm exactly",
+    # and `state_of` raises without a belief since #152, so every caller of this
+    # module is now on the one arm below.
+    claimed = _plan_recovery_(book, containers=())
+    assert [str(one) for one in claimed.transitions] == [
         "#4: claimed -> eligible, attempt 1 "
         "(claimed with no live container behind it)"
     ]
     # The budget, which is the half a transition's `str` does not show and the
     # only half a user feels.
-    assert [one.attempt for one in obeyed.transitions] == [1]
-
-    # And `believed=None` - `Recovery.startup`, the `__main__` dry run - is the
-    # labels arm exactly, which is what "every existing caller is unchanged"
-    # has to mean for a module whose other entry point runs before any belief
-    # exists.
-    assert _plan_recovery_(book, containers=()).transitions == obeyed.transitions
+    assert [one.attempt for one in claimed.transitions] == [1]
 
 
 def test_a_failed_label_typed_onto_merged_work_no_longer_resigns_the_run():
@@ -1074,7 +1129,7 @@ def test_a_failed_label_typed_onto_merged_work_no_longer_resigns_the_run():
     abandoned arithmetic is a *refusal*, so the run ended asking a human about a
     task that had landed, with the objective never assessed at all.
     """
-    book, derived, labels = a_hand_edited(
+    book, derived = a_hand_edited(
         FAILED,
         REVIEW_STATE,
         pulls=(PullFact(number=pull_ref(TASK_PULL), ref=ref(4), merged=True),),
@@ -1091,10 +1146,12 @@ def test_a_failed_label_typed_onto_merged_work_no_longer_resigns_the_run():
     # the assessment is computed from.
     assert "task-4" in oracle.asked[0][1][1]
 
-    resigned = assess("ship it", book, oracle=Says(met()), believed=labels)
-    assert not resigned.met
-    assert resigned.reason == GAVE_UP
-    assert resigned.abandoned == (ref(4),)
+    # The `labels` arm stood here: the same gate over a belief built from
+    # `swarm:failed`, refusing with `GAVE_UP` and `abandoned == (ref(4),)`. It is
+    # deleted rather than rewritten because it was the *pair* - a demonstration
+    # that the flag put the task on the other side of the partition - and the
+    # partition itself is pinned on the one remaining arm above and in
+    # `tests/test_goal.py`.
 
 
 def test_a_done_label_typed_onto_an_open_pull_request_no_longer_assesses_early():
@@ -1105,7 +1162,7 @@ def test_a_done_label_typed_onto_an_open_pull_request_no_longer_assesses_early()
     read exhausted, and the gate assessed - and could declare the run met - over
     a task whose pull request was still open.
     """
-    book, derived, labels = a_hand_edited(
+    book, derived = a_hand_edited(
         DONE, CLAIMED_STATE, pulls=(PullFact(number=pull_ref(TASK_PULL), ref=ref(4)),)
     )
     assert derived.state("task-4") == REVIEW_STATE
@@ -1118,7 +1175,9 @@ def test_a_done_label_typed_onto_an_open_pull_request_no_longer_assesses_early()
     assert held.reason.startswith(IN_FLIGHT)
     assert not held.consulted, "no model is worth swapping in for a half-landed run"
 
-    assert assess("ship it", book, oracle=Says(met()), believed=labels).met
+    # The `labels` arm stood here - the same gate under `swarm:done`, assessing
+    # the objective as met over a task whose pull request was still open. Deleted
+    # with the flag: there is no second belief to build.
 
 
 def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
@@ -1134,7 +1193,7 @@ def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
     the planner as abandoned, and `REPLAN_SUFFIX` asks the model to re-emit
     every id it is shown.
     """
-    book, derived, labels = a_hand_edited(
+    book, derived = a_hand_edited(
         FAILED,
         REVIEW_STATE,
         pulls=(PullFact(number=pull_ref(TASK_PULL), ref=ref(4), merged=True),),
@@ -1143,15 +1202,18 @@ def test_the_replan_brief_names_a_task_in_the_runs_own_vocabulary():
 
     _, tracked = brief(book, verdict, derived)
     assert "task-4 (landed):" in tracked
+    # The whole of the other half of epic #140: no `swarm:*` string reaches a
+    # prompt, because a model reads the vocabulary it is shown as the run's own
+    # and re-emits it.
     assert "swarm:" not in tracked
 
-    _, under_the_labels = brief(book, verdict, labels)
-    assert "task-4 (needs-human):" in under_the_labels
-
-    # `believed=None` prints the label verbatim rather than translating it: this
-    # is a string in a prompt, so "unchanged" has to mean the same characters.
-    _, unchanged = brief(book, verdict)
-    assert "task-4 (swarm:failed):" in unchanged
+    # Two arms stood here and both are deleted. The first was the same brief
+    # under `labels`, naming the merged task `needs-human`. The second was
+    # `believed=None` printing the label *verbatim* - `task-4 (swarm:failed)` -
+    # on the argument that a string in a prompt has to stay byte-identical for
+    # the callers outside `Reconciler.cycle`. Neither has a subject: there is no
+    # second source, and `state_of` raises without a belief rather than reaching
+    # for a label, so every caller of `brief` is on the arm above.
 
 
 # --------------------------------------------------------------------------
@@ -1183,6 +1245,23 @@ def carry(held: Belief) -> dict[str, Any]:
         "remembered": held.carried(),
         "landed": held.landed,
         "announced": dict(held.announced),
+    }
+
+
+def first_seen(state: str, *refs: Any) -> dict[str, Any]:
+    """The same three, for the **first** cycle a test drives by hand.
+
+    `believe` consults the ratchet's set only for a work item it is already
+    carrying a memory of - `entry.ref in held_by_ref` - so a hand-built `landed`
+    with no `remembered` beside it is silently inert. That pairing used to be
+    invisible here, because the label seeded `previous` for every task and the
+    membership test therefore never took its other branch. #152 removed the seed,
+    so a test that wants to start from "this run has already believed this"
+    supplies both halves, which is exactly what `carry` hands the cycle after.
+    """
+    return {
+        "remembered": {ref: state for ref in refs},
+        "landed": frozenset(refs) if state == LANDED else frozenset(),
     }
 
 
@@ -1242,41 +1321,38 @@ def test_a_reminted_id_does_not_inherit_the_departed_issues_edge():
     the cap. Since #214 the memory is keyed by work item, so there is no lookup
     that could find it.
 
-    The fallback is deliberate rather than inherited: a re-minted id drops to
-    the label seed, because a re-minted id **is** a first sight. That is the
-    answer `docs/issue-contract.md` §4 already gives for the human case.
+    The fallback is deliberate rather than inherited: a re-minted id is a first
+    sight, and since #152 a first sight has **no** prior state at all. It dropped
+    to the label seed until this ticket; the second assertion below is what
+    changed, and it changed in the safe direction - an edge fires on a change, so
+    no memory means no edge rather than an edge inferred from something a human
+    typed.
     """
     fresh = entry(9, label=READY)
     carried = {ref(7): REVIEW_STATE}  # believed about #7, whose id #9 has taken
 
     held = believe(ledger(fresh), world(fresh), remembered=carried)
 
-    assert held.previous["task-9"] != REVIEW_STATE, "inherited another issue's edge"
-    assert held.previous["task-9"] == ELIGIBLE  # the label seed, as a first sight
+    assert held.previous.get("task-9") != REVIEW_STATE, "inherited another issue's edge"
+    assert "task-9" not in held.previous, "a first sight has no prior state to read"
 
 
-def test_a_standing_ratchet_speaks_again_when_the_label_changes():
-    """Quiet about the same disagreement, not quiet forever.
-
-    The suppression was keyed only on "the ratchet already spoke", so once
-    standing it silenced a *changed* label too. That is the very scenario
-    `Belief.hold`'s guard was written for - a human relabelling landed work
-    `swarm:failed` mid-run - so the run would mute the one event telling an
-    operator the guard had done its job.
-    """
-    done = entry(4, label=DONE)
-    first = believe(ledger(done), world(done), landed=frozenset({ref(4)}))
-    assert [one.kind for one in first.overrides] == [LANDED_STANDS]
-
-    # Same label again: quiet.
-    quiet = believe(ledger(done), world(done), **carry(first))
-    assert [one.kind for one in quiet.overrides] == []
-
-    # A human moves it. The disagreement is new, so the log says so.
-    moved = entry(4, label=FAILED)
-    spoke = believe(ledger(moved), world(moved), **carry(quiet))
-    assert [one.kind for one in spoke.overrides] == [LANDED_STANDS]
-    assert spoke.state("task-4") == LANDED
+# `test_a_standing_ratchet_speaks_again_when_the_label_changes` stood here (#215).
+# It drove three cycles over a task the ratchet was holding, moved the issue from
+# `swarm:done` to `swarm:failed` in the third, and required `landed-stands` to be
+# announced a second time: quiet about the *same* disagreement, not quiet forever.
+#
+# It cannot fail any more, and the reason is structural rather than a fixture
+# problem. The mute compares `Belief.announced[ref]` against `was_stored`, and
+# `was_stored` is `previous` - which since #152 is what the *previous cycle
+# believed*, carried by `Belief.carried()`, rather than the label the issue is
+# wearing. Once the ratchet stands, `states[task]` is `landed` on every following
+# cycle by construction, so `was_stored` is `landed` on every following cycle
+# too. There is no longer any input that can move it while the ratchet holds, so
+# the second announcement this test demanded is unreachable and the assertion
+# would have had to be inverted to something that says nothing. Deleted rather
+# than inverted. What survives is the mute itself, pinned by
+# `test_a_ratchet_that_keeps_standing_stops_announcing_itself` below.
 
 
 def dispatchable(book: Any, held: Belief, *refs: Any) -> tuple[int, ...]:
@@ -1298,19 +1374,22 @@ def dispatchable(book: Any, held: Belief, *refs: Any) -> tuple[int, ...]:
 def test_a_label_the_resolver_had_no_verdict_for_never_pins_a_task():
     """The `UNRESOLVED` arm may decide a cycle; it may not decide the run.
 
-    That arm writes `entry.state_label` into the belief because there is nothing
-    else to write - "the resolver said nothing" is not an opinion, and the label
-    is the only record left. Harmless for one cycle. The defect was that the
-    value was then carried forward like any other and could not be told from a
-    verdict, so a `swarm:done` on a task the resolver has no opinion about
-    entered the ratchet and pinned it for the life of the process: **a label
-    reaching a decision nothing can undo**, which is the exact seam #147 closed
-    everywhere else.
+    That arm writes the remembered state into the belief because there is
+    nothing else to write - "the resolver said nothing" is not an opinion, and
+    the memory is the only record left. It was `entry.state_label` until #152,
+    which is what made it dangerous: a `swarm:done` a human typed onto a task the
+    resolver had no opinion about entered the ratchet and pinned it for the life
+    of the process, **a label reaching a decision nothing can undo**.
 
-    Driven the way it actually happens rather than by handing `believe` a map,
-    and **mid-run**, which is what makes it a different fact from the first-sight
-    seed below: three cycles, a human typing `swarm:done` onto a live task in the
-    second, and a resolver that has no verdict for it on the cycle that matters.
+    **The way in is narrower now, and the guarantee is the same one.** The arm
+    still has no write to `Belief.landed`, so a `landed` that arrives through it
+    decides that cycle and never the run. The input is built by hand rather than
+    typed onto an issue - a memory saying `landed` about a work item the ratchet
+    was never given - because with the label gone that is the only remaining
+    shape of "a state that was never a decision", and it is exactly the pairing
+    `believe` distinguishes: `previous` is read for the edge rules, `landed` is
+    read for the ratchet, and only the second is a set of things this process
+    decided.
     """
     task = entry(4, label=READY)
     book = ledger(task)
@@ -1319,12 +1398,13 @@ def test_a_label_the_resolver_had_no_verdict_for_never_pins_a_task():
     seen = believe(book, world(task))
     assert seen.state("task-4") == ELIGIBLE
 
-    # Cycle two: a human types `swarm:done` onto it, and this is one of the
-    # cycles the observation has nothing to say about the task - a stack with no
-    # image, a listing that came back without it. The label stands in, which is
-    # the documented fallback and is harmless for one cycle.
-    typed = ledger(entry(4, label=DONE))
-    silent = believe(typed, world(), **carry(seen))
+    # Cycle two: the observation has nothing to say about the task - a stack with
+    # no image, a listing that came back without it - and what stands in says
+    # `landed` while the ratchet's own set does not carry the work item. That is
+    # the documented fallback, and it is harmless for one cycle.
+    silent = believe(
+        book, world(), remembered={ref(4): LANDED}, landed=frozenset()
+    )
     assert silent.state("task-4") == LANDED
     assert [one.kind for one in silent.overrides] == [UNRESOLVED]
     # The state decided that cycle; the *set* the ratchet reads is untouched,
@@ -1332,15 +1412,15 @@ def test_a_label_the_resolver_had_no_verdict_for_never_pins_a_task():
     assert silent.landed == frozenset()
 
     # Cycle three: the resolver has an opinion again, and it is `eligible`. The
-    # label never became a belief, so there is nothing for the ratchet to stand
-    # on and the task runs.
-    after = believe(typed, world(task), **carry(silent))
+    # fallback never became a decision, so there is nothing for the ratchet to
+    # stand on and the task runs.
+    after = believe(book, world(task), **carry(silent))
 
     assert after.state("task-4") == ELIGIBLE
-    # One override, and it is the plain kind: the label is stale, which is
-    # ordinary and is reported. What must not be here is `landed-stands`.
+    # One override, and it is the plain kind: the belief moved, which is ordinary
+    # and is reported. What must not be here is `landed-stands`.
     assert [one.kind for one in after.overrides] == [""]
-    assert dispatchable(typed, after, ref(4)) == (4,)
+    assert dispatchable(book, after, ref(4)) == (4,)
 
 
 def test_a_cycle_with_no_verdict_does_not_drop_a_ratchet_it_did_not_test():
@@ -1356,7 +1436,7 @@ def test_a_cycle_with_no_verdict_does_not_drop_a_ratchet_it_did_not_test():
     merged = entry(4, label=DONE)
     book = ledger(merged)
 
-    landed = believe(book, world(merged), landed=frozenset({ref(4)}))
+    landed = believe(book, world(merged), **first_seen(LANDED, ref(4)))
     assert landed.state("task-4") == LANDED
 
     silent = believe(book, world(), **carry(landed))
@@ -1367,83 +1447,49 @@ def test_a_cycle_with_no_verdict_does_not_drop_a_ratchet_it_did_not_test():
     assert dispatchable(book, resumed, ref(4)) == ()
 
 
-def adopted_issue(number: int, *, title: str, label: str = READY) -> dict[str, Any]:
-    """A hand-written issue: a legal contract body with **no identity marker**.
-
-    The marker is what makes an id stable, so an issue without one is the only
-    kind whose id `ledger._adopted_id` has to invent - and inventing it is where
-    the reuse below comes from.
-    """
-    return {
-        "number": number,
-        "title": title,
-        "state": "open",
-        "labels": [{"name": label}],
-        "body": (
-            "## Goal\nDo the thing.\n\n"
-            f"## Files\n- src/mod{number}.py\n\n"
-            "## Verify\npython -m pytest -q\n\n"
-            "## Blocked by\n_none._\n"
-        ),
-    }
-
-
-class Tracker:
-    """The one call `load_ledger` makes when it is not allowed to write."""
-
-    def __init__(self, *issues: dict[str, Any]) -> None:
-        self.issues = list(issues)
-
-    def list_issues(self, *, state: str = "open", **_: Any) -> list[dict[str, Any]]:
-        return [dict(issue) for issue in self.issues]
-
-
-def test_an_adopted_id_minted_for_another_issue_does_not_inherit_landed():
+def test_an_id_that_now_names_another_issue_does_not_inherit_landed():
     """`remembered` is keyed by task id, and a task id is not a durable name.
 
-    `ledger._adopted_id` derives a hand-written issue's id from its title and
-    disambiguates collisions by *order*: the first taker gets the bare slug and
-    later ones get `<slug>-<number>`. So the bare slug is not owned - it is
-    leased, and it moves to the next issue in line the moment the holder leaves
-    `Ledger.entries`. This drives that for real rather than asserting on a
-    hand-built map: one cycle where `a-task` is #7, then a human breaks #7's
-    contract, and the very same string now names #9.
+    **This drove the id reuse through `ledger._adopted_id` until #152.** A
+    hand-written issue joined the ledger by being labelled `swarm:ready`, its id
+    was derived from its title, and collisions were disambiguated by *order* - so
+    the bare slug was leased rather than owned and moved to the next issue in
+    line the moment the holder fell out of `Ledger.entries`. There is no label to
+    adopt an issue with any more: membership is the identity marker, an unmarked
+    issue is never in the ledger, and that route to a re-minted id is closed.
 
-    Keyed by task id, #9 inherits #7's `landed` and is **never dispatched and
-    never escalated** - the quietest failure in this module, because `landed`
-    emits no transition and, once the ratchet is standing, no event either.
-    Keyed by `TaskRef` (#214) the lookup cannot land on somebody else's memory:
-    #9 asks about #9.
+    The property it was driving is not, and it is #214's whole subject rather
+    than adoption's, so the two ledgers are built by hand instead: one where
+    `add-a-retry` names #7 and one where the same string names #9. Keyed by task
+    id, #9 inherits #7's `landed` and is **never dispatched and never
+    escalated** - the quietest failure in this module, because `landed` emits no
+    transition and, once the ratchet is standing, no event either. Keyed by
+    `TaskRef` the lookup cannot land on somebody else's memory: #9 asks about #9.
     """
-    first = adopted_issue(7, title="Add a retry", label=DONE)
-    second = adopted_issue(9, title="Add a retry")
+    before = ledger(replace(entry(7, label=DONE), task_id="add-a-retry"))
+    after = ledger(replace(entry(9, label=READY), task_id="add-a-retry"))
 
-    before = load_ledger(Tracker(first, second))
-    assert sorted(before.entries) == ["add-a-retry", "add-a-retry-9"]
     assert before.entries["add-a-retry"].ref == ref(7)
-
-    # A human edits #7 and drops a required section. §1.4's policy is that the
-    # issue lands in `Ledger.errors` and never in `entries` - so the lease on
-    # the bare slug is up, and #9 takes it.
-    broken = dict(first, body="## Goal\nDo the thing.\n")
-    after = load_ledger(Tracker(broken, second))
     assert after.entries["add-a-retry"].ref == ref(9)
 
     # What the previous cycle carried: #7, believed landed, under the id it held
     # at the time.
-    carried = frozenset({ref(7)})
-    now = believe(after, world(*after.entries.values()), landed=carried)
+    carried = {"remembered": {ref(7): LANDED}, "landed": frozenset({ref(7)})}
+    now = believe(after, world(*after.entries.values()), **carried)
 
     assert now.state("add-a-retry") == ELIGIBLE
-    assert [one.kind for one in now.overrides] == []
+    # The plain kind - #9 is a task this run has no memory of, which is reported
+    # and is ordinary. What must not be here is `landed-stands`, which is the
+    # silent one: it emits no transition and, once standing, no event either.
+    assert [one.kind for one in now.overrides] == [""]
     assert dispatchable(after, now, ref(9)) == (9,)
 
     # And the same memory still pins the task it is actually about, which is
     # what makes the assertion above about identity rather than about the
     # ratchet having been weakened.
-    still = believe(before, world(*before.entries.values()), landed=carried)
+    still = believe(before, world(*before.entries.values()), **carried)
     assert still.state("add-a-retry") == LANDED
-    assert dispatchable(before, still, ref(7), ref(9)) == (9,)
+    assert dispatchable(before, still, ref(7)) == ()
 
 
 def test_a_revival_cannot_clear_a_merge():
@@ -1478,7 +1524,7 @@ def test_a_revival_cannot_clear_a_merge():
 
     merged = entry(4, label=DONE)
     book = ledger(merged)
-    held = believe(book, world(merged), landed=frozenset({ref(4)}))
+    held = believe(book, world(merged), **first_seen(LANDED, ref(4)))
     assert held.state("task-4") == LANDED
 
     revived = held.hold({"task-4": ELIGIBLE})
@@ -1516,7 +1562,7 @@ def test_a_ratchet_that_keeps_standing_stops_announcing_itself():
     book = ledger(merged)
 
     cycles: list[Belief] = []
-    carried: dict[str, Any] = {"landed": frozenset({ref(4)})}
+    carried: dict[str, Any] = first_seen(LANDED, ref(4))
     for _ in range(4):
         held = believe(book, world(merged), **carried)
         cycles.append(held)
@@ -1542,46 +1588,26 @@ def test_a_ratchet_that_keeps_standing_stops_announcing_itself():
     assert tally.override_kinds == ((LANDED_STANDS, 1),)
 
 
-def test_the_first_sight_seed_is_the_label_and_the_contract_says_so():
-    """The one entry point #201 deliberately **kept**, and its price, written down.
-
-    A task this process has never carried is decided by the label, because on a
-    fresh process the label is the only record of the last belief this system
-    held. `swarm:done` on an open issue is produced by three different things and
-    a restarted orchestrator cannot tell them apart - the window in which
-    `checks._decide_passed` has written the label before GitHub honoured
-    `Closes #<n>`, a pull request merged without the keyword at all, and a human
-    reopening finished work. Two of the three must not be dispatched, so a seed
-    that honoured the third would put a worker back on merged code in the other
-    two.
-
-    The cost falls on a human: an issue reopened *mid-run* to have the work
-    redone stays pinned until the process restarts. That is the same fact as the
-    relabel #147 already ignores, in a different field - but it is a fact
-    somebody has to be told, so it is in `docs/issue-contract.md` §4 beside the
-    human rows rather than only in a docstring. Asserted rather than promised,
-    for `test_doctor`'s reason.
-    """
-    reopened = entry(4, label=DONE)
-    book = ledger(reopened)
-
-    fresh = believe(book, world(reopened))
-    assert fresh.state("task-4") == LANDED
-    assert [one.kind for one in fresh.overrides] == [LANDED_STANDS]
-    assert dispatchable(book, fresh, ref(4)) == ()
-
-    # The documented route back, and the reason the pin is not a dead end: the
-    # first cycle is the one place the label still seeds, so a restart with the
-    # issue already moved off `swarm:done` is honoured.
-    moved = ledger(entry(4, label=READY))
-    restarted = believe(moved, world(*moved.entries.values()))
-    assert restarted.state("task-4") == ELIGIBLE
-    assert dispatchable(moved, restarted, ref(4)) == (4,)
-
-    contract = (Path(__file__).resolve().parents[1] / "docs" / "issue-contract.md").read_text()
-    section = contract.split("## 4. The label state machine")[1].split("\n## 5.")[0]
-    # Unwrapped, because a sentence's line breaks are a formatter's business and
-    # a test that pinned them would fail on a reflow that changed nothing.
-    prose = " ".join(section.split())
-    assert "reopening the issue does not take it back" in prose
-    assert "stays pinned until the process restarts" in prose
+# `test_the_first_sight_seed_is_the_label_and_the_contract_says_so` stood here,
+# and #152 is the ticket that removed its subject. It asserted the one entry into
+# the ratchet #201 deliberately kept: a task this process had never carried was
+# decided by the `swarm:*` label its issue wore, so a restarted orchestrator that
+# found `swarm:done` on an open issue pinned it rather than dispatching a worker
+# over merged code. It also asserted the price of that seed against
+# `docs/issue-contract.md` §4 - a `swarm:done` issue reopened mid-run stays pinned
+# until the process restarts - because a cost a human pays belongs in the contract
+# and not only in a docstring.
+#
+# There is no label to seed from. `previous` is the remembered overlay alone, so a
+# task apiary has not seen *this process* is unknown to it, and the ratchet cannot
+# be entered by anything but a merge this run watched. Both halves of the test go
+# with it: the behaviour it pinned is inverted, and the contract prose it quoted
+# describes a machine that no longer exists.
+#
+# What that costs is worth naming rather than leaving in the diff: the ratchet no
+# longer survives a restart at all, so the three facts §4 says a fresh process
+# cannot tell apart - a reopened `swarm:done` issue, a merge whose pull request
+# omitted the closing keyword, and the gate's own write-before-close window - now
+# all read `eligible` on the first cycle of a new process. That is the documented
+# consequence of removing the control plane and not a hole this suite can close;
+# the within-run ratchet is pinned by everything above.

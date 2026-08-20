@@ -655,23 +655,51 @@ class Recovery:
         return RecoveryReport(plan=plan, result=result)
 
     def startup(self) -> RecoveryReport:
-        """The ticket's row: sweep what a dead orchestrator left labelled.
+        """The ticket's row: sweep the claims a dead orchestrator left behind.
 
         Reads the ledger itself, because a startup sweep runs before there is a
         cycle to share a read with. One issue listing serves the ledger, each
         issue's open/closed state and the pull-request probe, exactly as it
         does inside a cycle.
+
+        **It resolves a belief of its own, and #152 is why it has to.** The
+        sweep decides on a task's state, and until this ticket that state was
+        the `swarm:claimed` label a dead process had left on the issue - which
+        is precisely what "sweep what a dead orchestrator left labelled" meant.
+        There is no such label now, so a startup sweep with no belief asks
+        `state_of` a question it can only raise on, and the method was
+        unreachable in practice.
+
+        The observation is built from the same one listing plus the daemon's
+        container list, which is what a cycle's first pass does. `believe` with
+        no `remembered` is the honest shape here: a startup sweep is by
+        definition the first sight of this repository by this process, so there
+        is nothing carried forward for it to consult.
         """
+        from .derived import build_observation
+        from .authority import believe
+
         snapshot = Snapshot(self.client)
         ledger = load_ledger(
             snapshot,  # type: ignore[arg-type]
-            adopt=not self.dry_run,
             store=self.store,
+        )
+        states = snapshot.states()
+        open_branches = snapshot.open_branches()
+        containers = self.containers()
+        observation = build_observation(
+            cycle=0,
+            entries=ledger.entries.values(),
+            branch_names=open_branches or (),
+            containers=containers,
+            state_reasons={ref: state.state_reason for ref, state in states.items()},
         )
         return self.sweep(
             ledger,
-            states=snapshot.states(),
-            open_branches=snapshot.open_branches(),
+            containers=containers,
+            states=states,
+            open_branches=open_branches,
+            believed=believe(ledger, observation),
         )
 
     # --- plumbing ---------------------------------------------------------

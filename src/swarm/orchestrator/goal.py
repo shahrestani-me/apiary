@@ -358,8 +358,18 @@ def propose(
     *,
     proposer: Proposer | None = None,
     files: Sequence[str] | None = None,
+    believed: Belief | None = None,
 ) -> Plan:
     """Ask for the tasks that close the named gap. The planner's own prompt.
+
+    `believed` is the cycle's authority on state, and it reaches `shipped`.
+    `replan.propose` grew the same parameter in #147 and this one did not, which
+    went unnoticed while `state_of` still fell back to the issue's label. #152
+    removed that fallback, so the omission stopped being cosmetic: `shipped`
+    raised, `close_the_loop`'s broad `except` caught it, and the goal gate
+    reported "the planner could not be reached" for every non-empty ledger -
+    which is every ledger, because `assess` refuses an empty one. The whole
+    follow-up extension path was dead and said it was a transport problem.
 
     `SYSTEM` plus `FOLLOWUP_SUFFIX`, imported rather than rewritten, for
     `replan.propose`'s reason: the hard rules in the planner's prompt are what
@@ -371,7 +381,7 @@ def propose(
     None sends the turn exactly as it always was.
     """
     prompt = SYSTEM + FOLLOWUP_SUFFIX.format(
-        shipped=_catalogue(shipped(ledger)),
+        shipped=_catalogue(shipped(ledger, believed)),
         missing="\n".join(f"- {line}" for line in assessment.missing) or "- not stated",
     )
     llm = proposer if proposer is not None else structured(orchestrator_llm(), Plan)
@@ -673,7 +683,12 @@ def close_the_loop(
         # Best-effort by `repository_files`'s contract: a follow-up whose tree
         # read fails is planned exactly as it was before listings existed.
         plan = propose(
-            objective, ledger, assessment, proposer=proposer, files=repository_files(client)
+            objective,
+            ledger,
+            assessment,
+            proposer=proposer,
+            files=repository_files(client),
+            believed=believed,
         )
     except Exception as exc:  # noqa: BLE001 - any transport failure reads the same
         # The stall's reading again: the model is unreachable, the run is not

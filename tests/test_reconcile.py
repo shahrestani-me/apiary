@@ -91,7 +91,7 @@ from swarm.orchestrator.reconcile import (
 )
 from swarm.orchestrator.lifecycle import internal_state, lifecycle_events
 from swarm.run import Run
-from swarm.store import STORE_DIR_ENV, SqliteTaskStore, TaskJudgement
+from swarm.store import STORE_DIR_ENV, SqliteTaskStore, StoreError, TaskJudgement
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
@@ -258,6 +258,19 @@ def issue_payload(
     }
 
 
+def landed_payload(number: int, **kwargs: Any) -> dict[str, Any]:
+    """An issue that is out of the run - the fixture `swarm:done` used to be.
+
+    `run.live_entries` decided what a cycle still had to do by reading
+    `swarm:done` / `swarm:failed` off each entry, and #152 removed both. It asks
+    the one terminal fact the code host still carries at the moment the loop
+    asks - before any observation exists to resolve a state from - so an issue is
+    out of the run when it is *closed*, which is what `Closes #<n>` does to it
+    when the task's pull request merges.
+    """
+    return issue_payload(number, state="closed", state_reason="completed", **kwargs)
+
+
 @dataclass
 class FakeClient:
     """Every call a cycle makes, recorded, with no HTTP anywhere.
@@ -384,8 +397,19 @@ class FakeFleet:
 
 
 def running(*issues: int) -> dict[TaskRef, Handle]:
-    """The handle map a cycle holds: keyed by task, valued by container."""
-    return {ref(n): Handle(id=f"{n:0>64x}", run_id=RUN_ID, issue=n) for n in issues}
+    """The handle map a cycle holds: keyed by task, valued by container.
+
+    `state=RUNNING_STATE` is load-bearing since #152 and was inert before it.
+    A claim used to be a `swarm:claimed` label, so a handle here only had to
+    exist; the state is derived now and `derived._claiming_container` filters on
+    `Handle.running`, which reads the daemon's own word and defaults to false.
+    A handle without it is a container this suite calls running and the resolver
+    reads as a corpse.
+    """
+    return {
+        ref(n): Handle(id=f"{n:0>64x}", run_id=RUN_ID, issue=n, state=RUNNING_STATE)
+        for n in issues
+    }
 
 
 class ModelCalled(BaseException):
@@ -1205,31 +1229,45 @@ def test_plan_reconcile_cannot_tell_blocked_from_ready():
 def test_a_malformed_issue_is_failed_and_carries_the_reason_as_a_comment():
     error = ContractError(7, "Verify", "section is missing")
 
-    plan = reconcile_plan(ledger(errors=(error,)), labels={ref(7): frozenset({READY})})
+    plan = reconcile_plan(ledger(errors=(error,)))
 
     transition = plan.transitions[0]
-    assert (transition.ref, transition.from_state, transition.to_state) == (ref(7), ELIGIBLE, NEEDS_HUMAN)
+    # `from_state` is empty rather than a state, and that is the honest answer
+    # rather than a gap: a body that does not parse has no task id, so it is in
+    # `Ledger.errors` and in nothing else - not in `entries`, not in the cycle's
+    # belief. There is no state to have come *from*, and since #152 there is no
+    # label standing in for one either.
+    assert (transition.ref, transition.from_state, transition.to_state) == (ref(7), "", NEEDS_HUMAN)
     # §1.4: the parse failure is posted back on the issue that failed it.
     assert "section is missing" in transition.comment
 
 
-def test_a_malformed_issue_already_failed_is_not_failed_again():
+def test_a_malformed_issue_already_escalated_is_not_failed_again():
+    """Once per run, not once per cycle - the guard #152 had to replace.
+
+    It was the issue's own label: `swarm:failed` on it meant "already dealt
+    with". A malformed issue has no task id, so it has no belief entry to read
+    that from now, and nothing apiary writes to it changes what the next cycle
+    parses. Without a memory the loop comments on the same issue forever, so
+    `plan_reconcile` takes the run's `escalated` set instead - the same fact,
+    held by the reconciler rather than by the code host.
+    """
     error = ContractError(7, "Verify", "section is missing")
 
-    plan = reconcile_plan(ledger(errors=(error,)), labels={ref(7): frozenset({FAILED})})
+    plan = reconcile_plan(ledger(errors=(error,)), escalated={ref(7)})
 
-    # Otherwise every cycle re-labels it and comments on it again forever.
     assert plan.transitions == ()
 
 
-def test_a_malformed_issue_outside_the_ledger_is_left_alone():
-    error = ContractError(7, "Goal", "section is empty")
-
-    plan = reconcile_plan(ledger(errors=(error,)), labels={ref(7): frozenset({"area/docs"})})
-
-    # No `swarm:*` label means not part of the ledger at all (§1.4). Humans use
-    # the tracker too.
-    assert plan.transitions == ()
+# `test_a_malformed_issue_outside_the_ledger_is_left_alone` stood here: an
+# issue whose only label was `area/docs` got no transition, because "carries a
+# `swarm:*` label" was what §1.4 meant by belonging to apiary.
+#
+# #152 moved membership to the `<!-- apiary:task id=... -->` marker and
+# `plan_reconcile` no longer reads labels for rule 5 at all, so there is no
+# label for this case to withhold and the assertion cannot fail for its own
+# reason. Membership is now `ledger.load_ledger`'s question - it drops an
+# unmarked issue into `ignored` - and it is asserted there.
 
 
 # --------------------------------------------------------------------------
@@ -1251,10 +1289,17 @@ def test_a_landed_transition_is_folded_into_the_ledger_rather_than_re_read():
 
     # A second listing to observe our own writes is the one request that buys
     # nothing, and the dispatcher needs the freed capacity this cycle.
+    #
+    # The counter is what is folded, and since #152 it is *all* that is folded.
+    # An entry carries no state, so a transition's consequence for the rest of
+    # the cycle travels on the belief instead (`authority.Belief.fold`, pinned
+    # in `tests/test_authority.py` §8); the attempt is folded here because it is
+    # a fact about the task rather than a state, and the entry does carry it.
     updated = folded.entries["task-4"]
-    assert (updated.state_label, updated.attempt) == (READY, 1)
-    assert updated.labels == frozenset({READY})
-    assert entries.entries["task-4"].state_label == CLAIMED
+    assert updated.attempt == 1
+    # And the input is not mutated - `fold` returns a new ledger, so a caller
+    # holding the pre-fold one still sees the pre-fold counter.
+    assert entries.entries["task-4"].attempt == 0
 
 
 def test_folding_a_transition_for_an_issue_outside_the_ledger_changes_nothing():
@@ -1269,7 +1314,19 @@ def test_folding_a_transition_for_an_issue_outside_the_ledger_changes_nothing():
 # --------------------------------------------------------------------------
 
 
-def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
+def test_the_counter_is_persisted_and_nothing_else_is_written():
+    """§5's crash ordering, after #152 left only one write to order.
+
+    The rule was "the judgment is persisted *before* the label re-readies the
+    task", so a crash between them cost an attempt rather than granting a free
+    one. There is no second write to be before any more: the label writes are
+    gone, the marker's read-modify-write went with ADR 0005, and the store is
+    the whole of what a transition does to the world.
+
+    Which makes the assertion the stronger half of the old one rather than what
+    is left of it - the ordering could only ever be got wrong, and an extra
+    write here would be a control plane growing back.
+    """
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)), results={ref(4): record(4, 1)}, max_attempts=3
@@ -1279,16 +1336,7 @@ def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
         apply_plan(client, plan, store=store)
         held = store.read()[ref(4)]
 
-    # The crash ordering §5 fixed, kept after the counter changed address (ADR
-    # 0005): the judgment is persisted before the label re-readies the task, so
-    # a crash between them costs an attempt rather than granting a free one. And
-    # add-before-remove, because two state labels are repairable by §3's
-    # precedence and none is not.
-    assert client.log == [
-        f"store {ref(4)} attempt=1",
-        f"+{READY} #4",
-        f"-{CLAIMED} #4",
-    ]
+    assert client.log == [f"store {ref(4)} attempt=1"]
     assert held.attempt == 1
     # The two calls that used to open the list - the marker's read-modify-write
     # - are gone with it.
@@ -1309,23 +1357,66 @@ def test_the_body_is_re_read_immediately_before_the_counter_is_patched():
     assert "A human typed this mid-cycle." in client.issues[4]["body"]
 
 
+class RefusingStore:
+    """A store that will not take the judgment for one ref. See below."""
+
+    def __init__(self, repo: str, log: list[str], *, refuse: set[TaskRef]) -> None:
+        self._store = SqliteTaskStore.open(repo)
+        self._log = log
+        self._refuse = refuse
+
+    def read(self) -> Any:
+        return self._store.read()
+
+    def write(self, judgement: TaskJudgement) -> None:
+        if judgement.ref in self._refuse:
+            raise StoreError(f"cannot record a judgment for {judgement.ref}")
+        self._log.append(f"store {judgement.ref} attempt={judgement.attempt}")
+        self._store.write(judgement)
+
+    def close(self) -> None:
+        self._store.close()
+
+    def __enter__(self) -> "RefusingStore":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
 def test_one_issue_failing_does_not_cost_the_others_their_transition():
+    """One of this file's five headline properties, at its new failure site.
+
+    It was a `POST /issues/4/labels` that came back 404 - a human deleting an
+    issue between the read and the write. #152 removed the label writes, so the
+    only thing a transition still writes is apiary's own judgment, and that is
+    where the blast radius now has to be held: a store that will not take one
+    task's judgment must not cost the other nineteen their transition, and the
+    un-bumped counter leaves that one task exactly where the next cycle expects
+    to find it.
+    """
     client = FakeClient(
         issues={4: issue_payload(4, label=CLAIMED), 5: issue_payload(5, label=CLAIMED)},
-        fail_labels_on={4},
     )
     plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED), entry(5, label=CLAIMED)),
-        states={ref(4): closed(4), ref(5): closed(5)},
+        results={ref(4): record(4, 1), ref(5): record(5, 1)},
+        max_attempts=3,
     )
+    # Both tasks are being charged an attempt, which is what puts a store write
+    # on each transition - a plan whose transitions carried no counter would
+    # never reach the store and the test would be asserting about nothing.
+    assert [t.attempt for t in plan.transitions] == [1, 1]
 
-    report = apply_plan(client, plan)
+    with RefusingStore(REPO, client.log, refuse={ref(4)}) as store:
+        report = apply_plan(client, plan, store=store)
 
-    # A human deleting an issue between the read and the write lands here. It
-    # is a fact about one issue, not a reason to abandon the cycle.
     assert [t.ref for t in report.applied] == [ref(5)]
     assert [f.ref for f in report.failures] == [ref(4)]
     assert report.ok is False
+    # And #5's judgment really landed, rather than the cycle having given up
+    # quietly after #4 refused.
+    assert client.log == [f"store {ref(5)} attempt=1"]
 
 
 def test_a_container_that_will_not_die_does_not_stop_the_labels_from_moving():
@@ -1393,11 +1484,16 @@ def test_the_comment_is_posted_once_the_client_can_post_one():
 
 
 def test_closing_an_issue_mid_run_disposes_its_worker_and_the_run_continues():
-    client = FakeClient(
+    # A client that can list pull requests, because since #152 that listing is
+    # what a cycle's belief is derived from: a blind cycle believes nothing, and
+    # a dispatcher with no belief has nothing to call eligible. #5 waiting behind
+    # #4 is half of what this test is about, so the cycle has to be able to see.
+    client = PullAwareClient(
         issues={
             4: issue_payload(4, label=CLAIMED, state="closed", state_reason="not_planned"),
             5: issue_payload(5, label=READY),
-        }
+        },
+        open_pulls=(),
     )
     fleet = FakeFleet(handles=running(4))
 
@@ -1406,8 +1502,16 @@ def test_closing_an_issue_mid_run_disposes_its_worker_and_the_run_continues():
     # #22's "done when", end to end: the worker for the cancelled issue is
     # gone, the issue is out of the ledger's live set, and the cycle went on to
     # dispatch the work that was waiting behind it.
+    #
+    # "Out of the run" used to be readable as the `swarm:failed` label the cycle
+    # wrote onto #4, and it is read off the belief now. Closed-as-`not_planned`
+    # is evidence the resolver reads directly, so #4 arrives at the cycle already
+    # believed `needs-human` and there is no transition left to make - rule 2
+    # disposes the container and stops, which is the same outcome reached one
+    # rule earlier. That the container still goes is #22's actual criterion.
     assert fleet.disposed == [4]
-    assert client.labels_on(4) == {FAILED}
+    assert report.belief.state("task-4") == NEEDS_HUMAN
+    assert [d.ref for d in report.plan.disposals] == [ref(4)]
     assert fleet.spawned == [5]
     assert report.live == 1
 
@@ -1439,13 +1543,36 @@ def test_a_dependency_cycle_is_reported_every_cycle_rather_than_killing_the_run(
 
 
 def test_a_review_issue_whose_pull_request_vanished_is_retried_once_prs_are_readable():
+    """Rule 4, and #152 is why it now takes two cycles to reach.
+
+    The trigger is edge-triggered - "it *was* in review and its pull request has
+    since gone" - and until #152 a `swarm:review` label answered the "was" on
+    the very first cycle of a process. There is no label to read, and
+    `authority.believe` deliberately does not invent a cycle-0 seed, so the
+    "was" has to be something this process actually watched: cycle one sees the
+    pull request open and believes `review`, and cycle two finds it gone.
+
+    That is a stronger world to assert in, not a weaker one. The single-cycle
+    version could not tell rule 4 firing on an observed transition from rule 4
+    firing on a string a human typed into the label field.
+    """
     client = PullAwareClient(
         issues={4: issue_payload(4, label=REVIEW)},
-        open_pulls=(),
+        open_pulls=(task_branch(ref(4), 0),),
     )
 
     fleet = FakeFleet()
-    loop = reconciler(client, fleet)
+    # No merge gate: this client cannot list check runs, and the question here
+    # is rule 4's, not the gate's.
+    loop = reconciler(client, fleet, merge_gate=False)
+    first = loop.cycle()
+
+    # Cycle one: the pull request is open, so this is what `review` means now.
+    assert first.belief.state("task-4") == REVIEW_STATE
+    assert fleet.spawned == []
+
+    # A human closes it unmerged between the cycles, and the issue stays open.
+    client.open_pulls = ()
     report = loop.cycle()
 
     # Freed and re-dispatched inside the one cycle: reconciling before
@@ -1453,7 +1580,6 @@ def test_a_review_issue_whose_pull_request_vanished_is_retried_once_prs_are_read
     # store before the second container exists.
     assert report.plan.blind is False
     assert loop.store.read()[ref(4)].attempt == 1
-    assert client.labels_on(4) == {CLAIMED}
     assert fleet.spawned == [4]
 
 
@@ -1467,12 +1593,21 @@ def test_a_client_that_cannot_list_pull_requests_leaves_the_review_queue_alone()
 
 
 def test_a_finished_worker_is_observed_from_its_artifact_and_not_from_docker(tmp_path):
-    client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    # Docker still says this container is running - `running()` sets the state
+    # the daemon would print - and the record says the worker is done. That
+    # disagreement is the whole test, and since #152 it is sharper than it was:
+    # the belief reads `claimed` *from* the live container, and rule 3 observes
+    # the exit anyway, off the artifact.
+    client = PullAwareClient(issues={4: issue_payload(4, label=CLAIMED)}, open_pulls=())
     fleet = FakeFleet(handles=running(4))
     write_result(record(4, 1, reason="the verify command failed"), tmp_path)
 
     report = reconciler(client, fleet, artifacts=tmp_path).cycle()
 
+    # `from_state` is display-only since #152 and is sourced from the belief, so
+    # this is the belief as rule 3 found it - `claimed`, off the live container -
+    # rather than a label anybody wrote.
+    assert report.result.applied[0].from_state == CLAIMED_STATE
     # The worker writes its record last, so a record is the evidence that the
     # container finished - no blocking `docker wait`, no extra API call. Its
     # container is disposed and the retry goes out in the same cycle.
@@ -1482,7 +1617,15 @@ def test_a_finished_worker_is_observed_from_its_artifact_and_not_from_docker(tmp
 
 
 def test_the_loop_stops_when_nothing_is_live():
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    """Terminal is *closed* now, which is what #152 left of the question.
+
+    `run.live_entries` read `swarm:done` or `swarm:failed` off each entry, and
+    both are gone. It reads the one terminal fact the code host still carries at
+    the moment the loop asks - before any observation exists to resolve a state
+    from - so an issue is out of the run when it is closed, and a landed task's
+    issue is closed by its own merge (`Closes #<n>`).
+    """
+    client = FakeClient(issues={4: landed_payload(4)})
 
     reports = reconciler(client, FakeFleet()).loop(cycles=5)
 
@@ -1723,7 +1866,7 @@ def test_an_exhausted_ledger_is_not_the_end_of_the_run_if_the_gate_extends(monke
 
     monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
 
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     reports = reconciler(
         client, FakeFleet(), goal_gate=True, objective="make the thing work"
     ).loop(cycles=5)
@@ -1764,7 +1907,7 @@ def test_the_goal_gate_is_skipped_without_an_objective(monkeypatch, capsys):
         lambda *a, **k: pytest.fail("the gate assessed an empty objective"),
     )
 
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     reports = reconciler(client, FakeFleet(), goal_gate=True, objective="  ").loop(cycles=3)
 
     assert len(reports) == 1
@@ -2147,7 +2290,7 @@ def test_a_gate_that_extended_flushes_the_cache_so_the_next_read_sees_its_issues
     monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
 
     flushed: list[int] = []
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     client.invalidate_cache = lambda: flushed.append(1)
 
     reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(cycles=5)
@@ -2185,7 +2328,7 @@ def test_a_gate_that_revived_keeps_the_loop_running_and_flushes_the_cache(monkey
     monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
 
     flushed: list[int] = []
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     client.invalidate_cache = lambda: flushed.append(1)
 
     reports = reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(
@@ -3295,47 +3438,18 @@ def test_a_revived_attempt_that_does_leave_a_result_is_unchanged(tmp_path, monke
     assert loop._believed[ref(TASK_ISSUE)] == NEEDS_HUMAN
 
 
-# The `write_labels` block stood here: five tests pinning add-before-remove,
-# the no-op when a transition does not change state, and the "exactly one
-# writer" property that made #152 a deletion rather than a hunt. The writer
-# is gone, so all five went with their subject.
-# --------------------------------------------------------------------------
+# The `write_labels` block stood here: eight tests over apiary's one label
+# writer - add-before-remove (GitHub has no transaction across two label calls,
+# so a crash between them had to leave two state labels rather than none), the
+# no-op when a transition does not change state, the mapping from a
+# `Transition`'s internal state to the `swarm:*` name that stored it, and the
+# "exactly one writer" property that made #152 a deletion rather than a hunt.
 #
-# `Transition` speaks ADR 0001's internal states since #152, so the `swarm:*`
-# names appear at exactly one point in the transition path: `write_labels`.
-# These are the properties that made it safe to move the vocabulary.
-
-
-def test_a_transition_is_stored_as_the_label_that_holds_its_state():
-    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-
-    write_labels(client, Transition(ref(4), CLAIMED_STATE, LANDED, "merged"))
-
-    assert client.labels_on(4) == {DONE}
-
-
-def test_the_label_is_added_before_the_stale_one_is_removed():
-    """`readiness._relabel`'s rule, held at the one place that now writes.
-
-    GitHub has no transaction across two label calls. A crash between them leaves
-    two state labels or none: two is repairable by §3's precedence, none puts the
-    issue outside the ledger entirely, where nothing looks at it again.
-    """
-    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-
-    write_labels(client, Transition(ref(4), CLAIMED_STATE, LANDED, "merged"))
-
-    assert client.log == [f"+{DONE} #4", f"-{CLAIMED} #4"]
-
-
-def test_a_transition_that_does_not_move_writes_no_removal():
-    """Adding and removing the same name is a call that undoes itself."""
-    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-
-    write_labels(client, Transition(ref(4), CLAIMED_STATE, CLAIMED_STATE, "unchanged"))
-
-    assert client.log == [f"+{CLAIMED} #4"]
-    assert client.labels_on(4) == {CLAIMED}
+# `write_labels` is deleted and nothing writes a label any more, so there is no
+# ordering to get wrong, no name to look up and no writer to be the only one of.
+# All eight went with their subject. `Transition`'s internal-state vocabulary,
+# which is what the last three were really guarding the move to, is now the only
+# vocabulary it has - see `Transition.__str__` and `fold` below.
 
 
 # --------------------------------------------------------------------------
