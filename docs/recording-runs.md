@@ -15,7 +15,7 @@ pass CI today. What does not exist is the evidence that deleting them is safe.
 #152 is the point of no return, and it is worth being precise about why.
 
 Today the labels are still written and still compared. That buys two things:
-`APIARY_STATE_SOURCE=labels` restores the old behaviour completely, and the
+`APIARY_STATE_SOURCE=labels` restored the old behaviour completely, and the
 shadow window has something to diff the resolver against. Delete the writes and
 **both vanish at once** — a resolver mistake stops being a divergence somebody
 can see and becomes ordinary wrong behaviour with no second opinion to catch it.
@@ -124,7 +124,7 @@ Leave the state-source variable **unset**:
 
 | | default | what setting it would do |
 |---|---|---|
-| `APIARY_STATE_SOURCE` | `derived` | `labels` is the escape hatch; a run on it measures nothing |
+| `APIARY_STATE_SOURCE` | *(removed with #152)* | it was the escape hatch back to the labels; both are gone |
 
 `APIARY_DERIVED_SHADOW` was the other one and no longer exists — #244 deleted the
 window it switched. The recorder it did not switch is unconditional, so there is

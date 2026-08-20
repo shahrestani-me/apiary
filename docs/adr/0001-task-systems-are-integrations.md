@@ -1,6 +1,6 @@
 # ADR 0001 — Task systems are an integration, not a subsystem
 
-Status: **proposed**
+Status: **accepted** — delivered by epic #140, closed out by #152 and #153
 Date: 2026-08-18
 Amends: `docs/architecture-v2.md` ("GitHub is the database", "Labels are the
 protocol"), `docs/issue-contract.md` §3–§4
@@ -28,7 +28,7 @@ are currently fused into one.**
 | Agent execution state — eligible, claimed, review, landed | apiary | private, internal, identical for every customer |
 | Organization workflow — Backlog, In Progress, QA, UAT, Done | the customer | arbitrary, per-team, already exists |
 
-apiary stores the first one *inside* the second. `github/labels.py` provisions
+apiary stored the first one *inside* the second. `github/labels.py` provisioned
 six `swarm:*` labels into the target repository and `orchestrator/reconcile.py`
 uses them as working memory — `Snapshot`, `_label_names`, `fold`,
 `rewrite_marker`, `bump_attempt`.
@@ -364,3 +364,46 @@ workflow.
 
 `docs/issue-contract.md` §3 and §4 become a description of the GitHub Issues
 adapter, not of the system.
+
+
+---
+
+## As delivered (epic #140, 2026-08-20)
+
+**Accepted, and built.** The label control plane is gone: nothing writes a
+`swarm:*` label, nothing reads one, and `github/labels.py` is deleted. Ledger
+membership is the identity marker of `docs/issue-contract.md` §2; state is
+derived per cycle by `orchestrator/derived.py`, joined with apiary's own
+judgments in `orchestrator/authority.py`, and the judgments live in the store
+ADR 0002 called for. `docs/architecture-v2.md` § "State is derived, not stored"
+is the current description; §3–§5 of the issue contract are marked historical.
+
+### What S1 (#143) concluded
+
+The spike asked whether one capability contract could reach more than one
+tracker, and its answer shaped what got built:
+
+- **Three capabilities are enough** - intake, comment, create. ADR 0004 closed
+  the set there, and nothing in the epic needed a fourth. The one place a fourth
+  looked necessary - `readiness.resolve_states`' `get_issue` fallback - was
+  answered by a *rule* instead (`INTAKE_IS_AUTHORITATIVE`: an item intake did not
+  list is one apiary does not act on).
+- **The filters are the customer's, forwarded verbatim.** Nothing translates
+  apiary's idea of "open" onto a server's spelling, which is the adapter this
+  ADR exists to avoid, written one keyword at a time.
+- **Dropping Jira made intake *more* uniform, not less.** The opaque-query story
+  (JQL) is Jira's alone; GitHub and Linear both take discrete typed filters. Its
+  known requirements are recorded as "must not be precluded" rather than built.
+- **Auth is simpler than feared for the two that matter.** GitHub's tracker
+  credential is one apiary already holds in another role; Linear offers an API
+  key. The admin-gated Atlassian token left the near-term path with Jira.
+
+### What is honestly still open
+
+- **Linear is read-only in practice.** The block validates and intake reads, but
+  payloads reach the GitHub adapter unchanged, so one item mints two refs
+  (#260). The seam is proven in shape, not yet in a second live tracker.
+- **Adoption is gone, not replaced.** A hand-written issue used to join the
+  ledger by being labelled `swarm:ready`. The answer for an existing repository
+  is the customer's own `intake` filter, which exists for a configured tracker
+  and has no equivalent on the direct GitHub path.

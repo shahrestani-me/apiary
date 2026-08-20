@@ -240,6 +240,16 @@ work.
 
 ## 3. Status mapping, both directions
 
+> **Historical, since #152.** §3 and §4 describe the `swarm:*` label control
+> plane, which no longer exists: nothing writes those labels and nothing reads
+> them. They are kept because `events.jsonl` and `observed.jsonl` are
+> append-only and runs recorded while the labels were live still replay, and
+> because the *rows* of these tables survived the storage - `lifecycle.INTERNAL_STATE`
+> is this mapping, keyed on the label it used to be stored in. Read them as a
+> description of the GitHub Issues adapter as it was, not of the system.
+> `docs/architecture-v2.md` § "State is derived, not stored" is the current
+> answer.
+
 v1 `TaskStatus` is `pending | running | verified | failed | abandoned`
 ([`state.py`](../src/swarm/state.py)). The v2 state labels are `swarm:ready |
 blocked | claimed | review | done | failed`. This is not a bijection in either
@@ -319,6 +329,11 @@ read by the state machine.
 
 ## 4. The label state machine
 
+> **Historical, since #152** - see the note at the head of §3. The transitions
+> below are still the transitions apiary makes; what is gone is the label each
+> one used to write. `orchestrator/derived.py` computes the state instead, and
+> `orchestrator/authority.py` is the one place that answers it.
+
 Every legal transition, and the one component permitted to make it. Without the
 writer column the dispatcher, the worker, the reconciler and a human all write
 labels and fight.
@@ -363,10 +378,10 @@ table as a specification:
   2. Change the label *before* the next process starts. The first cycle a task
      is seen is the one place the label still seeds the belief, so a restart with
      the issue already moved off `swarm:done` is honoured.
-  3. `APIARY_STATE_SOURCE=labels`, which restores every row below as a read.
-- `APIARY_STATE_SOURCE=labels` restores every row here as a read as well as a
-  write. #152 removes the writes, at which point this section describes the
-  GitHub Issues adapter and nothing else.
+  3. (Removed with #152: `APIARY_STATE_SOURCE=labels` restored every row below
+     as a read. The flag and the reads are both gone.)
+- (Removed with #152.) `APIARY_STATE_SOURCE=labels` restored every row here as a
+  read as well as a write. There is no flag and no label to read.
 
 | From | To | Trigger | Writer |
 |---|---|---|---|
@@ -418,8 +433,19 @@ Rules the table does not show:
 
 ## 5. The attempt counter
 
-**Decision: the counter is a field in the identity marker, not a label.**
-`swarm:attempt/1..3` is removed from the protocol.
+> **Superseded, since #152 and `docs/adr/0005-the-attempt-counter-moves-to-the-store.md`.**
+> The counter is in apiary's own store. The body `PATCH` described below is
+> gone, and with it the last write apiary made into an issue after creating it -
+> `rewrite_marker` and `bump_attempt` no longer exist. The marker itself stays:
+> it is the task's *identity* (§2), it is what decides whether an issue is in
+> the ledger at all, and the worker is told its attempt number through
+> `APIARY_ATTEMPT` rather than reading it back out of a customer's issue body.
+>
+> A human who wants to give a stuck task another go uses `swarm reset` now,
+> which writes the store. Editing the marker's `attempt=` does nothing.
+
+**Decision (historical): the counter is a field in the identity marker, not a
+label.** `swarm:attempt/1..3` is removed from the protocol.
 
 ```
 <!-- apiary:task id=add-retry-logic attempt=2 -->
