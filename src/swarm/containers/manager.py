@@ -261,6 +261,12 @@ NAME_SUFFIX_LENGTH = 4
 #: has already blown its timeout has forfeited a long goodbye.
 STOP_GRACE_S = 10
 
+#: Ceiling on `docker create`. With `--pull=never` the command is local and
+#: returns in milliseconds, so this is not a budget - it is the backstop for a
+#: daemon that has stopped answering at all. Without it #288 blocked the whole
+#: orchestrator indefinitely, at 0% CPU, with no event and no error.
+CREATE_TIMEOUT_S = 60
+
 
 class ContainerError(RuntimeError):
     """Base for everything this module raises."""
@@ -355,6 +361,11 @@ class StackImages:
 #: `docker create` on an image that was never built. Matching the message is
 #: the same trade `is_missing` makes, for the same reason: the CLI gives no
 #: other signal. Used only to *improve* an error, never to decide anything.
+#:
+#: `no such image` is the one `--pull=never` produces ("Error response from
+#: daemon: No such image: apiary-worker:latest"), and is therefore the arm that
+#: carries this predicate now that `spawn` no longer lets a missing image
+#: become a registry pull - see #288.
 _NO_IMAGE_RE = re.compile(r"unable to find image|no such image|manifest unknown", re.I)
 
 
@@ -957,6 +968,14 @@ class ContainerManager:
             # verify command; without an init it reaps none of them and a
             # finished task can sit on zombies until the pids limit bites.
             "--init",
+            # Without this, a missing image is not an error at all: `create`
+            # falls back to a registry pull, and apiary's worker images are
+            # built locally and exist in no registry, so the pull leaves the
+            # host, hangs behind the egress proxy and never returns (#288).
+            # `--pull=never` makes an absent image fail as an absent image -
+            # which is the error `dispatcher.missing_image` was written for and,
+            # until now, never received.
+            "--pull=never",
             "--label", f"{RUN_LABEL}={self.run.id}",
             "--label", f"{ISSUE_LABEL}={token}",
             # Per *spawn*, so it goes here rather than through `self.env`: that
@@ -977,7 +996,7 @@ class ContainerManager:
         args.append(image)
         args += list(command) if command is not None else self._worker_args(issue, base_commit)
 
-        created = self._cli(*args).strip().splitlines()
+        created = self._cli(*args, timeout_s=CREATE_TIMEOUT_S).strip().splitlines()
         if not created or not created[-1]:
             raise ContainerError(f"docker create returned no container id for {task}")
 
