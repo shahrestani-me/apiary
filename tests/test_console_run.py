@@ -600,6 +600,18 @@ def test_stop_disposes_every_container_the_run_spawned(monkeypatch):
         def summary(self) -> str:
             return "store: hermetic"
 
+        def read(self):
+            """Nothing judged yet, so the attempt floor seeds nothing.
+
+            `_loop` reads the store once at startup to seed the floor under the
+            attempt counter (ADR 0005). An empty mapping is the honest answer
+            for a hermetic double and keeps this test about container disposal.
+            """
+            return {}
+
+        def write(self, judgement) -> None:
+            raise AssertionError("this run judges nothing; it disposes containers")
+
     monkeypatch.setattr("swarm.orchestrator.reconcile.Reconciler",
                         lambda **kwargs: Interrupted())
     monkeypatch.setattr("swarm.containers.manager.ContainerManager",
@@ -619,7 +631,7 @@ def test_stop_disposes_every_container_the_run_spawned(monkeypatch):
         SimpleNamespace(base_commit="", no_merge=True, no_goal_check=True,
                         dry_run=False, max_cycles=None),
         SimpleNamespace(run=run),
-        source=SimpleNamespace(head_sha=lambda ref=None: "a" * 40),
+        source=SimpleNamespace(head_sha=lambda ref=None: "a" * 40, list_branches=lambda: []),
     )
 
     assert code == 130                      # what `swarm run` exits on Ctrl-C

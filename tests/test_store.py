@@ -37,7 +37,14 @@ from typing import Any, Mapping
 import pytest
 
 from fixtures.markers import legacy_marker
-from swarm.github.ledger import Ledger, load_ledger, render_marker
+from swarm.github.branches import task_branch
+from swarm.github.ledger import (
+    Ledger,
+    attempt_floor,
+    load_ledger,
+    render_marker,
+    seed_attempt_floor,
+)
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED
 from swarm.orchestrator.reconcile import (
@@ -480,11 +487,19 @@ def test_a_judgment_about_this_attempt_wins_over_the_body():
     assert (entry.blocker, entry.streak, entry.renewals) == ("ffffffffff", 1, 1)
 
 
-def test_a_counter_moved_underneath_a_judgment_drops_the_signature_not_the_counter():
-    """A human resetting the counter after fixing the environment is the
-    workflow ADR 0002 quotes, and "GitHub wins on every disagreement" is the
-    reconciler's oldest rule. The signature is a statement about one attempt,
-    so it goes; the renewal count is a history of the task, so it stays."""
+def test_the_stored_counter_wins_over_a_marker_that_still_carries_one():
+    """The inversion ADR 0005 made, and the case that used to prove the old rule.
+
+    This test read the other way until the counter moved: the tracker held it,
+    the store held a claim *about* it, and a marker saying `attempt=0` under a
+    judgment stamped at 3 meant somebody had reset the counter - so the counter
+    stood and the signature was dropped as stale.
+
+    The store owns the counter now, so there is no second opinion to lose to. A
+    marker left saying `attempt=0` is a fossil of a body apiary no longer
+    writes, and reading it would hand the task a fresh budget on the strength of
+    a field nothing maintains. The row wins whole - counter, signature, streak
+    and renewals together, because they were written in one act."""
     client = FakeClient(
         {4: issue(4, label=READY, task_id="task-4", marker=render_marker("task-4", 0))}
     )
@@ -494,7 +509,12 @@ def test_a_counter_moved_underneath_a_judgment_drops_the_signature_not_the_count
         ledger = load_ledger(client, adopt=False, store=store)
 
     entry = ledger.entries["task-4"]
-    assert (entry.attempt, entry.blocker, entry.streak, entry.renewals) == (0, "", None, 2)
+    assert (entry.attempt, entry.blocker, entry.streak, entry.renewals) == (
+        3,
+        "ab12cd34ef",
+        3,
+        2,
+    )
 
 
 def test_a_loader_with_no_store_reads_exactly_what_it_read_before():
@@ -585,15 +605,275 @@ def test_a_failure_that_changes_renews_the_budget_and_the_store_counts_it():
     assert held.blocker == signature(ASSERT_FAILURE)
 
 
-def test_the_signature_never_reaches_the_issue_body():
-    """The acceptance criterion, as a grep. Whatever else changed, no code path
-    writes the failure record onto the customer's tracker."""
+def test_nothing_apiary_judges_reaches_the_issue_body_any_more():
+    """The acceptance criterion, as a grep - and it grew a third field.
+
+    #159 put `blocker` and `streak` in the store and left the counter in the
+    marker, so this asserted the first two were absent and the third still
+    present. ADR 0005 moved the counter too, so `attempt=` joins them: after a
+    consumed attempt the body is byte-identical to what it was, and the `0` its
+    marker still carries is a fossil the loader ignores in favour of the store.
+
+    That is the whole of `docs/issue-contract.md` §5 gone - the body `PATCH` had
+    no other payload left."""
     client = FakeClient({4: issue(4, label=CLAIMED, task_id="task-4")})
 
     with SqliteTaskStore.open(REPO) as store:
         cycle(client, store, IMPORT_FAILURE)
+        held = store.read()[ref(4)]
 
     text = client.issues[4]["body"]
     assert "blocker=" not in text
     assert "streak=" not in text
-    assert "attempt=1" in text
+    # The counter, too: the consumed attempt is in the store and the body was
+    # never touched, so the marker still reads whatever it read at creation.
+    assert "attempt=1" not in text
+    # And it really was consumed - an absent write is only the criterion if the
+    # number landed somewhere.
+    assert held.attempt == 1
+
+
+# --------------------------------------------------------------------------
+# The floor under the counter (ADR 0005)
+# --------------------------------------------------------------------------
+
+
+def test_the_floor_takes_the_furthest_attempt_each_task_pushed():
+    """One branch per attempt since #144, so the furthest is the lower bound."""
+    assert attempt_floor(
+        [
+            task_branch(ref(4), 0),
+            task_branch(ref(4), 2),
+            task_branch(ref(4), 1),
+            task_branch(ref(7), 3),
+        ]
+    ) == {ref(4): 2, ref(7): 3}
+
+
+def test_the_floor_ignores_branches_apiary_did_not_mint():
+    """`build_observation`'s discipline: a branch this system did not create
+    says nothing about a task, so it is dropped rather than counted."""
+    assert attempt_floor(["main", "fix/typo", "swarm/issue-4", "release-1.2"]) == {}
+
+
+def test_seeding_gives_an_unjudged_task_the_floor_its_branches_imply():
+    with SqliteTaskStore.open(REPO) as store:
+        seeded = seed_attempt_floor(store, [task_branch(ref(4), 2)])
+        held = store.read()[ref(4)]
+
+    assert seeded == (ref(4),)
+    assert held.attempt == 2
+
+
+def test_a_seeded_row_leaves_the_streak_absent_rather_than_zero():
+    """The line ADR 0002 warns by name not to simplify.
+
+    `previous_streak = entry.attempt if entry.streak is None else entry.streak`
+    falls back to the counter, which is the largest streak consistent with it -
+    so absence gives up sooner and never later. Writing `0` here would look
+    tidier and would silently hand every seeded task its budget back.
+    """
+    with SqliteTaskStore.open(REPO) as store:
+        seed_attempt_floor(store, [task_branch(ref(4), 2)])
+        held = store.read()[ref(4)]
+
+    assert held.streak is None
+    assert held.blocker == ""
+    assert held.renewals == 0
+
+
+def test_seeding_never_overwrites_a_task_the_store_has_already_judged():
+    """A floor is under a counter apiary wrote, not an adjudicator of it.
+
+    The branch listing is a *lower* bound reconstructed from the code host; the
+    row is what this project actually decided. A seed that overwrote it would
+    lose a signature and a renewal count to a number that is only ever <= the
+    truth.
+    """
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab12cd34ef", streak=3, renewals=1))
+        seeded = seed_attempt_floor(store, [task_branch(ref(4), 1)])
+        held = store.read()[ref(4)]
+
+    assert seeded == ()
+    assert (held.attempt, held.blocker, held.streak, held.renewals) == (3, "ab12cd34ef", 3, 1)
+
+
+def test_a_task_whose_only_branch_is_attempt_zero_is_not_seeded():
+    """Attempt 0 is the floor every task already has, so a row saying so is
+    noise - and a row is also the thing that stops the marker's legacy fields
+    being read on an upgrade."""
+    with SqliteTaskStore.open(REPO) as store:
+        seeded = seed_attempt_floor(store, [task_branch(ref(4), 0)])
+        held = store.read()
+
+    assert seeded == ()
+    assert held == {}
+
+
+def test_seeding_without_a_store_writes_nothing_rather_than_raising():
+    assert seed_attempt_floor(None, [task_branch(ref(4), 2)]) == ()
+
+
+def test_a_seeded_floor_is_what_the_ledger_then_reads_as_the_counter():
+    """End to end: a wiped store plus a branch listing rebuilds the budget.
+
+    This is the whole point of the floor. Without it the same ledger read would
+    report `attempt=0` for a task that has already burned three attempts, and
+    `max_attempts` would bound nothing.
+    """
+    client = FakeClient(
+        {4: issue(4, label=READY, task_id="task-4", marker=render_marker("task-4", 0))}
+    )
+
+    with SqliteTaskStore.open(REPO) as store:
+        seed_attempt_floor(store, [task_branch(ref(4), 3)])
+        ledger = load_ledger(client, adopt=False, store=store)
+
+    assert ledger.entries["task-4"].attempt == 3
+
+
+# --------------------------------------------------------------------------
+# `swarm reset` - the gesture the issue marker used to be (ADR 0005 decision 4)
+# --------------------------------------------------------------------------
+
+
+def reset(*argv: str) -> int:
+    import swarm.cli as cli
+
+    return cli.main(["reset", *argv])
+
+
+def test_reset_gives_a_capped_task_its_budget_back():
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(
+            TaskJudgement(ref=ref(4), attempt=3, blocker="ab12cd34ef", streak=3, renewals=2)
+        )
+
+    assert reset(str(ref(4)), "--repo", REPO, "--yes") == 0
+
+    with SqliteTaskStore.open(REPO) as store:
+        held = store.read()[ref(4)]
+    assert (held.attempt, held.blocker, held.streak) == (0, "", None)
+
+
+def test_reset_keeps_the_renewal_count():
+    """A history of the task, not a claim about one attempt - and nothing
+    branches on it, so keeping it costs nothing and losing it costs the one
+    number a human reading a capped task actually wants."""
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3, renewals=4))
+
+    reset(str(ref(4)), "--repo", REPO, "--yes")
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].renewals == 4
+
+
+def test_a_reset_survives_the_next_runs_floor_seeding():
+    """The reason a reset writes a row rather than deleting one.
+
+    `seed_attempt_floor` seeds only tasks the store has never judged, so a
+    deleted row would be refilled from the branch listing at the next startup -
+    putting the task straight back under the cap the human just lifted. The row
+    is what makes the reset stick.
+    """
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    reset(str(ref(4)), "--repo", REPO, "--yes")
+
+    with SqliteTaskStore.open(REPO) as store:
+        seeded = seed_attempt_floor(store, [task_branch(ref(4), 3)])
+        held = store.read()[ref(4)]
+
+    assert seeded == ()
+    assert held.attempt == 0
+
+
+def test_reset_writes_nothing_when_the_task_has_no_judgment():
+    """Already a full budget, so there is nothing to give back - and a row
+    written here would shadow the marker for no reason."""
+    assert reset(str(ref(4)), "--repo", REPO, "--yes") == 0
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read() == {}
+
+
+def test_reset_declined_at_the_prompt_writes_nothing(monkeypatch):
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    assert reset(str(ref(4)), "--repo", REPO) == 1
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 3
+
+
+def test_reset_with_no_answer_available_declines(monkeypatch):
+    """A pipe or a CI job. "Nobody is there" reads as no; `--yes` is how an
+    unattended caller says yes deliberately."""
+    def no_terminal(_prompt):
+        raise EOFError
+
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    monkeypatch.setattr("builtins.input", no_terminal)
+    assert reset(str(ref(4)), "--repo", REPO) == 1
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 3
+
+
+def test_reset_can_write_a_counter_other_than_zero():
+    """A human who knows two of the three attempts were the broken environment
+    and one was a real failure."""
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    reset(str(ref(4)), "--repo", REPO, "--attempt", "1", "--yes")
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 1
+
+
+def test_reset_takes_the_ref_verbatim_so_a_non_github_tracker_works():
+    """No format is invented here (`_reset`). The store's keys are refs in the
+    tracker's own spelling, and Linear's are `ENG-123` rather than numbers - a
+    command that parsed an issue number would be the GitHub adapter leaking into
+    a place epic #140 is removing it from."""
+    linear = TaskRef("ENG-123")
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=linear, attempt=3, blocker="ab", streak=3))
+
+    assert reset("ENG-123", "--repo", REPO, "--yes") == 0
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[linear].attempt == 0
+
+
+def test_reset_names_what_the_store_holds_when_the_ref_does_not_match():
+    """"Nothing to reset" and "you typed the wrong spelling" look identical
+    otherwise, and the second is the likely one against a tracker whose refs are
+    not numbers."""
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    assert reset("ENG-999", "--repo", REPO, "--yes") == 0
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 3
+
+
+@pytest.mark.parametrize("bad", ["", "  "])
+def test_reset_refuses_an_empty_ref(bad):
+    with pytest.raises(SystemExit) as exc:
+        reset(bad, "--repo", REPO, "--yes")
+    assert exc.value.code == 2
+
+
+def test_reset_refuses_a_negative_counter():
+    with pytest.raises(SystemExit) as exc:
+        reset(str(ref(4)), "--repo", REPO, "--attempt", "-1", "--yes")
+    assert exc.value.code == 2

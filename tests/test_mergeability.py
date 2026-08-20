@@ -42,6 +42,8 @@ from typing import Any, Callable, Iterable, Mapping, cast
 
 import pytest
 
+from fixtures.store import RecordingStore
+from swarm.store import STORE_DIR_ENV
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
@@ -86,6 +88,26 @@ from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
+
+
+REPO = "shahrestani-me/apiary"
+
+
+@pytest.fixture(autouse=True)
+def store_root(tmp_path, monkeypatch):
+    """Every store this module opens lands under `tmp_path`.
+
+    `test_reconcile`'s fixture and its reason, which this module needed the day
+    it started asserting against a store (ADR 0005): autouse and unconditional,
+    because the failure it prevents is silent. A test that forgot to redirect
+    the root would open the *operator's* store at `.swarm/store`, read a real
+    project's retry budgets and write test judgments into them. Nothing would
+    fail; the next real run would simply believe something untrue about its own
+    history.
+    """
+    root = tmp_path / "store"
+    monkeypatch.setenv(STORE_DIR_ENV, str(root))
+    return root
 
 
 def entry(
@@ -891,16 +913,18 @@ def test_a_conflict_persists_the_counter_before_the_label_moves():
         files={task_ref(23): ("src/mod23.py",)},
     )
 
-    apply_mergeability(client, plan)
+    with RecordingStore(REPO, client.log) as store:
+        apply_mergeability(client, plan, store=store)
+        held = store.read()[task_ref(23)]
 
     # `checks`' crash-ordering test's sibling, and the same surviving subject:
-    # the counter lands before the label re-readies the task. The conflict
-    # detail used to ride the same `PATCH`; #152 removed it, and the conflict is
-    # on the pull request.
+    # the judgment lands before the label re-readies the task. The conflict
+    # detail used to ride a body `PATCH` and the counter used to ride it too;
+    # ADR 0005 took the last of it, and the conflict is on the pull request.
     assert client.labels_on(23) == {READY}
-    assert render_marker("task-23", 1) in client.issues[23]["body"]
-    assert client.log.index("update_issue #23") < client.log.index(f"+{READY} #23")
-    assert client.log.count("update_issue #23") == 1
+    assert held.attempt == 1
+    assert client.log.index(f"store {task_ref(23)} attempt=1") < client.log.index(f"+{READY} #23")
+    assert not [line for line in client.log if "update_issue" in line or "get_issue" in line]
 
 
 def test_starving_a_pull_request_says_so_where_a_human_will_find_it():

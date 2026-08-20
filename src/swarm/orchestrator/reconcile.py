@@ -1460,67 +1460,30 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
 # --------------------------------------------------------------------------
 
 
-def rewrite_marker(body: str, task_id: str, attempt: int) -> str:
-    """Set the counter in the identity marker, preserving every other byte.
-
-    §5's write rule, and the reason it is a body `PATCH` rather than a label: it
-    either applied or it did not. Every line other than the marker is returned
-    untouched, because a human editing prose while the orchestrator bumps a
-    counter must not lose their edit.
-
-    The marker is located, not parsed: the first line that looks like one and is
-    not inside a fence. A body with no marker at all - or one whose only marker
-    is a fenced example, which `ledger._parse_marker` correctly ignores - gets a
-    fresh marker prepended, which is where the loader's own adoption puts it and
-    which the parser reads first either way.
-
-    **The counter and nothing else.** The marker used to carry the failure
-    signature too, and #159 moved that into apiary's own store
-    (`docs/adr/0002-apiary-owns-a-thin-task-store.md`) - so this rewrite drops
-    `blocker=` and `streak=` from any body that still has them, which is how a
-    repository upgraded mid-flight sheds them. The counter itself stays,
-    because the worker reads it: it is a container with no view of the host and
-    it derives its branch name and its result filename from that number
-    (`render_marker`).
-    """
-    marker = render_marker(task_id, attempt)
-    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    fenced = False
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        if stripped.startswith("<!--") and "apiary:task" in stripped:
-            lines[index] = marker
-            return "\n".join(lines)
-    return f"{marker}\n\n{body}" if body else marker
-
-
-def bump_attempt(client: Any, number: int, task_id: str, attempt: int) -> None:
-    """Persist the counter, re-reading the body immediately before the patch.
-
-    Two API calls, and the re-read is the point: the body in the ledger was
-    fetched at the top of the cycle, and a human editing in between would have
-    their edit overwritten by a patch built from the stale copy. §5 requires the
-    fresh read, and it is cheap because it happens only for an issue that just
-    finished an attempt.
-
-    The failure signature no longer travels with it - it is written to
-    apiary's own store, immediately before this call, by the same `apply_plan`
-    loop (#159). §5's crash-ordering argument survives the split intact and
-    reads the same way: judgment, then counter, then the label that re-readies
-    the task, so a crash anywhere in the sequence costs an attempt with its
-    signature recorded rather than granting a retry whose streak forgot what it
-    was retrying. The two writes are not atomic together and never were - the
-    counter and the label were already two calls - and the order is what buys
-    the guarantee, not a transaction.
-    """
-    issue = client.get_issue(number)
-    body = issue.get("body") or ""
-    client.update_issue(number, body=rewrite_marker(body, task_id, attempt))
+# The counter no longer travels through the tracker at all
+# --------------------------------------------------------------------------
+#
+# `rewrite_marker` and `bump_attempt` stood here until ADR 0005. They were the
+# issue-body `PATCH` of `docs/issue-contract.md` §5: fetch the issue, rewrite
+# the `<!-- apiary:task ... -->` marker's `attempt=`, put it back. The counter
+# is apiary's own judgment about its own execution, which is ADR 0002's test
+# for what belongs in apiary's store, and after this it lives there - written
+# by `record_judgement` in the same act as the signature it was taken at.
+#
+# Two things that used to depend on this read are worth naming, because both
+# are now answered somewhere else rather than merely dropped:
+#
+# - **The worker's copy.** A container derives its branch name and its result
+#   filename from the counter and cannot reach the store. #239 threaded the
+#   number through `ContainerManager.spawn` as `APIARY_ATTEMPT`, so the worker
+#   is told rather than made to read a customer's issue body.
+# - **The durable floor.** The marker's value was never the marker; it was that
+#   the number lived somewhere a store wipe could not reach. `ledger.attempt_floor`
+#   rebuilds it from the `apiary/<ref>-attempt-<n>` branches #144 put on the
+#   code host, seeded once per run by `ledger.seed_attempt_floor`.
+#
+# `get_issue` and `update_issue` lose their last orchestrator caller here, which
+# is what `mcp/tracker.LABEL_PLANE` said would happen.
 
 
 # --------------------------------------------------------------------------
@@ -1699,8 +1662,8 @@ def apply_plan(
         # below addresses the GitHub API, which takes issue numbers.
         number = issue_number(transition.ref)
         try:
-            if transition.attempt is not None and transition.task_id:
-                # apiary's own judgment first, the tracker's counter second.
+            if transition.attempt is not None:
+                # apiary's own judgment, and no tracker counter behind it.
                 # A store write that fails raises out of this `try` like a
                 # GitHub error does and lands in `failures` for that one issue,
                 # which is the right blast radius: one task whose judgment
@@ -1715,7 +1678,6 @@ def apply_plan(
                     streak=transition.streak,
                     renewals=transition.renewals,
                 )
-                bump_attempt(client, number, transition.task_id, transition.attempt)
             write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
             # A human deleting or relabelling this issue between the read and

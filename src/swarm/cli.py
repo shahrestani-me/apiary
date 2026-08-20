@@ -63,6 +63,7 @@ have I run" means the last one - and dispatch.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import os
 import sys
 from pathlib import Path
@@ -78,7 +79,7 @@ from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .doctor import preflight
 from .github.client import GitHubClient, GitHubError
-from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError
+from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError, seed_attempt_floor
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.bootstrap import Bootstrap
 from .greenfield.provision import ProvisionPlan, provision
@@ -261,6 +262,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="artifacts directory to read (default: $APIARY_ARTIFACTS, else .swarm/runs)",
     )
 
+    reset = sub.add_parser(
+        "reset",
+        help="give a task its retry budget back, in apiary's own store",
+    )
+    reset.add_argument(
+        "task",
+        help="the task ref as the store spells it: #12 on GitHub, ENG-123 on Linear",
+    )
+    reset.add_argument(
+        "--repo",
+        default=None,
+        help="target repository as owner/name (default: $GITHUB_REPOSITORY)",
+    )
+    reset.add_argument(
+        "--attempt",
+        type=int,
+        default=0,
+        help="the counter to write (default: 0, a full budget)",
+    )
+    reset.add_argument("--yes", action="store_true", help="do not ask")
+
     local = sub.add_parser(
         "local",
         help=("run against a local checkout with no sandbox: model-written code "
@@ -341,6 +363,8 @@ def main(argv: Sequence[str] | None = None, *, client: GitHubClient | None = Non
             return _show(args)
         if args.command == "console":
             return _console(args)
+        if args.command == "reset":
+            return _reset(args, parser)
         if args.command == "local":
             return _local(args, parser)
         return _run(args, parser, client=client)
@@ -436,6 +460,126 @@ def _console(args: argparse.Namespace) -> int:
         port=args.port,
         directory=Path(args.dir) if args.dir else None,
     )
+    return 0
+
+
+def _confirm(question: str, *, ask: Any = None) -> bool:
+    """A y/n prompt, which `provision`'s deliberately is not.
+
+    `confirm_on_terminal` makes you type the repository name back, because a
+    y/n in a terminal is muscle memory and the reflex fires before the screen is
+    read. That guard is proportionate to creating a repository that cannot be
+    uncreated. A reset writes one row in a local store, changes nothing outside
+    this machine, and the line above it already names the before and after - so
+    the cost of a mis-fired `y` is one task getting a retry it did not need,
+    which the next reset undoes.
+
+    Not a terminal, no answer: `EOFError` is a pipe or a CI job, and the safe
+    reading of "nobody is there" is no rather than yes. `--yes` is how an
+    unattended caller says so on purpose.
+    """
+    # Resolved at call time, not bound as a default. `ask=input` in the
+    # signature captures the builtin at import, which makes the prompt
+    # unreachable to anything that replaces `builtins.input` afterwards - a test
+    # monkeypatching it, and equally a host embedding this behind its own
+    # console. The seam has to be live to be a seam.
+    reader = ask if ask is not None else input
+    try:
+        answer = reader(f"{question} [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _reset(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Give one task its retry budget back. **The gesture the marker used to be.**
+
+    ADR 0002 quotes a real workflow: a person fixes whatever the environment was
+    doing wrong and edits the issue marker's `attempt=` so a stuck task gets
+    another go. That worked because the counter lived in the customer's issue
+    body, where a human already was. ADR 0005 moved it into apiary's own store,
+    and decision 4 says the affordance "moves rather than being lost" - this is
+    the move. Without it the counter is in a SQLite file with nothing to reach
+    it, and a capped task is capped forever.
+
+    **The ref is taken verbatim, and that is what keeps this tracker-agnostic.**
+    The first draft took an issue number and minted `#12` through
+    `github.refs.task_ref`, which baked the GitHub adapter into a command that
+    has no business knowing which tracker is configured - the thing epic #140
+    exists to remove. `tests/test_framework_boundary.py` caught it: a subcommand
+    that reaches `swarm.github` composes the tracker capability, and this one
+    composes nothing. So the argument is the ref *as the store already spells
+    it*, which is `#12` on GitHub and `ENG-123` on Linear, and no format is
+    invented here. `TaskRef`'s docstring says to construct through the adapter
+    because a core module must not invent an id format; taking one a human read
+    off the board and typed back is not inventing one.
+
+    A ref the store has never judged is reported with the refs it does hold,
+    because "nothing to reset" and "you typed the wrong spelling" look identical
+    otherwise, and the second is the likely one the first time somebody uses
+    this against a tracker whose refs are not numbers.
+
+    **What it writes, and why not simply delete the row.** A row saying
+    `attempt=0, blocker='', streak=None` is arithmetically identical to no row
+    at all - `_retry_or_give_up` falls back to the counter when the streak is
+    absent, and a miss cannot renew because renewal is gated on a blocker being
+    present. But deleting it is *not* identical, twice over:
+
+    - `ledger._judged` reads the issue marker when the store has no row, and
+      that marker is a fossil nothing has maintained since ADR 0005. Deleting
+      would resurrect whatever number it happens to carry.
+    - `seed_attempt_floor` seeds only tasks the store has never judged, so a
+      deleted row would be refilled from the branch listing at the next run's
+      startup - which is exactly the number the human is trying to get out from
+      under. Writing the row is what makes a reset survive the floor.
+
+    `renewals` is preserved, because it is a history of the task rather than a
+    claim about one attempt (`store.TaskJudgement`), and nothing branches on it.
+    """
+    from .store import SqliteTaskStore, TaskJudgement
+    from .taskref import TaskRef
+
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repo:
+        parser.error("pass --repo owner/name, or export GITHUB_REPOSITORY")
+    if args.attempt < 0:
+        parser.error(f"--attempt {args.attempt} is negative; a counter starts at 0")
+    try:
+        ref = TaskRef(args.task.strip())
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    with SqliteTaskStore.open(repo) as store:
+        held = store.read()
+        judgement = held.get(ref)
+        if judgement is None:
+            print(
+                f"{ref} has no judgment in {repo}'s store, so it already has a full "
+                f"budget - or it is spelled differently here."
+            )
+            if held:
+                print(f"  the store holds: {', '.join(str(one) for one in sorted(held))}")
+            return 0
+        print(
+            f"{ref} in {repo}: attempt {judgement.attempt} -> {args.attempt}, "
+            f"blocker {judgement.blocker or 'none'} -> none, "
+            f"streak {judgement.streak if judgement.streak is not None else 'none'} -> none, "
+            f"renewals {judgement.renewals} (kept)"
+        )
+        if not args.yes and not _confirm("reset this task's budget?"):
+            print("nothing written")
+            return 1
+        store.write(
+            TaskJudgement(
+                ref=ref,
+                attempt=args.attempt,
+                blocker="",
+                streak=None,
+                renewals=judgement.renewals,
+                updated_at=dt.datetime.now(dt.timezone.utc),
+            )
+        )
+    print(f"» {ref} reset; the next run may dispatch it again")
     return 0
 
 
@@ -780,6 +924,24 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # trusted must stop the run *before* a container is spawned, and
     # `SqliteTaskStore.open` raises rather than degrading to an empty one.
     store = SqliteTaskStore.open(run.repo)
+    # The floor under the counter, rebuilt once (ADR 0005 as amended). The store
+    # owns the attempt counter now, and an empty one would read as "every task
+    # on attempt 0" - a fresh retry budget for the whole plan, handed out at the
+    # moment something is already wrong. The `apiary/<ref>-attempt-<n>` branches
+    # #144 put on the code host outlive both the store and the run, so they are
+    # what it is rebuilt from.
+    #
+    # **Here, and deliberately not in the cycle.** #146 refused to add an API
+    # call to the observation and that refusal stands: the floor is only ever
+    # consulted for a task the store has no row for, and during a run this
+    # process writes those rows itself. One listing at startup is the same
+    # answer a listing every cycle would give.
+    seeded = seed_attempt_floor(store, github.list_branches())
+    if seeded:
+        print(
+            f"» seeded the attempt floor for {len(seeded)} task(s) the store had "
+            f"never judged, from their branches"
+        )
     if args.no_merge:
         print("» merge policy: --no-merge; every pull request waits for a human")
     else:

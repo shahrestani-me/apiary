@@ -551,11 +551,12 @@ def test_a_failed_worker_is_still_observed_when_its_container_has_gone(tmp_path,
     loop.cycle()
 
     # The counter moved, which is the whole of the retry engine: without this
-    # the task is re-dispatched forever and `max_attempts` bounds nothing. The
-    # label ends the cycle at `swarm:claimed` rather than `swarm:ready` because
-    # the same cycle re-dispatched the retry, which is what it did before #147
-    # too.
-    assert "attempt=1" in client.issues[TASK_ISSUE]["body"]
+    # the task is re-dispatched forever and `max_attempts` bounds nothing. It
+    # moved in apiary's own store rather than in the issue body since ADR 0005;
+    # the property being tested is the same one. The label ends the cycle at
+    # `swarm:claimed` rather than `swarm:ready` because the same cycle
+    # re-dispatched the retry, which is what it did before #147 too.
+    assert loop.store.read()[ref(TASK_ISSUE)].attempt == 1
     assert fleet.spawned == [TASK_ISSUE, TASK_ISSUE]
 
 
@@ -583,7 +584,7 @@ def test_a_pull_request_closed_unmerged_still_costs_an_attempt(monkeypatch):
     fleet.handles.clear()
     loop.cycle()
 
-    assert "attempt=0" in client.issues[TASK_ISSUE]["body"]
+    assert ref(TASK_ISSUE) not in loop.store.read()
 
     # ...and then a human closed the pull request without merging it. Nothing in
     # the world records that this ever happened - `Snapshot` lists open pull
@@ -592,7 +593,7 @@ def test_a_pull_request_closed_unmerged_still_costs_an_attempt(monkeypatch):
     client.open_pulls = ()
     loop.cycle()
 
-    assert "attempt=1" in client.issues[TASK_ISSUE]["body"]
+    assert loop.store.read()[ref(TASK_ISSUE)].attempt == 1
 
 
 @pytest.mark.parametrize("source", [DERIVED, LABELS])

@@ -399,6 +399,41 @@ class GitHubClient:
         """
         return self._paginate(f"/repos/{self.repo}/issues/{number}/comments", None)
 
+    # --- branches ---------------------------------------------------------
+
+    def list_branches(self) -> list[str]:
+        """Every branch name on the repository. **One call per run, not per cycle.**
+
+        The durable floor under the attempt counter
+        (`docs/adr/0005-the-attempt-counter-moves-to-the-store.md`). Once the
+        counter lives in apiary's own store, a wiped store would otherwise read
+        as "every task on attempt 0", which hands every task a fresh retry
+        budget at the moment something is already wrong - the failure ADR 0002
+        forbids by name. The branch names `apiary/<ref>-attempt-<n>` that #144
+        put on the code host outlive both the store and the run, so they are
+        what the floor is rebuilt from.
+
+        **Why this is not on the cycle's path, and why that is the whole
+        design.** #146 refused to add an API call to the observation, and that
+        refusal stands: this is called once, by `start_run`, to seed the floor
+        for tasks the store has never judged. A task the store *has* judged
+        needs no floor - the run itself is writing that row, and it is strictly
+        fresher than any listing. So the question the floor answers is a
+        startup question, and asking it once is not a weaker version of asking
+        it every cycle; it is the same answer, because nothing that could change
+        it happens without this process writing the store first.
+
+        Names only. The caller wants `(ref, attempt)` pairs out of
+        `github/branches.parse_task_branch`, and every other field on a branch
+        payload - the head sha, the protection block - is a fact no rule here
+        reads.
+        """
+        return [
+            str(payload.get("name") or "")
+            for payload in self._paginate(f"/repos/{self.repo}/branches", None)
+            if payload.get("name")
+        ]
+
     # --- pull requests ----------------------------------------------------
 
     def delete_branch(self, branch: str) -> bool:

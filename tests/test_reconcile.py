@@ -43,6 +43,7 @@ from types import SimpleNamespace
 import pytest
 
 from fixtures.github import SentRequest, not_modified, page, response
+from fixtures.store import RecordingStore
 from swarm.containers.manager import RUNNING_STATE, DockerError, Handle
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
@@ -85,7 +86,6 @@ from swarm.orchestrator.reconcile import (
     fold,
     plan_reconcile,
     retry_comment,
-    rewrite_marker,
     signature,
     write_labels,
 )
@@ -973,19 +973,20 @@ def test_the_signature_is_persisted_in_the_store_before_the_relabel():
 
     sig = signature(SQLALCHEMY_TRACEBACK)
     held = store.read()[ref(4)]
+    # One row, one act: counter, signature and streak are written together now
+    # (ADR 0005), so "durable before the label" is a single ordering rather than
+    # the two-writer sequence §5 described.
     assert (held.attempt, held.blocker, held.streak) == (1, sig, 1)
-    # The judgment is durable before the counter is, and the counter before the
-    # label: `update_issue` is the counter's write, so the store's must precede
-    # a body that already carries the bump.
-    assert "attempt=1" in client.issues[4]["body"]
-    assert client.log.index("update_issue #4") < client.log.index(f"+{READY} #4")
     # And it is nowhere near the customer's issue - that is the whole point of
     # ADR 0002.
     body_text = client.issues[4]["body"]
     assert "blocker=" not in body_text
     assert "streak=" not in body_text
+    # And the counter is not there either, since ADR 0005. The marker still
+    # parses - it is the identity the worker and the loader key on - it simply
+    # reads whatever it read at creation, because nothing writes it any more.
     contract = parse_contract(4, body_text)
-    assert (contract.attempt, contract.blocker, contract.streak) == (1, "", None)
+    assert (contract.attempt, contract.blocker, contract.streak) == (0, "", None)
 
 
 def test_folding_a_signature_transition_updates_the_in_memory_ledger():
@@ -1031,19 +1032,6 @@ def test_a_counter_bump_without_a_signature_clears_the_stale_record():
 
     held = store.read()[ref(4)]
     assert (held.attempt, held.blocker, held.streak) == (2, "", None)
-
-
-def test_a_marker_still_carrying_an_older_builds_signature_sheds_it_on_the_next_bump():
-    # The upgrade path: the parse still reads `blocker=`/`streak=` so a live
-    # repository's budgets survive the change, and the first rewrite takes them
-    # out of the body for good.
-    original = legacy_marker("task-4", 1, blocker="ab12cd34ef", streak=1)
-
-    updated = rewrite_marker(original, "task-4", 2)
-
-    assert updated.splitlines()[0] == render_marker("task-4", 2)
-    assert "blocker=" not in updated
-    assert "streak=" not in updated
 
 
 # --------------------------------------------------------------------------
@@ -1222,37 +1210,6 @@ def test_a_malformed_issue_outside_the_ledger_is_left_alone():
 # --------------------------------------------------------------------------
 
 
-def test_the_counter_is_rewritten_and_every_other_byte_survives():
-    original = "\n".join(
-        [render_marker("add-retry-logic", 1), "", "## Goal", "A human's prose.", "  indented  "]
-    )
-
-    updated = rewrite_marker(original, "add-retry-logic", 2)
-
-    assert updated.splitlines()[0] == render_marker("add-retry-logic", 2)
-    assert updated.splitlines()[1:] == original.splitlines()[1:]
-
-
-def test_a_body_with_no_marker_gets_one_without_losing_the_body():
-    updated = rewrite_marker("## Goal\nwritten by a human", "adopted-task", 1)
-
-    assert updated.startswith(render_marker("adopted-task", 1))
-    assert "written by a human" in updated
-
-
-def test_a_marker_quoted_inside_a_fence_is_not_the_one_rewritten():
-    original = "\n".join(
-        ["```markdown", render_marker("add-retry-logic", 0), "```", "", "## Goal", "x"]
-    )
-
-    updated = rewrite_marker(original, "real-task", 2)
-
-    # `ledger._parse_marker` ignores fenced markers, so rewriting one would set
-    # a counter nothing ever reads while leaving the real identity untouched.
-    assert updated.splitlines()[0] == render_marker("real-task", 2)
-    assert render_marker("add-retry-logic", 0) in updated
-
-
 # --------------------------------------------------------------------------
 # Folding
 # --------------------------------------------------------------------------
@@ -1291,18 +1248,24 @@ def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
         ledger(entry(4, label=CLAIMED)), results={ref(4): record(4, 1)}, max_attempts=3
     )
 
-    apply_plan(client, plan)
+    with RecordingStore(REPO, client.log) as store:
+        apply_plan(client, plan, store=store)
+        held = store.read()[ref(4)]
 
-    # §5: a crash between the write and the re-dispatch must cost an attempt,
-    # not grant a free one. And add-before-remove, because two state labels are
-    # repairable by §3's precedence and none is not.
+    # The crash ordering §5 fixed, kept after the counter changed address (ADR
+    # 0005): the judgment is persisted before the label re-readies the task, so
+    # a crash between them costs an attempt rather than granting a free one. And
+    # add-before-remove, because two state labels are repairable by §3's
+    # precedence and none is not.
     assert client.log == [
-        "get_issue #4",
-        "update_issue #4",
+        f"store {ref(4)} attempt=1",
         f"+{READY} #4",
         f"-{CLAIMED} #4",
     ]
-    assert "attempt=1" in client.issues[4]["body"]
+    assert held.attempt == 1
+    # The two calls that used to open the list - the marker's read-modify-write
+    # - are gone with it.
+    assert "attempt=1" not in client.issues[4]["body"]
 
 
 def test_the_body_is_re_read_immediately_before_the_counter_is_patched():
@@ -1455,13 +1418,14 @@ def test_a_review_issue_whose_pull_request_vanished_is_retried_once_prs_are_read
     )
 
     fleet = FakeFleet()
-    report = reconciler(client, fleet).cycle()
+    loop = reconciler(client, fleet)
+    report = loop.cycle()
 
     # Freed and re-dispatched inside the one cycle: reconciling before
-    # dispatching is what returns the capacity, and §5's increment is on the
-    # issue before the second container exists.
+    # dispatching is what returns the capacity, and the increment is in the
+    # store before the second container exists.
     assert report.plan.blind is False
-    assert "attempt=1" in client.issues[4]["body"]
+    assert loop.store.read()[ref(4)].attempt == 1
     assert client.labels_on(4) == {CLAIMED}
     assert fleet.spawned == [4]
 

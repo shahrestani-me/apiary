@@ -38,9 +38,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..state import TaskRecord, TaskStatus
-from ..store import TaskJudgement, TaskStore
+from ..store import TaskJudgement, TaskStore, record_judgement
 from ..taskref import TaskRef
-from .branches import task_branch
+from .branches import parse_task_branch, task_branch
 from .client import GitHubClient
 from .refs import task_ref
 
@@ -871,37 +871,108 @@ def _judgements(store: TaskStore | None) -> Mapping[TaskRef, TaskJudgement]:
 def _judged(entry: LedgerEntry, judgement: TaskJudgement | None) -> LedgerEntry:
     """Put apiary's own judgment onto an entry the tracker's facts built.
 
-    Three cases, and the third is the one worth writing down.
+    **Two cases now, where there were three** (ADR 0005). The store owns the
+    attempt counter, so `attempt` comes from the row alongside the signature it
+    was taken at, rather than from the issue marker.
 
     - **No judgment.** The store has never ruled on this task, so the marker's
-      legacy `blocker=`/`streak=` stand - already on `entry` from the parse.
-      That is the upgrade path, and it is read-through rather than a write:
-      seeding the store here would put a write inside a read, and it buys
-      nothing, because the first thing that consumes an attempt writes the
-      store and rewrites the marker without the legacy fields anyway.
-    - **A judgment about this attempt.** It wins outright. The store is
-      authoritative for the signature; the body is not, and after the first
-      bump the body does not carry one.
-    - **A judgment about a different attempt.** Somebody moved the counter
-      underneath it - a human resetting it after fixing the environment is the
-      workflow ADR 0002 quotes, and "GitHub wins, every cycle, on every
-      disagreement" is `orchestrator/reconcile.py`'s oldest rule. The counter
-      stands as the tracker has it and the *signature* is dropped, because a
-      signature is a statement about one attempt and this is no longer that
-      attempt. Downstream that reads as "no previous blocker" and falls back to
-      the pre-signature arithmetic, which is precisely what a human who reset a
-      counter is asking for. The renewal count survives: it is a history of the
-      task, not a claim about one attempt.
+      legacy `attempt=`/`blocker=`/`streak=` stand - already on `entry` from the
+      parse. That is the upgrade path for a repository whose markers were
+      written before the counter moved, and it is read-through rather than a
+      write: `seed_attempt_floor` does the writing, once, at startup.
+    - **A judgment.** It wins outright, counter included.
+
+    The third case is gone with the split it arbitrated. It read "somebody moved
+    the counter underneath the judgment" and dropped the signature as stale,
+    because the tracker held the counter and the store held the claim about it,
+    so the two could disagree. One authority cannot disagree with itself: after
+    ADR 0005 the counter and the signature are written in one act, to one row,
+    by one writer.
+
+    What that costs is worth naming rather than discovering later. The staleness
+    rule was also the only cross-check between the two stores, and the *human*
+    gesture it existed to honour - editing the marker to give a stuck task
+    another go, the workflow ADR 0002 quotes - no longer has anything to edit.
+    It moves to `swarm reset`, which is where a human reaches the counter now.
     """
     if judgement is None:
         return entry
-    resolved = judgement if judgement.matches(entry.attempt) else judgement.stale()
     return replace(
         entry,
-        blocker=resolved.blocker,
-        streak=resolved.streak,
-        renewals=resolved.renewals,
+        attempt=judgement.attempt,
+        blocker=judgement.blocker,
+        streak=judgement.streak,
+        renewals=judgement.renewals,
     )
+
+
+def attempt_floor(branch_names: Iterable[str]) -> dict[TaskRef, int]:
+    """The furthest attempt each task's branches can account for.
+
+    `apiary/<ref>-attempt-<n>` was pushed by a worker dispatched when the
+    counter read `n` (#144), so a branch is evidence the counter reached that
+    number. Names apiary did not mint parse to `None` and are dropped, which is
+    the same discipline `derived.build_observation` applies: a branch this
+    system did not create says nothing about a task.
+
+    A **lower** bound, deliberately. A deleted branch reads lower than the
+    truth, and under-counting merely grants a retry while over-counting would
+    refuse one that was earned - the direction `derived._attempts_spent` already
+    argues for. In practice the erosion lands where it costs nothing: apiary
+    deletes a head branch after **merging** it (`checks.py`), so the branches
+    that disappear belong to landed work whose budget no longer matters, while
+    a task that failed three times keeps all three.
+    """
+    floors: dict[TaskRef, int] = {}
+    for name in branch_names:
+        branch = parse_task_branch(name)
+        if branch is not None:
+            floors[branch.ref] = max(floors.get(branch.ref, 0), branch.attempt)
+    return floors
+
+
+def seed_attempt_floor(
+    store: TaskStore | None, branch_names: Iterable[str]
+) -> tuple[TaskRef, ...]:
+    """Give every task the store has never judged the floor its branches imply.
+
+    **Once per run, at startup** - `docs/adr/0005-the-attempt-counter-moves-to-the-store.md`
+    as amended. Once the store owns the counter, an empty store would read as
+    "every task on attempt 0 with no blocker" and hand every task a fresh retry
+    budget at the moment something is already wrong, which is the failure ADR
+    0002 forbids by name. The branch names on the code host outlive both the
+    store and the run, so they are what the floor is rebuilt from.
+
+    **Why startup is enough, and why this is not a weaker per-cycle listing.**
+    The floor is consulted only for a task the store has no row for. During a
+    run the run itself writes those rows, and a row is strictly fresher than any
+    listing - so nothing that could raise the floor happens without this process
+    having written the store first. Asking once is the same answer as asking
+    every cycle, which is what lets #146's refusal to add a call to the
+    observation stand rather than be overridden.
+
+    **`streak` stays `None`, and that is load-bearing.** ADR 0002 names
+    `previous_streak = entry.attempt if entry.streak is None else entry.streak`
+    as one of the two pieces of arithmetic holding the budget together: absence
+    falls back to the counter, which is the largest streak consistent with it,
+    so a miss gives up sooner and never later. Seeding `0` here would be exactly
+    the simplification that ADR warns by name not to make - it would look like a
+    tidier record and would silently unbound the budget.
+
+    Existing rows are never touched. A task the store has judged has a counter
+    apiary itself wrote, and a branch listing is a floor under it, not an
+    adjudicator of it.
+    """
+    if store is None:
+        return ()
+    judged = store.read()
+    seeded: list[TaskRef] = []
+    for ref, floor in sorted(attempt_floor(branch_names).items()):
+        if ref in judged or floor <= 0:
+            continue
+        record_judgement(store, ref, floor)
+        seeded.append(ref)
+    return tuple(seeded)
 
 
 def load_ledger(
