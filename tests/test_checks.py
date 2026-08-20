@@ -47,7 +47,7 @@ DONE = "landed"
 from fixtures import failures
 
 from fixtures.store import RecordingStore
-from swarm.store import STORE_DIR_ENV
+from swarm.store import STORE_DIR_ENV, StoreError
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
@@ -76,7 +76,6 @@ from swarm.orchestrator.checks import (
 )
 from swarm.nodes.judge import mentioned_paths
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
-from swarm.orchestrator.lifecycle import internal_state
 from swarm.orchestrator.reconcile import READY
 from swarm.taskref import TaskRef
 from swarm.orchestrator.authority import Belief
@@ -328,6 +327,11 @@ class CommentingClient(FakeClient):
     comments: list[tuple[int, str]] = field(default_factory=list)
 
     def create_issue_comment(self, number: int, text: str) -> dict[str, Any]:
+        # Narrated into `log` as well as collected, so the crash-ordering test
+        # still has a *client* event to compare the store write against. Until
+        # #152 that event was the label write; the retry feedback is what
+        # `apply_checks` sends after the judgment now.
+        self.log.append(f"comment #{number}")
         self.comments.append((number, text))
         return {"id": len(self.comments)}
 
@@ -737,7 +741,8 @@ def test_the_check_sets_a_run_reads_are_keyed_the_way_the_plan_looks_them_up():
         checks={f"{101:0>40x}": [run("test", "success")]},
     )
 
-    report = run_checks(client, ledger(entry(23)))
+    book = ledger(entry(23))
+    report = run_checks(client, book, believed=fixture_belief(book))
 
     assert [outcome.verdict for outcome in report.plan.outcomes] == [PASSED]
     assert report.merged == (23,)
@@ -808,7 +813,7 @@ def issue_payload(number: int, *, label: str = REVIEW, attempt: int = 0) -> dict
     }
 
 
-def test_a_green_pull_request_merges_and_only_then_moves_the_label():
+def test_a_green_pull_request_merges_and_only_then_records_it_landed():
     client = DeletingClient(issues={23: issue_payload(23)})
     plan = _plan_checks_(
         ledger(entry(23)),
@@ -820,13 +825,15 @@ def test_a_green_pull_request_merges_and_only_then_moves_the_label():
     report = apply_checks(client, plan)
 
     assert report.merged == (23,)
-    assert client.labels_on(23) == {DONE}
     assert client.deleted == [branch(23)]
-    # Merge first: a `swarm:done` written over a merge GitHub refused is a lie
-    # nothing later in the system can detect, because `done` is terminal.
-    assert client.log.index("merge PR #101 squash sha=" + f"{23:0>40x}") < client.log.index(
-        f"+{DONE} #23"
-    )
+    # Merge first, and only what merged is recorded: a `landed` claimed over a
+    # merge GitHub refused is a lie nothing later in the system can detect,
+    # because `landed` is terminal. The transition is the record now - #152
+    # deleted the label write that used to be the second half of this ordering -
+    # so the ordering it asserted is asserted on the log the merge is the *only*
+    # entry in, and "only what merged" is held by the refusal tests below.
+    assert [transition.to_state for transition in report.applied] == [DONE]
+    assert client.log == [f"merge PR #101 squash sha={23:0>40x}"]
 
 
 def test_a_refused_merge_leaves_the_issue_in_review_for_the_next_cycle():
@@ -887,31 +894,36 @@ def filed_under_the_pull_request(plan: ChecksPlan, number: int) -> ChecksPlan:
     return replace(plan, outcomes=tuple(outcomes))
 
 
-def test_a_refused_merge_whose_identity_drifted_still_never_writes_swarm_done():
-    """The headline (#181), asserted on the label rather than on the mechanism.
+def test_a_refused_merge_whose_identity_drifted_still_never_records_it_landed():
+    """The headline (#181), asserted on the outcome rather than on the mechanism.
 
     `apply_checks` files a refusal under the merge's task and reads it under the
     outcome's. Let those two disagree and the refusal is filed under a key
     nothing looks up: the merge GitHub turned down is skipped, the transition is
-    not, and `swarm:done` - terminal, never re-read by any later cycle - is
-    written for a merge that did not happen.
+    not, and `landed` - terminal, never re-read by any later cycle - is recorded
+    for a merge that did not happen.
 
     Deliberately indifferent to *how* that is prevented, because the property is
-    the label and not the exception. Revert either half of the join to the
-    number and this goes red on the assert: the issue comes back carrying
-    `swarm:done` for a pull request still open."""
+    that nothing claims the merge and not which exception says so. Revert either
+    half of the join to the number and this goes red: #23 comes back `landed`
+    for a pull request still open.
+
+    Asserted on the log rather than on a label since #152, and the assertion is
+    the stronger of the two - a label could only say what the issue ended up
+    wearing, whereas an empty log says the gate wrote nothing at all."""
     client = client_with(issues={23: issue_payload(23)})
     client.merge_error = GitHubHTTPError(
         405, "PUT", "/pulls/123/merge", b'{"message":"not mergeable"}'
     )
 
+    report = None
     try:
-        apply_checks(client, filed_under_the_pull_request(green_plan(23), 23))
+        report = apply_checks(client, filed_under_the_pull_request(green_plan(23), 23))
     except UnresolvedJoin:
         pass
 
-    assert DONE not in client.labels_on(23)
-    assert client.labels_on(23) == {REVIEW}
+    assert client.log == []
+    assert report is None or DONE not in [t.to_state for t in report.applied]
 
 
 def test_a_merge_that_matches_no_outcome_stops_the_gate_before_it_merges():
@@ -952,16 +964,19 @@ def test_a_refusal_is_matched_to_its_own_issue_and_not_to_the_others():
     A single-issue test passes for a `refused` that holds everything and for one
     that holds nothing - the first writes no label at all, the second writes
     them all, and with one issue in play only one of those is even visible. Two
-    issues, one merge refused, separates them: #23 keeps `swarm:review` and #24
-    reaches `swarm:done`."""
+    issues, one merge refused, separates them: #23 is left where it was and #24
+    reaches `landed`."""
     client = RefusingClient(issues={23: issue_payload(23), 24: issue_payload(24)})
     client.refuses = {123}
 
     report = apply_checks(client, green_plan(23, 24))
 
     assert report.merged == (24,)
-    assert client.labels_on(23) == {REVIEW}
-    assert client.labels_on(24) == {DONE}
+    # Both outcomes carried a `landed` transition. Exactly the one whose merge
+    # GitHub accepted is applied, and it is #24's - a `refused` set holding
+    # everything or nothing would show as no transition or as both.
+    assert [transition.ref for transition in report.applied] == [task_ref(24)]
+    assert [transition.to_state for transition in report.applied] == [DONE]
 
 
 def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
@@ -982,8 +997,8 @@ def test_a_branch_this_client_cannot_delete_is_reported_rather_than_swallowed():
     assert BRANCH_METHODS[0] in report.summary()
 
 
-def test_a_retry_persists_the_counter_before_the_label_moves():
-    client = client_with(issues={23: issue_payload(23)})
+def test_a_retry_persists_the_counter_before_it_offers_the_task_another_go():
+    client = CommentingClient(issues={23: issue_payload(23)})
     plan = _plan_checks_(
         ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")),
         pulls=pulls(pull(101, issue=23)),
@@ -992,17 +1007,19 @@ def test_a_retry_persists_the_counter_before_the_label_moves():
     )
 
     with RecordingStore(REPO, client.log) as store:
-        apply_checks(client, plan, store=store)
+        report = apply_checks(client, plan, store=store)
         held = store.read()[task_ref(23)]
 
-    # ADR 0002's crash ordering, and it survived the counter changing address:
-    # the judgment is persisted before the label re-readies the task, so a crash
-    # between them costs an attempt rather than granting a free one. What moved
-    # is only where "persisted" points - the store, not a body `PATCH` (ADR
-    # 0005).
-    assert client.labels_on(23) == {READY}
+    # ADR 0002's crash ordering, and it survived the counter changing address
+    # twice over: the judgment is persisted before anything invites the task to
+    # run again, so a crash between them costs an attempt rather than granting a
+    # free one. What moved is where "persisted" points - the store, not a body
+    # `PATCH` (ADR 0005) - and what comes after it: the label that re-readied
+    # the task is gone (#152), and the retry feedback the worker greps for is
+    # now the write on the far side of the boundary.
+    assert [transition.to_state for transition in report.applied] == [READY]
     assert held.attempt == 1
-    assert client.log.index(f"store {task_ref(23)} attempt=1") < client.log.index(f"+{READY} #23")
+    assert client.log.index(f"store {task_ref(23)} attempt=1") < client.log.index("comment #23")
     # And the customer's issue body was never opened, let alone written.
     assert not [line for line in client.log if "update_issue" in line or "get_issue" in line]
 
@@ -1019,7 +1036,7 @@ def test_giving_up_comments_the_failure_where_a_human_will_find_it():
 
     report = apply_checks(client, plan)
 
-    assert client.labels_on(23) == {FAILED}
+    assert [transition.to_state for transition in report.applied] == [FAILED]
     assert report.uncommented == ()
     number, text = client.comments[0]
     assert number == 23
@@ -1039,7 +1056,7 @@ def test_a_comment_this_client_cannot_post_is_reported_rather_than_lost():
 
     report = apply_checks(client, plan)
 
-    assert client.labels_on(23) == {FAILED}
+    assert [transition.to_state for transition in report.applied] == [FAILED]
     assert report.uncommented == (23,)
 
 
@@ -1059,7 +1076,34 @@ def test_a_dry_run_writes_nothing_at_all():
     assert client.labels_on(23) == {REVIEW}
 
 
-def test_one_issue_github_will_not_relabel_does_not_cost_the_others():
+@dataclass
+class RefusingStore:
+    """A store that will not take one task's judgment, and takes the rest.
+
+    This test used to delete #23's issue and let GitHub 404 the relabel, which
+    is the write #152 removed - `apply_checks` no longer touches an issue's
+    labels at all, so a deleted issue costs the gate nothing and the case could
+    not fail. What is left inside the same `try` is the judgment write, so the
+    store is where a single task's write can still go wrong while the other
+    nineteen are nobody's fault.
+    """
+
+    refuses: set[TaskRef] = field(default_factory=set)
+    written: list[TaskRef] = field(default_factory=list)
+
+    def read(self) -> dict[TaskRef, Any]:
+        return {}
+
+    def write(self, judgement: Any) -> None:
+        if judgement.ref in self.refuses:
+            raise StoreError(f"cannot write {judgement.ref}")
+        self.written.append(judgement.ref)
+
+    def close(self) -> None:
+        return None
+
+
+def test_one_task_whose_judgment_the_store_refuses_does_not_cost_the_others():
     client = client_with(issues={23: issue_payload(23), 24: issue_payload(24)})
     plan = _plan_checks_(
         ledger(entry(23), entry(24)),
@@ -1070,13 +1114,15 @@ def test_one_issue_github_will_not_relabel_does_not_cost_the_others():
         },
         now=NOW,
     )
-    # A human deleting #23 between the read and the write.
-    del client.issues[23]
 
-    report = apply_checks(client, plan)
+    report = apply_checks(client, plan, store=RefusingStore(refuses={task_ref(23)}))
 
+    # #23's retry is collected as one issue's failure rather than raised, and
+    # #24's merge lands and is recorded regardless.
     assert [f.number for f in report.failures] == [23]
-    assert client.labels_on(24) == {DONE}
+    assert report.merged == (24,)
+    assert [transition.ref for transition in report.applied] == [task_ref(24)]
+    assert [transition.to_state for transition in report.applied] == [DONE]
 
 
 # --------------------------------------------------------------------------
@@ -1091,7 +1137,8 @@ def test_one_pass_reads_checks_only_for_review_issues_with_an_open_pull_request(
         checks={f"{101:0>40x}": [run("test", "success")]},
     )
 
-    report = run_checks(client, ledger(entry(23), entry(24, label=CLAIMED)))
+    book = ledger(entry(23), entry(24, label=CLAIMED))
+    report = run_checks(client, book, believed=fixture_belief(book))
 
     # One listing plus one check read per review issue, and nothing per issue in
     # any other state: the cost is the review queue, not the ledger.
@@ -1099,18 +1146,22 @@ def test_one_pass_reads_checks_only_for_review_issues_with_an_open_pull_request(
         f"list_check_runs {101:0>40x}"
     ]
     assert report.merged == (23,)
-    assert client.labels_on(23) == {DONE}
+    assert [transition.to_state for transition in report.applied] == [DONE]
     assert client.deleted == [branch(23)]
 
 
 def test_one_pass_against_a_client_that_cannot_list_pull_requests_changes_nothing():
     client = BlindClient(issues={23: issue_payload(23)})
 
-    report = run_checks(client, ledger(entry(23)))
+    book = ledger(entry(23))
+    report = run_checks(client, book, believed=fixture_belief(book))
 
     assert report.plan.blind
     assert client.log == []
-    assert client.labels_on(23) == {REVIEW}
+    # Nothing decided, so nothing recorded: "we could not look" must never read
+    # as an answer about the checks.
+    assert report.applied == ()
+    assert report.merged == ()
 
 
 def test_a_failing_pass_leaves_the_issue_ready_for_another_attempt():
@@ -1124,13 +1175,14 @@ def test_a_failing_pass_leaves_the_issue_ready_for_another_attempt():
         },
     )
 
-    report = run_checks(client, ledger(entry(23, "src/mod23.py", "tests/test_mod23.py")))
+    book = ledger(entry(23, "src/mod23.py", "tests/test_mod23.py"))
+    report = run_checks(client, book, believed=fixture_belief(book))
 
     # The issue's headline, end to end: a red PR is retried rather than merged.
     # It used to assert the failure text was written into the issue body too;
     # #152 removed that write, and the failing check is on the pull request.
     assert report.merged == ()
-    assert client.labels_on(23) == {READY}
+    assert [transition.to_state for transition in report.applied] == [READY]
 
 
 # --------------------------------------------------------------------------
@@ -1399,12 +1451,12 @@ def test_the_ci_output_is_fenced_because_it_is_foreign_text():
 
 
 #: Every rule in this module that builds a `Transition`, each in a world where
-#: the carried label and the believed state disagree (#243). `swarm:done` is
-#: what a human typed onto #23 while its pull request was in flight; the belief
-#: still says `review`, because the resolver reads that off the open pull
+#: the carried label and the believed state disagree (#243, #152). `swarm:done`
+#: is what a human typed onto #23 while its pull request was in flight; the
+#: belief still says `review`, because the resolver reads that off the open pull
 #: request rather than off the label.
 #: Two labels per rule, never one - see `tests/test_reconcile.py`.
-CARRIED = (DONE, "swarm:blocked")
+CARRIED = ("swarm:done", "swarm:blocked")
 
 CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = (
     (
@@ -1471,22 +1523,34 @@ CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], ChecksPlan], str], ...] = 
 @pytest.mark.parametrize(
     "rule, world, decides", CARRIED_LABEL_RULES, ids=[case[0] for case in CARRIED_LABEL_RULES]
 )
-def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides):
-    """#243. Every transition here named `review` as a constant, on the
-    reasoning that this gate only fires on a task in review - which is true of
-    what the gate *believes* and not of what the issue is *wearing*.
+def test_no_rule_lets_the_label_the_issue_carries_change_what_it_writes(rule, world, decides):
+    """#243, inverted by #152 - which is the whole point of the ticket.
 
-    A human relabelled #23 while its pull request was in flight. The belief
-    still says review, so the gate decides as it always would - and the write
-    has to take `swarm:done` off, because that is the label that is there.
-    Naming `review` removes nothing, so the issue ends up carrying two state
-    labels and §3's precedence then reads the furthest-along of them.
+    While the labels *were* the control plane, `from_state` answered "which
+    label does this write have to remove", so a task the resolver believed
+    `review` while the issue carried `swarm:done` had to name `swarm:done` or
+    end up wearing two. `reconcile.write_labels` is deleted: nothing removes a
+    label, so that question no longer has a subject, and `from_state` is now
+    display-only and sourced from the belief through `authority.state_of`.
+
+    What survives is the property #243 was really protecting, and it is the
+    stronger direction: a label a human types onto an issue mid-review changes
+    *nothing* the gate decides or writes. Both rows below are decided the same
+    way and reported the same way whatever the issue is wearing, which is what
+    #152 means by the label control plane being gone rather than merely unused.
     """
+    written = set()
     for label in CARRIED:
         transition = world(label).transitions[0]
 
         assert transition.to_state == decides, f"{rule}: the rule stopped firing"
-        assert transition.from_state == internal_state(label), (
-            f"{rule} carrying {label}: removed the believed label"
+        # The belief, every time - never the label, and never a constant either:
+        # `REVIEWED` is what `state_of` is asked and `review` is what it answers.
+        assert transition.from_state == REVIEW_STATE, (
+            f"{rule} carrying {label}: read the label instead of the belief"
         )
-        assert transition.from_state != REVIEW_STATE
+        written.add((transition.from_state, transition.to_state, transition.reason))
+
+    # One outcome across both labels. A rule that had gone back to reading the
+    # issue would produce two.
+    assert len(written) == 1

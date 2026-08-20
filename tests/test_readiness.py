@@ -1,4 +1,4 @@
-"""Unit tests for readiness: `swarm:blocked` <-> `swarm:ready`.
+"""Unit tests for readiness: `blocked` <-> `eligible`.
 
 The five graphs `docs/architecture-v2.md`'s orchestration loop can meet are all
 here - a linear chain, a diamond, a cycle, a dangling reference and a
@@ -12,9 +12,13 @@ the run waits forever looking healthy, and a cancelled prerequisite, where
 nobody built.
 
 No network and no token. `FakeClient` replays issue payloads shaped like
-GitHub's and records the label writes; the ledgers are built by running the
-real parser over real issue bodies, so a body that would not parse cannot
-become a fixture here. #31 will lift the double into the shared fixture set.
+GitHub's; the ledgers are built by running the real parser over real issue
+bodies, so a body that would not parse cannot become a fixture here. #31 will
+lift the double into the shared fixture set.
+
+The double still records label writes even though #152 left this module with
+none to make: an empty `writes` is the assertion that the readiness pass is
+still the read-only thing that ticket made it.
 """
 
 from __future__ import annotations
@@ -39,14 +43,36 @@ from swarm.github.readiness import (
 )
 from swarm.github.refs import issue_number
 from swarm.github.refs import task_ref as ref
+from swarm.orchestrator.authority import Belief
+from swarm.orchestrator.derived import LANDED, STATES
 from swarm.taskref import TaskRef
 from fixtures.belief import fixture_belief
 
 
-# The cycle's belief, supplied from what each fixture declares (see
-# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def believed_for(book) -> Belief:
+    """The cycle's belief, from the state each fixture declares.
+
+    Readiness was told which entries were its to speak about by reading
+    `LedgerEntry.state_label`; since #152 the caller says, and what it says
+    comes off the cycle's `Belief`. The fixtures stash their declaration on
+    `labels` (`fixtures.belief`), next to a real repository label an issue
+    would also carry, so the state is picked out by name rather than taken as
+    whichever member of a `frozenset` came first.
+    """
+    entries = getattr(book, "entries", book)
+    states = {
+        task_id: next((name for name in getattr(entry, "labels", ()) if name in STATES), "")
+        for task_id, entry in entries.items()
+    }
+    return fixture_belief(book, states=states, stored=dict(states), previous=dict(states))
+
+
+# What a caller hands `compute_readiness` now that no label carries it: the
+# waiting entries, and what they are believed to be waiting in.
 def _compute_readiness_(book, *args, **kwargs):
-    kwargs.setdefault("believed", fixture_belief(book))
+    believed = believed_for(book)
+    kwargs.setdefault("transitionable", believed.waiting())
+    kwargs.setdefault("current", believed.states)
     return compute_readiness(book, *args, **kwargs)
 
 
@@ -133,13 +159,25 @@ def task(
 
 def done(number: int, refs: Sequence[int] = (), **kwargs: Any) -> dict[str, Any]:
     """A merged, closed-as-completed task - the only kind that unblocks."""
-    kwargs.setdefault("label", "swarm:done")
+    kwargs.setdefault("label", LANDED)
     return task(number, refs, state="closed", state_reason="completed", **kwargs)
 
 
-def plan_for(client: FakeClient):
-    """The whole path - parse, resolve, decide - stopping short of the writes."""
-    return apply_readiness(client)
+def plan_for(client: FakeClient, ledger: Ledger | None = None):
+    """The whole path - parse, resolve, decide. There is nothing after it.
+
+    `apply_readiness` wrote the two waiting labels until #152 and now returns
+    the plan and stops, so this helper is the whole module rather than the part
+    before the writes.
+    """
+    ledger = load_ledger(client) if ledger is None else ledger
+    believed = believed_for(ledger)
+    return apply_readiness(
+        client,
+        ledger=ledger,
+        transitionable=believed.waiting(),
+        current=believed.states,
+    )
 
 
 def verdicts_by_number(plan) -> dict[int, str]:
@@ -148,7 +186,7 @@ def verdicts_by_number(plan) -> dict[int, str]:
     The plan itself is keyed on `TaskRef` (#142); un-minting here rather than
     spelling `ref(41)` in thirty assertions keeps these tests about readiness.
     """
-    return {issue_number(verdict.ref): verdict.label for verdict in plan.verdicts}
+    return {issue_number(verdict.ref): verdict.state for verdict in plan.verdicts}
 
 
 def refs(numbers) -> tuple[TaskRef, ...]:
@@ -328,7 +366,7 @@ def test_a_dangling_reference_pulls_a_ready_issue_back():
 
     plan = plan_for(client)
 
-    assert [(v.ref, v.current_label, v.label) for v in plan.transitions] == [
+    assert [(v.ref, v.current_state, v.state) for v in plan.transitions] == [
         (ref(60), READY, BLOCKED)
     ]
 
@@ -378,7 +416,7 @@ def test_the_same_dependency_closed_as_completed_does_unblock():
 
 
 # --------------------------------------------------------------------------
-# Which labels get written
+# Which entries the pass speaks about, and which it moves
 # --------------------------------------------------------------------------
 
 
@@ -394,38 +432,31 @@ def test_only_the_disagreements_are_transitions():
 
     plan = plan_for(client)
 
-    assert [(v.ref, v.label) for v in plan.transitions] == [(ref(41), READY), (ref(42), BLOCKED)]
+    assert [(v.ref, v.state) for v in plan.transitions] == [(ref(41), READY), (ref(42), BLOCKED)]
     assert len(plan.verdicts) == 3
 
 
-def test_a_label_is_added_before_the_old_one_is_removed():
-    """A crash between the two calls must leave two labels, never none.
-
-    Two is repairable - §3's precedence reads `blocked` over `ready`, which is
-    the conservative answer. None puts the issue outside the ledger, where
-    nothing looks at it again.
-    """
-    client = FakeClient([done(40), task(41, [40])])
-
-    plan = apply_readiness(client)
-
-    assert plan.transitions[0].ref == ref(41)
-    assert client.writes == [("add", 41, READY), ("remove", 41, BLOCKED)]
+# Deleted with #152: `test_a_label_is_added_before_the_old_one_is_removed`
+# pinned the order of readiness's two label calls - add `swarm:ready`, then
+# remove `swarm:blocked` - so that a crash between them left an issue wearing
+# two labels rather than none. `_relabel` is gone and `apply_readiness` makes no
+# write at all, so there is no pair of calls left to order and no way for this to
+# fail. What replaces it is the assertion below that the pass writes nothing.
 
 
-@pytest.mark.parametrize("label", ["swarm:claimed", "swarm:review", "swarm:done", "swarm:failed"])
-def test_issues_in_another_state_are_never_relabelled(label):
-    """Readiness owns two rows of §4's table and touches nothing else.
+@pytest.mark.parametrize("state", ["claimed", "review", "landed", "needs-human"])
+def test_issues_in_another_state_get_no_verdict(state):
+    """Readiness owns two rows of §4's table and speaks about nothing else.
 
     A claimed issue whose dependency graph changed still has a container
-    working on it; relabelling it would pull the issue out from underneath.
+    working on it; a verdict about it would be this module telling the cycle
+    that an issue somebody is running is merely waiting.
     """
-    client = FakeClient([task(80, [999], label=label)])
+    client = FakeClient([task(80, [999], label=state)])
 
-    plan = apply_readiness(client)
+    plan = plan_for(client)
 
     assert plan.verdicts == ()
-    assert client.writes == []
     # The dangling ref is still reported - the entry is out of scope for the
     # label, not for the error.
     assert [e.task for e in plan.errors] == [ref(80)]
@@ -434,33 +465,41 @@ def test_issues_in_another_state_are_never_relabelled(label):
 def test_a_task_a_human_closed_is_never_readied():
     """`docs/architecture-v2.md`: closing a task mid-run is a supported edit.
 
-    Its dependency is met and its label still says `swarm:blocked`, so the
-    naive pass marks it ready and the dispatcher resurrects work somebody
+    Its dependency is met and the cycle still believes it is waiting, so the
+    naive pass calls it ready and the dispatcher resurrects work somebody
     cancelled on purpose.
     """
     client = FakeClient(
         [done(40), task(41, [40], state="closed", state_reason="not_planned")]
     )
 
-    plan = apply_readiness(client)
+    plan = plan_for(client)
 
     assert plan.verdicts == ()
-    assert client.writes == []
 
 
-def test_a_cycle_is_detected_before_anything_is_written():
-    client = FakeClient([done(40), task(41, [40]), task(50, [51]), task(51, [50])])
+# Deleted with #152: `test_a_cycle_is_detected_before_anything_is_written` ran a
+# ring through `apply_readiness` and asserted the label writes never happened.
+# The pass has no writes to suppress, and the assertion it would become - that a
+# function which never writes did not write - cannot fail. That a ring raises
+# instead of returning a plan is asserted by
+# `test_a_cycle_raises_instead_of_reporting_everything_blocked` and
+# `test_a_cycle_reached_from_an_acyclic_prefix_is_still_found`, both over the
+# same whole path; that the pass writes nothing is
+# `test_a_pass_computes_the_plan_and_writes_nothing`.
 
-    with pytest.raises(DependencyCycleError):
-        apply_readiness(client)
 
-    assert client.writes == []
+def test_a_pass_computes_the_plan_and_writes_nothing():
+    """#152's whole claim about this module, and the reason `dry_run` went.
 
-
-def test_dry_run_computes_the_same_plan_and_writes_nothing():
+    The parameter guarded the two label calls; with those gone every pass is
+    what `dry_run=True` used to be, so the property is asserted unconditionally
+    - the double still records writes, and a regression that put one back would
+    land here.
+    """
     client = FakeClient([done(40), task(41, [40])])
 
-    plan = apply_readiness(client)
+    plan = plan_for(client)
 
     assert plan.ready == refs([41])
     assert plan.transitions[0].changed is True
@@ -473,7 +512,7 @@ def test_a_prebuilt_ledger_is_not_re_read():
     ledger = load_ledger(client)
     client.listed.clear()
 
-    apply_readiness(client, ledger=ledger)
+    plan_for(client, ledger)
 
     # One list call, for resolving the referenced issues' open/closed state.
     assert client.listed == ["all"]
@@ -630,23 +669,27 @@ class ForeignEntry:
     Deliberately *not* a `LedgerEntry`: that type is the GitHub adapter's
     record and mints its ref from an issue number, so building the graph out of
     one could never demonstrate the property under test. This carries only the
-    four fields readiness reads, which is itself the assertion - anything more
+    three fields readiness reads, which is itself the assertion - anything more
     the graph reached for would be a piece of GitHub it has no business
     knowing.
+
+    `labels` is the fourth and is not one of them: since #152 it is the
+    fixture's *declaration* of what state the entry is in, which `believed_for`
+    turns into the belief the caller passes. Readiness never looks at it.
     """
 
     ref: TaskRef
     task_id: str
-    state_label: str
+    labels: frozenset[str] = frozenset()
     blocked_by: tuple[TaskRef, ...] = ()
 
 
 def linear_ledger():
     """`ENG-9 -> ENG-10 -> ENG-11`, with the root already delivered."""
     entries = [
-        ForeignEntry(TaskRef("ENG-9"), "eng-9", "swarm:done"),
-        ForeignEntry(TaskRef("ENG-10"), "eng-10", BLOCKED, (TaskRef("ENG-9"),)),
-        ForeignEntry(TaskRef("ENG-11"), "eng-11", BLOCKED, (TaskRef("ENG-10"),)),
+        ForeignEntry(TaskRef("ENG-9"), "eng-9", frozenset({LANDED})),
+        ForeignEntry(TaskRef("ENG-10"), "eng-10", frozenset({BLOCKED}), (TaskRef("ENG-9"),)),
+        ForeignEntry(TaskRef("ENG-11"), "eng-11", frozenset({BLOCKED}), (TaskRef("ENG-10"),)),
     ]
     return Ledger(entries={entry.task_id: entry for entry in entries})
 
@@ -677,8 +720,8 @@ def test_a_non_numeric_ref_survives_the_readiness_graph():
 def test_a_cycle_of_non_numeric_refs_is_still_a_cycle():
     """The one failure that must never pass silently, on a foreign tracker."""
     entries = [
-        ForeignEntry(TaskRef("ENG-1"), "eng-1", BLOCKED, (TaskRef("ENG-2"),)),
-        ForeignEntry(TaskRef("ENG-2"), "eng-2", BLOCKED, (TaskRef("ENG-1"),)),
+        ForeignEntry(TaskRef("ENG-1"), "eng-1", frozenset({BLOCKED}), (TaskRef("ENG-2"),)),
+        ForeignEntry(TaskRef("ENG-2"), "eng-2", frozenset({BLOCKED}), (TaskRef("ENG-1"),)),
     ]
     ledger = Ledger(entries={entry.task_id: entry for entry in entries})
 

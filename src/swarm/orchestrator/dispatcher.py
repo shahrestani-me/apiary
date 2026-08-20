@@ -844,7 +844,7 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
 
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
     # Read-only on every path: no adoption write, no label, no container.
-    report = plan_dispatch(load_ledger(GitHubClient.from_env(repo), adopt=False))
+    report = plan_dispatch(load_ledger(GitHubClient.from_env(repo)))
     print(Capacity.detect(provider=_worker_provider()).summary())
     for chosen in report.dispatch:
         print(f"dispatch #{chosen.number} {chosen.task_id}: {', '.join(chosen.files)}")

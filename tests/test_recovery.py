@@ -1,12 +1,11 @@
 """Tests for stale-claim recovery.
 
-This module takes `swarm:claimed` off an issue and returns it to the pool, so
-these tests are about two opposite mistakes and the line between them.
+This module takes a claim nothing is honouring and returns the task to the
+pool, so these tests are about two opposite mistakes and the line between them.
 
 **A claim with nothing behind it must not survive.** The dispatcher claims
-before it spawns, so a crash in that window leaves a label no other component
-will ever remove and an issue that is undispatchable while looking perfectly
-healthy. The ticket's done-when is here twice: once as the startup sweep it
+before it spawns, so a crash in that window leaves a task nothing is running
+and nothing will pick up - undispatchable while looking perfectly healthy. The ticket's done-when is here twice: once as the startup sweep it
 asks for, and once as the mid-cycle case that actually happened - three issues
 claimed, one spawned, the process interrupted before the rest.
 
@@ -19,8 +18,14 @@ minted, both keep their claims.
 
 **The counter is the difference between recovering and looping.** An issue that
 crashes the orchestrator is the issue that will crash it again, so every
-release consumes an attempt and the cap ends in `swarm:failed`. The `review`
+release consumes an attempt and the cap ends in `needs-human`. The `review`
 path consumes none: that worker finished.
+
+**Where the claim itself is stated changed with #152.** It was `swarm:claimed`
+on the issue, which is why a sweep could read the world and decide alone; it is
+now the cycle's `Belief`, so every pass here is handed one - `fixture_belief`
+over what the fixture declares - and what a pass decided is read off its
+transitions rather than off the labels it used to leave behind.
 
 Hermetic throughout. The container listings go through a `Runner` double that
 parses `--filter` for real, so `find_containers`' own behaviour is under test
@@ -34,7 +39,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 import pytest
 
@@ -51,18 +56,18 @@ from swarm.containers.manager import (
     Limits,
 )
 from fixtures.store import RecordingStore
-from swarm.store import STORE_DIR_ENV, SqliteTaskStore
+from swarm.store import STORE_DIR_ENV, SqliteTaskStore, StoreError
 from swarm.github.branches import task_branch
-from swarm.github.client import GitHubHTTPError
-from swarm.github.ledger import Ledger, LedgerEntry, render_marker
+from swarm.github.ledger import Ledger, LedgerEntry, load_ledger, render_marker
 from swarm.github.readiness import BLOCKED, READY, IssueState
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, claim
-from swarm.orchestrator.lifecycle import internal_state
+from swarm.orchestrator.reconcile import Snapshot
 from swarm.orchestrator.recovery import (
     Held,
     Recovery,
     RecoveryPlan,
+    RecoveryReport,
     holders,
     in_flight,
     live_runs,
@@ -70,8 +75,7 @@ from swarm.orchestrator.recovery import (
     unrecognised,
 )
 from swarm.run import RUN_LABEL, Run
-from swarm.orchestrator.authority import Belief
-from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN
+from swarm.orchestrator.derived import ELIGIBLE, NEEDS_HUMAN
 from swarm.orchestrator.derived import CLAIMED as CLAIMED_STATE
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
 from fixtures.belief import fixture_belief
@@ -176,7 +180,6 @@ class FakeClient:
 
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     log: list[str] = field(default_factory=list)
-    fail_labels_on: set[int] = field(default_factory=set)
 
     def list_issues(self, *, state: str = "open", **kwargs: Any) -> list[dict[str, Any]]:
         self.log.append(f"list_issues {state}")
@@ -191,27 +194,28 @@ class FakeClient:
         self.issues[number].update(kwargs)
         return dict(self.issues[number])
 
+    # --- the two calls this module used to make ---------------------------
+
     def add_labels(self, number: int, labels: Iterable[str]) -> Any:
-        names = list(labels)
-        self.log.append(f"+{','.join(names)} #{number}")
-        if number in self.fail_labels_on:
-            raise GitHubHTTPError(404, "POST", f"/issues/{number}/labels", b'{"message":"gone"}')
-        current = self.issues.get(number, {}).setdefault("labels", [])
-        current.extend({"name": name} for name in names)
-        return current
+        # A sweep moved the claim by writing `swarm:ready` or `swarm:review`
+        # here and removing `swarm:claimed`. #152 deleted both calls, so the
+        # honest double refuses them: a rule that grew one back would otherwise
+        # write into a fake that cheerfully accepted it, and every assertion in
+        # this file would stay green.
+        pytest.fail(f"the sweep wrote labels {list(labels)!r} onto #{number}")
 
     def remove_label(self, number: int, label: str) -> bool:
-        self.log.append(f"-{label} #{number}")
-        payload = self.issues.get(number)
-        if payload is None:
-            return False
-        payload["labels"] = [item for item in payload["labels"] if item["name"] != label]
-        return True
+        pytest.fail(f"the sweep removed {label!r} from #{number}")
+
+    def create_issue_comment(self, number: int, body: str) -> dict[str, Any]:
+        # The only tracker write a sweep still makes (#152): the give-up
+        # comment. `apply_plan` posts it *after* it has persisted the judgment,
+        # which is the ordering `test_the_counter_is_persisted_before_apiary_says_so`
+        # reads out of this log.
+        self.log.append(f"comment #{number}")
+        return {"id": 1, "body": body}
 
     # --- what the assertions read ---------------------------------------
-
-    def labels_on(self, number: int) -> set[str]:
-        return {item["name"] for item in self.issues[number]["labels"]}
 
     def attempt_on(self, number: int) -> int:
         marker = self.issues[number]["body"].splitlines()[0]
@@ -311,6 +315,27 @@ def store_root(tmp_path, monkeypatch):
     return root
 
 
+def startup(sweeper: Recovery, client: Any) -> RecoveryReport:
+    """A sweep before there is a cycle to share a read with.
+
+    `Recovery.startup()` reads the ledger, each issue's open/closed state and
+    the pull-request probe off one listing, and that half is unchanged - it is
+    spelled out here rather than called because of the half that did change.
+    A claim was `swarm:claimed` on the issue, so a sweep could read the world
+    and decide alone; since #152 the claim is a state on the cycle's `Belief`
+    and has to come from outside the sweep. The fixtures declare it, the same
+    way every other test in this file does.
+    """
+    snapshot = Snapshot(client)
+    book = load_ledger(snapshot, store=sweeper.store)  # type: ignore[arg-type]
+    return sweeper.sweep(
+        book,
+        states=snapshot.states(),
+        open_branches=snapshot.open_branches(),
+        believed=fixture_belief(book),
+    )
+
+
 def recovery(client: Any, daemon: Daemon | None = None, **kwargs: Any) -> Recovery:
     kwargs.setdefault("run", make_run())
     # A real store by default (ADR 0005). The sweep consumes attempts, and a
@@ -408,7 +433,8 @@ def test_a_container_that_exited_still_holds_the_claim_of_a_live_run():
     run = make_run()
     daemon = Daemon([Handle(id="a" * 64, run_id=run.id, issue=4, state="exited")])
 
-    plan = recovery(FakeClient(), daemon, run=run).plan(ledger(entry(4)))
+    book = ledger(entry(4))
+    plan = recovery(FakeClient(), daemon, run=run).plan(book, believed=fixture_belief(book))
 
     assert plan.transitions == ()
     assert [item.ref for item in plan.held] == [ref(4)]
@@ -437,12 +463,12 @@ def test_a_container_of_a_dead_run_speaks_for_nothing_and_is_not_removed():
     daemon = Daemon([handle(4, DEAD_RUN)])
     client = FakeClient(issues={4: issue_payload(4)})
 
-    recovery(client, daemon).sweep(ledger(entry(4)))
+    report = startup(recovery(client, daemon), client)
 
     # The reaper's rule, reused rather than re-invented: ids are never reused,
-    # so a label naming a run this process is not names a process that is gone.
-    # Its container is #20's to remove, and this module removes none.
-    assert client.labels_on(4) == {READY}
+    # so a container naming a run this process is not belongs to a process that
+    # is gone. Its container is #20's to remove, and this module removes none.
+    assert [item.to_state for item in report.applied] == [ELIGIBLE]
     assert daemon.commands == ["ps"]
 
 
@@ -595,9 +621,9 @@ def test_the_review_path_is_taken_once_pull_requests_can_be_listed():
     )
 
     sweeper = recovery(client)
-    report = sweeper.startup()
+    report = startup(sweeper, client)
 
-    assert client.labels_on(4) == {REVIEW}
+    assert [item.to_state for item in report.applied] == [REVIEW_STATE]
     # Nothing charged at all: `attempt=None` means the counter is left alone,
     # which is not the same as writing back the value it already had. Under ADR
     # 0005 that reads as an **absent row** rather than an absent body `PATCH` -
@@ -613,34 +639,65 @@ def test_the_review_path_is_taken_once_pull_requests_can_be_listed():
 # --------------------------------------------------------------------------
 
 
-def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
-    client = FakeClient(issues={4: issue_payload(4)})
+def test_the_counter_is_persisted_before_apiary_says_so_on_the_tracker():
+    """The crash ordering §5 fixed, kept after the counter changed address twice.
+
+    It was "the judgment is persisted before the label that re-readies the
+    task", so that a crash between the two costs an attempt rather than
+    granting a free one. ADR 0005 moved the judgment into apiary's own store and
+    #152 removed the label - and the ordering survives both, because the
+    give-up comment is a tracker write like any other and is still the *second*
+    thing to happen. A sweep that announced the cap and then died without
+    recording it would hand the task a fresh budget with a comment on it saying
+    it had none.
+
+    At the cap rather than with budget left, because that is the release that
+    still writes to the tracker at all.
+    """
+    client = FakeClient(issues={4: issue_payload(4, attempt=1)})
 
     with RecordingStore(REPO, client.log) as store:
-        recovery(client, store=store).sweep(ledger(entry(4)))
+        book = ledger(entry(4, attempt=1))
+        report = recovery(client, store=store, max_attempts=2).sweep(
+            book, believed=fixture_belief(book)
+        )
         held = store.read()[ref(4)]
 
-    # The crash ordering §5 fixed, kept after the counter changed address (ADR
-    # 0005): the judgment is persisted before the label re-readies the task, so
-    # a crash between them costs an attempt rather than granting a free one. And
-    # add-before-remove, because two state labels are repairable by §3's
-    # precedence and none is not.
-    assert client.log[-3:] == [f"store {ref(4)} attempt=1", f"+{READY} #4", f"-{CLAIMED} #4"]
-    assert held.attempt == 1
-    assert client.attempt_on(4) == 0
+    assert [item.to_state for item in report.applied] == [NEEDS_HUMAN]
+    assert client.log[-2:] == [f"store {ref(4)} attempt=2", "comment #4"]
+    assert held.attempt == 2
+    # And the issue body was not touched on the way past: the counter lives in
+    # the store now (ADR 0005), so the marker still reads what it read at
+    # creation.
+    assert client.attempt_on(4) == 1
 
 
-def test_one_issue_that_cannot_be_relabelled_does_not_cost_the_others_their_recovery():
-    client = FakeClient(
-        issues={4: issue_payload(4), 5: issue_payload(5)},
-        fail_labels_on={4},
-    )
+def test_one_judgment_that_cannot_be_persisted_does_not_cost_the_others_their_recovery():
+    """One release's write failing is a fact about one task, not a reason to
+    abandon a sweep that was about to free four others.
 
-    report = recovery(client).sweep(ledger(entry(4), entry(5)))
+    The failing write was `add_labels` on an issue a human had deleted or
+    relabelled between the read and the write. #152 left the sweep with one
+    write per release - the attempt it consumes, into apiary's own store (ADR
+    0005) - so that is the one made to fail here. The policy is what is under
+    test and it did not move: collect the failure, keep going, and report the
+    sweep as not ok.
+    """
 
-    # A human deleting or relabelling an issue between the read and the write
-    # lands here. It is a fact about one issue, not a reason to abandon a sweep
-    # that was about to free four others.
+    class Refusing(RecordingStore):
+        """A store that cannot write the judgment for one task."""
+
+        def write(self, judgement: Any) -> None:
+            if judgement.ref == ref(4):
+                raise StoreError(f"cannot persist a judgment for {judgement.ref}")
+            super().write(judgement)
+
+    client = FakeClient(issues={4: issue_payload(4), 5: issue_payload(5)})
+
+    with Refusing(REPO, client.log) as store:
+        book = ledger(entry(4), entry(5))
+        report = recovery(client, store=store).sweep(book, believed=fixture_belief(book))
+
     assert report.refs == (ref(5),)
     assert [failure.ref for failure in report.result.failures] == [ref(4)]
     assert report.ok is False
@@ -648,11 +705,14 @@ def test_one_issue_that_cannot_be_relabelled_does_not_cost_the_others_their_reco
 
 def test_a_dry_run_writes_nothing_and_still_says_what_it_would_do():
     client = FakeClient(issues={4: issue_payload(4)})
+    sweeper = recovery(client, dry_run=True)
 
-    report = recovery(client, dry_run=True).startup()
+    report = startup(sweeper, client)
 
+    # One listing in, nothing out: no comment on the tracker and - the write
+    # that matters since ADR 0005 - no attempt charged in the store.
     assert client.log == ["list_issues all"]
-    assert client.labels_on(4) == {CLAIMED}
+    assert sweeper.store.read() == {}
     assert report.plan.refs == (ref(4),)
     assert report.applied == ()
 
@@ -660,7 +720,7 @@ def test_a_dry_run_writes_nothing_and_still_says_what_it_would_do():
 def test_the_startup_sweep_reads_the_issue_list_once():
     client = FakeClient(issues={n: issue_payload(n) for n in range(4, 12)})
 
-    recovery(client).startup()
+    startup(recovery(client), client)
 
     # The ledger, each issue's open/closed state and the pull-request probe all
     # come off one listing, exactly as they do inside a cycle.
@@ -688,9 +748,9 @@ def test_a_claim_left_by_a_killed_orchestrator_is_back_at_ready_on_restart():
         max_attempts=3,
         store=SqliteTaskStore.open(REPO),
     )
-    report = sweeper.startup()
+    report = startup(sweeper, client)
 
-    assert client.labels_on(4) == {READY}
+    assert [item.to_state for item in report.applied] == [ELIGIBLE]
     assert sweeper.store.read()[ref(4)].attempt == 1
     assert report.ok and report.refs == (ref(4),)
 
@@ -698,15 +758,19 @@ def test_a_claim_left_by_a_killed_orchestrator_is_back_at_ready_on_restart():
 def test_a_second_sweep_finds_nothing_left_to_do():
     client = FakeClient(issues={4: issue_payload(4)})
     sweeper = recovery(client)
+    book = ledger(entry(4))
+    believed = fixture_belief(book)
 
-    sweeper.startup()
-    again = sweeper.startup()
+    first = sweeper.sweep(book, believed=believed)
+    again = sweeper.sweep(book, believed=believed.fold(first.applied))
 
-    # Nothing is carried between passes, so a sweep is safe to run at startup
-    # and then at the top of every cycle. The second one reads what the first
-    # one wrote and has no opinion about it.
+    # The sweep holds no state between passes, which is what makes "at startup"
+    # and "at the top of every cycle" the same code with no mode flag. What
+    # carries is the cycle's belief: the first pass released the claim, the
+    # second is told so, and it has no opinion about a task that is not claimed.
+    # The claim was `swarm:claimed` on the issue and the second pass read it
+    # back off the tracker; since #152 `fold` is that read.
     assert again.plan == RecoveryPlan(blind=True)
-    assert client.labels_on(4) == {READY}
     assert sweeper.store.read()[ref(4)].attempt == 1
 
 
@@ -826,14 +890,16 @@ def test_a_real_dead_runs_container_does_not_hold_its_claim_and_a_live_ones_does
         }
     )
 
-    report = Recovery(client=client, run=live.run).startup()
+    sweeper = Recovery(client=client, run=live.run, store=SqliteTaskStore.open(REPO))
+    report = startup(sweeper, client)
 
     # The done-when against the real listing: the killed run's claim is back in
     # the pool with its attempt consumed, and the running worker's is untouched.
     assert report.ok, report.summary()
-    assert client.labels_on(DEAD_ISSUE) == {READY}
-    assert client.attempt_on(DEAD_ISSUE) == 1
-    assert client.labels_on(LIVE_ISSUE) == {CLAIMED}
+    assert [(item.ref, item.to_state) for item in report.applied] == [
+        (ref(DEAD_ISSUE), ELIGIBLE)
+    ]
+    assert sweeper.store.read()[ref(DEAD_ISSUE)].attempt == 1
     assert [item.ref for item in report.plan.held] == [ref(LIVE_ISSUE)]
 
 
@@ -846,72 +912,27 @@ def test_recovering_a_claim_leaves_the_orphaned_container_for_the_reaper(two_run
     )
     client = FakeClient(issues={DEAD_ISSUE: issue_payload(DEAD_ISSUE)})
 
-    Recovery(client=client, run=make_run()).startup()
+    sweeper = Recovery(client=client, run=make_run(), store=SqliteTaskStore.open(REPO))
+    report = startup(sweeper, client)
 
     # Both halves of the fault are needed and they belong to different tickets.
     # A second module issuing `docker rm` is how a container gets removed out
     # from under the sweep that was capturing its logs.
     assert [found.issue for found in dead.find()] == [DEAD_ISSUE]
-    assert client.labels_on(DEAD_ISSUE) == {READY}
+    assert [item.to_state for item in report.applied] == [ELIGIBLE]
 
 
-#: Every rule in `plan_recovery` that builds a `Transition`, each in a world
-#: where the carried label and the believed state disagree - which is the
-#: ordinary case for this sweep rather than a contrived one: the authority
-#: selects a task because a *container* says `claimed`, so the label on the
-#: issue is whatever a human last typed onto it.
-#: Two labels per rule, never one: a world whose carried label happens to
-#: equal the state a mutation substitutes cannot see that mutation.
-CARRIED = (DONE, "swarm:blocked")
-
-CARRIED_LABEL_RULES: tuple[tuple[str, Callable[[str], Any], str], ...] = (
-    (
-        "the claim is released with budget left",
-        lambda label: _plan_recovery_(
-            ledger(entry(4, label=label, attempt=0)),
-            believed=Belief(states={"task-4": CLAIMED_STATE}),
-            max_attempts=3,
-        ),
-        ELIGIBLE,
-    ),
-    (
-        "the claim is released at the cap",
-        lambda label: _plan_recovery_(
-            ledger(entry(4, label=label, attempt=1)),
-            believed=Belief(states={"task-4": CLAIMED_STATE}),
-            max_attempts=2,
-        ),
-        NEEDS_HUMAN,
-    ),
-    (
-        "a pull request was pushed and no cycle saw it",
-        lambda label: _plan_recovery_(
-            ledger(entry(4, label=label, attempt=1)),
-            believed=Belief(states={"task-4": CLAIMED_STATE}),
-            open_branches=(branch(4, attempt=1),),
-        ),
-        REVIEW_STATE,
-    ),
-)
-
-
-@pytest.mark.parametrize(
-    "rule, world, decides", CARRIED_LABEL_RULES, ids=[case[0] for case in CARRIED_LABEL_RULES]
-)
-def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides):
-    """#243. All three rows build their `Transition` from the label the issue
-    carries, and only two of them were pinned - the cap row could have named
-    any state at all with the whole suite still green.
-
-    Here a human has typed `swarm:done` onto a task a container is holding. The
-    write has to take *that* off; taking `swarm:claimed` off would leave the
-    issue wearing two state labels, and §3 would then read the furthest-along
-    of them and stop a task that is only out of budget.
-    """
-    for label in CARRIED:
-        transition = world(label).transitions[0]
-
-        assert transition.to_state == decides, f"{rule}: the rule stopped firing"
-        assert transition.from_state == internal_state(label), (
-            f"{rule} carrying {label}: removed the believed label"
-        )
+# Deleted with #152: `test_every_rule_removes_the_label_the_issue_carries`
+# (#243) ran all three transition-building rules in `plan_recovery` over two
+# carried labels each, and asserted that `Transition.from_state` was the state
+# of the label the *issue* was wearing rather than the state the authority
+# believed. The point was the write: taking `swarm:claimed` off an issue
+# carrying `swarm:done` would have left it wearing two state labels, and §3
+# would then read the furthest-along of them. Nothing carries a label and
+# nothing is removed, so `from_state` is now the believed state by
+# construction - there is no second source left for it to disagree with, and
+# the assertion cannot fail. That each of the three rules still fires and names
+# its state is asserted by
+# `test_a_claim_with_no_container_behind_it_returns_to_the_pool`,
+# `test_the_release_consumes_an_attempt_so_a_second_crash_gives_up` and
+# `test_a_claim_with_an_open_pull_request_moves_forward_to_review`.

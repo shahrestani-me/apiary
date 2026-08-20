@@ -329,7 +329,6 @@ class BoardReader:
                 f"it still wanted a human"
             )
         try:
-            # `adopt=False`: a board is a reader. Adoption writes markers onto
             # hand-written issues, and a page polling every few seconds must not
             # be the thing that edits somebody's backlog.
             ledger = load_ledger(client, store=store)

@@ -1039,6 +1039,11 @@ def _retry_or_give_up(
 #: whichever control plane this cycle believes.
 FINISHED_STATES = frozenset({LANDED, NEEDS_HUMAN})
 
+#: The "no grant" answer for the live count, so the lookup has one shape. A task
+#: nobody revived is treated as a grant already spent - it is not being kept
+#: alive by one.
+_SPENT = Grant(attempt=0, dispatched=True)
+
 
 def _now(entry: LedgerEntry, believed: Belief | None) -> str:
     """What this task **is**, as the cycle's authority has it (#147).
@@ -2341,7 +2346,28 @@ class Reconciler:
             checks=checks,
             recovered=recovered,
             cycle_error=cycle_error,
-            live=len(live_entries(ledger)),
+            # **From the belief, not from `live_entries`.** `run.live_entries`
+            # answers "not closed", which is the only terminal fact available at
+            # `start_run` - before any observation exists to resolve a state
+            # from. Inside a cycle there *is* one, and the difference is not
+            # cosmetic: a task that needs a human is **open**, so counting it as
+            # live would mean the ledger never exhausts, `close_the_loop` is
+            # never called, and the goal gate's revival - the one thing that
+            # could rescue that very task - becomes unreachable. Under the
+            # labels this worked because `swarm:failed` was terminal *and* open,
+            # and that combination is exactly what #152 removed.
+            # Over the *ledger*, asking the belief - not over the belief's own
+            # keys. A belief with no states is a cycle that resolved nothing
+            # (no observation yet), and every task in it reads `""`, which is
+            # not terminal and therefore live. Counting the belief's keys
+            # instead would read an unresolved cycle as a finished plan and end
+            # the run on its first pass.
+            live=sum(
+                1
+                for entry in ledger.entries.values()
+                if belief.state(entry.task_id) not in FINISHED_STATES
+                or not self._revived.get(entry.ref, _SPENT).dispatched
+            ),
         )
         # `belief`, as it stands *here* - folded by `apply_plan`, the recovery
         # sweep and the merge gate - rather than the one `believe` returned at
@@ -2456,7 +2482,7 @@ class Reconciler:
         if report.readiness is not None:
             for verdict in report.readiness.verdicts:
                 if verdict.task_id:
-                    overlay[verdict.task_id] = label_state(verdict.label)
+                    overlay[verdict.task_id] = verdict.state
         if report.dispatched is not None:
             slugs = {entry.ref: entry.task_id for entry in report.ledger.entries.values()}
             for item in report.dispatched.dispatched:

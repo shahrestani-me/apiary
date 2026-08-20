@@ -346,7 +346,10 @@ def test_a_ledger_with_live_issues_is_attached_to_not_replanned():
     assert attachment.mode == "attach"
     assert attachment.resumed is True
     assert [entry.number for entry in attachment.live] == [1, 2]
-    assert attachment.counts == {"swarm:claimed": 1, "swarm:review": 1}
+    # `attachment.counts` was asserted here too - a census of the live entries
+    # by `swarm:*` label. #152 removed the labels and `Attachment` lost the
+    # property; what the entries are *doing* is the resolver's answer a cycle
+    # later, not something a `start_run` can know before one has run.
 
 
 def test_an_empty_ledger_plans():
@@ -357,12 +360,18 @@ def test_an_empty_ledger_plans():
 
 
 def test_a_ledger_of_only_finished_work_plans_rather_than_attaching():
-    # `done` and `failed` are terminal. A new objective against a repo whose
-    # last run completed is new work, not a resumption - attaching to it would
-    # leave the run with nothing to dispatch and no reason to plan.
+    # A new objective against a repo whose last run finished is new work, not a
+    # resumption - attaching to it would leave the run with nothing to dispatch
+    # and no reason to plan.
+    #
+    # Terminal is *closed* since #152: it was `swarm:done` or `swarm:failed`,
+    # and `live_entries` now reads the one terminal fact the code host still
+    # carries at the moment `start_run` asks. A task that needs a human stays
+    # open and is therefore live - deliberately, because the goal gate may
+    # revive it - so it cannot stand for finished work here any more.
     ledger = ledger_of(
         done_issue(1, marker="task-one"),
-        issue(2, marker="task-two", labels=("swarm:failed",)),
+        issue(2, marker="task-two", state="closed", state_reason="not_planned"),
     )
 
     assert attach(Run.start(REPO, OBJECTIVE, now=NOW), ledger).mode == "plan"
@@ -385,8 +394,8 @@ def test_reinvoking_mints_a_new_id_and_adopts_the_same_ledger():
         issue(2, marker="task-two", labels=("swarm:ready",)),
     ])
 
-    first = start_run(REPO, OBJECTIVE, now=NOW)
-    second = start_run(REPO, OBJECTIVE, now=NOW + dt.timedelta(seconds=90))
+    first = start_run(REPO, OBJECTIVE, source=client, now=NOW)
+    second = start_run(REPO, OBJECTIVE, source=client, now=NOW + dt.timedelta(seconds=90))
 
     # A new id, because the containers and artifacts of the dead process must
     # stay distinguishable from this one's (#20, #29).
@@ -394,33 +403,36 @@ def test_reinvoking_mints_a_new_id_and_adopts_the_same_ledger():
     # And the same work, because the issues are the checkpoint.
     assert second.mode == "attach"
     assert [entry.task_id for entry in second.live] == [entry.task_id for entry in first.live]
-    # Nothing was written either time: both issues already carry markers, so
-    # there was nothing to adopt and certainly nothing to create.
+    # Nothing was written either time: attaching reads, and since #152 there is
+    # no adoption write left for an unmarked issue either.
     assert client.writes == []
 
 
-def test_a_dry_run_does_not_even_adopt_a_hand_written_issue():
-    # Adoption is a real write to somebody's issue body. A command that
-    # promised to change nothing must not make that one either.
+def test_a_hand_written_issue_is_neither_adopted_nor_attached_to():
+    """Adoption ended with the label that selected what to adopt (#152).
+
+    A hand-written issue joined the ledger by carrying `swarm:ready`, and
+    apiary wrote a marker into its body on the way past. Membership is the
+    marker now, so an issue nobody minted one for is simply not apiary's: it is
+    ignored rather than edited, and a run that finds only those has nothing to
+    resume. Somebody else's backlog is not written to on any path, which is the
+    half of this the dry-run test used to carry on its own.
+    """
     client = FakeClient([issue(1, marker=None, title="Add retry logic")])
 
-    attachment = start_run(REPO, OBJECTIVE, now=NOW)
+    attachment = start_run(REPO, OBJECTIVE, source=client, now=NOW)
 
-    assert attachment.mode == "attach"
+    assert attachment.mode == "plan"
+    assert attachment.live == ()
     assert client.writes == []
 
 
-def test_attaching_adopts_a_hand_written_issue_under_a_stable_id():
-    client = FakeClient([issue(1, marker=None, title="Add retry logic")])
-
-    first = start_run(REPO, OBJECTIVE, now=NOW)
-    second = start_run(REPO, OBJECTIVE, now=NOW + dt.timedelta(seconds=90))
-
-    assert [entry.task_id for entry in first.live] == ["add-retry-logic"]
-    # The marker was persisted on the first pass, so the second reads it back
-    # rather than deriving a second identity for the same work.
-    assert [entry.task_id for entry in second.live] == ["add-retry-logic"]
-    assert [write[0] for write in client.writes] == ["update"]
+# Deleted with #152: `test_attaching_adopts_a_hand_written_issue_under_a_stable_id`
+# asserted that the first attach wrote a marker onto an unmarked issue and the
+# second read the same task id back rather than minting a second identity for
+# the same work. `load_ledger` adopts nothing - there is no `swarm:ready` to
+# say an unmarked issue is apiary's - so there is no write to make stable, and
+# the test above asserts the rule that replaced it.
 
 
 # --------------------------------------------------------------------------
@@ -428,7 +440,15 @@ def test_attaching_adopts_a_hand_written_issue_under_a_stable_id():
 # --------------------------------------------------------------------------
 
 
-def test_run_against_a_live_ledger_reports_the_run_and_reconciles_readiness(capsys):
+def test_run_against_a_live_ledger_reports_the_run_and_reads_readiness(capsys):
+    """What `--plan-only` still is: the resume report, and a readiness pass.
+
+    It asserted the writes that pass made - `swarm:ready` onto #2, whose only
+    dependency #1 had closed as completed, and `swarm:blocked` off it. Readiness
+    writes nothing since #152, so the two label assertions became one:
+    **`--plan-only` touches the tracker exactly as much as `--dry-run` does**,
+    which is not at all.
+    """
     client = FakeClient([
         done_issue(1, marker="task-one"),
         issue(2, marker="task-two", labels=("swarm:blocked",), blocked=[1]),
@@ -440,10 +460,7 @@ def test_run_against_a_live_ledger_reports_the_run_and_reconciles_readiness(caps
     out = capsys.readouterr().out
     assert "attached to 1 live issue(s)" in out
     assert "no issues were replanned" in out
-    # #1 is closed as completed, so #2's only dependency is discharged and the
-    # first act of the resumed run is to unblock it.
-    assert ("add", 2, "swarm:ready") in client.writes
-    assert ("remove", 2, "swarm:blocked") in client.writes
+    assert client.writes == []
 
 
 def test_a_dry_run_reports_readiness_without_writing_a_single_label(capsys):
@@ -524,13 +541,6 @@ PROMPT = "a markdown to CSV tool"
 NEW_REPO = "me/a-markdown-to-csv-tool"
 
 
-class NoLabels:
-    """`LabelReport`'s one method, which is all `ProvisionReport.summary` calls."""
-
-    def summary(self) -> str:
-        return "labels: unchanged"
-
-
 @dataclass
 class Provisioning:
     """Records what would have been created, and answers as `provision` does.
@@ -554,7 +564,9 @@ class Provisioning:
             html_url=f"https://github.com/{plan.full_name}",
             default_branch=plan.default_branch,
             commit_sha="0" * 40,
-            labels=NoLabels(),
+            # No `labels=`: provisioning the six `swarm:*` labels into somebody
+            # else's repository was the first thing #152 deleted, and
+            # `ProvisionReport` lost the field with the step.
             protection=("required_status_checks",),
             verify_command=plan.verify_command,
         )

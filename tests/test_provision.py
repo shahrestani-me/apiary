@@ -1,7 +1,7 @@
 """Unit tests for greenfield provisioning, against a mocked GitHub.
 
 **Nothing here creates a repository.** Every test drives `FakeGitHub`, an
-in-memory account that stores repos, blobs, refs, labels and rulesets and hands
+in-memory account that stores repos, blobs, refs and rulesets and hands
 them back. That is not only about speed: the thing this module does is
 irreversible and outward-facing, so a test suite that reached the real API
 would leave a trail of half-provisioned repos behind every red run, and the one
@@ -18,7 +18,7 @@ through on a different but equally wrong implementation:
   a property of the code instead of a comment in it.
 
 It is written to be lifted into the shared fixture set (#31), alongside
-`test_github_client.py`'s `FakeTransport` and `test_labels.py`'s `FakeRepo`.
+`test_github_client.py`'s `FakeTransport`.
 """
 
 from __future__ import annotations
@@ -92,7 +92,6 @@ class FakeGitHub:
     trees: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     commits: dict[str, dict[str, Any]] = field(default_factory=dict)
     refs: dict[str, str] = field(default_factory=dict)
-    labels: dict[str, dict[str, str]] = field(default_factory=dict)
     rulesets: list[dict[str, Any]] = field(default_factory=list)
     requests: list[tuple[str, str, Any]] = field(default_factory=list)
 
@@ -148,11 +147,6 @@ class FakeGitHub:
             return self.create_ref(repo, payload)
         if method == "PATCH" and rest[:3] == ["git", "refs", "heads"]:
             return self.update_ref(repo, "/".join(rest[3:]), payload)
-        if rest == ["labels"]:
-            if method == "GET":
-                return response(200, list(self.labels.values()))
-            if method == "POST":
-                return self.create_label(payload)
         if method == "POST" and rest == ["rulesets"]:
             return self.create_ruleset(payload)
         raise AssertionError(f"unexpected request {method} {split.path}")
@@ -230,10 +224,6 @@ class FakeGitHub:
             )
         self.refs[payload["ref"]] = payload["sha"]
         return response(201, {"ref": payload["ref"], "object": {"sha": payload["sha"]}})
-
-    def create_label(self, payload: Any) -> Response:
-        self.labels[payload["name"].casefold()] = dict(payload)
-        return response(201, self.labels[payload["name"].casefold()])
 
     def create_ruleset(self, payload: Any) -> Response:
         self.rulesets.append(dict(payload))
@@ -775,12 +765,14 @@ def test_the_report_carries_the_command_the_committed_workflow_runs():
     assert report.verify_command in report.summary()
 
 
-def test_the_swarm_labels_are_provisioned():
-    fake = FakeGitHub()
-    report = provision_into(fake)
-
-    assert set(fake.labels) == {spec.name.casefold() for spec in SWARM_LABELS}
-    assert report.labels.changed is True
+# `test_the_swarm_labels_are_provisioned` stood here: it asserted that
+# provisioning created the six `swarm:*` state labels and that
+# `ProvisionReport.labels` said so. #152 deleted the label control plane, so
+# there is no `SWARM_LABELS` to compare against and no `report.labels` to read
+# - the test cannot fail because the behaviour it described cannot happen. It
+# is not replaced by an inverse assertion because `FakeGitHub` no longer serves
+# `/labels` at all: a re-introduced label write now dies on its `unexpected
+# request` rather than on an assertion anyone has to remember to write.
 
 
 def test_protection_is_applied_after_the_commit_not_before():

@@ -38,6 +38,7 @@ import pytest
 
 FAILED = "needs-human"
 
+from fixtures.belief import fixture_belief
 from fixtures.markers import legacy_marker
 from swarm.github.branches import task_branch
 from swarm.github.ledger import (
@@ -546,12 +547,19 @@ def test_record_judgement_without_a_store_writes_nothing_rather_than_raising():
 # --------------------------------------------------------------------------
 
 
-def cycle(client: FakeClient, store: SqliteTaskStore, verify_output: str) -> Ledger:
+def cycle(client: FakeClient, store: SqliteTaskStore, verify_output: str) -> str:
     """One observe-and-write pass: read the ledger, judge a failed worker, write.
 
     Deliberately assembled from the real functions rather than from
     `Reconciler`, so what is exercised is the counter-and-judgment path and not
     a container, a pull request or a model.
+
+    Returns the state the pass decided, because since #152 that is the only
+    place it is legible: the pass wrote it to an issue as a `swarm:*` label and
+    the next cycle read it back, and now the label is gone and the belief is
+    the cycle's. Each pass here declares the claim again for the same reason -
+    the fixture's own `Belief`, not a label `apply_plan` left behind, is what
+    says the task is claimed.
     """
     ledger = load_ledger(client, store=store)
     entry = next(iter(ledger.entries.values()))
@@ -559,11 +567,12 @@ def cycle(client: FakeClient, store: SqliteTaskStore, verify_output: str) -> Led
         ledger,
         results={entry.ref: record(entry.number, attempt=entry.attempt, verify_output=verify_output)},
         max_attempts=3,
+        believed=fixture_belief(ledger),
     )
-    apply_plan(client, plan, store=store)
-    # The label the transition wrote is what the next `load_ledger` reads, and
-    # `FakeClient` already applied it; re-reading is the point.
-    return ledger
+    report = apply_plan(client, plan, store=store)
+    # The counter the transition persisted is what the next `load_ledger`
+    # reads back out of the store; re-reading is the point.
+    return report.applied[-1].to_state if report.applied else ""
 
 
 def test_the_same_failure_three_times_still_gives_up_at_the_cap():
@@ -573,13 +582,11 @@ def test_the_same_failure_three_times_still_gives_up_at_the_cap():
     client = FakeClient({4: issue(4, label=CLAIMED, task_id="task-4")})
 
     with SqliteTaskStore.open(REPO) as store:
-        for _ in range(3):
-            client.issues[4]["labels"] = [{"name": CLAIMED}]
-            cycle(client, store, IMPORT_FAILURE)
+        decided = [cycle(client, store, IMPORT_FAILURE) for _ in range(3)]
 
         held = store.read()[ref(4)]
 
-    assert {label["name"] for label in client.issues[4]["labels"]} == {FAILED}
+    assert decided == [READY, READY, FAILED]
     assert (held.attempt, held.streak, held.renewals) == (3, 3, 0)
     assert held.blocker == signature(IMPORT_FAILURE)
 
@@ -592,16 +599,14 @@ def test_a_failure_that_changes_renews_the_budget_and_the_store_counts_it():
 
     with SqliteTaskStore.open(REPO) as store:
         for _ in range(2):
-            client.issues[4]["labels"] = [{"name": CLAIMED}]
             cycle(client, store, IMPORT_FAILURE)
-        client.issues[4]["labels"] = [{"name": CLAIMED}]
-        cycle(client, store, ASSERT_FAILURE)
+        decided = cycle(client, store, ASSERT_FAILURE)
 
         held = store.read()[ref(4)]
 
     # Still ready: the third failure was a different one, so the per-blocker
     # streak restarted rather than the task being given up.
-    assert {label["name"] for label in client.issues[4]["labels"]} == {READY}
+    assert decided == READY
     assert (held.attempt, held.streak, held.renewals) == (3, 1, 1)
     assert held.blocker == signature(ASSERT_FAILURE)
 

@@ -38,6 +38,7 @@ from typing import Any, Sequence, cast
 
 import pytest
 
+from fixtures.belief import fixture_belief
 from fixtures.github import REPO, response
 from swarm.github.ledger import Ledger, LedgerEntry
 from swarm.github.refs import task_ref
@@ -58,11 +59,16 @@ from swarm.orchestrator.goal import (
 from swarm.state import ObjectiveAssessment, Plan, PlannedTask
 from swarm.taskref import TaskRef
 
-READY = "swarm:ready"
-CLAIMED = "swarm:claimed"
-REVIEW = "swarm:review"
-DONE = "swarm:done"
-FAILED = "swarm:failed"
+# ADR 0001's internal states, which is what a fixture declares since #152 took
+# the `swarm:*` control plane away. A state is derived per cycle and lives on
+# the cycle's `Belief`; each `entry(label=...)` below stashes the declared state
+# on `LedgerEntry.labels`, and `fixtures.belief.fixture_belief` turns the whole
+# ledger's declarations into the `Belief` this gate now requires.
+READY = "eligible"
+CLAIMED = "claimed"
+REVIEW = "review"
+DONE = "landed"
+FAILED = "needs-human"
 
 VERIFY = "python -m pytest -q"
 OBJECTIVE = "a trip planner that plans a trip"
@@ -102,6 +108,32 @@ def entry(
 
 def ledger(*entries: LedgerEntry) -> Ledger:
     return Ledger(entries={item.task_id: item for item in entries})
+
+
+# The four seams #152 opened. Every partition this gate computes - shipped,
+# abandoned, live - goes through `authority.state_of`, which since #152 raises
+# rather than falling back to a label nothing writes any more. So the belief the
+# fixture's own declarations imply is handed in here, once, and the tests below
+# read as they did: what each one is about is the partition, not the plumbing.
+
+
+def _assess_(objective: str, book: Ledger, **kwargs: Any) -> Assessment:
+    kwargs.setdefault("believed", fixture_belief(book))
+    return assess(objective, book, **kwargs)
+
+
+def _close_the_loop_(client: Any, book: Ledger, *args: Any, **kwargs: Any) -> Any:
+    kwargs.setdefault("believed", fixture_belief(book))
+    return close_the_loop(client, book, *args, **kwargs)
+
+
+def _revive_abandoned_(client: Any, book: Ledger, *args: Any, **kwargs: Any) -> Any:
+    kwargs.setdefault("believed", fixture_belief(book))
+    return _revive_abandoned(client, book, *args, **kwargs)
+
+
+def _shipped_(book: Ledger) -> Any:
+    return shipped(book, fixture_belief(book))
 
 
 class ModelCalled(BaseException):
@@ -234,7 +266,7 @@ def follow_up(*ids: str) -> Plan:
 
 def test_an_empty_ledger_is_not_assessed() -> None:
     """Nothing was planned, so there is no evidence to assess an objective on."""
-    verdict = assess(OBJECTIVE, Ledger(), oracle=Never())
+    verdict = _assess_(OBJECTIVE, Ledger(), oracle=Never())
 
     assert not verdict.met
     assert not verdict.consulted
@@ -244,7 +276,7 @@ def test_an_empty_ledger_is_not_assessed() -> None:
 def test_work_in_flight_is_not_assessed() -> None:
     """Half a run is not an answer about the objective, and asking mid-run would
     make the gate's verdict depend on which cycle happened to call it."""
-    verdict = assess(OBJECTIVE, ledger(entry(1, label=DONE), entry(2, label=REVIEW)), oracle=Never())
+    verdict = _assess_(OBJECTIVE, ledger(entry(1, label=DONE), entry(2, label=REVIEW)), oracle=Never())
 
     assert not verdict.met
     assert not verdict.consulted
@@ -255,7 +287,7 @@ def test_work_in_flight_is_not_assessed() -> None:
 def test_an_abandoned_task_stops_the_gate_and_is_named() -> None:
     """`swarm:failed` is the swarm saying a human is needed. Planning more work
     on top of it stacks tasks onto a repository whose last known state is broken."""
-    verdict = assess(OBJECTIVE, ledger(entry(1, label=DONE), entry(2, label=FAILED)), oracle=Never())
+    verdict = _assess_(OBJECTIVE, ledger(entry(1, label=DONE), entry(2, label=FAILED)), oracle=Never())
 
     assert not verdict.met
     assert not verdict.consulted
@@ -269,7 +301,7 @@ def test_a_finished_plan_is_assessed_against_the_objective() -> None:
     """The one case worth a model swap: everything merged, nothing abandoned."""
     oracle = Says(met("the library and its CLI are both there"))
 
-    verdict = assess(OBJECTIVE, ledger(entry(1), entry(2)), oracle=oracle)
+    verdict = _assess_(OBJECTIVE, ledger(entry(1), entry(2)), oracle=oracle)
 
     assert verdict.met
     assert verdict.consulted
@@ -283,7 +315,7 @@ def test_a_finished_plan_is_assessed_against_the_objective() -> None:
 
 def test_an_unreachable_model_is_unresolved_not_unmet() -> None:
     """The judge's rule and §4's exit 2: infrastructure is not an answer."""
-    verdict = assess(OBJECTIVE, ledger(entry(1)), oracle=Unreachable())
+    verdict = _assess_(OBJECTIVE, ledger(entry(1)), oracle=Unreachable())
 
     assert not verdict.met
     assert verdict.unresolved
@@ -303,7 +335,7 @@ def test_the_gate_revives_an_open_failed_task_with_budget_remaining() -> None:
     client = RevivalClient(issues=[open_issue(2)])
     writer = Writer()
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
         OBJECTIVE,
@@ -322,15 +354,19 @@ def test_the_gate_revives_an_open_failed_task_with_budget_remaining() -> None:
     assert report.reason == "revived 1 failed task(s) with budget remaining: #2"
     assert "revived 1 failed task(s)" in report.summary()
     assert "the run continues" in report.summary()
-    # The writes: ready on, failed off, in that order (two labels beats none),
-    # and the marker is never touched - no update_issue method even exists on
-    # this double, so a body write would have been an AttributeError.
-    assert client.added == [(2, (READY,))]
-    assert client.removed == [(2, FAILED)]
+    # The writes, and since #152 there is exactly one: the comment. This used
+    # to assert `swarm:ready` on and `swarm:failed` off, in that order; the
+    # label plane the pair moved on is gone, and what the next cycle dispatches
+    # on is the state it derives. The recorders stay so that a relabel growing
+    # back is caught here rather than passing unnoticed.
+    assert client.added == [] and client.removed == []
+    # The marker is never touched either - the revival resets no counter, so
+    # the budget arithmetic at the next failure is the guard.
+    assert client.closed == []
     number, text = client.comments[0]
     assert number == 2
     assert text.startswith("apiary: the goal gate found the objective unmet")
-    assert "returned to `swarm:ready`" in text
+    assert f"returned to `{READY}`" in text
     assert "streak 3 of 3, total 5 of 9" in text
     # No follow-up was planned and no model consulted: the revival is
     # arithmetic, and the objective is re-assessed only after the retry runs.
@@ -345,7 +381,7 @@ def test_a_closed_failed_issue_is_never_revived() -> None:
     keeps the resignation verbatim, writing nothing."""
     client = RevivalClient(issues=[closed_issue(2)])
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=1)),
         OBJECTIVE,
@@ -371,7 +407,7 @@ def test_a_budget_spent_failed_task_is_not_revived() -> None:
     client = RevivalClient(issues=[open_issue(2)])
     oracle = Says(unmet("there is no CLI"))
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9, streak=3)),
         OBJECTIVE,
@@ -396,7 +432,7 @@ def test_a_budget_spent_failed_task_is_not_revived() -> None:
 def test_only_the_revivable_failed_tasks_are_revived() -> None:
     client = RevivalClient(issues=[open_issue(2), open_issue(3), closed_issue(4)])
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(
             entry(1, label=DONE),
@@ -415,7 +451,9 @@ def test_only_the_revivable_failed_tasks_are_revived() -> None:
     assert not report.done
     assert [action.number for action in report.revived] == [2]
     assert report.reason == "revived 1 failed task(s) with budget remaining: #2"
-    assert client.added == [(2, (READY,))]
+    # The comment is the whole of the write since #152; the label pair it used
+    # to accompany does not exist any more.
+    assert client.added == [] and client.removed == []
     assert [number for number, _ in client.comments] == [2]
     # An unmet objective with budget remaining revives - it never closes. A
     # closure here would be the gate declaring work superseded that it is
@@ -448,7 +486,7 @@ def test_the_revival_join_matches_the_ledger_on_the_ref() -> None:
     recognises and the revival silently does nothing - so this fails."""
     client = RevivalClient(issues=[open_issue(2), open_issue(3), open_issue(4)])
 
-    revived = _revive_abandoned(
+    revived = _revive_abandoned_(
         client,
         ledger(
             entry(1, label=DONE),
@@ -467,8 +505,10 @@ def test_the_revival_join_matches_the_ledger_on_the_ref() -> None:
     # discriminating and revives every abandoned entry in the ledger, or it
     # honours only the first ref it was given and drops the rest.
     assert [action.number for action in revived] == [2, 4]
-    assert client.added == [(2, (READY,)), (4, (READY,))]
-    assert client.removed == [(2, FAILED), (4, FAILED)]
+    # The comments are what the join is now visible through: #152 removed the
+    # label pair each revival used to write, so the per-issue evidence that the
+    # match landed on #2 and #4 and on nothing else is the comment on each.
+    assert client.added == [] and client.removed == []
     assert [number for number, _ in client.comments] == [2, 4]
 
 
@@ -478,7 +518,7 @@ def test_a_ref_no_ledger_entry_carries_revives_nothing() -> None:
     - a gate that relabels on a miss is worse than one that misses."""
     client = RevivalClient(issues=[open_issue(2)])
 
-    revived = _revive_abandoned(
+    revived = _revive_abandoned_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
         Assessment(abandoned=(task_ref(404),)),
@@ -503,7 +543,7 @@ def test_an_issue_number_is_not_a_ref_and_matches_nothing() -> None:
     client = RevivalClient(issues=[open_issue(2)])
     wrong_key = cast(tuple[TaskRef, ...], (2,))
 
-    revived = _revive_abandoned(
+    revived = _revive_abandoned_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
         Assessment(abandoned=wrong_key),
@@ -519,7 +559,7 @@ def test_the_abandoned_refs_survive_the_round_trip_from_assess() -> None:
     """End to end, and the reason the join is worth typing at all: the tuple
     `assess` builds is the tuple `_revive_abandoned` can match, and the summary
     a human reads still spells the ref `#2` exactly as the issue number did."""
-    verdict = assess(
+    verdict = _assess_(
         OBJECTIVE,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
         oracle=Never(),
@@ -530,7 +570,7 @@ def test_the_abandoned_refs_survive_the_round_trip_from_assess() -> None:
     assert "abandoned: #2" in verdict.summary()
 
     client = RevivalClient(issues=[open_issue(2)])
-    revived = _revive_abandoned(
+    revived = _revive_abandoned_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=5, streak=3)),
         verdict,
@@ -554,7 +594,7 @@ def test_a_met_objective_closes_the_superseded_failed_leftovers() -> None:
     client = RevivalClient(issues=[open_issue(2)])
     oracle = Says(met("the shipped work covers the objective"))
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9, streak=3)),
         OBJECTIVE,
@@ -589,7 +629,7 @@ def test_a_met_objective_leaves_a_closed_failed_issue_alone() -> None:
     conversation that is over."""
     client = RevivalClient(issues=[closed_issue(2)])
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(entry(1, label=DONE), entry(2, label=FAILED, attempt=9)),
         OBJECTIVE,
@@ -614,7 +654,7 @@ def test_a_met_objective_leaves_a_closed_failed_issue_alone() -> None:
 def test_a_gap_becomes_follow_up_issues() -> None:
     writer = Writer(created=(11, 12))
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1), entry(2)),
         OBJECTIVE,
@@ -636,7 +676,7 @@ def test_a_follow_up_round_never_retires_anything() -> None:
     plan omits, and a follow-up plan omits all of them by construction."""
     writer = Writer()
 
-    close_the_loop(
+    _close_the_loop_(
         object(),
         ledger(entry(1), entry(2)),
         OBJECTIVE,
@@ -657,7 +697,7 @@ def test_the_shipped_work_is_shown_to_the_planner() -> None:
     which is a second issue for work that already merged."""
     proposer = Says(follow_up("add-cli"))
 
-    close_the_loop(
+    _close_the_loop_(
         object(),
         ledger(entry(1, task_id="core", goal="implement the core library")),
         OBJECTIVE,
@@ -680,7 +720,7 @@ def test_the_follow_up_shows_the_model_the_repositorys_tree() -> None:
     proposer = Says(follow_up("add-cli"))
     client = SimpleNamespace(list_tree=lambda ref=None: ["src/core.py", "README.md"])
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(entry(1, task_id="core", goal="implement the core library")),
         OBJECTIVE,
@@ -706,7 +746,7 @@ def test_a_tree_read_failure_does_not_fail_the_follow_up() -> None:
 
     proposer = Says(follow_up("add-cli"))
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         SimpleNamespace(list_tree=boom),
         ledger(entry(1, task_id="core")),
         OBJECTIVE,
@@ -723,7 +763,7 @@ def test_a_tree_read_failure_does_not_fail_the_follow_up() -> None:
 def test_a_met_objective_extends_nothing() -> None:
     writer = Writer()
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -742,7 +782,7 @@ def test_an_unmet_objective_with_no_named_gap_extends_nothing() -> None:
     nothing to decompose; asking anyway plans its guess at its own answer."""
     writer = Writer()
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -759,7 +799,7 @@ def test_an_unmet_objective_with_no_named_gap_extends_nothing() -> None:
 def test_the_rounds_are_bounded() -> None:
     writer = Writer()
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -781,7 +821,7 @@ def test_a_plan_that_normalises_to_nothing_is_refused() -> None:
     answered with no usable task has not spent a follow-up round."""
     writer = Writer()
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -797,7 +837,7 @@ def test_a_plan_that_normalises_to_nothing_is_refused() -> None:
 
 
 def test_an_unwritable_plan_leaves_the_tracker_alone() -> None:
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -813,7 +853,7 @@ def test_an_unwritable_plan_leaves_the_tracker_alone() -> None:
 def test_a_write_that_created_nothing_is_not_an_extension() -> None:
     """Every draft rejected by the planner's self-check. Reporting an extension
     would send the loop round again to find the same nothing."""
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -828,7 +868,7 @@ def test_a_write_that_created_nothing_is_not_an_extension() -> None:
 
 
 def test_an_unreachable_planner_does_not_spend_a_round() -> None:
-    report = close_the_loop(
+    report = _close_the_loop_(
         object(),
         ledger(entry(1)),
         OBJECTIVE,
@@ -842,10 +882,15 @@ def test_an_unreachable_planner_does_not_spend_a_round() -> None:
     assert "could not be reached" in report.reason
 
 
-def test_shipped_reads_the_label_not_the_issue_state() -> None:
+def test_shipped_reads_the_believed_state_not_the_issue_state() -> None:
+    """Renamed from `..._reads_the_label_...`: the partition is the same one and
+    the thing it is read off is not. Until #152 `shipped` asked the issue's
+    `swarm:*` label; it now asks the cycle's belief, and the property that
+    matters is unchanged - only `landed` is shipped, and an issue being open or
+    closed says nothing about it either way."""
     done = ledger(entry(1, label=DONE), entry(2, label=FAILED), entry(3, label=CLAIMED))
 
-    assert [item.number for item in shipped(done)] == [1]
+    assert [item.number for item in _shipped_(done)] == [1]
 
 
 # --------------------------------------------------------------------------
@@ -890,7 +935,7 @@ def test_the_real_writer_creates_and_closes_nothing(fake_github) -> None:
 
     client, transport, _ = fake_github(handler=answer)
 
-    report = close_the_loop(
+    report = _close_the_loop_(
         client,
         ledger(
             entry(1, task_id="task-1", label=DONE),
