@@ -2182,7 +2182,9 @@ class Reconciler:
         # it would escalate a task on the strength of a move that never
         # happened. Same rule `fold` follows one line up, for the same reason.
         self._infrastructure = infrastructure_streaks(self._infrastructure, result.applied)
-        self._escalated.update(error.number and task_ref(error.number) for error in ledger.errors)
+        self._escalated.update(
+            task_ref(error.number) for error in ledger.errors if error.number
+        )
         # Same input, same rule, same reason: a record whose move landed has
         # been accounted for and must not be accounted for again while its
         # retry - which §4 runs at the *same* attempt number - is in flight.

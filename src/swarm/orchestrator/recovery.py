@@ -676,8 +676,8 @@ class Recovery:
         definition the first sight of this repository by this process, so there
         is nothing carried forward for it to consult.
         """
-        from .derived import build_observation
         from .authority import believe
+        from .observed import build_observation
 
         snapshot = Snapshot(self.client)
         ledger = load_ledger(
@@ -690,9 +690,8 @@ class Recovery:
         observation = build_observation(
             cycle=0,
             entries=ledger.entries.values(),
-            branch_names=open_branches or (),
             containers=containers,
-            state_reasons={ref: state.state_reason for ref, state in states.items()},
+            states=states,
         )
         return self.sweep(
             ledger,

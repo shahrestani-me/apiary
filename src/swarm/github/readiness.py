@@ -578,7 +578,8 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke test
     import sys
 
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
-    report = apply_readiness(repo, dry_run=True)
+    # Writes nothing since #152, so there is no dry run to ask for.
+    report = apply_readiness(repo)
     for line in report.verdicts:
         print(line)
     for problem in report.errors:
