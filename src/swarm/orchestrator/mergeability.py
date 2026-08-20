@@ -154,7 +154,6 @@ from .dispatcher import REVIEW
 from .reconcile import (
     COMMENT_METHOD,
     Transition,
-    bump_attempt,
     post_comment,
     retry_comment,
     write_labels,
@@ -1189,13 +1188,6 @@ def apply_mergeability(
                     blocker=transition.blocker,
                     streak=transition.streak,
                     renewals=transition.renewals,
-                )
-            if transition.attempt is not None and transition.task_id:
-                # The counter, and nothing else - `checks._apply`'s reasoning
-                # and the same removal (#152). The conflict is on the pull
-                # request, which is where a human looking for it will be.
-                bump_attempt(
-                    client, issue_number(transition.ref), transition.task_id, transition.attempt
                 )
             # One writer for the whole transition path (#152): the label names
             # are `reconcile.write_labels`'s business and not this module's, and

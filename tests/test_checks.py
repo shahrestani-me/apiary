@@ -42,6 +42,8 @@ from typing import Any, Callable, Iterable, Mapping, cast
 import pytest
 from fixtures import failures
 
+from fixtures.store import RecordingStore
+from swarm.store import STORE_DIR_ENV
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
@@ -83,6 +85,26 @@ NOW = dt.datetime(2026, 8, 14, 14, 25, 30, tzinfo=dt.timezone.utc)
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
+
+
+REPO = "shahrestani-me/apiary"
+
+
+@pytest.fixture(autouse=True)
+def store_root(tmp_path, monkeypatch):
+    """Every store this module opens lands under `tmp_path`.
+
+    `test_reconcile`'s fixture and its reason, which this module needed the day
+    it started asserting against a store (ADR 0005): autouse and unconditional,
+    because the failure it prevents is silent. A test that forgot to redirect
+    the root would open the *operator's* store at `.swarm/store`, read a real
+    project's retry budgets and write test judgments into them. Nothing would
+    fail; the next real run would simply believe something untrue about its own
+    history.
+    """
+    root = tmp_path / "store"
+    monkeypatch.setenv(STORE_DIR_ENV, str(root))
+    return root
 
 
 def entry(
@@ -236,7 +258,15 @@ class FakeClient:
     def add_labels(self, number: int, labels: Iterable[str]) -> Any:
         names = list(labels)
         self.log.append(f"+{','.join(names)} #{number}")
-        current = self.issues.setdefault(number, {}).setdefault("labels", [])
+        # 404 on an issue that is not there, as GitHub does. It used to
+        # `setdefault` the number into existence, which was invisible while
+        # `get_issue` ran first on this path and 404'd for the same reason - the
+        # marker's read-modify-write was the guard. ADR 0005 removed that read,
+        # so a fake that quietly recreates a deleted issue would report a clean
+        # relabel of something that no longer exists.
+        if number not in self.issues:
+            raise GitHubHTTPError(404, "POST", f"/issues/{number}/labels", b'{"message":"Not Found"}')
+        current = self.issues[number].setdefault("labels", [])
         current.extend({"name": name} for name in names)
         return current
 
@@ -949,16 +979,20 @@ def test_a_retry_persists_the_counter_before_the_label_moves():
         now=NOW,
     )
 
-    apply_checks(client, plan)
+    with RecordingStore(REPO, client.log) as store:
+        apply_checks(client, plan, store=store)
+        held = store.read()[task_ref(23)]
 
-    # ADR 0002's crash ordering, which outlived the feedback block this test
-    # also used to assert: the counter is persisted before the label re-readies
-    # the task, so a crash between them costs an attempt rather than granting a
-    # free one. The single `update_issue` is now the counter alone (#152).
+    # ADR 0002's crash ordering, and it survived the counter changing address:
+    # the judgment is persisted before the label re-readies the task, so a crash
+    # between them costs an attempt rather than granting a free one. What moved
+    # is only where "persisted" points - the store, not a body `PATCH` (ADR
+    # 0005).
     assert client.labels_on(23) == {READY}
-    assert render_marker("task-23", 1) in client.issues[23]["body"]
-    assert client.log.index("update_issue #23") < client.log.index(f"+{READY} #23")
-    assert client.log.count("update_issue #23") == 1
+    assert held.attempt == 1
+    assert client.log.index(f"store {task_ref(23)} attempt=1") < client.log.index(f"+{READY} #23")
+    # And the customer's issue body was never opened, let alone written.
+    assert not [line for line in client.log if "update_issue" in line or "get_issue" in line]
 
 
 def test_giving_up_comments_the_failure_where_a_human_will_find_it():

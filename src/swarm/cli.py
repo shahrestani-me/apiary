@@ -78,7 +78,7 @@ from .doctor import DEFAULT_CI_REF
 from .doctor import main as doctor_main
 from .doctor import preflight
 from .github.client import GitHubClient, GitHubError
-from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError
+from .github.ledger import DEFAULT_STACK, KNOWN_STACKS, LedgerError, seed_attempt_floor
 from .github.readiness import DependencyCycleError, ReadinessError, apply_readiness
 from .greenfield.bootstrap import Bootstrap
 from .greenfield.provision import ProvisionPlan, provision
@@ -780,6 +780,24 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # trusted must stop the run *before* a container is spawned, and
     # `SqliteTaskStore.open` raises rather than degrading to an empty one.
     store = SqliteTaskStore.open(run.repo)
+    # The floor under the counter, rebuilt once (ADR 0005 as amended). The store
+    # owns the attempt counter now, and an empty one would read as "every task
+    # on attempt 0" - a fresh retry budget for the whole plan, handed out at the
+    # moment something is already wrong. The `apiary/<ref>-attempt-<n>` branches
+    # #144 put on the code host outlive both the store and the run, so they are
+    # what it is rebuilt from.
+    #
+    # **Here, and deliberately not in the cycle.** #146 refused to add an API
+    # call to the observation and that refusal stands: the floor is only ever
+    # consulted for a task the store has no row for, and during a run this
+    # process writes those rows itself. One listing at startup is the same
+    # answer a listing every cycle would give.
+    seeded = seed_attempt_floor(store, github.list_branches())
+    if seeded:
+        print(
+            f"» seeded the attempt floor for {len(seeded)} task(s) the store had "
+            f"never judged, from their branches"
+        )
     if args.no_merge:
         print("» merge policy: --no-merge; every pull request waits for a human")
     else:

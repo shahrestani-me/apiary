@@ -1,6 +1,6 @@
 # ADR 0005 — the attempt counter moves to the store
 
-Status: **proposed**
+Status: **accepted** — built in #152 c2, with decision 3 corrected below
 Date: 2026-08-19
 Amends: `docs/adr/0002-apiary-owns-a-thin-task-store.md`
 
@@ -191,3 +191,84 @@ column. And ADR 0002's decision 4 — the store is per project and not under the
 run artifacts root — becomes *more* load-bearing, not less: it was already the
 thing standing between a wiped store and a fresh budget, and after this it is the
 only structural thing doing so.
+
+
+---
+
+## As built (#152 c2) — decision 3 was wrong, and decision 2 changed shape
+
+Recorded here rather than quietly diverged from, because this ADR is itself a
+correction of an argument ADR 0002 got right for the wrong reason, and repeating
+that pattern would be worse than the original error.
+
+### Decision 3's premise does not hold
+
+Decision 3 says:
+
+> That listing is `recovery`'s, not a new call. `orchestrator/recovery.py`
+> already lists remote branches every cycle and already parses them with
+> `in_flight` into the `TaskBranch` values `Observation.branches` holds.
+
+**There is no such listing.** Checked against `main` before implementing:
+
+- `GitHubClient` had no branch-listing method at all — only `delete_branch`.
+  `grep -rn "list_branches" src/ tests/` returned nothing.
+- What `recovery.plan_recovery` receives is `open_branches`, and that comes from
+  `Snapshot.open_branches()`, which is built from `pull_requests()` — the head
+  refs of **open pull requests**. It is the same narrow source this ADR spends
+  "Why the obvious answer is not enough" explaining is insufficient.
+
+`in_flight` is real and does parse branch names, which is most likely what made
+the claim look true. It is simply fed the wrong thing.
+
+So decision 2 as written required a listing that did not exist, from a source
+that did not have it, while decision 3 forbade creating one — "anyone closing
+this gap by adding a listing call to the observation would be reintroducing
+exactly what #146 refused". Implementing decision 1 on that basis would have
+shipped the silent budget-unbounding ADR 0002 forbids by name.
+
+### What replaces it: one listing per run, not per cycle
+
+The floor is consulted **only for a task the store has no row for**. During a
+run, the run itself writes those rows, and a row is strictly fresher than any
+listing — so nothing that could raise the floor happens without this process
+having written the store first. A missing row is therefore a *startup*
+condition, not a per-cycle one.
+
+- `GitHubClient.list_branches` is new, paginated, and called **once**, by
+  `cli._loop`, before the reconciler is constructed.
+- `ledger.attempt_floor` reduces those names to `ref -> furthest attempt`.
+- `ledger.seed_attempt_floor` writes a judgement row for every task the store
+  has never judged, and never touches one it has.
+- `Observation.branches` is **untouched**. This is the part worth keeping: the
+  replay corpus records what an observation held, so widening that field would
+  have changed the meaning of every run recorded before it. The corpus stays
+  comparable across the change.
+
+#146's refusal is honoured rather than overridden, and `test_tracker_path.py`
+pins it: no module under `orchestrator/` may call `list_branches`. A count in
+`test_cli_run.py` pins the other half — one call, before the first cycle.
+
+### What this costs, stated plainly
+
+- **The counter stops being exact and becomes a lower bound.** Inherent to
+  leaving the tracker, not specific to this shape. Erosion lands where it costs
+  least: apiary deletes a head branch after *merging* it, so the branches that
+  disappear belong to landed work whose budget is moot, while a task that failed
+  three times keeps all three.
+- **Staleness detection is gone.** `ledger._judged`'s third case arbitrated a
+  disagreement between two authorities; one authority cannot disagree with
+  itself. That was also the only cross-check between the two stores.
+- **The human reset gesture has no home yet.** Decision 4 says it "moves rather
+  than being lost". It has not moved — the counter is in SQLite and nothing
+  exposes it. Until something does, the affordance ADR 0002 quotes is *lost*,
+  not moved, and #153 must not describe it as though it works.
+
+### On the evidence sequencing
+
+The "Evidence" section above requires the ten recorded runs before this lands,
+because `_attempts_spent` under-reading is exactly what the derived-state
+comparison detects, and the comparison only exists while the labels are still
+written. That still holds: **c2 does not merge until the runs are recorded and
+their divergences explained.** This amendment is written from implementing it,
+not from shipping it.

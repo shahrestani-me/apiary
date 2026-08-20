@@ -509,27 +509,27 @@ def test_no_module_on_the_tracker_path_names_an_unrouted_tracker_endpoint():
     )
 
 
-def test_get_issue_has_exactly_one_caller_and_it_is_bump_attempt():
-    """`LABEL_PLANE`'s rationale names a caller. This is what keeps it true.
+def test_get_issue_has_no_orchestrator_caller_left():
+    """`LABEL_PLANE`'s rationale named a caller. ADR 0005 removed it.
 
-    The docstring on `mcp.LABEL_PLANE` argues `get_issue` stays on the direct
-    path because its one orchestrator caller is the marker's read-modify-write,
-    which §5 requires to be a *fresh* read - unservable from the cycle's cached
-    listing and unservable by a three-capability contract. That argument is only
-    as good as the claim about callers, and the claim rots silently: it named
-    three until #152 collapsed `checks._patch_body` and
-    `mergeability._patch_body` into `bump_attempt`, and the docstring went on
-    naming two functions that no longer existed until somebody read it.
+    This test used to assert `{"reconcile.py": 1}` and to explain why that one
+    was allowed: `get_issue` stayed on the direct path because its one
+    orchestrator caller was the marker's read-modify-write, which
+    `docs/issue-contract.md` §5 required to be a *fresh* read - unservable from
+    the cycle's cached listing and unservable by a three-capability contract.
 
-    Nothing caught that, because the partition test above asks whether an
-    *endpoint* is classified, not whether the reason given for its
-    classification is still true. So this asserts the reason: one caller, in
-    `reconcile.py`, and a second one appearing is both a stale docstring and a
-    harder deletion for the ticket that removes the marker.
+    The counter has moved into apiary's own store, so that read is gone and the
+    exemption it justified has nothing left to protect. The assertion inverts
+    rather than being deleted, because the property worth holding is the same
+    one and it is now stronger: **no module under `orchestrator/` fetches a work
+    item at all.** A new caller appearing is a tracker read that has grown back
+    on the direct path, which is exactly what ADR 0001 is about - and it would
+    need either routing through the capability contract or an argument of its
+    own.
 
     `github/readiness.py` is excluded deliberately - its `get_issue` is the
-    `resolve_states` fallback, which is a genuine tracker read and which the
-    same docstring already accounts for under `INTAKE_IS_AUTHORITATIVE`.
+    `resolve_states` fallback, a genuine tracker read that the same docstring
+    accounts for under `INTAKE_IS_AUTHORITATIVE`.
     """
     callers: dict[str, int] = {}
     for path in _modules():
@@ -546,11 +546,50 @@ def test_get_issue_has_exactly_one_caller_and_it_is_bump_attempt():
         if hits:
             callers[path.name] = hits
 
-    assert callers == {"reconcile.py": 1}, (
-        f"`get_issue` is called from {callers}. `mcp.LABEL_PLANE`'s docstring says "
-        f"its one orchestrator caller is `reconcile.bump_attempt`; either that is no "
-        f"longer true and the docstring needs correcting, or the new caller wants "
-        f"the same §5 freshness argument made for it."
+    assert callers == {}, (
+        f"`get_issue` is called from {callers}. The marker's read-modify-write was "
+        f"its last orchestrator caller and ADR 0005 removed it, so a work-item fetch "
+        f"here is a tracker read back on the direct path: route it through "
+        f"`mcp.TrackerView`, or make the case for it the way §5 once did."
+    )
+
+
+def test_no_cycle_module_lists_branches():
+    """#146's constraint, kept as a property rather than a promise (ADR 0005).
+
+    The floor under the attempt counter is rebuilt from branch names, and the
+    tempting way to do that is to widen what the observation reads - which is
+    precisely the API call #146 refused to add to a cycle, and which ADR 0005's
+    own decision 3 warns against by name.
+
+    So the listing happens once, in `cli._loop`, before the reconciler exists.
+    A call appearing under `orchestrator/` is that constraint being lost, and it
+    would be lost quietly: the floor would still be correct, the tests would
+    still pass, and every cycle of every run would carry one more request.
+
+    `github/` is not scanned - `GitHubClient.list_branches` is the method being
+    counted, and `derived`/`observed` take branch *names* as strings precisely
+    so that they never make the call themselves.
+    """
+    callers: dict[str, int] = {}
+    for path in _modules():
+        if path.parent.name != "orchestrator":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        hits = sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "list_branches"
+        )
+        if hits:
+            callers[path.name] = hits
+
+    assert callers == {}, (
+        f"`list_branches` is called from {callers}. The attempt floor is seeded once "
+        f"at startup by `cli._loop`; a cycle that lists branches is the per-cycle API "
+        f"call #146 refused and ADR 0005 decision 3 warns about."
     )
 
 

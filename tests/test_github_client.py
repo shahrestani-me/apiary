@@ -160,6 +160,28 @@ def test_pagination_follows_the_next_link():
     assert transport.sent[1].url == page2
 
 
+def test_list_branches_returns_names_and_paginates():
+    """The attempt floor's source (ADR 0005). Paginated, because a run that has
+    retried leaves one branch per attempt (#144) and a repository outgrows one
+    page faster than it used to."""
+    page2 = f"{API}/repos/{REPO}/branches?page=2"
+    gh, transport, _ = client(
+        response(200, [{"name": "main"}], Link=f'<{page2}>; rel="next", <{page2}>; rel="last"'),
+        response(200, [{"name": "apiary/%2312-attempt-1"}]),
+    )
+
+    assert gh.list_branches() == ["main", "apiary/%2312-attempt-1"]
+    assert transport.sent[0].url.startswith(f"{API}/repos/{REPO}/branches")
+    assert transport.sent[1].url == page2
+
+
+def test_list_branches_drops_a_payload_with_no_name():
+    """A listing entry without a name is not a branch this can act on, and
+    `parse_task_branch` would only reject the empty string one step later."""
+    gh, _, _ = client(response(200, [{"name": "main"}, {"protected": True}, {"name": ""}]))
+    assert gh.list_branches() == ["main"]
+
+
 def test_create_issue_posts_the_payload():
     gh, transport, _ = client(response(201, {"number": 42}))
     gh.create_issue("t", body="b", labels=["swarm:ready"], milestone=1)

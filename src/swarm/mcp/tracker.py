@@ -150,6 +150,7 @@ CODE_HOST: dict[str, str] = {
     "list_check_runs": "check runs are the code host's",
     "list_workflow_runs": "check runs are the code host's",
     "delete_branch": "branches are the code host's",
+    "list_branches": "branches are the code host's: the attempt floor under ADR 0005",
     "head_sha": "a commit is the code host's",
     "get_repo": "the repository is the code host's",
     "list_tree": "a git-trees read: the planner seeing the repository it plans against (#161)",

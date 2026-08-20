@@ -185,6 +185,16 @@ class FakeClient:
     def list_issues(self, *, state: str = "open", **_: Any) -> list[dict[str, Any]]:
         return [dict(payload) for payload in self.issues]
 
+    def list_branches(self) -> list[str]:
+        """No branches, which is a greenfield repository's honest answer.
+
+        Read once at startup to seed the attempt floor (ADR 0005). Empty means
+        nothing is seeded, which is correct for a repo whose first worker has
+        not pushed yet - and it keeps this fixture about the wiring it is for.
+        """
+        self.writes.append(("list_branches", 0, ""))
+        return []
+
     def get_issue(self, number: int) -> dict[str, Any]:
         for payload in self.issues:
             if payload["number"] == number:
@@ -1456,3 +1466,53 @@ def test_the_flag_is_the_only_thing_in_front_of_a_local_run(tmp_path, monkeypatc
         )
 
     assert reached
+
+
+def test_the_branch_listing_happens_once_and_before_the_first_cycle(monkeypatch):
+    """ADR 0005's amendment, as a count.
+
+    The floor under the attempt counter is rebuilt from the branch names on the
+    code host. The obvious way to do that is to widen what every cycle reads,
+    and #146 refused to add an API call to the observation - so this pins the
+    listing to startup: one call, made before the reconciler exists at all.
+
+    The other half of the property - that no cycle grows one later - is static
+    and lives in `test_tracker_path.py`, because a count here can only speak for
+    the cycles this double actually runs.
+    """
+    import swarm.cli as cli
+
+    class StopHere(Exception):
+        pass
+
+    def stop(**kwargs):
+        raise StopHere
+
+    monkeypatch.setattr("swarm.orchestrator.reconcile.Reconciler", stop)
+    monkeypatch.setattr(
+        "swarm.containers.manager.ContainerManager", lambda **k: SimpleNamespace(docker=None)
+    )
+    monkeypatch.setattr("swarm.containers.reaper.Reaper", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(cli.RunArtifacts, "open", classmethod(
+        lambda cls, run, **_: SimpleNamespace(
+            worker_env=lambda: {},
+            mount_flags=lambda: [],
+            log_sink=lambda handle: None,
+            results_dir="/var/apiary/results",
+            event=lambda name, **fields: {},
+            observed=lambda payload: {},
+        )
+    ))
+
+    client = FakeClient(issues=[])
+    args = SimpleNamespace(
+        base_commit="a" * 40, no_merge=True, no_goal_check=False, dry_run=False, max_cycles=3
+    )
+    attachment = SimpleNamespace(
+        run=SimpleNamespace(id="r", repo=REPO, objective="make the thing work")
+    )
+
+    with pytest.raises(StopHere):
+        cli._loop(args, attachment, source=client)
+
+    assert [w for w in client.writes if w[0] == "list_branches"] == [("list_branches", 0, "")]

@@ -46,6 +46,8 @@ from swarm.containers.manager import (
     Handle,
     Limits,
 )
+from fixtures.store import RecordingStore
+from swarm.store import STORE_DIR_ENV, SqliteTaskStore
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry, render_marker
@@ -283,8 +285,28 @@ def make_run(run_id: str | None = None) -> Run:
     return Run.start(REPO, OBJECTIVE, run_id=run_id)
 
 
+@pytest.fixture(autouse=True)
+def store_root(tmp_path, monkeypatch):
+    """Every store this module opens lands under `tmp_path`.
+
+    `test_reconcile`'s fixture and its reason, needed here the day this module
+    started asserting against a store (ADR 0005): autouse and unconditional,
+    because the failure it prevents is silent. A test that forgot to redirect
+    the root would open the *operator's* store at `.swarm/store`, read a real
+    project's retry budgets and write test judgments into them.
+    """
+    root = tmp_path / "store"
+    monkeypatch.setenv(STORE_DIR_ENV, str(root))
+    return root
+
+
 def recovery(client: Any, daemon: Daemon | None = None, **kwargs: Any) -> Recovery:
     kwargs.setdefault("run", make_run())
+    # A real store by default (ADR 0005). The sweep consumes attempts, and a
+    # sweep with nowhere to record them would leave the counter nowhere at all
+    # now that the issue body no longer carries one - so every test here would
+    # be exercising a recovery that silently forgets what it charged.
+    kwargs.setdefault("store", SqliteTaskStore.open(REPO))
     return Recovery(client=client, docker=DockerCLI(runner=daemon or Daemon()), **kwargs)
 
 
@@ -561,13 +583,17 @@ def test_the_review_path_is_taken_once_pull_requests_can_be_listed():
         open_pulls=(branch(4, attempt=1),),
     )
 
-    report = recovery(client).startup()
+    sweeper = recovery(client)
+    report = sweeper.startup()
 
     assert client.labels_on(4) == {REVIEW}
-    # No body PATCH at all: `attempt=None` means the counter is left alone,
-    # which is not the same as writing back the value it already had.
+    # Nothing charged at all: `attempt=None` means the counter is left alone,
+    # which is not the same as writing back the value it already had. Under ADR
+    # 0005 that reads as an **absent row** rather than an absent body `PATCH` -
+    # the sweep found published work, so it consumed nothing and recorded
+    # nothing.
     assert "update_issue #4" not in client.log
-    assert client.attempt_on(4) == 1
+    assert ref(4) not in sweeper.store.read()
     assert report.plan.blind is False
 
 
@@ -579,13 +605,18 @@ def test_the_review_path_is_taken_once_pull_requests_can_be_listed():
 def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
     client = FakeClient(issues={4: issue_payload(4)})
 
-    recovery(client).sweep(ledger(entry(4)))
+    with RecordingStore(REPO, client.log) as store:
+        recovery(client, store=store).sweep(ledger(entry(4)))
+        held = store.read()[ref(4)]
 
-    # §5: a crash between the write and the re-dispatch must cost an attempt,
-    # not grant a free one. And add-before-remove, because two state labels are
-    # repairable by §3's precedence and none is not.
-    assert client.log[-4:] == ["get_issue #4", "update_issue #4", f"+{READY} #4", f"-{CLAIMED} #4"]
-    assert client.attempt_on(4) == 1
+    # The crash ordering §5 fixed, kept after the counter changed address (ADR
+    # 0005): the judgment is persisted before the label re-readies the task, so
+    # a crash between them costs an attempt rather than granting a free one. And
+    # add-before-remove, because two state labels are repairable by §3's
+    # precedence and none is not.
+    assert client.log[-3:] == [f"store {ref(4)} attempt=1", f"+{READY} #4", f"-{CLAIMED} #4"]
+    assert held.attempt == 1
+    assert client.attempt_on(4) == 0
 
 
 def test_one_issue_that_cannot_be_relabelled_does_not_cost_the_others_their_recovery():
@@ -639,15 +670,17 @@ def test_a_claim_left_by_a_killed_orchestrator_is_back_at_ready_on_restart():
     client = FakeClient(issues={4: issue_payload(4, attempt=0)})
     daemon = Daemon([handle(4, DEAD_RUN)])
 
-    report = Recovery(
+    sweeper = Recovery(
         client=client,
         run=make_run(),
         docker=DockerCLI(runner=daemon),
         max_attempts=3,
-    ).startup()
+        store=SqliteTaskStore.open(REPO),
+    )
+    report = sweeper.startup()
 
     assert client.labels_on(4) == {READY}
-    assert client.attempt_on(4) == 1
+    assert sweeper.store.read()[ref(4)].attempt == 1
     assert report.ok and report.refs == (ref(4),)
 
 
@@ -663,7 +696,7 @@ def test_a_second_sweep_finds_nothing_left_to_do():
     # one wrote and has no opinion about it.
     assert again.plan == RecoveryPlan(blind=True)
     assert client.labels_on(4) == {READY}
-    assert client.attempt_on(4) == 1
+    assert sweeper.store.read()[ref(4)].attempt == 1
 
 
 def test_a_mid_cycle_sweep_recovers_the_claims_a_spawn_never_reached():

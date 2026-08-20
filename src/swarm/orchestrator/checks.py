@@ -130,7 +130,6 @@ from .reconcile import (
     Transition,
     post_comment,
     retry_comment,
-    bump_attempt,
     write_labels,
 )
 
@@ -1361,16 +1360,6 @@ def apply_checks(
                     blocker=transition.blocker,
                     streak=transition.streak,
                     renewals=transition.renewals,
-                )
-            if transition.attempt is not None and transition.task_id:
-                # The counter, and nothing else. The failure text used to ride
-                # along in a delimited block; #152 removed it - nothing read it
-                # (`read_feedback` was exported for a worker call site never
-                # written, and the worker reads comments). It travels as the
-                # transition's `comment` since #248, posted below, which is where
-                # `fetch_feedback` looks.
-                bump_attempt(
-                    client, issue_number(transition.ref), transition.task_id, transition.attempt
                 )
             # One writer for the whole transition path (#152): the label names
             # are `reconcile.write_labels`'s business and not this module's, and
