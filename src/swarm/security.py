@@ -46,11 +46,17 @@ from typing import Iterable, Iterator, Mapping, Sequence
 # is the point: a second opinion here about what a secret looks like would
 # drift from the one that actually does the redacting, and this module's job is
 # to *audit* that one rather than to compete with it.
+from .config import _flag
 from .containers.manager import MIN_SECRET_LENGTH, SECRET_NAME_RE, SECRET_PATTERNS
 
 __all__ = [
     "SecurityError",
     "CredentialError",
+    "MODEL_CREDENTIAL_ENV",
+    "MODEL_HOSTS",
+    "WORKER_MODEL_CREDENTIAL_ENV",
+    "model_egress_hosts",
+    "worker_model_credentials",
     "PolicyError",
     "REQUIRED_PERMISSIONS",
     "WORKER_PERMISSIONS",
@@ -387,6 +393,151 @@ MCP_HOSTS: tuple[str, ...] = ("mcp.linear.app",)
 
 EGRESS_ALLOWLIST: tuple[str, ...] = (*GITHUB_HOSTS, OLLAMA_HOST_NAME, *MCP_HOSTS)
 
+# --------------------------------------------------------------------------
+# A model-provider credential in a worker container (#269)
+# --------------------------------------------------------------------------
+#
+# **The decision: by default, no.** A worker container executes model-generated
+# code - `docs/architecture-v2.md`'s third constraint, and the reason this
+# module exists. Today it holds exactly one credential, `GITHUB_TOKEN`, and the
+# model needs none: Ollama is unauthenticated, which is a property of the
+# local-first design that nobody chose and everybody has been relying on. ADR
+# 0006 ended that by construction, so the question had to be answered rather
+# than inherited.
+#
+# The full reasoning, the options weighed and what would change the answer are
+# in `docs/security.md`. What lives here is the enforcement, and it has three
+# parts:
+#
+# 1. **Nothing by default.** `containers.manager.INHERITED_ENV` carries no
+#    model credential, and a remote worker without an explicit opt-in is
+#    refused *before* a container is created.
+# 2. **An opt-in that is per-run and out loud**, on the same reasoning as
+#    `APIARY_EGRESS_ALLOW`: adding a second credential to a container running
+#    generated code is a decision an operator makes deliberately, not a default
+#    nobody reads.
+# 3. **Short-lived where the provider has a notion of it.** AWS does: session
+#    credentials from SSO or `sts:AssumeRole` begin `ASIA` and expire, while a
+#    long-lived IAM user key begins `AKIA` and does not. That prefix is a
+#    *checkable* difference, so this module refuses the long-lived one even
+#    under the opt-in. An operator cannot accidentally hand a worker a
+#    credential with no expiry.
+#
+# The orchestrator roles have none of this problem, and nothing here touches
+# them. Only the worker executes generated code.
+
+#: The opt-in. Unset, or set to anything falsey, means a remote worker is
+#: refused rather than run without a credential - which would fail at the first
+#: call anyway, several minutes and one container later.
+WORKER_MODEL_CREDENTIAL_ENV = "APIARY_WORKER_MODEL_CREDENTIAL"
+
+#: The variables each provider's client reads, in the order the SDK reads them.
+#: A worker gets *these and nothing else* of the orchestrator's environment,
+#: and only under the opt-in.
+MODEL_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
+    "openai": ("OPENAI_API_KEY",),
+    # No `AWS_PROFILE`: a profile name is useless inside a container that has
+    # no `~/.aws`, and passing one would produce a confusing "profile not
+    # found" rather than an honest "this worker was given no credential". The
+    # three session variables are what an assumed role actually yields.
+    "bedrock": (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+    ),
+}
+
+#: The one host each provider is reached at, and nothing wider. Bedrock's is
+#: regional and is therefore built per spec rather than listed: `amazonaws.com`
+#: as an allowlist entry would open S3, STS, and every other AWS service to a
+#: container running generated code, which is precisely the "widened to `.*` by
+#: the third person who hits it" failure `allows` is written to avoid.
+MODEL_HOSTS: dict[str, tuple[str, ...]] = {
+    "openai": ("api.openai.com",),
+    "bedrock": (),
+}
+
+#: A long-lived IAM user key. Refused even under the opt-in - see part 3 above.
+AWS_LONG_LIVED_KEY_PREFIX = "AKIA"
+#: A temporary session credential, which is what SSO and `sts:AssumeRole` mint.
+AWS_SESSION_KEY_PREFIXES = ("ASIA",)
+
+
+def model_egress_hosts(provider: str, region: str = "") -> tuple[str, ...]:
+    """The host(s) a worker on `provider` must reach, and nothing wider."""
+    if provider == "bedrock":
+        return (f"bedrock-runtime.{region}.amazonaws.com",) if region else ()
+    return MODEL_HOSTS.get(provider, ())
+
+
+def worker_model_credentials(
+    provider: str, env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The credential variables a worker container may carry for its model.
+
+    Empty for Ollama, always: the local path needs no credential and this
+    function must never be the reason that changes.
+
+    Empty for everything else unless the opt-in is set, and raising rather than
+    empty when a remote worker is configured *without* it - a worker shipped
+    with no credential fails at its first call, several minutes and one
+    container later, and reads like a broken model rather than a policy.
+    """
+    source = os.environ if env is None else env
+    if provider == "ollama":
+        return {}
+    if not _flag(source.get(WORKER_MODEL_CREDENTIAL_ENV)):
+        raise CredentialError(
+            f"a {provider} worker would need a model-provider credential inside a "
+            f"container that runs model-generated code, and {WORKER_MODEL_CREDENTIAL_ENV} "
+            f"is not set. See docs/security.md (#269): the orchestrator roles may be "
+            f"remote without this - only the worker executes generated code"
+        )
+    carried = {
+        name: source[name]
+        for name in MODEL_CREDENTIAL_ENV.get(provider, ())
+        if source.get(name)
+    }
+    if not carried:
+        raise CredentialError(
+            f"{WORKER_MODEL_CREDENTIAL_ENV} is set, but none of "
+            f"{', '.join(MODEL_CREDENTIAL_ENV.get(provider, ())) or 'this provider'} "
+            f"is in this environment, so the worker would be shipped without one"
+        )
+    if provider == "bedrock":
+        _assert_session_credential(carried)
+    return carried
+
+
+def _assert_session_credential(carried: Mapping[str, str]) -> None:
+    """Refuse a long-lived AWS key even under the opt-in.
+
+    The distinction is checkable, which is the whole reason it is enforced
+    rather than recommended: `ASIA...` is a session credential from SSO or
+    `sts:AssumeRole` and expires; `AKIA...` is an IAM user key and does not.
+    Handing generated code a credential with no expiry is the version of this
+    decision with an unbounded blast radius, and it is also the easiest one to
+    reach for by accident - it is what `aws configure` writes.
+    """
+    key = (carried.get("AWS_ACCESS_KEY_ID") or "").strip()
+    if key.startswith(AWS_LONG_LIVED_KEY_PREFIX):
+        raise CredentialError(
+            "AWS_ACCESS_KEY_ID is a long-lived IAM user key (AKIA...), and a worker "
+            "container runs model-generated code. Use session credentials instead - "
+            "`aws sso login`, or `aws sts assume-role` scoped to bedrock:InvokeModel - "
+            "which begin ASIA and expire. See docs/security.md (#269)"
+        )
+    if not carried.get("AWS_SESSION_TOKEN"):
+        raise CredentialError(
+            "AWS_SESSION_TOKEN is missing, so these are not session credentials and "
+            "nothing bounds how long the worker's credential stays valid. See "
+            "docs/security.md (#269)"
+        )
+
+
+
 #: Where an operator widens it. Comma-separated hostnames, and the reason it is
 #: an environment variable rather than a constant is that the honest default
 #: breaks something: a `## Verify` command that runs `pip install -e .` needs
@@ -446,6 +597,25 @@ class EgressPolicy:
     hosts: tuple[str, ...] = EGRESS_ALLOWLIST
     proxy_host: str = EGRESS_PROXY_HOST
     proxy_port: int = EGRESS_PROXY_PORT
+
+    def with_model(self, provider: str, region: str = "") -> EgressPolicy:
+        """This policy plus the one host a remote worker's provider is reached at.
+
+        Not folded into `EGRESS_ALLOWLIST`, deliberately. That tuple is the
+        allowlist every installation gets, including the fully local ones that
+        are the default, and a provider host baked into it would open a
+        destination for containers that will never dial it. A remote worker is
+        an opt-in (`WORKER_MODEL_CREDENTIAL_ENV`), so the host it needs is an
+        opt-in too.
+
+        And nothing wider: Bedrock's entry is the regional
+        `bedrock-runtime.<region>.amazonaws.com` rather than `amazonaws.com`,
+        which would open S3, STS and every other AWS service to a container
+        running generated code. `allows` matches subdomains, so the short entry
+        is not a small widening - it is all of AWS.
+        """
+        extra = tuple(h for h in model_egress_hosts(provider, region) if h not in self.hosts)
+        return replace(self, hosts=self.hosts + extra)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> EgressPolicy:
