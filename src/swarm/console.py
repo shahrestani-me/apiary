@@ -168,13 +168,21 @@ class Site:
     blurb: str
     fields: tuple[Field, ...]
     prompt: Callable[[Mapping[str, str]], tuple[str, str]]
-    run: Callable[[Mapping[str, str]], Any]
+    run: Callable[[Mapping[str, str], Any], Any]
+    #: Whether this site accepts a per-call model override. Declared per site
+    #: rather than offered everywhere, because a site whose model an operator
+    #: could change without the change taking effect would be worse than one
+    #: that does not offer the control at all - `plan` and `intake` build their
+    #: own models several layers down, and wiring a spec through them is not
+    #: this ticket.
+    overridable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "key": self.key,
             "label": self.label,
             "blurb": self.blurb,
+            "overridable": self.overridable,
             "fields": [
                 {"name": f.name, "label": f.label, "kind": f.kind,
                  "placeholder": f.placeholder, "value": f.value}
@@ -205,11 +213,19 @@ def _edits_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
     return prompt_for(payload.get("goal", ""), writable, readable)
 
 
-def _edits_run(payload: Mapping[str, str]) -> Any:
+def _edits_run(payload: Mapping[str, str], spec: Any = None) -> Any:
+    from .llm import structured, worker_llm
+    from .state import WorkerOutput
     from .worker.edit import propose_edits
 
     writable, readable = _sources(payload)
-    output = propose_edits(payload.get("goal", ""), writable, readable)
+    # The `llm=` seam `propose_edits` already has, used for the first time by
+    # something that is not a test. Building the model here rather than adding
+    # a `spec=` parameter to `propose_edits` keeps the override entirely inside
+    # the console: the worker in its container reaches the factory with no
+    # argument and resolves exactly as it did before.
+    model = None if spec is None else structured(worker_llm(spec), WorkerOutput, spec)
+    output = propose_edits(payload.get("goal", ""), writable, readable, llm=model)
     return {
         "edits": [
             {"path": edit.path, "chars": len(edit.content), "content": edit.content}
@@ -228,7 +244,7 @@ def _plan_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
     return prompt_for(payload.get("objective", ""), verify=SETTINGS.verify_command)
 
 
-def _plan_run(payload: Mapping[str, str]) -> Any:
+def _plan_run(payload: Mapping[str, str], spec: Any = None) -> Any:
     from .nodes.planner import draft_plan
 
     plan = draft_plan(payload.get("objective", ""), verify=SETTINGS.verify_command)
@@ -257,10 +273,12 @@ def _stack_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
     return prompt_for(payload.get("brief", ""))
 
 
-def _stack_run(payload: Mapping[str, str]) -> Any:
-    from .greenfield.bootstrap import choose_stack
+def _stack_run(payload: Mapping[str, str], spec: Any = None) -> Any:
+    from .greenfield.bootstrap import StackChoice, choose_stack
+    from .llm import orchestrator_llm, structured
 
-    return {"stack": choose_stack(payload.get("brief", ""))}
+    model = None if spec is None else structured(orchestrator_llm(spec), StackChoice, spec)
+    return {"stack": choose_stack(payload.get("brief", ""), llm=model)}
 
 
 def _intake_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
@@ -269,7 +287,7 @@ def _intake_prompt(payload: Mapping[str, str]) -> tuple[str, str]:
     return prompt_for(compose_brief(payload))
 
 
-def _intake_run(payload: Mapping[str, str]) -> Any:
+def _intake_run(payload: Mapping[str, str], spec: Any = None) -> Any:
     from .console_intake import propose
 
     return propose(payload)
@@ -307,6 +325,7 @@ SITES: dict[str, Site] = {
         ),
         prompt=_edits_prompt,
         run=_edits_run,
+        overridable=True,
     ),
     "stack": Site(
         key="stack",
@@ -321,6 +340,7 @@ SITES: dict[str, Site] = {
         ),
         prompt=_stack_prompt,
         run=_stack_run,
+        overridable=True,
     ),
     "intake": Site(
         key="intake",
@@ -371,6 +391,15 @@ class Job:
     started: float
     state: str = "running"
     result: Any = None
+    #: Which model this call actually used, provider-qualified. Carried on the
+    #: job rather than read off the capture, because a call that failed before
+    #: reaching the model has no capture and is exactly the case where "which
+    #: model was that?" is the question being asked.
+    model: str = ""
+    #: Whether it came from a per-call override rather than from the default.
+    #: The page labels the two differently, because a result an operator is
+    #: comparing must say which of the two it is.
+    overridden: bool = False
     capture: dict[str, Any] | None = None
     #: `Any` rather than `str` because a build's failure carries doctor's
     #: failing checks alongside the message and the fix (#129), and a check is
@@ -383,6 +412,8 @@ class Job:
             "site": self.site,
             "state": self.state,
             "elapsed_s": round((now or time.monotonic()) - self.started, 1),
+            "model": self.model,
+            "overridden": self.overridden,
             "result": self.result,
             "capture": self.capture,
             "error": self.error,
@@ -465,9 +496,14 @@ class Console:
                                   # it is a form, not a call site, and nothing
                                   # that iterates `sites` may fire it at a model.
                                   "build": BUILD_SITE,
+                                  # The three original keys stay, spelled the
+                                  # same: an older page served by a newer
+                                  # backend still renders its header. The
+                                  # resolved half is additive beside them.
                                   "models": {"orchestrator": SETTINGS.orchestrator_model,
                                              "worker": SETTINGS.worker_model,
-                                             "base_url": SETTINGS.ollama_base_url}})
+                                             "base_url": SETTINGS.ollama_base_url,
+                                             "resolved": _models_payload()}})
         if method == "POST" and route == "/prompt":
             return self._prompt(body)
         if method == "POST" and route == "/run":
@@ -493,6 +529,10 @@ class Console:
             return self._swarm_external(path)
         if method == "GET" and path.startswith("/swarm/outcome"):
             return self._swarm_outcome(path)
+        if method == "GET" and route == "/models":
+            return Response.json(_models_payload())
+        if method == "POST" and route == "/models":
+            return self._models_save(body)
         if method == "GET" and route == "/projects":
             return self._projects_list()
         if method == "POST" and route == "/projects":
@@ -501,16 +541,85 @@ class Console:
             return self._projects_history(path)
         return Response.error(f"no route for {method} {path}", 404)
 
-    def _payload(self, body: bytes) -> tuple[Site, dict[str, str]]:
+    def _models_save(self, body: bytes) -> Response:
+        """Set, or clear, the saved default for one role.
+
+        Deliberately a different control from the per-call override, and the
+        two are never the same request: this one persists and affects every
+        subsequent run, that one affects nothing else. A page that conflated
+        them would repoint an operator's future runs the first time they
+        wanted to try something.
+        """
+        from .llm import ModelSpec
+        from .models import ROLES as MODEL_ROLES, parse_model, parse_options, store
+
+        try:
+            data = json.loads(body or b"{}")
+            role = str(data.get("role") or "")
+            if role not in MODEL_ROLES:
+                raise ConsoleError(f"unknown role {role!r}; the roles are {', '.join(MODEL_ROLES)}")
+            name = str(data.get("model") or "").strip()
+            if not name:
+                store().save(role, None)
+            else:
+                provider, model = parse_model(name)
+                store().save(role, ModelSpec(
+                    provider=provider,
+                    model=model,
+                    options=parse_options(str(data.get("options") or "")),
+                ))
+        except (ConsoleError, ConfigError) as exc:
+            return Response.error(str(exc), 400, fix=getattr(exc, "fix", "") or
+                                  "write it as `provider:model`, or leave it empty to clear")
+        except json.JSONDecodeError as exc:
+            return Response.error(f"bad request body: {exc}", 400)
+        return Response.json(_models_payload())
+
+    def _payload(self, body: bytes) -> tuple[Site, dict[str, str], Any]:
+        """The site, its typed values, and an optional one-call model override.
+
+        The override is **not persisted** and is deliberately a different thing
+        from the saved default below. Conflating them is the obvious mistake:
+        an operator who wanted to *try* a model once and accidentally
+        repointed every future run has been badly served.
+        """
         data = json.loads(body or b"{}")
         site = SITES.get(str(data.get("site", "")))
         if site is None:
             raise ConsoleError(f"unknown site: {data.get('site')!r}")
-        return site, {k: str(v) for k, v in (data.get("values") or {}).items()}
+        values = {k: str(v) for k, v in (data.get("values") or {}).items()}
+        spec = self._spec(site, data.get("model"))
+        return site, values, spec
+
+    @staticmethod
+    def _spec(site: Site, wanted: Any) -> Any:
+        """A `ModelSpec` from what the page sent, or `None` for "the default"."""
+        if not isinstance(wanted, Mapping):
+            return None
+        name = str(wanted.get("model") or "").strip()
+        if not name:
+            return None
+        if not site.overridable:
+            raise ConsoleError(
+                f"{site.key} does not take a per-call model; it builds its models "
+                f"several layers down and the override would not take effect"
+            )
+        from .llm import ModelSpec
+        from .models import parse_model, parse_options
+
+        try:
+            provider, model = parse_model(name)
+            return ModelSpec(
+                provider=provider,
+                model=model,
+                options=parse_options(str(wanted.get("options") or "")),
+            )
+        except ConfigError as exc:
+            raise ConsoleError(str(exc)) from exc
 
     def _prompt(self, body: bytes) -> Response:
         try:
-            site, values = self._payload(body)
+            site, values, _ = self._payload(body)
             system, human = site.prompt(values)
         except ConsoleError as exc:
             return Response.error(str(exc), 400)
@@ -553,17 +662,19 @@ class Console:
 
     def _run(self, body: bytes) -> Response:
         try:
-            site, values = self._payload(body)
+            site, values, spec = self._payload(body)
             job = self._claim(site.key)
+            job.model = _model_label(site, spec)
+            job.overridden = spec is not None
         except ConsoleBusy as exc:
             return Response.error(str(exc), 409, fix=exc.fix)
         except ConsoleError as exc:
             return Response.error(str(exc), 400)
 
-        threading.Thread(target=self._work, args=(site, values, job), daemon=True).start()
+        threading.Thread(target=self._work, args=(site, values, job, spec), daemon=True).start()
         return Response.json(job.to_dict(), 202)
 
-    def _work(self, site: Site, values: Mapping[str, str], job: Job) -> None:
+    def _work(self, site: Site, values: Mapping[str, str], job: Job, spec: Any = None) -> None:
         """`job.state` is written last, and that ordering is load-bearing.
 
         The page polls `/status` from another thread. Publishing "done" or
@@ -574,7 +685,7 @@ class Console:
         """
         state, result, error = "error", None, None
         try:
-            result = site.run(values)
+            result = site.run(values, spec)
             state = "done"
         except Exception as exc:  # noqa: BLE001 - every failure belongs on the page
             error = {
@@ -1052,6 +1163,72 @@ class Console:
             return Response.error(f"{type(exc).__name__}: {exc}", 502)
 
 
+def _role_for(site: Site) -> str:
+    """Which role's model a site's call will use.
+
+    `edits` is the worker - it is the whole-file generation a worker does
+    inside its container - and everything else here is orchestration.
+    """
+    return "worker" if site.key == "edits" else "orchestrator"
+
+
+def _model_label(site: Site, spec: Any) -> str:
+    """What to show as "which model answered", before the call is made."""
+    if spec is not None:
+        return str(spec.label)
+    from .models import resolve
+
+    try:
+        return str(resolve(_role_for(site)).spec.label)
+    except ConfigError as exc:  # pragma: no cover - reported by the call itself
+        return f"unresolved ({exc})"
+
+
+def _models_payload() -> dict[str, Any]:
+    """What each role will use, where that was decided, and what else it could be.
+
+    The first two are the point: switching models used to be an export and a
+    restart, which in practice meant nobody tried the alternative and the
+    choice never got revisited. Showing the *source* alongside the model is
+    what makes the saved default discoverable at all - it is the one rung an
+    operator cannot see from a shell.
+    """
+    from .llm import PROVIDERS
+    from .models import ROLES as MODEL_ROLES, resolve, store
+
+    roles: dict[str, Any] = {}
+    for role in MODEL_ROLES:
+        try:
+            resolution = resolve(role)
+        except ConfigError as exc:
+            roles[role] = {"error": str(exc)}
+            continue
+        roles[role] = {
+            "label": resolution.spec.label,
+            "provider": resolution.spec.provider,
+            "model": resolution.spec.model,
+            "options": dict(resolution.spec.options),
+            "credential": resolution.spec.credential,
+            "source": resolution.source,
+            "detail": resolution.detail,
+        }
+    saved = store().all()
+    return {
+        "roles": roles,
+        "saved": {role: spec.label for role, spec in saved.items()},
+        "providers": [
+            {
+                "name": name,
+                "options": [
+                    {"name": option.name, "default": option.default, "doc": option.doc}
+                    for option in provider.options
+                ],
+            }
+            for name, provider in PROVIDERS.items()
+        ],
+    }
+
+
 def _fix_for(exc: BaseException) -> str:
     """What to do about it, in doctor's sense: a failure that names no fix is
     a failure an operator has to go and research."""
@@ -1062,6 +1239,21 @@ def _fix_for(exc: BaseException) -> str:
         return named
     text = f"{type(exc).__name__}: {exc}".lower()
     base = SETTINGS.ollama_base_url
+    # Credentials first, and before the connection patterns below: a remote
+    # provider that has no key never opens a socket, and "start Ollama" is the
+    # answer this function used to give for it - advice about a server the
+    # operator is not using. `swarm doctor` says the same three things
+    # (`model.reachable`), and a failure on this page should not need a second
+    # tool to interpret.
+    if "is not set" in text and "_key" in text:
+        return ("export the API key this provider reads, or name a different variable in the "
+                "model's `api_key_env` option; `swarm doctor` reports it as model.reachable")
+    if "needs a region" in text or "could not authenticate" in text:
+        return ("configure AWS for this shell - `aws sso login --profile <name>` - and give the "
+                "model `profile=<name>,region=<region>`; `swarm doctor` reports it as "
+                "model.reachable")
+    if "does not install by default" in text:
+        return "install the provider's extra: `pip install -e \".[openai]\"` or `\".[bedrock]\"`"
     if "connection" in text or "refused" in text or "connect" in text:
         return f"start Ollama - `ollama serve`, or launch the app - and confirm with `curl {base}/api/version`"
     if "not found" in text or "no such model" in text or "pull" in text:

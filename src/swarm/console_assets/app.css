@@ -113,3 +113,35 @@ button.watch[aria-pressed="true"] { border-color:var(--accent); color:var(--acce
 .card.workerstrip { margin-top:12px; }
 .card.workerstrip .pills { margin-bottom:8px; }
 pre.worker { max-height:300px; margin:8px 0 12px; font-size:12px; }
+
+/* --- choosing a model (#266) -------------------------------------------
+   Two controls that must never look like one another: the model bar's "Set
+   default" persists, and the override box under the form does not. The
+   override is visually attached to the form it affects, and says so in
+   words, because the cost of confusing them is an operator's future runs
+   silently repointed. */
+/* Across both columns. `main` is a two-column grid whose left column is at
+   most 400px, and a row of "label · model · source · credential · two inputs
+   · two buttons" wrapped into four cramped lines there. The models card is a
+   fact about the whole page rather than about the form beside it. */
+#modelcard { grid-column: 1 / -1; }
+#modelcard h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; }
+.modelgroup { padding: 6px 0; }
+.modelgroup + .modelgroup { border-top: 1px solid var(--line); margin-top: 6px; }
+.modelrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 0; }
+.modelrow.controls { padding-left: 100px; }
+@media (max-width: 700px) { .modelrow.controls { padding-left: 0; } }
+.rolename { min-width: 92px; font-weight: 600; }
+/* Fixed rather than flexible: an input that grows pushes the row's buttons
+   onto a line of their own, and "Set default" separated from the model it
+   would set is the one arrangement this bar must not have. */
+.modelinput { flex: 0 0 240px; min-width: 0; }
+.modelopts { flex: 0 0 220px; min-width: 0; }
+.override {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line, #444);
+}
+.override .meta { flex-basis: 100%; }
+.card.stamp { padding: 8px 12px; }
+.modelstamp { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.card.pinned { opacity: .82; border-style: dashed; }
