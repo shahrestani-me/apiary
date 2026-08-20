@@ -120,31 +120,20 @@ GENERATED_FILES: Mapping[str, tuple[str, ...]] = {
 #: than a guess about it.
 DEFAULT_STACK = "python"
 
-# Labels → TaskStatus, straight from `docs/issue-contract.md` §3. Note the two
-# collapses and the two counter-intuitive rows: `review` is `running` because
-# completion is the merge, and `failed` is `abandoned` because v2 has no label
-# for "this attempt failed, another is available" - that state is persisted as
-# `swarm:ready` with a bumped counter and never sits in the ledger.
-STATUS_BY_LABEL: Mapping[str, TaskStatus] = {
-    "swarm:ready": "pending",
-    "swarm:blocked": "pending",
-    "swarm:claimed": "running",
-    "swarm:review": "running",
-    "swarm:done": "verified",
-    "swarm:failed": "abandoned",
+# ADR 0001's internal states → TaskStatus. The same table `docs/issue-contract.md`
+# §3 gave for the labels, keyed on the state since #152 removed them, and with
+# the same two counter-intuitive rows: `review` is `running` because completion
+# is the merge, and `needs-human` is `abandoned` because there is no state for
+# "this attempt failed, another is available" - a task with budget left is
+# `eligible` with a bumped counter and never sits here.
+STATUS_BY_STATE: Mapping[str, TaskStatus] = {
+    "eligible": "pending",
+    "blocked": "pending",
+    "claimed": "running",
+    "review": "running",
+    "landed": "verified",
+    "needs-human": "abandoned",
 }
-
-# Furthest-along-wins, for the two-state-labels fault. A human adding
-# `swarm:done` or `swarm:failed` to a claimed issue means "stop", and stopping
-# is the safe reading of an ambiguous ledger.
-LABEL_PRECEDENCE = (
-    "swarm:done",
-    "swarm:failed",
-    "swarm:review",
-    "swarm:claimed",
-    "swarm:blocked",
-    "swarm:ready",
-)
 
 MAX_ID_LENGTH = 64
 
@@ -250,30 +239,6 @@ class TaskContract:
 
 
 @dataclass(frozen=True)
-class LabelRepair:
-    """An issue carrying more than one state label, and the winner.
-
-    The loader only reports it. Removing the losing labels and commenting on
-    the issue is a write, and writes belong to the reconciler (#22).
-    """
-
-    number: int
-    kept: str
-    removed: tuple[str, ...]
-
-    @property
-    def ref(self) -> TaskRef:
-        """This repair's task, as the internal model names it."""
-        return task_ref(self.number)
-
-    def __str__(self) -> str:
-        return (
-            f"issue #{self.number}: {len(self.removed) + 1} state labels, kept {self.kept}, "
-            f"drop {', '.join(self.removed)}"
-        )
-
-
-@dataclass(frozen=True)
 class LedgerEntry:
     """One issue, fully resolved: contract, labels, identity and addressing.
 
@@ -290,14 +255,16 @@ class LedgerEntry:
     files: tuple[str, ...]
     verify: str
     blocked_by: tuple[TaskRef, ...]
-    state_label: str
+    #: Every label the work item carries. Read, never written (#152): `area/*`
+    #: and `size/*` are the planner's routing hints and `agent:*` is the `issue`
+    #: skill's, so a projection that wants them still has them. No `swarm:*`
+    #: label is among them any more, because nothing writes one.
     labels: frozenset[str]
     #: The stack this task targets, resolved. `TaskContract.stack` is optional;
     #: this one is not, because every consumer downstream - the image #99
     #: chooses, the CI setup #96 emits - needs an answer rather than a maybe.
     stack: str = DEFAULT_STACK
     depends_on: tuple[str, ...] = ()
-    adopted: bool = False
     #: The last consumed attempt's failure signature and the length of the
     #: consecutive run of it. **From apiary's own task store** since #159, not
     #: from the issue body: a signature is apiary's judgment about its own
@@ -348,10 +315,6 @@ class LedgerEntry:
         return generated_for(self.stack)
 
     @property
-    def status(self) -> TaskStatus:
-        return STATUS_BY_LABEL[self.state_label]
-
-    @property
     def branch(self) -> str:
         """The branch this task's *current* attempt pushes (`github/branches.py`).
 
@@ -371,14 +334,22 @@ class LedgerEntry:
         """
         return task_branch(self.ref, self.attempt)
 
-    def to_task_record(self) -> TaskRecord:
-        """Project onto v1's `TaskRecord`, which is all the graph ever sees."""
+    def to_task_record(self, state: str = "eligible") -> TaskRecord:
+        """Project onto v1's `TaskRecord`, which is all the graph ever sees.
+
+        `state` is passed rather than read off the entry because since #152 an
+        entry does not carry one: the five lifecycle states are derived per
+        cycle (ADR 0001) and live on the cycle's `Belief`. The default is the
+        state a task with no verdict is in - a plan that has just been written
+        and not yet resolved - which is what the v1 projection meant by
+        `pending` anyway.
+        """
         return TaskRecord(
             id=self.task_id,
             goal=self.goal,
             files=list(self.files),
             depends_on=list(self.depends_on),
-            status=self.status,
+            status=STATUS_BY_STATE.get(state, "pending"),
             attempts=self.attempt,
             branch=self.branch,
         )
@@ -397,7 +368,6 @@ class Ledger:
 
     entries: dict[str, LedgerEntry] = field(default_factory=dict)
     errors: tuple[ContractError, ...] = ()
-    repairs: tuple[LabelRepair, ...] = ()
     ignored: tuple[int, ...] = ()
 
     @property
@@ -780,49 +750,12 @@ def slugify(title: str, *, limit: int = MAX_ID_LENGTH) -> str:
     return slug
 
 
-def _adopted_id(number: int, title: str, taken: Iterable[str]) -> str:
-    """An id for a hand-written issue, unique against the ids already in use.
-
-    Deterministic on purpose: if the write that persists the marker fails, the
-    next cycle derives the same id from the same title rather than inventing a
-    second one for the same work.
-    """
-    taken = set(taken)
-    slug = slugify(title) or f"issue-{number}"
-    if slug not in taken:
-        return slug
-    suffix = f"-{number}"
-    return f"{slug[:MAX_ID_LENGTH - len(suffix)].rstrip('-')}{suffix}"
-
-
-# --------------------------------------------------------------------------
-# Labels
-# --------------------------------------------------------------------------
-
-
 def _label_names(issue: Mapping[str, Any]) -> frozenset[str]:
     """GitHub returns label objects; some fixtures and webhooks return strings."""
     names = []
     for label in issue.get("labels") or ():
         names.append(label.get("name", "") if isinstance(label, Mapping) else str(label))
     return frozenset(name for name in names if name)
-
-
-def resolve_state_label(
-    number: int, labels: Iterable[str]
-) -> tuple[str | None, LabelRepair | None]:
-    """Pick the one state label, repairing zero-or-two by precedence.
-
-    Zero is not "ready" - an issue with no state label is outside the ledger,
-    and defaulting it into the ledger would dispatch work nobody scheduled.
-    """
-    carried = set(labels)
-    present = [label for label in LABEL_PRECEDENCE if label in carried]
-    if not present:
-        return None, None
-    if len(present) == 1:
-        return present[0], None
-    return present[0], LabelRepair(number, present[0], tuple(present[1:]))
 
 
 # --------------------------------------------------------------------------
@@ -838,18 +771,6 @@ def _as_client(source: GitHubClient | str) -> GitHubClient:
     loader touches.
     """
     return GitHubClient.from_env(source) if isinstance(source, str) else source
-
-
-def _adopt(client: GitHubClient, issue: Mapping[str, Any], task_id: str) -> None:
-    """Persist a marker on a human's issue, preserving every byte below it.
-
-    Prepended rather than appended so it stays above the prose a human will
-    keep editing - §2's "survives … body edits below it". One invisible line is
-    the entire cost of making a hand-written backlog a real ledger.
-    """
-    body = issue.get("body") or ""
-    marker = render_marker(task_id, 0)
-    client.update_issue(int(issue["number"]), body=f"{marker}\n\n{body}" if body else marker)
 
 
 def _judgements(store: TaskStore | None) -> Mapping[TaskRef, TaskJudgement]:
@@ -979,7 +900,6 @@ def load_ledger(
     source: GitHubClient | str,
     *,
     state: str = "all",
-    adopt: bool = True,
     store: TaskStore | None = None,
 ) -> Ledger:
     """Read the tracker and build the ledger.
@@ -1008,22 +928,11 @@ def load_ledger(
     entries: dict[str, LedgerEntry] = {}
     numbers: dict[str, int] = {}
     errors: list[ContractError] = []
-    repairs: list[LabelRepair] = []
     ignored: list[int] = []
-    pending_adoption: list[tuple[Mapping[str, Any], LedgerEntry]] = []
 
     for issue in issues:
         number = int(issue["number"])
         labels = _label_names(issue)
-        state_label, repair = resolve_state_label(number, labels)
-        if state_label is None:
-            # Humans use the tracker too, and this repository's own backlog is
-            # the live example: no state label means not part of the ledger.
-            ignored.append(number)
-            continue
-        if repair is not None:
-            repairs.append(repair)
-
         title = issue.get("title") or ""
         try:
             contract = parse_contract(number, issue.get("body"))
@@ -1031,8 +940,29 @@ def load_ledger(
             errors.append(exc)
             continue
 
-        adopted = contract.task_id is None
-        task_id = contract.task_id or _adopted_id(number, title, entries.keys())
+        # **Membership is the identity marker** (`docs/issue-contract.md` §2),
+        # and this is the half of #152 that had to move in the same change as
+        # the writes. It was "carries exactly one `swarm:*` state label", which
+        # stopped being answerable the moment `planner._create` stopped applying
+        # one - every issue apiary planned would have fallen straight out of its
+        # own ledger.
+        #
+        # Humans use the tracker too, and this repository's own backlog is the
+        # live example: an issue nobody minted a marker for is not apiary's.
+        #
+        # **What this ends is adoption.** A hand-written issue used to join the
+        # ledger by being labelled `swarm:ready`, and apiary wrote a marker into
+        # it on the way past. There is no label to say that now, so an unmarked
+        # issue is never in the ledger and therefore never adopted. For a
+        # customer pointing apiary at an existing repository the way in is the
+        # tracker's own intake filter - `intake.args` in the capability contract,
+        # their vocabulary rather than apiary's, which is ADR 0001's answer and
+        # the reason it is not replaced here with a second apiary-owned label.
+        if contract.task_id is None:
+            ignored.append(number)
+            continue
+
+        task_id = contract.task_id
         if task_id in entries:
             raise DuplicateTaskIdError(task_id, numbers[task_id], number)
 
@@ -1050,17 +980,13 @@ def load_ledger(
             # Resolved here, so nothing downstream has to remember that `None`
             # means Python. The contract keeps the unresolved answer.
             stack=contract.stack or DEFAULT_STACK,
-            state_label=state_label,
             labels=labels,
-            adopted=adopted,
             closed=(issue.get("state") or "open") != "open",
             state_reason=issue.get("state_reason"),
         )
         entry = _judged(entry, judged.get(entry.ref))
         entries[task_id] = entry
         numbers[task_id] = number
-        if adopted:
-            pending_adoption.append((issue, entry))
 
     # depends_on is a task-id graph, so a ref to an issue outside the ledger has
     # no id to name and is dropped from the projection. The refs themselves
@@ -1076,14 +1002,10 @@ def load_ledger(
         for task_id, entry in entries.items()
     }
 
-    if adopt:
-        for issue, entry in pending_adoption:  # type: ignore[assignment]
-            _adopt(client, issue, entry.task_id)
 
     return Ledger(
         entries=resolved,
         errors=tuple(errors),
-        repairs=tuple(repairs),
         ignored=tuple(ignored),
     )
 
@@ -1092,7 +1014,6 @@ def load_tasks(
     repo: GitHubClient | str,
     *,
     state: str = "all",
-    adopt: bool = True,
     strict: bool = True,
 ) -> dict[str, TaskRecord]:
     """The v1-shaped read: issues in, the task ledger the graph expects out.
@@ -1104,7 +1025,7 @@ def load_tasks(
     nobody told. The orchestrator passes `strict=False` and applies §1.4's
     policy from `Ledger.errors` itself.
     """
-    ledger = load_ledger(repo, state=state, adopt=adopt)
+    ledger = load_ledger(repo, state=state)
     if strict and ledger.errors:
         raise ledger.errors[0]
     return ledger.tasks

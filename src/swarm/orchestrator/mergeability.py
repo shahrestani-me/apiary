@@ -148,7 +148,7 @@ from .checks import (
     render_keys,
 )
 from ..store import StoreError, TaskStore, record_judgement
-from .authority import Belief, in_review, label_state
+from .authority import Belief, in_review, state_of
 from .derived import ELIGIBLE, NEEDS_HUMAN
 from .dispatcher import REVIEW
 from .reconcile import (
@@ -156,7 +156,6 @@ from .reconcile import (
     Transition,
     post_comment,
     retry_comment,
-    write_labels,
 )
 
 #: The client methods this module probes for. Named because the probe and the
@@ -781,7 +780,7 @@ def _decide_conflicted(
             ),
             transition=Transition(
                 ref=entry.ref,
-                from_state=label_state(entry.state_label),
+                from_state=state_of(entry, believed),
                 to_state=NEEDS_HUMAN,
                 reason=(
                     f"the branch conflicts with {facts.base_name} and {attempt} attempt(s) "
@@ -810,7 +809,7 @@ def _decide_conflicted(
         detail=f"conflicts with {facts.base_name}; re-dispatching as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=state_of(entry, believed),
             to_state=ELIGIBLE,
             reason=reason,
             task_id=entry.task_id,
@@ -856,7 +855,7 @@ def _decide_behind(
             detail=reason,
             transition=Transition(
                 ref=entry.ref,
-                from_state=label_state(entry.state_label),
+                from_state=state_of(entry, believed),
                 to_state=NEEDS_HUMAN,
                 reason=reason,
                 task_id=entry.task_id,
@@ -1189,11 +1188,6 @@ def apply_mergeability(
                     streak=transition.streak,
                     renewals=transition.renewals,
                 )
-            # One writer for the whole transition path (#152): the label names
-            # are `reconcile.write_labels`'s business and not this module's, and
-            # three copies of add-before-remove were three places to find when
-            # the labels go.
-            write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
             failures.append(Failure(decision.ref, f"{transition.to_state}: {exc}"))
             continue
@@ -1296,12 +1290,16 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
     gh = GitHubClient.from_env(repo)
     rules = UpdatePolicy.from_env()
     print(rules.summary())
-    live = load_ledger(gh, adopt=False)
+    live = load_ledger(gh)
     open_pulls = read_pulls(gh)
+    # An open pull request on a task's current branch *is* review (ADR 0001), so
+    # the dry run reads it off the world rather than off a label. It selected on
+    # `entry.state_label == REVIEW` until #152, which asked the control plane the
+    # same question the pull request answers directly.
     seen = {
         entry.ref: read_checks(gh, (open_pulls or {})[entry.branch].ref)
         for entry in live.entries.values()
-        if entry.state_label == REVIEW and entry.branch in (open_pulls or {})
+        if entry.branch in (open_pulls or {})
     }
     dry = run_mergeability(
         gh,

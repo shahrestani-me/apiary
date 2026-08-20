@@ -59,32 +59,28 @@ from ..artifacts import (
     TASK_RESULT,
 )
 from ..github.branches import parse_task_branch
-from ..github.readiness import BLOCKED, READY
 from ..github.refs import issue_number, pull_number
 from ..taskref import TaskRef
 from ..worker.result import ResultRecord
 from .checks import CheckSet, PullState
 from .derived import LANDED as LANDED_STATE
 from .derived import NEEDS_HUMAN as NEEDS_HUMAN_STATE
-from .dispatcher import CLAIMED, REVIEW
-from .reconcile import DONE, FAILED, CycleReport, Transition
+from .reconcile import CycleReport, Transition
 
 __all__ = [
     "INTERNAL_STATE",
-    "STATE_LABEL",
     "LifecycleLog",
     "TaskEvent",
     "internal_state",
     "lifecycle_events",
-    "state_label",
     "scrub",
 ]
 
-#: ADR 0001's internal workflow, keyed by the label that happens to store it
-#: today. The states on the right are apiary's own and identical for every
-#: customer; the six strings on the left are a storage detail that epic #140
-#: removes. Everything announced here speaks the right-hand column, so a
-#: recorded run stays readable once the left-hand one is gone.
+#: ADR 0001's internal workflow, keyed by the `swarm:*` label that used to store
+#: it. **Nothing writes those labels any more** (#152) and the inverse table
+#: went with the last writer, but this direction stays: `internal_state` is how
+#: prose and archived records written in the old vocabulary are read forward,
+#: and `scrub` still rewrites a `swarm:ready` somebody typed into a comment.
 #:
 #: `blocked` is the sixth. ADR 0001's table names five because it is describing
 #: the states a *running* task passes through, and a task waiting on a
@@ -92,28 +88,18 @@ __all__ = [
 #: names it, so it is mapped explicitly rather than left to fall through the
 #: label suffix.
 INTERNAL_STATE = {
-    READY: "eligible",
-    BLOCKED: "blocked",
-    CLAIMED: "claimed",
-    REVIEW: "review",
-    DONE: "landed",
-    FAILED: "needs-human",
+    # Spelled out rather than built from constants, and that is the point of the
+    # table now. The constants became ADR 0001 states when #152 removed the
+    # labels, so referencing them here would map "eligible" to "eligible" and
+    # quietly stop being able to read the thing this exists to read: an
+    # `events.jsonl` or an `observed.jsonl` written while the labels were live.
+    "swarm:ready": "eligible",
+    "swarm:blocked": "blocked",
+    "swarm:claimed": "claimed",
+    "swarm:review": "review",
+    "swarm:done": "landed",
+    "swarm:failed": "needs-human",
 }
-
-#: The same table read the other way: which label *stores* a given state.
-#:
-#: Inverted rather than written out, because two hand-maintained tables of six
-#: rows each are two tables that disagree the day somebody edits one. The
-#: inversion is total - the six states are distinct, so `INTERNAL_STATE` is a
-#: bijection - and `test_the_label_and_state_vocabularies_round_trip` is what
-#: keeps that true if a seventh state ever arrives.
-#:
-#: **This is the direction epic #140 needs and #152 deletes.** Since #147 every
-#: decision is made on the internal state, so a `Transition` carries states and
-#: the label is looked up here at the single moment one is written
-#: (`reconcile.write_labels`). When that write goes, so does this - and with it
-#: the last module in the tree that knows what a `swarm:*` label is called.
-STATE_LABEL = {state: label for label, state in INTERNAL_STATE.items()}
 
 #: A branch name carries the task ref (`github/branches.py`), and for the
 #: GitHub adapter a ref *is* an issue number - `apiary/%2312-attempt-1` spells
@@ -129,25 +115,6 @@ _LABEL_RE = re.compile(r"\bswarm:([a-z_-]+)\b")
 def internal_state(label: str) -> str:
     """The internal state a `swarm:*` label is storing. See `INTERNAL_STATE`."""
     return INTERNAL_STATE.get(label, label.split(":", 1)[-1])
-
-
-def state_label(state: str) -> str:
-    """The `swarm:*` label that stores one internal state. See `STATE_LABEL`.
-
-    Raises on a state with no label rather than inventing `swarm:<state>`, which
-    is the direction `internal_state` guesses in and the wrong one here: that
-    function is reading a repository somebody else may have written labels into,
-    and this one is about to *write* one. A made-up label name is a label GitHub
-    creates with a random colour and no description, which is the exact failure
-    `github/labels.py` exists to prevent.
-    """
-    try:
-        return STATE_LABEL[state]
-    except KeyError:
-        raise KeyError(
-            f"no swarm:* label stores the state {state!r}; the six are "
-            f"{', '.join(sorted(STATE_LABEL))}"
-        ) from None
 
 
 def scrub(text: str, refs: Mapping[int, str]) -> str:

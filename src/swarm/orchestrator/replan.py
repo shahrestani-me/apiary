@@ -74,7 +74,7 @@ from ..nodes.planner import (
     write_plan,
 )
 from ..state import Plan
-from .authority import Belief
+from .authority import Belief, state_of
 
 #: How many times one run may rewrite its own plan. Two, because the second
 #: replan is where the evidence changes character: a decomposition that stalled,
@@ -204,7 +204,7 @@ def brief(
     # would translate it: this is a string in a prompt, so "unchanged" has to
     # mean the same characters, not the same fact.
     tracked = "\n".join(
-        f"- {task_id} ({entry.state_label if believed is None else believed.state(task_id)}): "
+        f"- {task_id} ({state_of(entry, believed)}): "
         f"{entry.goal[:120]}"
         for task_id, entry in sorted(ledger.entries.items(), key=lambda item: item[1].ref)
     ) or "- none"

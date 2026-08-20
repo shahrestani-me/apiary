@@ -55,6 +55,10 @@ from typing import Any
 
 import pytest
 
+FAILED = "needs-human"
+
+DONE = "landed"
+
 from swarm.artifacts import (
     CORPUS_MANIFEST_NAME,
     OBSERVED_LOG_NAME,
@@ -74,8 +78,6 @@ from swarm.orchestrator.checks import PullState
 from swarm.github.readiness import READY
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.reconcile import (
-    DONE,
-    FAILED,
     CycleReport,
     ReconcilePlan,
     ReconcileReport,

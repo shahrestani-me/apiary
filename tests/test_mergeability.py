@@ -42,6 +42,10 @@ from typing import Any, Callable, Iterable, Mapping, cast
 
 import pytest
 
+FAILED = "needs-human"
+
+DONE = "landed"
+
 from fixtures.store import RecordingStore
 from swarm.store import STORE_DIR_ENV
 from swarm.github.branches import task_branch
@@ -77,7 +81,7 @@ from swarm.orchestrator.mergeability import (
     read_touched_files,
     run_mergeability,
 )
-from swarm.orchestrator.reconcile import DONE, FAILED, READY
+from swarm.orchestrator.reconcile import READY
 from swarm.taskref import TaskRef
 from swarm.orchestrator.authority import Belief
 from swarm.orchestrator.lifecycle import internal_state

@@ -493,7 +493,7 @@ IN_FLIGHT = frozenset({CLAIMED_STATE, REVIEW_STATE})
 # stops storing it at all. The same spelling as `reconcile.FAILED`; spelled here
 # rather than imported because `orchestrator` modules import this one, and the
 # dependency must not point back up.
-FAILED = "swarm:failed"
+FAILED = "needs-human"
 
 # Path segments that are packaging, not subject matter. `src/swarm/github/…` is
 # work on the github area; the `src` says nothing about what the task is.
@@ -1356,9 +1356,6 @@ def revive(
     streak = entry.attempt if entry.streak is None else entry.streak
     budget = f"streak {streak} of {cap}, total {entry.attempt} of {total_cap}"
 
-    client.add_labels(entry.number, [READY])
-    client.remove_label(entry.number, FAILED)
-
     comment = (
         f"apiary: {because}, so it is returned to `{READY}`. "
         f"The retry budget stands as it was - {budget} - so a retry that fails "
@@ -1555,7 +1552,7 @@ def _read_back(
     for attempt in range(READ_BACK_ATTEMPTS):
         if invalidate is not None:
             invalidate()
-        ledger = load_ledger(client, adopt=False)
+        ledger = load_ledger(client)
         if expected <= set(ledger.entries):
             return ledger
         if attempt + 1 < READ_BACK_ATTEMPTS:
@@ -1709,5 +1706,5 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke test
     # somebody's tracker, which is exactly what `provision.py` refuses to do
     # for repositories and for the same reason.
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
-    for task_id, record in sorted(load_ledger(repo, adopt=False).tasks.items()):
+    for task_id, record in sorted(load_ledger(repo).tasks.items()):
         print(f"{task_id:<32} {record.get('status'):<10} {record.get('branch', '')}")

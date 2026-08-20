@@ -762,7 +762,6 @@ def _plan_and_run(
         repo,
         objective,
         source=source,
-        adopt=not args.dry_run,
     )
     _report_run(attachment, dry_run=args.dry_run)
 
@@ -800,7 +799,7 @@ def _plan_and_run(
         # the world as it was a moment earlier. Failing the run on that would
         # print "the planner produced nothing" directly under a line listing
         # the issues it had just created, which is exactly what it did.
-        attachment = start_run(repo, objective, source=source, adopt=True)
+        attachment = start_run(repo, objective, source=source)
         ledger = attachment.ledger
         if not ledger.entries:
             print("! the planner wrote nothing the ledger can read back",
@@ -808,7 +807,7 @@ def _plan_and_run(
             return 1
 
     if args.plan_only:
-        plan = apply_readiness(source, ledger=ledger, dry_run=args.dry_run)
+        plan = apply_readiness(source, ledger=ledger)
         for verdict in plan.verdicts:
             print(f"  · {verdict}")
         print()

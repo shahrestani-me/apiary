@@ -40,6 +40,10 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, cast
 
 import pytest
+
+FAILED = "needs-human"
+
+DONE = "landed"
 from fixtures import failures
 
 from fixtures.store import RecordingStore
@@ -73,7 +77,7 @@ from swarm.orchestrator.checks import (
 from swarm.nodes.judge import mentioned_paths
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.lifecycle import internal_state
-from swarm.orchestrator.reconcile import DONE, FAILED, READY
+from swarm.orchestrator.reconcile import READY
 from swarm.taskref import TaskRef
 from swarm.orchestrator.authority import Belief
 from swarm.orchestrator.derived import ELIGIBLE, LANDED, NEEDS_HUMAN

@@ -151,7 +151,7 @@ from ..github.readiness import IssueState
 from ..github.refs import task_ref
 from ..run import Run, RunError, validate_run_id
 from ..taskref import TaskRef
-from .authority import Belief, label_state, state_of
+from .authority import Belief, state_of
 from .derived import CLAIMED as CLAIMED_STATE
 from .derived import ELIGIBLE, NEEDS_HUMAN
 from .derived import REVIEW as REVIEW_STATE
@@ -342,7 +342,7 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
     if attempt >= cap:
         return Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=state_of(entry, believed),
             to_state=NEEDS_HUMAN,
             reason=f"{reason}; {attempt} attempt(s) made against a cap of {cap}",
             task_id=entry.task_id,
@@ -355,7 +355,7 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
         )
     return Transition(
         ref=entry.ref,
-        from_state=label_state(entry.state_label),
+        from_state=state_of(entry, believed),
         to_state=ELIGIBLE,
         reason=reason,
         task_id=entry.task_id,
@@ -469,7 +469,7 @@ def plan_recovery(
             transitions.append(
                 Transition(
                     ref=entry.ref,
-                    from_state=label_state(entry.state_label),
+                    from_state=state_of(entry, believed),
                     to_state=REVIEW_STATE,
                     reason=(
                         f"{branch} has an open pull request; "

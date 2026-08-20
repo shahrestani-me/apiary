@@ -36,6 +36,8 @@ from typing import Any, Mapping
 
 import pytest
 
+FAILED = "needs-human"
+
 from fixtures.markers import legacy_marker
 from swarm.github.branches import task_branch
 from swarm.github.ledger import (
@@ -48,7 +50,6 @@ from swarm.github.ledger import (
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED
 from swarm.orchestrator.reconcile import (
-    FAILED,
     READY,
     apply_plan,
     plan_reconcile,

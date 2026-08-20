@@ -56,7 +56,7 @@ from .derived import (
     observe,
 )
 from .dispatcher import CLAIMED as CLAIMED_LABEL
-from .lifecycle import INTERNAL_STATE, state_label
+from .lifecycle import INTERNAL_STATE
 from .reconcile import CycleReport
 
 __all__ = [
@@ -74,87 +74,40 @@ __all__ = [
 
 
 def control_labels(report: CycleReport) -> dict[str, str]:
-    """The `swarm:*` label each task wore when this cycle finished. By task id.
+    """What this cycle believed, by task id. **No longer a second opinion.**
 
-    Five sources, in the order the cycle writes them, so the last word wins:
+    This assembled the `swarm:*` label each task wore when the cycle finished,
+    from five writers in the order the cycle wrote them, so that a recorded run
+    carried *both* sides of #147's comparison: the derived world, and the
+    control plane the cycle had actually left behind. Replaying the two against
+    each other is what `docs/recording-runs.md` §2 grades a run on.
 
-    1. `report.ledger`, which `cycle` has already folded with what `apply_plan`,
-       the recovery sweep and the check gate **applied** - `fold`'s rule, and
-       for `fold`'s reason: a label write GitHub refused left the task where it
-       was, and crediting it would diff against a state the control plane never
-       reached.
-    2. mergeability, which is the fourth writer of a terminal label
-       (`lifecycle._landed_or_human` names all four) and the one the cycle does
-       **not** fold back: a pull request that will not rebase inside its update
-       budget is escalated here, and a control map built without it would report
-       every starved task as a divergence the resolver invented. Skipped for a
-       task the check gate also wrote, because the gate runs after this one and
-       step 1 already carries its answer.
-    3. the readiness pass, which writes `swarm:ready` / `swarm:blocked` and
-       whose result the cycle does not fold back into the ledger either. Its
-       verdicts cover exactly the transitionable entries, so nothing here can
-       overwrite a `claimed`, `review`, `done` or `failed` that step 1
-       established.
-    4. the dispatcher's claims, which are written after readiness and are also
-       not folded.
-    5. a dispatch that claimed and then failed to spawn. `DispatchFailure.claimed`
-       is precisely "the label was written and no container is running under
-       it", which is a claim the control plane is holding whether or not the
-       spawn worked - and the case #35's recovery sweep exists for.
+    #152 removed the control plane, so there is no second side to record. What
+    is written now is the cycle's own belief - which is the derived answer, and
+    therefore agrees with the resolver by construction. **A run recorded from
+    here on cannot be part of that gate**, and the runbook says so in as many
+    words: "a run recorded after it carries an empty `control` and can never be
+    part of this gate."
 
-    And a sixth that is not a label writer in `cycle` at all: `planner.revive`,
-    reached from step 5 through `replan` and from the goal gate, moves a task
-    `swarm:failed -> swarm:ready` on GitHub. `_judge` runs *before* this window
-    and nothing folds it either, so a map without it reports `needs-human` for a
-    task the cycle left `ready`. Overlaid before readiness, because that is
-    where it happens in the cycle and because a revived task is exactly the one
-    readiness may then move again.
+    The field is kept rather than dropped, and the belief is what fills it, for
+    two reasons that are not the same:
 
-    Labels rather than internal states, because that is what the replay corpus
-    records (`tests/fixtures/runs/README.md`: "the corpus records what the
-    control plane actually held, so the day epic #140 removes the labels it is
-    the translation that gets deleted and not the data"). The translation
-    happens once, on the way into `diverge`.
+    - `observed.jsonl` is append-only and read back. `tests/fixtures/corpus.py`
+      parses `control`, and runs recorded *before* this ticket still hold a real
+      control plane in it. Removing the key would make those runs unreadable,
+      which is the archive this whole exercise exists to have produced.
+    - What a reader of a *new* recording wants from that slot is "what did the
+      orchestrator think", and the belief is exactly that. It is honest as a
+      record and worthless as a comparison, which is a distinction this
+      docstring has to carry because nothing in the data will.
+
+    Labels rather than states was the old spelling, and it went with them: the
+    values here are ADR 0001's internal states.
     """
-    labels: dict[str, str] = {}
-    for entry in report.ledger.entries.values():
-        if entry.task_id:
-            labels[entry.task_id] = entry.state_label
-    if report.mergeability is not None:
-        gated = {
-            transition.task_id
-            for transition in getattr(report.checks, "applied", ()) or ()
-            if transition.task_id
-        }
-        for transition in report.mergeability.applied:
-            if transition.task_id and transition.task_id not in gated:
-                # Translated *back* to a label on purpose. A `Transition` carries
-                # a state since #152, and this function's whole subject is what
-                # the label control plane was left holding - the map is compared
-                # against the resolver's states by the caller, so keeping the
-                # state here would compare the derived answer with itself and
-                # report agreement that was never tested.
-                labels[transition.task_id] = state_label(transition.to_state)
-    for task in revived_tasks(report):
-        labels[task] = READY_LABEL
-    if report.readiness is not None:
-        for verdict in report.readiness.verdicts:
-            if verdict.task_id:
-                labels[verdict.task_id] = verdict.label
-    if report.dispatched is not None:
-        slugs = {entry.ref: entry.task_id for entry in report.ledger.entries.values()}
-        for item in report.dispatched.dispatched:
-            if item.entry.task_id:
-                labels[item.entry.task_id] = CLAIMED_LABEL
-        for failure in report.dispatched.failed:
-            # `DispatchFailure` carries the issue number rather than the entry,
-            # so the ref is re-minted through the adapter and joined back to the
-            # slug the ledger holds - `mergeability.py`'s rule, a task is a ref
-            # and an API address is a number.
-            task = slugs.get(task_ref(int(failure.number)), "")
-            if failure.claimed and task:
-                labels[task] = CLAIMED_LABEL
-    return labels
+    states = getattr(report.belief, "states", None) or {}
+    return {task_id: state for task_id, state in states.items() if state}
+
+
 
 
 def build_observation(

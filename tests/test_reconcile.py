@@ -42,6 +42,10 @@ from types import SimpleNamespace
 
 import pytest
 
+FAILED = "needs-human"
+
+DONE = "landed"
+
 from fixtures.github import SentRequest, not_modified, page, response
 from fixtures.store import RecordingStore
 from swarm.containers.manager import RUNNING_STATE, DockerError, Handle
@@ -49,7 +53,6 @@ from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import (
     ContractError,
-    LabelRepair,
     Ledger,
     LedgerEntry,
     parse_contract,
@@ -72,8 +75,6 @@ from swarm.orchestrator.reconcile import (
     observed_records,
     COMMENT_METHOD,
     PULLS_METHOD,
-    DONE,
-    FAILED,
     READY,
     CycleReport,
     Reconciler,
@@ -87,7 +88,6 @@ from swarm.orchestrator.reconcile import (
     plan_reconcile,
     retry_comment,
     signature,
-    write_labels,
 )
 from swarm.orchestrator.lifecycle import internal_state, lifecycle_events
 from swarm.run import Run
