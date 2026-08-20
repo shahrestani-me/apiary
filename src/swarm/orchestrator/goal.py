@@ -79,7 +79,7 @@ which `CONTRIBUTING.md` makes the first rule of this repository.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Protocol, Sequence
+from typing import Collection, Any, Callable, Protocol, Sequence
 
 from ..config import SETTINGS
 from ..github.ledger import Ledger, LedgerEntry
@@ -451,6 +451,7 @@ def _revive_abandoned(
     max_attempts: int,
     max_total_attempts: int,
     believed: Belief | None = None,
+    already: Collection[TaskRef] = (),
 ) -> tuple[IssueAction, ...]:
     """Revive every abandoned task the orchestrator may safely retry. See
     `close_the_loop` for the rule; this is only its per-issue application.
@@ -473,7 +474,8 @@ def _revive_abandoned(
     `planner.revive` owns it and answers a spent task with a `retained` action
     and no writes, which this function simply does not count as a revival.
     """
-    wanted = set(assessment.abandoned)
+    # One revival per task per run (`close_the_loop`'s docstring).
+    wanted = set(assessment.abandoned) - set(already)
     # The same `believed` `assess` partitioned on, because this is the other
     # half of one join: an assessment built under the resolver against a set
     # rebuilt from the labels matches on whatever the two happen to agree
@@ -563,8 +565,21 @@ def close_the_loop(
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
     believed: Belief | None = None,
+    already_revived: Collection[TaskRef] = (),
 ) -> GoalReport:
     """Assess, then revive what is revivable, then extend if a gap remains.
+
+    **`already_revived` bounds the gate at one revival per task per run**, and
+    #152 is why it has to be said out loud. A revival grants one more attempt
+    and `planner.revive` "deliberately resets nothing", so the task caps again
+    the moment that attempt is spent - at which point the plan is exhausted
+    again and this gate would revive it again, for the rest of the run.
+
+    That loop was previously broken by accident: `revive` wrote `swarm:ready`
+    onto the issue, `run.live_entries` counted the label as live, so the plan
+    was *not* exhausted and the gate did not re-run. The write is gone with the
+    control plane, so the bound is explicit. The caller owns the set because the
+    caller owns the run - this function sees one cycle.
 
     `ledger` is the read the caller already made this cycle, for
     `replan.replan`'s reason: re-listing the issues here would double the
@@ -621,6 +636,7 @@ def close_the_loop(
             max_attempts=max_attempts,
             max_total_attempts=max_total_attempts,
             believed=believed,
+            already=already_revived,
         )
         if revived:
             names = ", ".join(f"#{action.number}" for action in revived)

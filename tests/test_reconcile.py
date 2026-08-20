@@ -3364,7 +3364,14 @@ def test_a_revived_attempt_that_leaves_no_result_lapses_instead_of_looping(
         "the grant lapsed on the dispatch: one revival, one attempt, then the "
         "streak `planner.revive` never reset caps the task again"
     )
-    assert calls == [1], "the gate ran once; a re-revival would be a second grant"
+    # The grant, not the gate call. The gate is *asked* on every cycle whose
+    # plan is exhausted, and since #152 a task capped after its granted attempt
+    # keeps the plan exhausted - so counting invocations now measures how long
+    # the run went on rather than whether it re-revived. What the assertion has
+    # always meant is one grant, and `_ever_revived` is where that is bounded.
+    assert loop._ever_revived == {ref(TASK_ISSUE)}, "exactly one task was ever revived"
+    assert loop._revived == {}, "and its grant was spent, not renewed"
+    assert calls, "the gate did run"
     # And it stopped in the state a human is asked about, rather than by being
     # quietly skipped: `needs-human` is what the dispatcher refuses to start.
     from swarm.orchestrator.derived import NEEDS_HUMAN

@@ -2048,6 +2048,14 @@ class Reconciler:
     #: is the predicate, and `authority`'s module docstring argues why no other
     #: counter bounds that input.
     _revived: dict[TaskRef, Grant] = field(default_factory=dict, repr=False)
+    #: Every task this run has *ever* revived, spent or not. Separate from
+    #: `_revived` because the two answer different questions: that one is the
+    #: live grant an override reads, and a spent grant has to stop overriding or
+    #: the task is believed `eligible` forever; this one is the bound, and it has
+    #: to outlive the grant or the gate revives the same task every cycle.
+    #: Collapsing them into one set gets one of the two wrong, and #152 is when
+    #: that started to matter - the label write used to hold the bound.
+    _ever_revived: set[TaskRef] = field(default_factory=set, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -2366,7 +2374,7 @@ class Reconciler:
                 1
                 for entry in ledger.entries.values()
                 if belief.state(entry.task_id) not in FINISHED_STATES
-                or not self._revived.get(entry.ref, _SPENT).dispatched
+                or entry.ref in self._revived
             ),
         )
         # `belief`, as it stands *here* - folded by `apply_plan`, the recovery
@@ -2478,7 +2486,18 @@ class Reconciler:
         is in `authority`.
         """
         folded = belief.fold(getattr(report.mergeability, "applied", ()) or ())
-        overlay: dict[str, str] = {task: ELIGIBLE for task in revived_tasks(report)}
+        # Only a revival this run is actually *holding a grant for* moves the
+        # belief. The gate reports a revival for as long as the task is
+        # abandoned and the plan exhausted, and after #152 that is every cycle
+        # once the granted attempt is spent - so an unguarded overlay would
+        # believe a capped task `eligible` for the rest of the run. The bound
+        # itself is `_ever_revived`; this is the belief half of it.
+        overlay: dict[str, str] = {
+            task: ELIGIBLE
+            for task in revived_tasks(report)
+            if (entry := report.ledger.entries.get(task)) is not None
+            and entry.ref in self._revived
+        }
         if report.readiness is not None:
             for verdict in report.readiness.verdicts:
                 if verdict.task_id:
@@ -2514,7 +2533,11 @@ class Reconciler:
         if not self._revived:
             return
         for one in _dispatch_attempted(report) & self._revived.keys():
-            self._revived[one] = self._revived[one].spend()
+            # Dropped rather than marked. A spent grant that stayed here would
+            # keep overriding the resolver's cap and the task would be believed
+            # `eligible` for the rest of the run; the *bound* is
+            # `_ever_revived`, which keeps it.
+            del self._revived[one]
 
     def _record_revivals(self, report: CycleReport) -> None:
         """Remember the one attempt each revival granted. See `_revived`.
@@ -2527,8 +2550,12 @@ class Reconciler:
         """
         for task in revived_tasks(report):
             entry = report.ledger.entries.get(task)
-            if entry is not None:
-                self._revived[entry.ref] = Grant(attempt=entry.attempt)
+            if entry is None:
+                continue
+            if entry.ref in self._ever_revived:
+                continue
+            self._ever_revived.add(entry.ref)
+            self._revived[entry.ref] = Grant(attempt=entry.attempt)
 
     # --- step 5 ----------------------------------------------------------
 
@@ -2682,6 +2709,12 @@ class Reconciler:
             # `swarm:failed` typed onto merged work used to end the run asking
             # for a human about a task that had landed.
             believed=believed,
+            # Bounded at one revival per task per run. The grant buys one
+            # attempt and `planner.revive` resets nothing, so a task revived and
+            # spent caps again immediately - and would be revived again every
+            # cycle after that. See `close_the_loop` for why this used to be
+            # implicit and no longer can be.
+            already_revived=tuple(self._ever_revived),
         )
         self._goal_rounds = goal.rounds
         wrote = (
