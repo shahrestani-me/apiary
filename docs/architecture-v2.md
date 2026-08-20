@@ -10,8 +10,18 @@ v2 moves the control plane onto GitHub and the execution plane into containers.
 
 ## The one-line summary
 
-**GitHub is the database. Containers are the sandbox. The orchestrator is a
-scheduler that reconciles the two.**
+**The code host holds the work. Containers are the sandbox. The orchestrator is
+a scheduler that reconciles the two, and holds no state it could not rebuild.**
+
+*This used to read "GitHub is the database", and the change is
+`docs/adr/0001-task-systems-are-integrations.md`'s. The property that sentence
+was protecting is intact and is the second half of the new one: the orchestrator
+can be killed at any moment and resume, because nothing irreplaceable lives in
+it. What changed is what pays for that. It used to be the customer's issue
+tracker, carrying apiary's own vocabulary; it is now the code host's own facts -
+issues, pull requests, branches, containers, run artifacts - plus a small
+per-project store of the judgments only apiary makes
+(`docs/adr/0002-apiary-owns-a-thin-task-store.md`).*
 
 ## Shape
 
@@ -106,19 +116,38 @@ The **Files** section is load-bearing. Non-overlapping file sets across
 concurrently-runnable issues is what keeps merges sane; it is the v1 rule that
 survives unchanged.
 
-### Labels are the protocol
+### State is derived, not stored
 
-| Label | Meaning | Set by |
-|---|---|---|
-| `swarm:ready` | dependencies met, may be dispatched | orchestrator |
-| `swarm:blocked` | waiting on another issue | orchestrator |
-| `swarm:claimed` | a worker container holds it now | orchestrator |
-| `swarm:review` | PR open, awaiting checks/review | orchestrator (the worker's, until #148) |
-| `swarm:done` | PR merged | orchestrator |
-| `swarm:failed` | attempts exhausted, needs a human | orchestrator |
-| `swarm:attempt/1..3` | retry counter | orchestrator |
+There is no label protocol. **apiary writes no vocabulary of its own into a
+customer's tracker** - that is ADR 0001's decision and #152 is where it landed.
 
-Plus routing labels the planner assigns: `area/*`, `size/*`.
+A task's state is recomputed every cycle from facts that already exist, by
+`orchestrator/derived.py`:
+
+| State | What makes it true |
+|---|---|
+| `eligible` | every dependency discharged, nothing running, no pull request open |
+| `blocked` | a dependency in `## Blocked by` is not discharged |
+| `claimed` | a worker container for this task is running |
+| `review` | a pull request is open on this task's branch |
+| `landed` | its pull request merged, or its issue is closed as completed |
+| `needs-human` | the retry budget is spent, or a human closed it as not planned |
+
+Three of those cannot be read from the code host alone, and ADR 0001 says so:
+the infrastructure ceiling, a renewed per-blocker budget, and a revival. Those
+are apiary's own judgments and live in apiary's own store
+(`src/swarm/store/`, ADR 0002), which also holds the attempt counter since
+`docs/adr/0005-the-attempt-counter-moves-to-the-store.md`. The join is
+`orchestrator/authority.py`, and it is the single place that answers "what state
+is this task in".
+
+**Membership is the identity marker**, not a label: an issue is apiary's if its
+body carries `<!-- apiary:task id=... -->` (see `docs/issue-contract.md` §2).
+For a tracker reached over MCP it is whatever the customer's own `intake` filter
+returns - their vocabulary, not apiary's.
+
+Routing labels the planner assigns are unaffected and still written: `area/*`,
+`size/*`. They are hints for humans and decide nothing.
 
 ### The orchestrator is the sole dispatcher
 
