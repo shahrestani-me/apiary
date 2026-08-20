@@ -690,6 +690,8 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     the admin override's whole justification is that it is explicit.
     """
     from .containers.manager import INHERITED_ENV, ContainerManager
+    from .models import resolve as resolve_model
+    from .security import worker_model_credentials
     from .containers.reaper import Reaper
     from .orchestrator.authority import source_summary
     from .orchestrator.checks import MergePolicy
@@ -736,6 +738,17 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # workers with no token and no model host. The first worker to actually
     # start said "GITHUB_TOKEN is not set" and recorded it.
     inherited = {name: os.environ[name] for name in INHERITED_ENV if os.environ.get(name)}
+    # #269. The worker's model may now be remote, and a remote model needs a
+    # credential inside a container that runs model-generated code. That is a
+    # decision rather than a detail, so it is refused unless an operator has
+    # opted in - and refused *here*, before a container exists, rather than at
+    # the first call several minutes later where it would read as a broken
+    # model. A local Ollama worker reaches none of this and needs no credential.
+    worker_spec = resolve_model("worker").spec
+    model_credentials = worker_model_credentials(worker_spec.provider)
+    egress = EgressPolicy.from_env().with_model(
+        worker_spec.provider, worker_spec.option("region")
+    )
     # A worker sits on an `internal: true` network with no default route - that
     # is the containment, not an accident - so it reaches GitHub only through
     # the egress proxy, and only if its HTTP client is told to. `proxy_env()`
@@ -743,7 +756,8 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
     # token still died on "Temporary failure in name resolution".
     fleet = ContainerManager(
         run=run,
-        env={**inherited, **EgressPolicy().proxy_env(), **artifacts.worker_env()},
+        env={**inherited, **model_credentials, **egress.proxy_env(),
+             **artifacts.worker_env()},
         extra_flags=[*artifacts.mount_flags(), *worker_create_flags()],
     )
     # `sink` is what puts a disposed container's logs in the run directory.

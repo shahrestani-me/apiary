@@ -520,6 +520,127 @@ page.
 
 ---
 
+## 5b. A model-provider credential in a worker container (#269)
+
+Until ADR 0006 this question had no occasion to be asked. A worker container
+holds exactly one credential, `GITHUB_TOKEN`, and the model needs none: Ollama
+is unauthenticated. That is a property of the local-first design that nobody
+chose and everybody has been relying on, and making the provider a
+configurable detail ended it.
+
+**Only the worker has this problem.** The orchestrator roles emit planning and
+judgement; the worker executes model-generated code, which is
+`docs/architecture-v2.md`'s third constraint and the reason this whole document
+exists. A remote *orchestrator* is an ordinary configuration change. A remote
+*worker* means giving generated code a second credential and a second reachable
+endpoint.
+
+### The options
+
+1. **The key never enters the container.** The worker asks the orchestrator,
+   which holds the credential and makes the call. Strongest, and costs a hop
+   plus a protocol — an authenticated inference endpoint on the orchestrator,
+   which is a service surface this system does not otherwise have.
+2. **A short-TTL scoped credential.** Bounded blast radius, still a live
+   credential inside the container.
+3. **The key enters as-is.** Cheapest, and the one that needs the most explicit
+   consent.
+
+### The decision
+
+**By default, no credential, and a remote worker is refused rather than run.**
+Where a provider has a notion of a short-lived credential, only that kind is
+accepted. Where it does not, the operator opts in out loud.
+
+That is option 2 where option 2 exists, and option 3 under explicit consent
+where it does not. Option 1 is the right long-term answer and is not this
+ticket: an inference endpoint on the orchestrator is a service to authenticate,
+rate-limit and test, and building it before anyone has run a remote worker
+would be designing against a guess. What is built instead is the property
+option 1 would give — *no long-lived credential reaches generated code* —
+enforced by the two mechanisms that are available today.
+
+**1. Nothing by default, and refused early.**
+`containers.manager.INHERITED_ENV` carries no model credential. A run whose
+worker resolves to a remote provider is refused in `swarm.cli` *before a
+container is created*, naming this section. A worker shipped without a
+credential would fail at its first call instead — several minutes and one
+container later, reading like a broken model rather than a policy.
+
+**2. An opt-in that is per-run and deliberate.**
+`APIARY_WORKER_MODEL_CREDENTIAL`, on the same reasoning as
+`APIARY_EGRESS_ALLOW`: adding a second credential to a container running
+generated code is a decision an operator makes out loud, not a default nobody
+reads.
+
+**3. Short-lived where the provider has a notion of it, enforced by shape.**
+AWS publishes the distinction and it is checkable: a session credential from
+`aws sso login` or `sts:AssumeRole` has an access key id beginning `ASIA` and
+expires; a long-lived IAM user key begins `AKIA` and does not. **`AKIA` is
+refused even under the opt-in**, as is a session credential with no
+`AWS_SESSION_TOKEN`. An operator cannot accidentally hand generated code a
+credential with no expiry — which matters because `AKIA` is precisely what
+`aws configure` writes, so it is the one reached for by accident.
+
+OpenAI has no equivalent, so an `OPENAI_API_KEY` in a worker is option 3: it
+enters as-is, under the opt-in, and an operator choosing it should scope and
+rotate the key at the provider. That asymmetry is stated rather than smoothed
+over — the two providers genuinely offer different guarantees, and a document
+that reported the same confidence for both would be wrong about one of them.
+
+### What the credential can reach
+
+`EgressPolicy.with_model` adds **one host**, and only when a remote worker is
+configured:
+
+| Provider | Entry |
+|---|---|
+| `openai` | `api.openai.com` |
+| `bedrock` | `bedrock-runtime.<region>.amazonaws.com` |
+
+Bedrock's is regional and built per spec rather than listed as `amazonaws.com`.
+That is not a small widening: `allows` matches subdomains, so `amazonaws.com`
+would open S3, STS and every other AWS service to a container running generated
+code — the "widened to `.*` by the third person who hits it" failure the
+allowlist is written to avoid.
+
+The provider hosts are deliberately **not** in `EGRESS_ALLOWLIST`. That tuple is
+what every installation gets, including the fully local ones that are the
+default, and a destination no container will ever dial does not belong in it.
+
+### Redaction
+
+Both credentials are covered at the capture boundary, by name and by shape:
+
+- `SECRET_NAME_RE` gained `ACCESS_KEY`. `AWS_ACCESS_KEY_ID` matched none of the
+  existing alternatives — `_KEY\b` fails because `_ID` follows it — so an AWS
+  key id would have reached a container log unredacted while its secret half
+  was covered.
+- `SECRET_PATTERNS` gained `AKIA`/`ASIA` and OpenAI's `sk-` prefixes, shape-based
+  for the same reason the GitHub prefixes are: a worker can print a credential
+  that arrived in a file or was minted inside the container, and the literal
+  list would not know it. **Including `AKIA`**, which this module refuses — a
+  refusal that printed the credential in its own error message would be the
+  joke version of the control.
+
+### The local path is unchanged
+
+`worker_model_credentials("ollama", ...)` returns `{}` and raises nothing. A
+fully local run carries no model credential, opens no additional egress, and
+reaches none of the code above. That is asserted, not assumed.
+
+### What would change the answer
+
+Option 1, when a remote worker is in routine use and the hop is worth building.
+At that point the worker needs no provider credential at all, `MODEL_CREDENTIAL_ENV`
+empties, and the allowlist entries above come back out. Until then the gate
+above is the containment, and its weakest point is named: an `OPENAI_API_KEY`
+under the opt-in is a live, non-expiring credential inside a container running
+generated code, bounded only by the egress allowlist and by whatever scope the
+operator gave the key.
+
+---
+
 ## 6. Seams that are not closed yet
 
 Four, each waiting on a ticket whose file set was out of reach of the one that

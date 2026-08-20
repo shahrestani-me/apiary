@@ -617,6 +617,31 @@ def test_compose_carries_the_generated_allowlist(compose_text: str) -> None:
         assert f"      {line}\n" in compose_text, line
 
 
+def test_compose_carries_the_generated_allowlist_and_nothing_more(compose_text: str) -> None:
+    """The other direction, and the one that was missing (#269).
+
+    The test above asserts every generated line is *in* the YAML, which a
+    hand-widened `compose.yaml` satisfies for free - an extra entry pasted into
+    the block is an extra destination for every worker, and nothing failed.
+    Equality is what "the allowlist stays generated from `security.py`" was
+    always supposed to mean.
+
+    Read out of the `configs:` block by shape rather than by parsing YAML: the
+    lines are anchored regexes, so they are recognisable on their own and the
+    suite needs no YAML dependency to find them.
+    """
+    carried = [
+        line.strip()
+        for line in compose_text.splitlines()
+        if line.startswith("      ^") and line.rstrip().endswith("$")
+    ]
+
+    assert carried == EgressPolicy().filter_lines(), (
+        "compose.yaml's allowlist and EgressPolicy.filter_lines() disagree; "
+        "regenerate the block rather than editing it"
+    )
+
+
 def test_compose_points_the_orchestrator_at_the_socket_proxy(compose_text: str) -> None:
     assert f"DOCKER_HOST: {DOCKER_HOST_URL}" in compose_text
 
@@ -745,3 +770,173 @@ def test_compose_passes_the_worker_image_override_through(compose_text: str) -> 
     drift for the token and the proxy variables; #99's mapping joins them.
     """
     assert f"      {STACK_IMAGES_ENV}: ${{{STACK_IMAGES_ENV}:-}}\n" in compose_text
+
+
+# --------------------------------------------------------------------------
+# A model-provider credential in a worker container (#269)
+# --------------------------------------------------------------------------
+#
+# The decision and its reasoning are in docs/security.md §5b. What is asserted
+# here is the enforcement, and the assertion that matters most is the first
+# one: a fully local run reaches none of this.
+
+
+OPT_IN = {"APIARY_WORKER_MODEL_CREDENTIAL": "1"}
+SESSION = {
+    "AWS_ACCESS_KEY_ID": "ASIAABCDEFGHIJKLMNOP",
+    "AWS_SECRET_ACCESS_KEY": "secret",
+    "AWS_SESSION_TOKEN": "token",
+    "AWS_REGION": "eu-west-1",
+}
+
+
+def test_the_local_path_needs_no_credential_and_never_raises() -> None:
+    """The property of the local-first design that nobody chose and everybody
+    relies on. ADR 0006 made the provider configurable; it must not have made
+    the default path pay for it."""
+    from swarm.security import worker_model_credentials
+
+    assert worker_model_credentials("ollama", {}) == {}
+    assert worker_model_credentials("ollama", OPT_IN) == {}
+
+
+def test_a_remote_worker_is_refused_before_a_container_exists() -> None:
+    """A worker shipped without a credential fails at its first call instead -
+    several minutes and one container later, reading like a broken model
+    rather than like a policy."""
+    from swarm.security import worker_model_credentials
+
+    with pytest.raises(CredentialError) as caught:
+        worker_model_credentials("bedrock", SESSION)
+
+    assert "APIARY_WORKER_MODEL_CREDENTIAL" in str(caught.value)
+    assert "docs/security.md" in str(caught.value)
+
+
+def test_the_opt_in_carries_the_session_variables_and_nothing_else() -> None:
+    from swarm.security import worker_model_credentials
+
+    carried = worker_model_credentials("bedrock", {**OPT_IN, **SESSION, "GITHUB_TOKEN": "ghp_x"})
+
+    assert set(carried) == set(SESSION)
+    assert "GITHUB_TOKEN" not in carried
+
+
+def test_a_long_lived_aws_key_is_refused_even_under_the_opt_in() -> None:
+    """The enforceable half of "prefer short-lived". `AKIA` is an IAM user key
+    and does not expire; `ASIA` is a session credential and does. It is also
+    what `aws configure` writes, so it is the one reached for by accident."""
+    from swarm.security import worker_model_credentials
+
+    long_lived = dict(SESSION, AWS_ACCESS_KEY_ID="AKIAABCDEFGHIJKLMNOP")
+
+    with pytest.raises(CredentialError) as caught:
+        worker_model_credentials("bedrock", {**OPT_IN, **long_lived})
+
+    assert "AKIA" in str(caught.value)
+    assert "sso login" in str(caught.value)
+
+
+def test_aws_credentials_with_no_session_token_are_refused() -> None:
+    """Nothing would bound how long the worker's credential stays valid."""
+    from swarm.security import worker_model_credentials
+
+    without = {k: v for k, v in SESSION.items() if k != "AWS_SESSION_TOKEN"}
+
+    with pytest.raises(CredentialError):
+        worker_model_credentials("bedrock", {**OPT_IN, **without})
+
+
+def test_an_opt_in_with_nothing_to_carry_is_refused_rather_than_empty() -> None:
+    from swarm.security import worker_model_credentials
+
+    with pytest.raises(CredentialError) as caught:
+        worker_model_credentials("openai", OPT_IN)
+
+    assert "shipped without one" in str(caught.value)
+
+
+def test_a_profile_name_is_never_carried_into_a_container() -> None:
+    """It is useless inside a container with no `~/.aws`, and passing one would
+    produce "profile not found" rather than an honest "no credential"."""
+    from swarm.security import MODEL_CREDENTIAL_ENV
+
+    assert "AWS_PROFILE" not in MODEL_CREDENTIAL_ENV["bedrock"]
+
+
+# --- what the credential can reach ---------------------------------------
+
+
+def test_a_remote_worker_opens_exactly_one_host() -> None:
+    from swarm.security import EgressPolicy as Policy
+
+    widened = Policy().with_model("bedrock", "eu-west-1")
+
+    assert widened.allows("bedrock-runtime.eu-west-1.amazonaws.com")
+    assert set(widened.hosts) - set(EGRESS_ALLOWLIST) == {
+        "bedrock-runtime.eu-west-1.amazonaws.com"
+    }
+
+
+def test_bedrocks_entry_is_regional_because_the_short_one_is_all_of_aws() -> None:
+    """`allows` matches subdomains, so `amazonaws.com` would open S3, STS and
+    every other AWS service to a container running generated code. That is not
+    a small widening."""
+    from swarm.security import EgressPolicy as Policy
+
+    widened = Policy().with_model("bedrock", "eu-west-1")
+
+    assert not widened.allows("s3.amazonaws.com")
+    assert not widened.allows("sts.amazonaws.com")
+    assert not widened.allows("bedrock-runtime.us-east-1.amazonaws.com")
+
+
+def test_a_provider_host_is_not_in_the_allowlist_every_installation_gets() -> None:
+    """A destination no container will ever dial does not belong in the tuple
+    the fully local default carries."""
+    from swarm.security import EgressPolicy as Policy
+
+    assert not Policy().allows("bedrock-runtime.eu-west-1.amazonaws.com")
+    assert not Policy().allows("api.openai.com")
+
+
+def test_a_bedrock_worker_with_no_region_opens_nothing() -> None:
+    """Better than guessing a region: an entry for the wrong one is a hole with
+    no matching use."""
+    from swarm.security import EgressPolicy as Policy
+
+    assert Policy().with_model("bedrock").hosts == EGRESS_ALLOWLIST
+
+
+# --- redaction ------------------------------------------------------------
+
+
+def test_an_aws_key_id_is_redacted_by_name() -> None:
+    """It matched none of the existing alternatives - `_KEY\\b` fails because
+    `_ID` follows - so the id reached a log unredacted while its secret half
+    was covered."""
+    from swarm.containers.manager import Redactor
+
+    redactor = Redactor()
+    redactor.add_env({"AWS_ACCESS_KEY_ID": "ASIAABCDEFGHIJKLMNOP"})
+
+    assert "ASIAABCDEFGHIJKLMNOP" not in redactor("id=ASIAABCDEFGHIJKLMNOP")
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "AKIAABCDEFGHIJKLMNOP",
+        "ASIAABCDEFGHIJKLMNOP",
+        "sk-abcdefghijklmnopqrstuvwxyz",
+        "sk-proj-abcdefghijklmnopqrstuvwxyz",
+    ],
+)
+def test_a_model_credential_is_redacted_by_shape_too(secret: str) -> None:
+    """A worker can print a credential that arrived in a file or was minted
+    inside the container, and the literal list would not know it. `AKIA` is
+    included although it is refused: a refusal that printed the credential in
+    its own error would be the joke version of the control."""
+    from swarm.containers.manager import Redactor
+
+    assert secret not in Redactor()(f"leaked {secret} here")

@@ -151,7 +151,12 @@ MIN_SECRET_LENGTH = 8
 #: An environment variable whose *name* matches this has its value redacted
 #: from everything the daemon says, without anyone having to remember to
 #: register it. Handing a container a secret is what enrols it.
-SECRET_NAME_RE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|APIKEY|_KEY\b", re.I)
+#: `ACCESS_KEY` was added with #269: `AWS_ACCESS_KEY_ID` matches none of the
+#: others - `_KEY\b` fails because `_ID` follows - so an AWS key id reached a
+#: container log unredacted while its secret half was covered.
+SECRET_NAME_RE = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|APIKEY|ACCESS_KEY|_KEY\b", re.I
+)
 
 #: Shapes that are secrets regardless of whether this process was told about
 #: them. A worker can print a token it minted itself, or one that arrived in a
@@ -165,6 +170,17 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # when a push to an authenticated remote fails, and the one #28's clone URL
     # would take if it ever carried credentials.
     re.compile(r"(?<=://)[^\s/:@]+:[^\s/@]+(?=@)"),
+    # Model-provider credentials (#269). Shape-based for the same reason the
+    # GitHub prefixes are: a worker can print one that arrived in a file or was
+    # minted inside the container, and the literal list would not know it.
+    #
+    # AWS publishes these prefixes: AKIA is a long-lived IAM user key and ASIA
+    # a temporary session one. Both are redacted - `security.py` refuses the
+    # first, and a refusal that still printed the credential in its own error
+    # would be the joke version of this control.
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    # OpenAI's key prefixes, including the project- and service-scoped forms.
+    re.compile(r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}"),
 )
 
 #: Logs are captured whole and then bounded. A runaway `while true: print()`
