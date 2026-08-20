@@ -45,6 +45,7 @@ from swarm.containers.manager import (
     ContainerError,
     ContainerManager,
     ContainerTimeout,
+    CREATE_TIMEOUT_S,
     DockerCLI,
     DockerError,
     Handle,
@@ -274,6 +275,49 @@ def test_a_worker_container_is_created_with_explicit_resource_limits():
     assert runner.flag("create", "--memory") == "2g"
     assert runner.flag("create", "--pids-limit") == "256"
     assert "--init" in runner.argv_for("create")
+
+
+def test_a_missing_worker_image_is_never_allowed_to_become_a_registry_pull():
+    """#288: without `--pull=never`, `docker create` does not fail on a missing
+    local image - it falls back to pulling one. apiary's worker images are built
+    on the host and published nowhere, so that pull leaves for Docker Hub, hangs
+    behind the egress proxy and never returns, taking the orchestrator with it.
+
+    The flag turns that hang back into an immediate, local, matchable error."""
+    manager, runner = make_manager()
+
+    spawned(manager)
+
+    assert "--pull=never" in runner.argv_for("create")
+
+
+def test_the_create_that_hung_the_orchestrator_now_has_a_ceiling():
+    """Defence in depth for the same bug: `--pull=never` removes the network
+    from `create`, and this removes "wait forever" from a daemon that has simply
+    stopped answering. A blocked orchestrator produces no event and no error,
+    which is why the hang cost two hours before anyone saw it."""
+    runner = ScriptedRunner(
+        replies={"create": subprocess.TimeoutExpired(["docker", "create"], CREATE_TIMEOUT_S)}
+    )
+    manager, _ = make_manager(runner=runner)
+
+    with pytest.raises(ContainerTimeout):
+        spawned(manager)
+
+    assert runner.calls[0][1] == "create"
+
+
+def test_the_error_pull_never_actually_produces_is_the_one_the_hint_matches():
+    """The point of #288 is that `missing_image` was unreachable: the error it
+    matches never arrived, because the failure became a pull instead. Pin the
+    daemon's real wording for `--pull=never` against the matcher, so the handler
+    cannot go unreachable a second time by drifting away from it."""
+    absent = DockerError(
+        ["docker", "create"], 125, "Error response from daemon: No such image: apiary-worker:latest"
+    )
+
+    assert missing_image(absent)
+    assert build_hint("apiary-worker:latest") == "docker build -f Dockerfile.worker -t apiary-worker:latest ."
 
 
 def test_the_worker_gets_the_three_arguments_its_image_documents():
