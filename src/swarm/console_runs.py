@@ -112,6 +112,15 @@ _CYCLE_LINE = re.compile(r"\bcycle (\d+):")
 #: a model's prose ("not the objective met by this task"), which latched a met
 #: verdict onto runs that had none.
 _MET_LINE = re.compile(r"^\s*»\s*objective met\b")
+
+#: What a paid run has spent so far (#270). Parsed out of the log rather than
+#: read from a file, because that is how every other fact on the run strip
+#: arrives: the run is a child process and its stdout is the channel. The `+`
+#: after the dollar amount means a model with no known price contributed
+#: tokens, so the figure is a floor - it is carried through to the page rather
+#: than rounded away, for the same reason #268 refused to record a zero that
+#: meant "not reported".
+_SPEND_LINE = re.compile(r"^\s*»\s*spend:\s*\$([0-9.]+)(\+?)\s*·\s*([0-9,]+) tokens")
 #: `_report_outcome`'s verdict when the ledger did not decide the run - which
 #: is the cap, and is *also* a plan that simply ran out with the goal gate
 #: switched off. One line in `cli.py`, two different things to an operator.
@@ -384,6 +393,10 @@ class RunJob:
         # when it stopped. Named for the question rather than for one of its
         # two answers; `_no_verdict` reads the count to pick between them.
         "no_verdict": False, "live_at_end": 0,
+        # Empty on a local run, which spends nothing and prints no spend line.
+        # `floor` says the dollar figure is a lower bound because some model
+        # had no known price.
+        "spend": None,
         # Empty while the run lives, and one of `met`/`capped`/`exhausted`/
         # `stopped`/`failed`/`done` after. `state` alone cannot answer this:
         # a run that met its objective and one that ran out of cycles both end
@@ -430,6 +443,12 @@ class RunJob:
             p["note"] = stripped.lstrip("»! ").strip()
         if _MET_LINE.search(line):
             p["met"] = True
+        if m := _SPEND_LINE.search(line):
+            # Replaced rather than accumulated: the run prints a running total,
+            # so the newest line *is* the answer and adding them would report
+            # several times what was spent.
+            p["spend"] = {"usd": float(m.group(1)), "floor": m.group(2) == "+",
+                          "tokens": int(m.group(3).replace(",", ""))}
         if capped := _CAPPED_LINE.search(line):
             p["no_verdict"] = True
             p["live_at_end"] = int(capped.group(1))

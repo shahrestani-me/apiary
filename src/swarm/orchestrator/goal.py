@@ -128,6 +128,14 @@ EMPTY = "the ledger is empty; there is nothing to assess an objective against"
 IN_FLIGHT = "work is still in flight; the objective is not assessed mid-run"
 FAILED = "a task was abandoned; a human decides what happens before more is planned"
 EXHAUSTED = "the follow-up budget is spent"
+
+#: #270's halt, and it is deliberately in the same shape and the same place as
+#: `EXHAUSTED`. A run that stopped because it ran out of money must read like a
+#: run that stopped because it ran out of rounds - a first-class outcome an
+#: operator can read, rather than a crash or a silent stop. The sentence itself
+#: comes from the ledger, which is the only thing that knows *which* ceiling
+#: bound and by how much.
+HALTED = "the spend ceiling was reached"
 NO_TASKS = "the follow-up plan normalised to no writable task"
 MET = "the objective is met"
 
@@ -518,6 +526,19 @@ def _retire_superseded(
     return tuple(actions)
 
 
+def _spend_exceeded() -> str | None:
+    """The ledger's verdict, or `None` when nothing paid has been spent.
+
+    Imported lazily and asked rather than injected: a fully local run never
+    constructs a ledger, so `ledger()` answers `None` and this costs one
+    attribute lookup per round.
+    """
+    from ..spend import ledger  # noqa: PLC0415 - lazy; a local run has no ledger
+
+    accrued = ledger()
+    return None if accrued is None else accrued.exceeded()
+
+
 def close_the_loop(
     client: Any,
     ledger: Ledger,
@@ -640,6 +661,13 @@ def close_the_loop(
         return GoalReport(assessment, reason=assessment.reason, rounds=rounds)
     if rounds >= max(int(max_rounds), 0):
         return GoalReport(assessment, reason=f"{EXHAUSTED} after {rounds} round(s)", rounds=rounds)
+
+    # Checked here, beside the round cap, because this is the point at which the
+    # loop decides to spend *more* - and a ceiling that fired anywhere else
+    # would either abandon work already paid for or let one more full round run
+    # after the limit. A local run has no ledger and reaches none of this.
+    if (spent := _spend_exceeded()) is not None:
+        return GoalReport(assessment, reason=spent, rounds=rounds)
 
     try:
         # Best-effort by `repository_files`'s contract: a follow-up whose tree

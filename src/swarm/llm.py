@@ -54,6 +54,7 @@ import os
 from dataclasses import dataclass, replace
 from typing import Any, Callable, TypeVar
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel
 
@@ -241,9 +242,51 @@ def _callbacks(role: str, model: str, provider: str = "") -> list | None:
     every existing test double still bypasses capture without noticing it.
     """
     from .capture import handler_for  # noqa: PLC0415 - deliberately lazy, see above
+    from .spend import accounts  # noqa: PLC0415 - lazy, and only paid
 
-    handler = handler_for(role=role, model=model, provider=provider)
-    return [handler] if handler is not None else None
+    handlers = [
+        handler_for(role=role, model=model, provider=provider),
+        # #270. Attached on the *provider* rather than on a flag: capture
+        # records token counts too, but it is off unless `APIARY_CAPTURE` is
+        # set, and a spend ceiling that only worked while an operator was
+        # debugging would not be a ceiling. Nothing at all for Ollama, which is
+        # what makes "a fully local run is unaffected" true rather than
+        # aspirational.
+        _Accountant(provider=provider, label=f"{provider}:{model}")
+        if accounts(provider) else None,
+    ]
+    attached = [handler for handler in handlers if handler is not None]
+    return attached or None
+
+
+class _Accountant(BaseCallbackHandler):
+    """Hands one call's billed tokens to `spend.record` (#270).
+
+    It lives here rather than in `spend.py` because `BaseCallbackHandler` is a
+    LangChain type and ADR 0003 keeps the framework's reach countable at four
+    modules. `tests/test_framework_boundary.py` is what says so, and it caught
+    this class the first time it was written in the wrong file - which is the
+    entire point of that test existing.
+
+    A real subclass, for the same reason `capture._CaptureHandler` is one:
+    every client class in `PROVIDERS` is a pydantic model validating
+    `callbacks` as `list[BaseCallbackHandler]`, so a duck-typed object with the
+    right method is refused at construction rather than quietly not counting.
+    """
+
+    def __init__(self, *, provider: str, label: str) -> None:
+        self.provider = provider
+        self.label = label
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+        from .spend import record  # noqa: PLC0415 - lazy, like everything else here
+
+        usage: Any = {}
+        for batch in getattr(response, "generations", None) or ():
+            for generation in batch if isinstance(batch, (list, tuple)) else [batch]:
+                message = getattr(generation, "message", None)
+                usage = getattr(message, "usage_metadata", None) or {}
+        record(self.provider, self.label, usage)
 
 
 def _missing(extra: str, package: str, exc: BaseException) -> ConfigError:

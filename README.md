@@ -95,7 +95,10 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 | `SWARM_WORKER_MODEL` | `gemma4:26b` | Writes the code. MoE — buy throughput. Same spelling rules. |
 | `SWARM_ORCHESTRATOR_MODEL_OPTIONS` | — | Provider-specific settings for the role above, `name=value` comma separated — e.g. `region=eu-west-1,profile=acme`. An option the provider does not declare is refused by name. |
 | `SWARM_WORKER_MODEL_OPTIONS` | — | The same, for the worker. Passed through to worker containers alongside `SWARM_WORKER_MODEL`, so a container lands on the provider *and* the endpoint the host chose. |
-| `SWARM_MAX_PARALLEL` | `2` | Concurrent workers. Memory scales with this. |
+| `SWARM_MAX_PARALLEL` | `2` | Concurrent workers. Memory scales with this — and on a remote worker it is the *only* bound that holds, since Ollama's own limits describe a server the run is not calling. |
+| `SWARM_SPEND_CEILING_USD` | `5.00` | Halts a run that has spent this much. Only paid providers accrue; a fully local run never constructs a ledger. `0` means no limit. |
+| `SWARM_SPEND_CEILING_TOKENS` | `5000000` | The other ceiling, and the one that binds when a model has no known price — a ceiling you cannot compute is not a ceiling. |
+| `SWARM_MODEL_PRICES` | — | `provider:model=IN/OUT` in USD per million tokens, comma separated. Vendors change rates; this is where you state today's. |
 | `SWARM_MAX_ROUNDS` | `8` | Hard stop. |
 | `SWARM_MAX_STALLS` | `2` | No-progress rounds before **replanning** instead of retrying. |
 | `SWARM_MAX_ATTEMPTS` | `3` | Per-task retries before abandoning. |
