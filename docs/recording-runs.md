@@ -130,6 +130,31 @@ Leave the state-source variable **unset**:
 window it switched. The recorder it did not switch is unconditional, so there is
 nothing left to leave unset: every run records.
 
+**One you probably do want to set, because ten runs is a batch and the default
+is tuned for an audience.** The loop is a poller, and `APIARY_CYCLE_INTERVAL` is
+how stale it is willing to be between reads:
+
+| | default | what setting it would do |
+|---|---|---|
+| `APIARY_CYCLE_INTERVAL` | `15` | seconds between cycle *starts*; `5` is a reasonable batch value |
+
+Measured on a corpus run of 120 cycles: **29 of its 47 minutes were spent asleep
+in this interval**, against 9 minutes of genuine waiting on a worker or on CI.
+At `5` the same run is roughly half the wall clock.
+
+What you are trading is freshness for throughput, and it is worth being precise
+about what it does *not* trade. The number of API calls a run makes is
+unchanged — the same reads, compressed into less wall clock — so the rate at
+which a run spends its rate limit goes up by the same factor the interval comes
+down. A fine-grained PAT gets 5,000 requests/hour and a cycle makes a handful,
+so `5` is comfortable for one run at a time and is not a licence to run four
+concurrently.
+
+**It does not affect the measurement.** §2's gate compares derived state against
+the labels within each cycle, and that comparison is identical whether cycles
+arrive every 5s or every 15s. The interval changes how many cycles a run gets
+through, not what any one of them says.
+
 Then the images, and a read-only preflight:
 
 ```bash

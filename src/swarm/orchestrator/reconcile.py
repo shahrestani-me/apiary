@@ -171,6 +171,56 @@ FAILED = "swarm:failed"
 #: `config.py` is outside #22's file set, and the number belongs to this loop.
 DEFAULT_INTERVAL_S = 15.0
 
+#: The override, and why the default above is not simply the answer. 15s suits a
+#: human watching one long-running swarm: the loop is a poller, so the interval
+#: is how stale the orchestrator is willing to be about a world it cannot be
+#: called back by. It is the wrong number for a batch - recording the runs
+#: `docs/recording-runs.md` asks for measured **62% of a run's wall clock spent
+#: in this sleep** (120 cycles x 15s = 30 of 47 minutes), against 9 minutes of
+#: genuine waiting on a worker or on CI.
+#:
+#: Exposed rather than retuned, because both numbers are right for their case
+#: and neither is right for both. What the operator is trading is freshness for
+#: throughput: the *count* of API calls a run makes is unchanged, so a shorter
+#: interval compresses the same requests into less wall clock and spends rate
+#: limit faster. `interval_s` was always a constructor argument; it simply had
+#: no caller that could reach it from outside the process.
+INTERVAL_ENV = "APIARY_CYCLE_INTERVAL"
+
+#: Below this a cycle spends more time issuing requests than waiting between
+#: them, which is not a faster run - it is the same run plus rate-limit
+#: pressure. A floor rather than a clamp: an operator who typed `0.1` meant
+#: something, and silently giving them `1.0` is how a setting stops meaning
+#: what it says.
+MIN_INTERVAL_S = 1.0
+
+
+def cycle_interval(env: Mapping[str, str] | None = None) -> float:
+    """The pacing floor for this process. **Loud on garbage.**
+
+    `authority.state_source`'s rule and `dispatcher._env_int`'s: a variable that
+    decides how the loop behaves must not read a typo as its default. An
+    operator who exported `APIARY_CYCLE_INTERVAL=5s` to make a batch finish
+    before morning has to find out now, not from a run that took exactly as long
+    as it would have anyway.
+    """
+    raw = (env if env is not None else os.environ).get(INTERVAL_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_INTERVAL_S
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{INTERVAL_ENV}={raw!r} is not a number of seconds"
+        ) from None
+    if value < MIN_INTERVAL_S:
+        raise ValueError(
+            f"{INTERVAL_ENV}={raw!r} is below the {MIN_INTERVAL_S}s floor; a "
+            f"cycle issues several requests and a shorter interval buys "
+            f"rate-limit pressure rather than a faster run"
+        )
+    return value
+
 #: The method names this module probes for on the client. Named constants
 #: because the probe and the "here is what is missing" message must not drift,
 #: and because grepping for either name should find this line.
@@ -1895,7 +1945,7 @@ class Reconciler:
     #: which disables §4's retry rows entirely, so a real run must pass it.
     artifacts: str | Path | None = None
     capacity: Capacity | None = None
-    interval_s: float = DEFAULT_INTERVAL_S
+    interval_s: float = field(default_factory=cycle_interval)
     max_attempts: int = SETTINGS.max_attempts_per_task
     #: The hard ceiling across every failure mode. `max_attempts` bounds one
     #: blocker and renews when the failure changes; this bounds the task, so a
