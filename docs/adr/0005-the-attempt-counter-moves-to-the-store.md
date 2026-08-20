@@ -259,10 +259,24 @@ pins it: no module under `orchestrator/` may call `list_branches`. A count in
 - **Staleness detection is gone.** `ledger._judged`'s third case arbitrated a
   disagreement between two authorities; one authority cannot disagree with
   itself. That was also the only cross-check between the two stores.
-- **The human reset gesture has no home yet.** Decision 4 says it "moves rather
-  than being lost". It has not moved — the counter is in SQLite and nothing
-  exposes it. Until something does, the affordance ADR 0002 quotes is *lost*,
-  not moved, and #153 must not describe it as though it works.
+- **The human reset gesture moved, and `swarm reset` is where it moved to.**
+  Decision 4 required this and it would otherwise have been the one part of the
+  ADR that quietly did not happen: the counter would be in a SQLite file with
+  nothing to reach it, and a capped task would be capped forever.
+
+  It takes the ref **verbatim** - `#12` on GitHub, `ENG-123` on Linear - rather
+  than an issue number. The first draft parsed a number and minted the ref
+  through `github.refs`, which baked the GitHub adapter into a command that has
+  no business knowing which tracker is configured. `test_framework_boundary.py`
+  caught it: a subcommand reaching `swarm.github` composes the tracker
+  capability, and this one composes none. The guard #160 built for ADR 0003
+  turned out to catch an ADR 0001 violation, which is worth recording as
+  evidence that the classification is doing real work.
+
+  It writes a row rather than deleting one, and that is load-bearing in a way
+  worth stating: `seed_attempt_floor` seeds only tasks the store has never
+  judged, so a deleted row would be refilled from the branch listing at the next
+  startup - putting the task straight back under the cap the human just lifted.
 
 ### On the evidence sequencing
 

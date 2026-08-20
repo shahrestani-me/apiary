@@ -784,7 +784,15 @@ def test_every_subcommand_still_parses():
     parser = cli.build_parser()
     actions = [a for a in parser._actions if a.dest == "command"]
 
-    assert set(actions[0].choices) == {"run", "doctor", "runs", "show", "console", "local"}
+    assert set(actions[0].choices) == {
+        "run",
+        "doctor",
+        "runs",
+        "show",
+        "reset",
+        "console",
+        "local",
+    }
 
 
 def test_a_claimed_row_offers_a_watch_control_and_the_strip_carries_the_log():

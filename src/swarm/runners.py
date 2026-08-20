@@ -235,6 +235,15 @@ class NotARunner:
 #: The subcommands that read or check rather than execute.
 NOT_RUNNERS: tuple[NotARunner, ...] = (
     NotARunner(
+        command="reset",
+        entrypoint="swarm.cli:_reset",
+        why=(
+            "one write to apiary's own task store; it dispatches nothing. The "
+            "gesture ADR 0002 quotes - a human giving a stuck task another go - "
+            "which ADR 0005 moved out of the issue marker and into the store"
+        ),
+    ),
+    NotARunner(
         command="doctor",
         entrypoint="swarm.cli:_doctor",
         why="a read-only preflight; it checks preconditions and runs nothing",

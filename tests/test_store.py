@@ -731,3 +731,149 @@ def test_a_seeded_floor_is_what_the_ledger_then_reads_as_the_counter():
         ledger = load_ledger(client, adopt=False, store=store)
 
     assert ledger.entries["task-4"].attempt == 3
+
+
+# --------------------------------------------------------------------------
+# `swarm reset` - the gesture the issue marker used to be (ADR 0005 decision 4)
+# --------------------------------------------------------------------------
+
+
+def reset(*argv: str) -> int:
+    import swarm.cli as cli
+
+    return cli.main(["reset", *argv])
+
+
+def test_reset_gives_a_capped_task_its_budget_back():
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(
+            TaskJudgement(ref=ref(4), attempt=3, blocker="ab12cd34ef", streak=3, renewals=2)
+        )
+
+    assert reset(str(ref(4)), "--repo", REPO, "--yes") == 0
+
+    with SqliteTaskStore.open(REPO) as store:
+        held = store.read()[ref(4)]
+    assert (held.attempt, held.blocker, held.streak) == (0, "", None)
+
+
+def test_reset_keeps_the_renewal_count():
+    """A history of the task, not a claim about one attempt - and nothing
+    branches on it, so keeping it costs nothing and losing it costs the one
+    number a human reading a capped task actually wants."""
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3, renewals=4))
+
+    reset(str(ref(4)), "--repo", REPO, "--yes")
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].renewals == 4
+
+
+def test_a_reset_survives_the_next_runs_floor_seeding():
+    """The reason a reset writes a row rather than deleting one.
+
+    `seed_attempt_floor` seeds only tasks the store has never judged, so a
+    deleted row would be refilled from the branch listing at the next startup -
+    putting the task straight back under the cap the human just lifted. The row
+    is what makes the reset stick.
+    """
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    reset(str(ref(4)), "--repo", REPO, "--yes")
+
+    with SqliteTaskStore.open(REPO) as store:
+        seeded = seed_attempt_floor(store, [task_branch(ref(4), 3)])
+        held = store.read()[ref(4)]
+
+    assert seeded == ()
+    assert held.attempt == 0
+
+
+def test_reset_writes_nothing_when_the_task_has_no_judgment():
+    """Already a full budget, so there is nothing to give back - and a row
+    written here would shadow the marker for no reason."""
+    assert reset(str(ref(4)), "--repo", REPO, "--yes") == 0
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read() == {}
+
+
+def test_reset_declined_at_the_prompt_writes_nothing(monkeypatch):
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    assert reset(str(ref(4)), "--repo", REPO) == 1
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 3
+
+
+def test_reset_with_no_answer_available_declines(monkeypatch):
+    """A pipe or a CI job. "Nobody is there" reads as no; `--yes` is how an
+    unattended caller says yes deliberately."""
+    def no_terminal(_prompt):
+        raise EOFError
+
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    monkeypatch.setattr("builtins.input", no_terminal)
+    assert reset(str(ref(4)), "--repo", REPO) == 1
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 3
+
+
+def test_reset_can_write_a_counter_other_than_zero():
+    """A human who knows two of the three attempts were the broken environment
+    and one was a real failure."""
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    reset(str(ref(4)), "--repo", REPO, "--attempt", "1", "--yes")
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 1
+
+
+def test_reset_takes_the_ref_verbatim_so_a_non_github_tracker_works():
+    """No format is invented here (`_reset`). The store's keys are refs in the
+    tracker's own spelling, and Linear's are `ENG-123` rather than numbers - a
+    command that parsed an issue number would be the GitHub adapter leaking into
+    a place epic #140 is removing it from."""
+    linear = TaskRef("ENG-123")
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=linear, attempt=3, blocker="ab", streak=3))
+
+    assert reset("ENG-123", "--repo", REPO, "--yes") == 0
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[linear].attempt == 0
+
+
+def test_reset_names_what_the_store_holds_when_the_ref_does_not_match():
+    """"Nothing to reset" and "you typed the wrong spelling" look identical
+    otherwise, and the second is the likely one against a tracker whose refs are
+    not numbers."""
+    with SqliteTaskStore.open(REPO) as store:
+        store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab", streak=3))
+
+    assert reset("ENG-999", "--repo", REPO, "--yes") == 0
+
+    with SqliteTaskStore.open(REPO) as store:
+        assert store.read()[ref(4)].attempt == 3
+
+
+@pytest.mark.parametrize("bad", ["", "  "])
+def test_reset_refuses_an_empty_ref(bad):
+    with pytest.raises(SystemExit) as exc:
+        reset(bad, "--repo", REPO, "--yes")
+    assert exc.value.code == 2
+
+
+def test_reset_refuses_a_negative_counter():
+    with pytest.raises(SystemExit) as exc:
+        reset(str(ref(4)), "--repo", REPO, "--attempt", "-1", "--yes")
+    assert exc.value.code == 2
