@@ -44,8 +44,14 @@ prefix is what opts in:
 
 ```bash
 export SWARM_WORKER_MODEL="bedrock:eu.anthropic.claude-haiku-4-5-20251001-v1:0"
-export SWARM_WORKER_MODEL_OPTIONS="profile=preprod,region=eu-west-1"
+export SWARM_WORKER_MODEL_OPTIONS="profile=<aws-profile>,region=<aws-region>"
 ```
+
+`<aws-profile>` is a profile in your own `~/.aws/config`, and `<aws-region>` a
+region that serves the model you named. Neither has a default worth guessing at,
+which is why they are placeholders throughout this document rather than an
+example you could paste — a region that silently pointed somewhere else in the
+world is the failure mode `ModelSpec`'s declared options exist to prevent.
 
 `SWARM_ORCHESTRATOR_MODEL` / `SWARM_ORCHESTRATOR_MODEL_OPTIONS` are the same
 shape, and the two roles are resolved independently — they need not be the same
@@ -84,7 +90,7 @@ Run doctor first; it is much cheaper than a failed replay.
 A real failure, for reference — the endpoint is fine and the *model* is not:
 
 ```
-ok    model.reachable   bedrock reachable as aws profile 'preprod' in eu-west-1
+ok    model.reachable   bedrock reachable as aws profile '<aws-profile>' in <aws-region>
 FAIL  model.schema      AccessDeniedException: Model access is denied due to IAM
                         user or service role is not authorized to perform the
                         required AWS Marketplace actions
@@ -119,7 +125,7 @@ The override is two fields:
 | field | value |
 |---|---|
 | model | `bedrock:eu.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| options | `profile=preprod,region=eu-west-1` |
+| options | `profile=<aws-profile>,region=<aws-region>` |
 
 Only `propose_edits` and `choose_stack` accept an override. The other sites build
 their models several layers down, and the console refuses rather than accepting a
