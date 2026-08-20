@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-10-20260820-060518-m2epcy",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "conflict-detection",
+  "repo": "shahrestani-me/apiary-corpus-10",
+  "branch": "apiary/%231-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "router/conflicts.py",
+    "tests/test_conflicts.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T06:08:40.256277+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

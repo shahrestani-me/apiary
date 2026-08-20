@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-01-20260819-230751-p96im6",
+  "issue": 2,
+  "attempt": 0,
+  "task_id": "calculate-column-stats",
+  "repo": "shahrestani-me/apiary-corpus-01",
+  "branch": "apiary/%232-attempt-0",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -f README.md",
+  "verify_output": "",
+  "written": [
+    "stats.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": "570cd1fcf986bc8b41711a1a247d5613a5d19904",
+  "started_at": null,
+  "finished_at": "2026-08-19T23:13:47.736844+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

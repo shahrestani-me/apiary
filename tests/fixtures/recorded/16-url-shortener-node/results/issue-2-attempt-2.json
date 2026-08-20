@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-11-20260820-073625-oyrm2j",
+  "issue": 2,
+  "attempt": 2,
+  "task_id": "base62-codec",
+  "repo": "shahrestani-me/apiary-corpus-11",
+  "branch": "swarm/issue-2",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: base62 encoding and decoding\n    # Subtest: encodes 0 correctly\n    ok 1 - encodes 0 correctly\n      ---\n      duration_ms: 0.430208\n      type: 'test'\n      ...\n    # Subtest: encodes small integers correctly\n    ok 2 - encodes small integers correctly\n      ---\n      duration_ms: 0.107792\n      type: 'test'\n      ...\n    # Subtest: round-trip for various values\n    ok 3 - round-trip for various values\n      ---\n      duration_ms: 0.511917\n      type: 'test'\n      ...\n    # Subtest: throws error for negative values\n    ok 4 - throws error for negative values\n      ---\n      duration_ms: 0.271625\n      type: 'test'\n      ...\n    # Subtest: throws error for invalid characters in decode\n    ok 5 - throws error for invalid characters in decode\n      ---\n      duration_ms: 0.092125\n      type: 'test'\n      ...\n    # Subtest: throws error for non-string input in decode\n    ok 6 - throws error for non-string input in decode\n      ---\n      duration_ms: 0.07475\n      type: 'test'\n      ...\n    1..6\nok 1 - base62 encoding and decoding\n  ---\n  duration_ms: 2.155542\n  type: 'test'\n  ...\n1..1\n# tests 7\n# suites 0\n# pass 7\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 33.546584",
+  "written": [
+    "lib/base62.js",
+    "test/base62.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "2a6cfcb1da5d3eb8f260e0a42c36edf741ab2931",
+  "started_at": null,
+  "finished_at": "2026-08-20T07:46:33.961883+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

@@ -1,0 +1,1268 @@
+{
+  "schema": 1,
+  "origin": "recorded",
+  "describes": "a dependency-ordered task scheduler",
+  "exercises": [],
+  "expected_divergences": [
+    {
+      "cycle": 0,
+      "task": "retry-policy",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 3,
+      "task": "retry-policy",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 10,
+      "task": "retry-policy",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 15,
+      "task": "task-definition",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 17,
+      "task": "task-definition",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 21,
+      "task": "task-definition",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 33,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "eligible",
+      "why": "revived: the cycle a revival was granted on. `planner.revive` resets nothing, so the resolver re-reads the spent budget while the control plane carries the granted retry. ADR 0001's third non-derivable state."
+    },
+    {
+      "cycle": 33,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "eligible",
+      "why": "revived: the cycle a revival was granted on. `planner.revive` resets nothing, so the resolver re-reads the spent budget while the control plane carries the granted retry. ADR 0001's third non-derivable state."
+    },
+    {
+      "cycle": 34,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 34,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "eligible",
+      "why": "revived: the cycle a revival was granted on. `planner.revive` resets nothing, so the resolver re-reads the spent budget while the control plane carries the granted retry. ADR 0001's third non-derivable state."
+    },
+    {
+      "cycle": 35,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 35,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 36,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 36,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 37,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 37,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 38,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 38,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 39,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 39,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 40,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 40,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 41,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 41,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 42,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 42,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 43,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 43,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 44,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 44,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 45,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 45,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 46,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 46,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 47,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 47,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 48,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 48,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 49,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 49,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 50,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 50,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 51,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 51,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 52,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 52,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 53,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 53,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 54,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 54,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 55,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 55,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 56,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 56,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 57,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 57,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 58,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 58,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 59,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 59,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 60,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 60,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 61,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 61,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 62,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 62,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 63,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 63,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 64,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 64,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 65,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 65,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 66,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 66,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 67,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 67,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 68,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 68,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 69,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 69,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 70,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 70,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 71,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 71,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 72,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 72,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 73,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 73,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 74,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 74,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 75,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 75,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 76,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 76,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 77,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 77,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 78,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 78,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 79,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 79,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 80,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 80,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 81,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 81,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 82,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 82,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 83,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 83,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 84,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 84,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 85,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 85,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 86,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 86,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 87,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 87,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 88,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 88,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 89,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 89,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 90,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 90,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 91,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 91,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 92,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 92,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 93,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 93,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 94,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 94,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 95,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 95,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 96,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 96,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 97,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 97,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 98,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 98,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 99,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 99,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 100,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 100,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 101,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 101,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 102,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 102,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 103,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 103,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 104,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 104,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 105,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 105,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 106,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 106,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 107,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 107,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 108,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 108,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 109,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 109,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 110,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 110,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 111,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 111,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 112,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 112,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 113,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 113,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 114,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 114,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 115,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 115,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 116,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 116,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 117,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 117,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 118,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 118,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 119,
+      "task": "retry-policy",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 119,
+      "task": "task-definition",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    }
+  ]
+}

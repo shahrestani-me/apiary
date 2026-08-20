@@ -1,0 +1,1030 @@
+{
+  "schema": 1,
+  "origin": "recorded",
+  "describes": "a Node schema validator; exercises exhausted budgets",
+  "exercises": [],
+  "expected_divergences": [
+    {
+      "cycle": 0,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 7,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 8,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 15,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 16,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 28,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 29,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 29,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 30,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 31,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 32,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 33,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 34,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 35,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 35,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 36,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 36,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 37,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 38,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 39,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 40,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 41,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 42,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 43,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 43,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 44,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 44,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 45,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 46,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 47,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 48,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 49,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 50,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 51,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 52,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 53,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 53,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 54,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 54,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 55,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 55,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 56,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 56,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 57,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 57,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 58,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 58,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 59,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 59,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 60,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 60,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 61,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 61,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 62,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 62,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 63,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 63,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 64,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 64,
+      "task": "constraints",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 65,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 65,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 66,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 66,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 67,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 68,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 69,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 70,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 71,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 72,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 73,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 74,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 75,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 75,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 76,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 76,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 77,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 78,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 79,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 80,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 81,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 81,
+      "task": "constraints",
+      "derived": "claimed",
+      "control": "review",
+      "why": "the worker's container outlived the pull request being opened, so the resolver read the running container while the control plane had moved on."
+    },
+    {
+      "cycle": 82,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 82,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 83,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 83,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 83,
+      "task": "types",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 84,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 84,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 85,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 85,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 86,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 86,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 87,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 87,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 88,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 88,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 89,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 89,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 90,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 90,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 90,
+      "task": "types",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 91,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 91,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 91,
+      "task": "types",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 92,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 92,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 93,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 93,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 94,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 94,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 95,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 95,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 96,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 96,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 97,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 97,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 97,
+      "task": "types",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 98,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 98,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 98,
+      "task": "types",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 99,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 99,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 100,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 100,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 101,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 101,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 102,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 102,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 103,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 103,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 104,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 104,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 105,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 105,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 105,
+      "task": "types",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 106,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 106,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 106,
+      "task": "types",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 107,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 107,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 107,
+      "task": "types",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 109,
+      "task": "coercion",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 117,
+      "task": "coercion",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 117,
+      "task": "constraints",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 118,
+      "task": "coercion",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    },
+    {
+      "cycle": 119,
+      "task": "coercion",
+      "derived": "needs-human",
+      "control": "claimed",
+      "why": "budget-renewed: the resolver's arithmetic over code-host evidence says the cap is reached, but apiary's own store had renewed the per-blocker budget, so the task was legitimately re-dispatched. ADR 0001's second non-derivable state; the resolver's verdict is advisory here by design."
+    }
+  ]
+}

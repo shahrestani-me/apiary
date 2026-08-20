@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-08-20260820-032118-qx8dab",
+  "issue": 1,
+  "attempt": 3,
+  "task_id": "coercion",
+  "repo": "shahrestani-me/apiary-corpus-08",
+  "branch": "swarm/issue-1",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: coerce\n    # Subtest: returns original value if type is not number\n    ok 1 - returns original value if type is not number\n      ---\n      duration_ms: 0.402167\n      type: 'test'\n      ...\n    # Subtest: converts numeric string to number when type is number\n    not ok 2 - converts numeric string to number when type is number\n      ---\n      duration_ms: 0.102125\n      type: 'test'\n      location: '/workspace/issue-1/test/coercion.test.js:12:5'\n      failureType: 'cancelledByParent'\n      error: 'test did not finish before its parent and was cancelled'\n      code: 'ERR_TEST_FAILURE'\n      ...\n    # Subtest: does not convert non-numeric string to number when type is number\n    not ok 3 - does not convert non-numeric string to number when type is number\n      ---\n      duration_ms: 0\n      type: 'test'\n      location: '/workspace/issue-1/test/coercion.test.js:19:5'\n      failureType: 'cancelledByParent'\n      error: 'test did not finish before its parent and was cancelled'\n      code: 'ERR_TEST_FAILURE'\n      ...\n    # Subtest: does not convert non-string values to number when type is number\n    not ok 4 - does not convert non-string values to number when type is number\n      ---\n      duration_ms: 0\n      type: 'test'\n      location: '/workspace/issue-1/test/coercion.test.js:26:5'\n      failureType: 'cancelledByParent'\n      error: 'test did not finish before its parent and was cancelled'\n      code: 'ERR_TEST_FAILURE'\n      ...\n    1..4\nnot ok 1 - coerce\n  ---\n  duration_ms: 0.966834\n  type: 'test'\n  location: '/workspace/issue-1/test/coercion.test.js:5:1'\n  failureType: 'subtestsFailed'\n  error: '3 subtests failed'\n  code: 'ERR_TEST_FAILURE'\n  ...\n1..1\n# tests 5\n# suites 0\n# pass 1\n# fail 1\n# cancelled 3\n# skipped 0\n# todo 0\n# duration_ms 37.090333",
+  "written": [
+    "src/coercion.js",
+    "test/coercion.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T03:58:53.462646+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

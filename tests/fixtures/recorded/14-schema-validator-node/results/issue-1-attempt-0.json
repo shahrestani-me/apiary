@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-08-20260820-032118-qx8dab",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "coercion",
+  "repo": "shahrestani-me/apiary-corpus-08",
+  "branch": "swarm/issue-1",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: coerce\n    # Subtest: coerces numeric strings to numbers\n    ok 1 - coerces numeric strings to numbers\n      ---\n      duration_ms: 0.625708\n      type: 'test'\n      ...\n    # Subtest: does not coerce non-numeric strings to numbers\n    ok 2 - does not coerce non-numeric strings to numbers\n      ---\n      duration_ms: 0.099916\n      type: 'test'\n      ...\n    # Subtest: does not coerce when type is not number\n    ok 3 - does not coerce when type is not number\n      ---\n      duration_ms: 0.051958\n      type: 'test'\n      ...\n    # Subtest: does not coerce non-string values\n    ok 4 - does not coerce non-string values\n      ---\n      duration_ms: 0.0555\n      type: 'test'\n      ...\n    1..4\nok 1 - coerce\n  ---\n  duration_ms: 1.866292\n  type: 'test'\n  ...\n1..1\n# tests 5\n# suites 0\n# pass 5\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 70.874",
+  "written": [
+    "src/coercion.js",
+    "test/coercion.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "a317350edc5c85552da84afb7e04bea3d1dbf5d9",
+  "started_at": null,
+  "finished_at": "2026-08-20T03:23:04.128440+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

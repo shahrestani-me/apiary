@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-11-20260820-073625-oyrm2j",
+  "issue": 2,
+  "attempt": 1,
+  "task_id": "base62-codec",
+  "repo": "shahrestani-me/apiary-corpus-11",
+  "branch": "swarm/issue-2",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# /workspace/issue-2/lib/base62.js:20\n#     n = n / 6LTn;\n#             ^\n# SyntaxError: Invalid or unexpected token\n#     at wrapSafe (node:internal/modules/cjs/loader:1713:18)\n#     at Module._compile (node:internal/modules/cjs/loader:1755:20)\n#     at Object..js (node:internal/modules/cjs/loader:1913:10)\n#     at Module.load (node:internal/modules/cjs/loader:1505:32)\n#     at Function._load (node:internal/modules/cjs/loader:1309:12)\n#     at wrapModuleLoad (node:internal/modules/cjs/loader:254:19)\n#     at Module.require (node:internal/modules/cjs/loader:1527:12)\n#     at require (node:internal/modules/helpers:147:16)\n#     at Object.<anonymous> (/workspace/issue-2/test/base62.test.js:3:28)\n#     at Module._compile (node:internal/modules/cjs/loader:1781:14)\n# Node.js v22.23.2\n# Subtest: test/base62.test.js\nnot ok 1 - test/base62.test.js\n  ---\n  duration_ms: 25.626625\n  type: 'test'\n  location: '/workspace/issue-2/test/base62.test.js:1:1'\n  failureType: 'testCodeFailure'\n  exitCode: 1\n  signal: ~\n  error: 'test failed'\n  code: 'ERR_TEST_FAILURE'\n  ...\n1..1\n# tests 1\n# suites 0\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 35.012166",
+  "written": [
+    "lib/base62.js",
+    "test/base62.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T07:44:33.297789+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

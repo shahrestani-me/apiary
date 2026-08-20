@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "objective": "A Python library that parses and evaluates simple arithmetic expressions.\n\nIt should provide: a lexer producing tokens for numbers, operators and\nparentheses; a recursive descent parser building an expression tree with the\nusual precedence for plus, minus, times, divide and exponent; an evaluator that\ncomputes a result and reports division by zero as a typed error; named\nvariables supplied through an environment mapping; and a formatter that renders\nan expression tree back to a canonical string with minimal parentheses.\n\nPure standard library.",
+  "started_at": "2026-08-20T01:46:29.652533+00:00",
+  "finished_at": "2026-08-20T02:24:49.983147+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q",
+  "note": "",
+  "outcome": {
+    "kind": "capped",
+    "reason": "stopped after 120 cycle(s) with 2 live issue(s)",
+    "cycles": 120,
+    "cap": 120,
+    "live": 2,
+    "merged": [
+      2,
+      4,
+      5
+    ],
+    "abandoned": []
+  },
+  "metrics": {
+    "api_calls": 0,
+    "inference_calls": 0,
+    "inference_s": 0,
+    "model_swaps": 0,
+    "swap_s": 0,
+    "peak_queue_depth": 0,
+    "swap_share": null,
+    "cycles": []
+  },
+  "results": {
+    "attempts": 10,
+    "consumed": 10,
+    "counts": {
+      "pr-open": 3,
+      "task-failed": 7
+    },
+    "issues": {
+      "1": "task-failed",
+      "2": "pr-open",
+      "3": "task-failed",
+      "4": "pr-open",
+      "5": "pr-open"
+    }
+  }
+}

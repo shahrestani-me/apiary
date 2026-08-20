@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-02-20260819-233441-q6vks7",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "clock",
+  "repo": "shahrestani-me/apiary-corpus-02",
+  "branch": "apiary/%231-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "clock.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-19T23:35:24.408339+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-08-20260820-032118-qx8dab",
+  "repo": "shahrestani-me/apiary-corpus-08",
+  "objective": "A Node.js library that validates plain objects against a small schema.\n\nIt should provide: schema definitions for string, number, boolean, array and\nobject types; constraints for required fields, minimum and maximum, and regular\nexpression patterns; nested object and array-of-schema validation; error\nreporting that names the failing path with a dotted key; and a coercion mode\nthat converts numeric strings to numbers before validating.\n\nPure Node standard library, tested with the built-in test runner. No\nthird-party dependencies.",
+  "started_at": "2026-08-20T03:21:18.725393+00:00",
+  "finished_at": "2026-08-20T03:59:37.180632+00:00",
+  "stack": "python",
+  "verify": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "note": "",
+  "outcome": {
+    "kind": "capped",
+    "reason": "stopped after 120 cycle(s) with 5 live issue(s)",
+    "cycles": 120,
+    "cap": 120,
+    "live": 5,
+    "merged": [],
+    "abandoned": []
+  },
+  "metrics": {
+    "api_calls": 0,
+    "inference_calls": 0,
+    "inference_s": 0,
+    "model_swaps": 0,
+    "swap_s": 0,
+    "peak_queue_depth": 0,
+    "swap_share": null,
+    "cycles": []
+  },
+  "results": {
+    "attempts": 14,
+    "consumed": 14,
+    "counts": {
+      "pr-open": 11,
+      "task-failed": 3
+    },
+    "issues": {
+      "1": "task-failed",
+      "2": "pr-open",
+      "3": "pr-open"
+    }
+  }
+}

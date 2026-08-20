@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-01-20260819-230751-p96im6",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "bootstrap-the-project",
+  "repo": "shahrestani-me/apiary-corpus-01",
+  "branch": "apiary/%231-attempt-0",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -f README.md",
+  "verify_output": "",
+  "written": [
+    "pyproject.toml",
+    "src/main.py",
+    "tests/test_main.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": "0db28f495de6aa22947526b1b1f998e74d1ae72d",
+  "started_at": null,
+  "finished_at": "2026-08-19T23:11:00.461491+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

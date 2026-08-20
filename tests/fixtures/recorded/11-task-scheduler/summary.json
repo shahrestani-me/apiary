@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-05-20260820-064540-kvund5",
+  "repo": "shahrestani-me/apiary-corpus-05",
+  "objective": "A Python task scheduler that runs units of work in dependency order.\n\nIt should provide: a task definition carrying a name, a callable, and the names\nit depends on; a graph that detects cycles and reports the offending path; a\ntopological ordering that groups tasks into levels which could run in parallel;\na sequential executor that runs the levels in order and records per-task\nduration and outcome; a retry policy with a maximum attempt count and a\nconfigurable backoff; failure propagation that skips dependents of a failed\ntask and reports them as skipped rather than failed; a run report summarising\nsucceeded, failed and skipped tasks; persistence of a run report to JSON; and a\ncommand line interface that loads task definitions from a Python module and\nruns them.\n\nPure standard library.",
+  "started_at": "2026-08-20T06:45:40.275353+00:00",
+  "finished_at": "2026-08-20T07:29:53.043098+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q",
+  "note": "",
+  "outcome": {
+    "kind": "capped",
+    "reason": "stopped after 120 cycle(s) with 7 live issue(s)",
+    "cycles": 120,
+    "cap": 120,
+    "live": 7,
+    "merged": [],
+    "abandoned": []
+  },
+  "metrics": {
+    "api_calls": 0,
+    "inference_calls": 0,
+    "inference_s": 0,
+    "model_swaps": 0,
+    "swap_s": 0,
+    "peak_queue_depth": 0,
+    "swap_share": null,
+    "cycles": []
+  },
+  "results": {
+    "attempts": 6,
+    "consumed": 6,
+    "counts": {
+      "task-failed": 6
+    },
+    "issues": {
+      "1": "task-failed",
+      "2": "task-failed"
+    }
+  }
+}

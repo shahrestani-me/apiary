@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-07-20260820-023601-qzjz3y",
+  "issue": 1,
+  "attempt": 2,
+  "task_id": "money-core",
+  "repo": "shahrestani-me/apiary-corpus-07",
+  "branch": "apiary/%231-attempt-2",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "money/core.py",
+    "tests/test_core.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T02:43:15.064200+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

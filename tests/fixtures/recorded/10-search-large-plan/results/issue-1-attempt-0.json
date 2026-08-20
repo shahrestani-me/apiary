@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-03-20260819-235926-cqg7hf",
+  "issue": 1,
+  "attempt": 0,
+  "task_id": "document-store",
+  "repo": "shahrestani-me/apiary-corpus-03",
+  "branch": "apiary/%231-attempt-0",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN",
+  "written": [
+    "document_store.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T00:00:08.462954+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

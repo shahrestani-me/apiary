@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "issue": 5,
+  "attempt": 2,
+  "task_id": "parser",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "branch": "apiary/%235-attempt-2",
+  "exit_code": 1,
+  "outcome": "task-failed",
+  "consumes_attempt": true,
+  "reason": "the verify command failed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "python syntax error in parser.py, line 108: unterminated string literal (detected at line 108)\n    if self._current_token().type != 'RPA:\npython syntax error in test_parser.py, line 15: invalid syntax\n    expected = BinaryOp(Number(1), '+', Binary:\n\nThe verify command was not run: a file that does not parse fails every test that imports it, and proves nothing in a suite that never collects it. Rewrite the file so the quoted line parses.",
+  "written": [
+    "parser.py",
+    "test_parser.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": null,
+  "started_at": null,
+  "finished_at": "2026-08-20T02:11:09.914516+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

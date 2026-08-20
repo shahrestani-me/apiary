@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-08-20260820-032118-qx8dab",
+  "issue": 2,
+  "attempt": 5,
+  "task_id": "constraints",
+  "repo": "shahrestani-me/apiary-corpus-08",
+  "branch": "swarm/issue-2",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "test -n \"$(ls test/*.test.js 2>/dev/null)\" && node --test",
+  "verify_output": "TAP version 13\n# Subtest: checkConstraints\n    # Subtest: numbers\n        # Subtest: min constraint\n        ok 1 - min constraint\n          ---\n          duration_ms: 0.5865\n          type: 'test'\n          ...\n        # Subtest: max constraint\n        ok 2 - max constraint\n          ---\n          duration_ms: 0.066\n          type: 'test'\n          ...\n        # Subtest: min and max constraint\n        ok 3 - min and max constraint\n          ---\n          duration_ms: 0.145083\n          type: 'test'\n          ...\n        1..3\n    ok 1 - numbers\n      ---\n      duration_ms: 1.119041\n      type: 'test'\n      ...\n    # Subtest: strings\n        # Subtest: min length constraint\n        ok 1 - min length constraint\n          ---\n          duration_ms: 0.066958\n          type: 'test'\n          ...\n        # Subtest: max length constraint\n        ok 2 - max length constraint\n          ---\n          duration_ms: 0.054042\n          type: 'test'\n          ...\n        # Subtest: pattern constraint\n        ok 3 - pattern constraint\n          ---\n          duration_ms: 0.596917\n          type: 'test'\n          ...\n        1..3\n    ok 2 - strings\n      ---\n      duration_ms: 1.016417\n      type: 'test'\n      ...\n    1..2\nok 1 - checkConstraints\n  ---\n  duration_ms: 2.556875\n  type: 'test'\n  ...\n1..1\n# tests 9\n# suites 0\n# pass 9\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 37.282209",
+  "written": [
+    "src/constraints.js",
+    "test/constraints.test.js"
+  ],
+  "image": "apiary-worker-node",
+  "commit": "e465e6a92b8878b10a94f7119df668e18a475267",
+  "started_at": null,
+  "finished_at": "2026-08-20T03:39:58.572330+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

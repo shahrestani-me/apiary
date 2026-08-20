@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "origin": "recorded",
+  "describes": "delimited-data summary statistics",
+  "exercises": [],
+  "expected_divergences": [
+    {
+      "cycle": 0,
+      "task": "bootstrap-the-project",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 14,
+      "task": "bootstrap-the-project",
+      "derived": "review",
+      "control": "landed",
+      "why": "merged-this-cycle: the merge gate landed the pull request after the world was read, so the resolver still saw it open."
+    },
+    {
+      "cycle": 15,
+      "task": "calculate-column-stats",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 25,
+      "task": "calculate-column-stats",
+      "derived": "review",
+      "control": "landed",
+      "why": "merged-this-cycle: the merge gate landed the pull request after the world was read, so the resolver still saw it open."
+    },
+    {
+      "cycle": 25,
+      "task": "format-summary-text",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 52,
+      "task": "format-summary-text",
+      "derived": "review",
+      "control": "landed",
+      "why": "merged-this-cycle: the merge gate landed the pull request after the world was read, so the resolver still saw it open."
+    },
+    {
+      "cycle": 52,
+      "task": "parse-delimited-files",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    }
+  ]
+}

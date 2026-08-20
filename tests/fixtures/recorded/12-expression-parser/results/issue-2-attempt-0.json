@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "issue": 2,
+  "attempt": 0,
+  "task_id": "evaluator",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "branch": "apiary/%232-attempt-0",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 9 tests in 0.000s\n\nOK",
+  "written": [
+    "evaluator.py",
+    "test_evaluator.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": "e66f6dc5048090c0ff4456f67969796f75fd8e6a",
+  "started_at": null,
+  "finished_at": "2026-08-20T02:15:37.004488+00:00",
+  "duration_s": null,
+  "synthesised": false
+}

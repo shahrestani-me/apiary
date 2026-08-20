@@ -1,0 +1,820 @@
+{
+  "schema": 1,
+  "origin": "recorded",
+  "describes": "a Node URL shortener",
+  "exercises": [],
+  "expected_divergences": [
+    {
+      "cycle": 0,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 6,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 7,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 10,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 11,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 16,
+      "task": "alias-store",
+      "derived": "claimed",
+      "control": "review",
+      "why": "the worker's container outlived the pull request being opened, so the resolver read the running container while the control plane had moved on."
+    },
+    {
+      "cycle": 17,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 17,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 18,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 19,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 20,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 21,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 22,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 23,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 23,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 24,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 25,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 26,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 27,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 28,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 29,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 30,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 31,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 32,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 33,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 33,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 34,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 35,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 36,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 37,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 38,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 39,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 40,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 41,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 41,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 42,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 42,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 43,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 44,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 45,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 46,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 47,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 48,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 49,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 50,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 51,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 52,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 52,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "review",
+      "why": "the pull request closed between the world being read and the cycle ending, so the resolver saw no open pull request while the control plane still carried review."
+    },
+    {
+      "cycle": 53,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 53,
+      "task": "base62-codec",
+      "derived": "eligible",
+      "control": "claimed",
+      "why": "dispatched-this-cycle: the observation was taken before the dispatcher claimed the task. \u00a75 names this as the ordinary class and the one seen most."
+    },
+    {
+      "cycle": 54,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 55,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 56,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 57,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 58,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 59,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 60,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 61,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 62,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 63,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 64,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 65,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 66,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 67,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 68,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 69,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 70,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 71,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 72,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 73,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 74,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 75,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 76,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 77,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 78,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 79,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 80,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 81,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 82,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 83,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 84,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 85,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 86,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 87,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 88,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 89,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 90,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 91,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 92,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 93,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 94,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 95,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 96,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 97,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 98,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 99,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 100,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 101,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 102,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 103,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 104,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 105,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 106,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 107,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 108,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 109,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 110,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 111,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 112,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 113,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 114,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 115,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 116,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 117,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 118,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    },
+    {
+      "cycle": 119,
+      "task": "alias-store",
+      "derived": "eligible",
+      "control": "needs-human",
+      "why": "budget-spent: apiary gave up on this task, and once its pull requests are closed the code host holds no evidence of the attempts. ADR 0001 names this as not derivable; `authority.BUDGET_SPENT` is the override that carries it."
+    }
+  ]
+}

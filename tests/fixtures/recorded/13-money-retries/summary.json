@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-07-20260820-023601-qzjz3y",
+  "repo": "shahrestani-me/apiary-corpus-07",
+  "objective": "A Python library for fixed-point decimal money arithmetic that never loses\ncents.\n\nIt should provide: a money type storing an integer number of minor units and a\nthree-letter currency code; addition, subtraction and comparison that refuse to\nmix currencies; multiplication by a rational rate with banker's rounding to the\nnearest minor unit; allocation of an amount across a list of integer ratios so\nthat the parts sum exactly to the original with remainders distributed one\nminor unit at a time; parsing and formatting for currencies with two and with\nzero decimal places; and exact behaviour on negative amounts and on halfway\ncases.\n\nPure standard library. Correctness at the boundaries is the whole point of this\nlibrary, so the tests should cover halfway rounding and exact allocation sums.",
+  "started_at": "2026-08-20T02:36:01.767764+00:00",
+  "finished_at": "2026-08-20T03:12:29.780975+00:00",
+  "stack": "python",
+  "verify": "python3 -m unittest discover -q",
+  "note": "",
+  "outcome": {
+    "kind": "capped",
+    "reason": "stopped after 120 cycle(s) with 6 live issue(s)",
+    "cycles": 120,
+    "cap": 120,
+    "live": 6,
+    "merged": [],
+    "abandoned": []
+  },
+  "metrics": {
+    "api_calls": 0,
+    "inference_calls": 0,
+    "inference_s": 0,
+    "model_swaps": 0,
+    "swap_s": 0,
+    "peak_queue_depth": 0,
+    "swap_share": null,
+    "cycles": []
+  },
+  "results": {
+    "attempts": 3,
+    "consumed": 3,
+    "counts": {
+      "task-failed": 3
+    },
+    "issues": {
+      "1": "task-failed"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "run_id": "apiary-corpus-06-20260820-014629-gk6hgb",
+  "issue": 4,
+  "attempt": 0,
+  "task_id": "lexer",
+  "repo": "shahrestani-me/apiary-corpus-06",
+  "branch": "apiary/%234-attempt-0",
+  "exit_code": 0,
+  "outcome": "pr-open",
+  "consumes_attempt": true,
+  "reason": "verified and committed",
+  "verify_command": "python3 -m unittest discover -q",
+  "verify_output": "----------------------------------------------------------------------\nRan 7 tests in 0.000s\n\nOK",
+  "written": [
+    "lexer.py",
+    "test_lexer.py"
+  ],
+  "deleted": [],
+  "image": "apiary-worker",
+  "commit": "0ba47b68a55d90ae5e1fa9c318b049783bb3f1af",
+  "started_at": null,
+  "finished_at": "2026-08-20T02:02:07.170707+00:00",
+  "duration_s": null,
+  "synthesised": false
+}
