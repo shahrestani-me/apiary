@@ -91,7 +91,7 @@ Everything is environment variables — see [`src/swarm/config.py`](src/swarm/co
 |---|---|---|
 | `SWARM_REPO` | `$PWD` | Target git repo. |
 | `SWARM_VERIFY` | `python -m pytest -q` | Your quality gate, and the `## Verify` every planned issue carries. `swarm run --verify` overrides it, and `--new` takes the command its scaffold committed instead. |
-| `SWARM_ORCHESTRATOR_MODEL` | `gemma4:31b` | Planning, routing, stall judgement. Dense — buy quality. A bare name means Ollama, as it always has; `bedrock:gpt-5.6-luna` or `openai:gpt-5.6-terra` names a provider (ADR 0006). |
+| `SWARM_ORCHESTRATOR_MODEL` | `gemma4:31b` | Planning, routing, stall judgement. Dense — buy quality. A bare name means Ollama, as it always has; `bedrock:eu.anthropic.claude-haiku-4-5-20251001-v1:0` or `openai:gpt-5.6-terra` names a provider ([ADR 0006](docs/adr/0006-the-model-provider-is-a-detail.md)). How to configure one, prove it, and what each model scored: [docs/remote-models.md](docs/remote-models.md). |
 | `SWARM_WORKER_MODEL` | `gemma4:26b` | Writes the code. MoE — buy throughput. Same spelling rules. |
 | `SWARM_ORCHESTRATOR_MODEL_OPTIONS` | — | Provider-specific settings for the role above, `name=value` comma separated — e.g. `region=eu-west-1,profile=acme`. An option the provider does not declare is refused by name. |
 | `SWARM_WORKER_MODEL_OPTIONS` | — | The same, for the worker. Passed through to worker containers alongside `SWARM_WORKER_MODEL`, so a container lands on the provider *and* the endpoint the host chose. |
