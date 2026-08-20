@@ -57,7 +57,6 @@ from swarm.doctor import (
     CHECK_CI,
     CHECK_DOCKER_CLI,
     CHECK_DOCKER_DAEMON,
-    CHECK_LABELS,
     CHECK_MODEL_AVAILABLE,
     CHECK_MODEL_REACHABLE,
     CHECK_MODEL_SCHEMA,
@@ -82,7 +81,6 @@ from swarm.doctor import (
     main,
     stack_check,
 )
-from swarm.github.labels import SWARM_LABELS
 from swarm.mcp.contract import ContractError, parse_tracker
 
 REPO = "shahrestani-me/apiary"
@@ -389,7 +387,6 @@ def test_a_healthy_environment_passes_every_check(doctor):
         CHECK_TOKEN,
         CHECK_BOOT_TOKEN,
         CHECK_REPO,
-        CHECK_LABELS,
         CHECK_CI,
         CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI,

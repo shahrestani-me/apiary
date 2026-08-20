@@ -106,7 +106,6 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # `docs/issue-contract.md` §3's label set, and read from the label rather than
 # from `TaskStatus`, because the projection is lossy and §3 says the label set
 # is the authority.
-TERMINAL_LABELS = frozenset({"swarm:done", "swarm:failed"})
 
 RunMode = Literal["plan", "attach"]
 
@@ -280,32 +279,27 @@ class Attachment:
     def resumed(self) -> bool:
         return self.mode == "attach"
 
-    @property
-    def counts(self) -> dict[str, int]:
-        """Live entries per state label, for the line a human reads on startup."""
-        tally: dict[str, int] = {}
-        for entry in self.live:
-            tally[entry.state_label] = tally.get(entry.state_label, 0) + 1
-        return tally
-
     def summary(self) -> str:
         if not self.resumed:
             return "no live issues; this run plans from the objective"
-        detail = ", ".join(f"{count} {label}" for label, count in sorted(self.counts.items()))
-        return f"attached to {len(self.live)} live issue(s): {detail}"
+        return f"attached to {len(self.live)} live issue(s)"
 
 
 def live_entries(ledger: Ledger) -> tuple[LedgerEntry, ...]:
     """The entries a previous process left unfinished, in issue order.
 
-    `swarm:done` and `swarm:failed` are terminal, so an entirely finished
-    ledger is not something to attach to - a fresh objective against a repo
-    whose last run completed is a new run's work, not a resumption of the old
-    one's.
+    **Closed is what terminal means here now.** It was `swarm:done` or
+    `swarm:failed`, and #152 removed both - so this reads the one terminal fact
+    the code host still carries at the moment `start_run` asks, which is before
+    any observation exists to resolve a state from. A landed task's issue is
+    closed by its merge (`Closes #<n>`), and a task a human closed is closed
+    whatever apiary thought.
+
+    A task that needs a human stays *open* and is therefore live, which is a
+    change and the right one: it is exactly the task a resumed run should see,
+    because the goal gate may revive it.
     """
-    unfinished = (
-        entry for entry in ledger.entries.values() if entry.state_label not in TERMINAL_LABELS
-    )
+    unfinished = (entry for entry in ledger.entries.values() if not entry.closed)
     return tuple(sorted(unfinished, key=lambda entry: entry.ref))
 
 
@@ -320,7 +314,6 @@ def start_run(
     *,
     source: GitHubClient | str | None = None,
     now: dt.datetime | None = None,
-    adopt: bool = True,
 ) -> Attachment:
     """Mint an identity, read the ledger, and report what this run continues.
 
@@ -329,5 +322,5 @@ def start_run(
     change nothing must not do that either.
     """
     run = Run.start(repo, objective, now=now)
-    ledger = load_ledger(source if source is not None else repo, adopt=adopt)
+    ledger = load_ledger(source if source is not None else repo)
     return attach(run, ledger)

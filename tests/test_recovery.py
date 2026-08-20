@@ -38,6 +38,10 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import pytest
 
+FAILED = "needs-human"
+
+DONE = "landed"
+
 from swarm.containers.manager import (
     ISSUE_LABEL,
     ContainerError,
@@ -55,7 +59,6 @@ from swarm.github.readiness import BLOCKED, READY, IssueState
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, claim
 from swarm.orchestrator.lifecycle import internal_state
-from swarm.orchestrator.reconcile import DONE, FAILED
 from swarm.orchestrator.recovery import (
     Held,
     Recovery,

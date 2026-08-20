@@ -30,9 +30,7 @@ from swarm.github.ledger import (
     DEFAULT_STACK,
     GENERATED_FILES,
     KNOWN_STACKS,
-    LABEL_PRECEDENCE,
     REQUIRED_SECTIONS,
-    STATUS_BY_LABEL,
     generated_for,
     ContractError,
     DuplicateTaskIdError,
@@ -40,7 +38,6 @@ from swarm.github.ledger import (
     load_tasks,
     parse_contract,
     render_marker,
-    resolve_state_label,
     slugify,
 )
 from swarm.github.refs import task_ref as ref

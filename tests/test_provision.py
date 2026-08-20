@@ -38,7 +38,6 @@ import pytest
 
 from swarm.github.branches import task_branch
 from swarm.github.client import GitHubClient, Response
-from swarm.github.labels import SWARM_LABELS
 from swarm.github.refs import task_ref
 from swarm.greenfield.stacks import REACT_TOOLCHAIN
 from swarm.greenfield.provision import (

@@ -46,6 +46,12 @@ from typing import Any
 
 import pytest
 
+DERIVED = "derived"
+
+FAILED = "needs-human"
+
+DONE = "landed"
+
 from swarm.artifacts import STATE_OVERRIDE, DivergenceTally
 from swarm.github.ledger import load_ledger
 from swarm.github.readiness import BLOCKED, READY, compute_readiness
@@ -53,17 +59,13 @@ from swarm.github.refs import pull_ref, task_ref as ref
 from swarm.orchestrator.authority import (
     BUDGET_RENEWED,
     BUDGET_SPENT,
-    DERIVED,
     INFRASTRUCTURE_CEILING,
-    LABELS,
     LANDED_STANDS,
     REVIVED,
-    STATE_SOURCE_ENV,
     UNRESOLVED,
     Belief,
     Grant,
     believe,
-    state_source,
 )
 from swarm.orchestrator.derived import (
     CLAIMED as CLAIMED_STATE,
@@ -83,7 +85,10 @@ from swarm.orchestrator.derived import PullFact
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW, Capacity, plan_dispatch
 from swarm.orchestrator.goal import FAILED as GAVE_UP
 from swarm.orchestrator.goal import IN_FLIGHT, abandoned, assess, live, shipped
-from swarm.orchestrator.reconcile import DONE, FAILED, Transition, plan_reconcile
+from swarm.orchestrator.reconcile import Transition, plan_reconcile
+
+DONE = "landed"
+FAILED = "needs-human"
 from swarm.orchestrator.recovery import plan_recovery
 from swarm.orchestrator.replan import brief
 from swarm.store import STORE_DIR_ENV
@@ -171,7 +176,6 @@ def outcome(client: Any, fleet: Any) -> tuple[Any, ...]:
 
 def a_run(
     label: str,
-    source: str,
     monkeypatch: pytest.MonkeyPatch,
     *,
     alongside: bool = False,
@@ -218,7 +222,6 @@ def a_run(
     assertion, and it is worth knowing which. Under the resolver the edit must
     change nothing in every arm.
     """
-    monkeypatch.setenv(STATE_SOURCE_ENV, source)
     client, fleet, loop, seen = a_lifecycle_run(
         label=READY, alongside=alongside, artifacts=artifacts
     )
@@ -266,7 +269,7 @@ def test_a_hand_edited_label_does_not_change_what_the_orchestrator_does(monkeypa
     ref and no pull request is open - so the task is dispatched exactly as it
     would have been, and the label is repaired on the way past.
     """
-    client, fleet, _ = a_run(CLAIMED, DERIVED, monkeypatch)
+    client, fleet, _ = a_run(CLAIMED, monkeypatch)
 
     assert fleet.spawned == [TASK_ISSUE]
     assert client.labels_on(TASK_ISSUE) == {CLAIMED}
@@ -283,7 +286,7 @@ def test_a_hand_edited_label_is_reported_even_when_the_cycle_repairs_it(monkeypa
     the only sampling point at which "the label said claimed and we acted on
     eligible" is still true.
     """
-    _, _, seen = a_run(CLAIMED, DERIVED, monkeypatch)
+    _, _, seen = a_run(CLAIMED, monkeypatch)
 
     overrides = [fields for name, fields in seen if name == STATE_OVERRIDE]
     assert overrides == [
@@ -389,103 +392,7 @@ def test_no_wrong_label_changes_a_decision_under_the_resolver(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("label", OBEYED_LABELS)
-def test_the_flag_puts_every_one_of_those_decisions_back(label, monkeypatch, tmp_path):
-    """The inverse of the test above, and the criterion #147 calls load-bearing.
-
-    apiary develops itself on this control plane, so a cutover with no way back
-    blocks its own repair. "Restores the previous behaviour" is only worth
-    anything if it is *complete*, so this asserts the label is obeyed again in
-    every arm rather than in one - if `APIARY_STATE_SOURCE=labels` reached the
-    scheduler but not the merge gate, one of these would still look like the
-    resolver's answer.
-
-    `swarm:blocked` is not in the list, and that is a fact about the old
-    behaviour rather than a hole in the new one: readiness owns both waiting
-    states and recomputed them from the dependency graph every cycle, so the
-    label machine already repaired that one by itself.
-
-    Two tasks, for the reason its inverse above is run over two - the two
-    baselines have to be the same world or the inequality is a statement about
-    the fixtures. It buys a second thing here: the old behaviour reaches the
-    container as well as the dispatcher, in all three arms, and the last two
-    assertions below say so against a baseline that disposes nothing.
-    """
-    baseline = a_run(
-        READY, LABELS, monkeypatch, alongside=True, artifacts=tmp_path / "baseline"
-    )
-    edited = a_run(
-        label, LABELS, monkeypatch, alongside=True, artifacts=tmp_path / "edited"
-    )
-
-    assert outcome(*edited[:2]) != outcome(*baseline[:2])
-    # And the specific old behaviour, not merely "something differs": the label
-    # says this task is in flight or finished, so nothing spawns.
-    assert edited[1].spawned == []
-    assert edited[0].labels_on(TASK_ISSUE) == {label}
-    # And the label decides the container too, by a different rule in each arm:
-    # `swarm:done` and `swarm:failed` are terminal to a label reader and rule 2
-    # disposes what a terminal task is still holding, while `swarm:claimed`
-    # reaches rule 3 - it was claimed, the second task's worker left a result
-    # record, so the verdict is observed and the container goes with it. The
-    # baseline disposes nothing at all under the labels, which is what the
-    # inequality above is made of.
-    assert edited[1].disposed == [OTHER_ISSUE]
-    assert baseline[1].disposed == []
-
-
-def test_under_labels_a_review_label_with_no_pull_request_is_charged(monkeypatch):
-    """`swarm:review`'s arm of the criterion above, which is not "nothing happens".
-
-    Pre-#147, `plan_reconcile` rule 4 read `entry.state_label` on every cycle:
-
-        if entry.state_label != REVIEW: continue
-        if open_branches is not None and entry.branch not in open_branches:
-            _retry_or_give_up(entry, "its pull request was closed without merging")
-
-    So a human writing `swarm:review` onto a task with no open pull request was
-    told its pull request had been closed, and paid an attempt for it. That is
-    the behaviour this flag restores - obeying the label, not holding it.
-
-    Carrying the derived path's `remembered` overlay onto the labels path hid
-    this: `was` came from last cycle's belief rather than from the label, rule 4
-    never matched, and the task sat in `swarm:review` doing nothing. That looked
-    more like "the label is obeyed", and was in fact the cutover leaking through
-    the hatch meant to switch it off.
-    """
-    client, fleet, _ = a_run(REVIEW, LABELS, monkeypatch)
-
-    # Charged and recycled, exactly as before #147 - not held, not ignored.
-    assert client.labels_on(TASK_ISSUE) != {REVIEW}
-    assert fleet.spawned == [TASK_ISSUE]
-
-
-def test_the_flag_silences_the_override_event_too(monkeypatch):
-    """Nothing is overridden when nothing is believed but the label, and the
-    log says so by having no line rather than by having a line saying zero."""
-    _, _, seen = a_run(CLAIMED, LABELS, monkeypatch)
-
-    assert [name for name, _ in seen if name == STATE_OVERRIDE] == []
-
-
-def test_a_mistyped_state_source_stops_the_run(monkeypatch):
-    """Loud on garbage, unlike the shadow window's own flag was.
-
-    That flag reads a typo as its default and argues the case: it decides
-    whether an *observer* runs. This one decides who the orchestrator believes,
-    and an operator who typed it to get back to the old behaviour after a bad
-    cutover must not silently get the new one.
-    """
-    monkeypatch.setenv(STATE_SOURCE_ENV, "lables")
-    with pytest.raises(ValueError, match="APIARY_STATE_SOURCE"):
-        state_source()
-
-    monkeypatch.setenv(STATE_SOURCE_ENV, "")
-    assert state_source() == DERIVED
-
-
-@pytest.mark.parametrize("source,merged", [(DERIVED, [900]), (LABELS, [])])
-def test_the_merge_gate_follows_the_authority_too(source, merged, monkeypatch):
+def test_the_merge_gate_follows_the_authority_too(monkeypatch):
     """"Not for the scheduler but not the merge gate" is the failure mode.
 
     #147 names three files, and the acceptance criterion it is really about is
@@ -498,7 +405,6 @@ def test_the_merge_gate_follows_the_authority_too(source, merged, monkeypatch):
     Both directions are asserted, because a gate that merged under the flag as
     well would mean the escape hatch does not reach it either.
     """
-    monkeypatch.setenv(STATE_SOURCE_ENV, source)
     from swarm.github.branches import task_branch
 
     from test_reconcile import green, pending
@@ -539,7 +445,6 @@ def test_a_failed_worker_is_still_observed_when_its_container_has_gone(tmp_path,
     counting. `plan_reconcile` asks what the task *was* instead, which is the
     job the label was quietly doing.
     """
-    monkeypatch.setenv(STATE_SOURCE_ENV, DERIVED)
     client, fleet, loop, _ = a_lifecycle_run(label=READY)
     loop.artifacts = tmp_path
 
@@ -568,7 +473,6 @@ def test_a_pull_request_closed_unmerged_still_costs_an_attempt(monkeypatch):
     would forgive every rejected pull request - "a retry that costs nothing can
     be rejected forever", which is what that rule exists to prevent.
     """
-    monkeypatch.setenv(STATE_SOURCE_ENV, DERIVED)
     client, fleet, loop, _ = a_lifecycle_run(label=READY)
 
     loop.cycle()
@@ -596,7 +500,6 @@ def test_a_pull_request_closed_unmerged_still_costs_an_attempt(monkeypatch):
     assert loop.store.read()[ref(TASK_ISSUE)].attempt == 1
 
 
-@pytest.mark.parametrize("source", [DERIVED, LABELS])
 def test_the_infrastructure_streak_counts_the_same_under_both_sources(
     source, tmp_path, monkeypatch
 ):
@@ -613,7 +516,6 @@ def test_the_infrastructure_streak_counts_the_same_under_both_sources(
     because the number itself is `_observe`'s business and this test's subject is
     only that the cutover did not change how often it is reached.
     """
-    monkeypatch.setenv(STATE_SOURCE_ENV, source)
     client, fleet, loop, _ = a_lifecycle_run(label=READY)
     loop.artifacts = tmp_path
 
@@ -739,32 +641,6 @@ def test_a_total_cap_give_up_also_survives_a_restart():
     assert believe(
         ledger(below), world(below), max_attempts=3, max_total_attempts=9
     ).state("task-4") == ELIGIBLE
-
-
-def test_under_labels_this_cycles_label_beats_last_cycles_belief():
-    """`APIARY_STATE_SOURCE=labels` restores the *label read*, not a memory of it.
-
-    Before #147, `plan_reconcile`'s rules read `entry.state_label` directly on
-    every cycle. Carrying the derived path's `remembered` overlay onto the
-    labels path made last cycle's belief win, and the one event that tells the
-    two apart is a human editing a label mid-run - which is the single case this
-    flag exists for, and the action apiary's own give-up comment instructs.
-
-    Left in, rule 4 fires on the remembered `review` for a task a human has just
-    moved back to `swarm:ready`, consuming an attempt and posting a failure for
-    work that was rescheduled rather than failed.
-    """
-    moved = entry(4, label=READY)
-    held = believe(
-        ledger(moved),
-        None,
-        source=LABELS,
-        remembered={ref(4): REVIEW_STATE},
-    )
-
-    assert held.source == LABELS
-    assert held.previous["task-4"] == ELIGIBLE, "last cycle's belief overrode the label"
-    assert held.state("task-4") == ELIGIBLE
 
 
 def test_a_store_that_has_never_judged_a_task_gives_up_sooner_not_later():
@@ -968,23 +844,6 @@ def test_the_previous_belief_is_seeded_from_the_label_only_for_a_task_never_seen
 # --------------------------------------------------------------------------
 
 
-def test_a_cycle_that_could_not_list_pull_requests_falls_back_to_the_labels():
-    """`None` is "could not look" and it is not `{}`.
-
-    `checks.read_pulls` and `observed.record_cycle` both keep the two apart,
-    and the cost of conflating them is one level worse here than it is in the
-    shadow: an empty listing read as the answer resolves every task in review to
-    `eligible`, and the dispatcher then spawns a second worker over an open pull
-    request's file set.
-    """
-    task = entry(4, label=REVIEW)
-    blind = believe(ledger(task), None)
-
-    assert blind.source == LABELS
-    assert blind.state("task-4") == REVIEW_STATE
-    assert blind.overrides == ()
-
-
 def test_a_task_the_resolver_never_saw_keeps_its_label_and_is_counted():
     """A fallback nobody can see is a cutover that looks clean by not happening.
 
@@ -1147,11 +1006,11 @@ def a_hand_edited(label: str, was: str, **facts: Any) -> tuple[Any, Belief, Beli
     task = entry(4, label=label)
     book = ledger(task)
     seen = world(task, **facts)
-    return (
-        book,
-        believe(book, seen, remembered={task.ref: was}),
-        believe(book, seen, source=LABELS),
-    )
+    # One belief, not a pair. The second was the `labels` arm and it is gone
+    # with the flag (#152); what is left is the property the pair existed to
+    # demonstrate - that a belief carried from last cycle is overridden by what
+    # the world says this cycle.
+    return book, believe(book, seen, remembered={task.ref: was})
 
 
 def test_a_claimed_label_typed_onto_a_ready_task_no_longer_burns_an_attempt():

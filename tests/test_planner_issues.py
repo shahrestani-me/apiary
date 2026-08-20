@@ -66,7 +66,7 @@ from swarm.nodes.planner import (
     size_label,
     write_plan,
 )
-from swarm.orchestrator.authority import LABELS, WAITING, Belief, believe
+from swarm.orchestrator.authority import WAITING, Belief, believe
 from swarm.orchestrator.derived import (
     ELIGIBLE,
     LANDED,

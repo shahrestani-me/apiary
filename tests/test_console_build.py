@@ -35,7 +35,6 @@ from swarm.console_build import BUILD_SITE, BuildError, Builder, plan_from_resul
 from swarm.console_runs import SwarmRuns
 from swarm.doctor import Check, Diagnosis
 from swarm.greenfield.provision import ProvisionReport
-from swarm.github.labels import LabelReport
 
 from fixtures.procs import FakeProc, settle, spawner
 

@@ -52,7 +52,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, Sequence
 
 from ..config import SETTINGS
-from ..github.ledger import STATUS_BY_LABEL, Ledger
+from ..github.ledger import STATUS_BY_STATE, Ledger
 from ..llm import orchestrator_llm, structured
 from ..state import ProgressJudgement, SwarmState, TaskRecord, TaskStatus
 from ..taskref import TaskRef
@@ -365,6 +365,7 @@ class Observation:
         *,
         results: Mapping[TaskRef, ResultRecord] | None = None,
         churn: Mapping[TaskRef, int] | None = None,
+        states: Mapping[str, str] | None = None,
     ) -> Observation:
         """Observe a v2 ledger, plus what the workers and #34 left behind.
 
@@ -386,12 +387,18 @@ class Observation:
         """
         results = results or {}
         churn = churn or {}
+        # ADR 0001's internal state per task, from the cycle's authority. It was
+        # `STATUS_BY_LABEL[entry.state_label]` until #152, and the table is the
+        # same table - §3's - keyed on the state the label used to store. A task
+        # the belief has no verdict for reads `pending`, which is what an
+        # unresolved task was already projected as.
+        states = states or {}
         signals: dict[str, Signal] = {}
         for task_id, entry in ledger.entries.items():
             evidence = _evidence(results.get(entry.ref))
             signals[task_id] = Signal(
                 task_id=task_id,
-                status=STATUS_BY_LABEL[entry.state_label],
+                status=STATUS_BY_STATE.get(states.get(task_id, ""), "pending"),
                 attempts=entry.attempt,
                 failure=failure_signature(evidence),
                 churn=int(churn.get(entry.ref, 0)),

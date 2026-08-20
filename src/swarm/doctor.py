@@ -19,12 +19,12 @@ tracker, a live daemon and a live model server, at the moment when the operator
 has the least confidence that any of them is configured correctly - which is
 the worst possible moment to also be creating things. Concretely:
 
-- `github/labels.py` can create the missing `swarm:*` labels, and this module
-  deliberately does not call it. It imports `SWARM_LABELS` and
-  `list_label_names` - the name list and the read - and reports
-  `python -m swarm.github.labels <repo>` as the fix. Provisioning is a decision
-  someone makes; a diagnostic that quietly repaired the thing it was asked to
-  measure would report a repo that was never in the state it just described.
+- the `swarm:*` labels are gone (#152), so nothing here checks for them. The
+  check that did was the clearest example of this module's rule: it could see
+  a missing label and could have created it, and deliberately did not.
+  Provisioning is a decision someone makes; a diagnostic that quietly repaired
+  the thing it was asked to measure would report a repo that was never in the
+  state it just described.
 - Write permission on the repository is *not* probed, for the same reason: the
   only honest probe is a write. `check_token` asserts the token's shape through
   `security.assert_scoped_token` and names the four permissions it must carry;
@@ -121,7 +121,6 @@ from .containers.manager import (
     build_hint,
 )
 from .github.client import GitHubClient, GitHubError, GitHubHTTPError
-from .github.labels import SWARM_LABELS, list_label_names
 from .llm import BEDROCK, OLLAMA, OPENAI, orchestrator_llm, structured, worker_llm
 from .mcp.client import McpAuthError, McpEgressBlocked, McpError, ServerInfo, ToolSpec
 from .mcp.contract import (
@@ -213,7 +212,6 @@ CHECK_MODEL_SCHEMA = "model.schema"
 CHECK_TOKEN = "github.token"
 CHECK_BOOT_TOKEN = "github.boot-token"
 CHECK_REPO = "github.repo"
-CHECK_LABELS = "github.labels"
 CHECK_CI = "github.ci"
 CHECK_TIMEOUTS = "config.timeouts"
 CHECK_DOCKER_CLI = "docker.cli"
@@ -246,7 +244,7 @@ _NAME_WIDTH = max(
     len(name)
     for name in (
         CHECK_MODEL_TARGET, CHECK_MODEL_REACHABLE, CHECK_MODEL_AVAILABLE, CHECK_MODEL_SCHEMA,
-        CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_LABELS, CHECK_CI, CHECK_TIMEOUTS,
+        CHECK_TOKEN, CHECK_BOOT_TOKEN, CHECK_REPO, CHECK_CI, CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI, CHECK_DOCKER_DAEMON,
         CHECK_TRACKER_CONFIG, CHECK_TRACKER_REACHABLE, CHECK_TRACKER_AUTH, CHECK_TRACKER_TOOLS,
         *(stack_check(stack) for stack in DEFAULT_STACK_IMAGES),
@@ -864,7 +862,6 @@ class Doctor:
             token,
             self.check_boot_token(),
             access,
-            self._after(access, CHECK_LABELS, self.check_labels),
             self._after(access, CHECK_CI, self.check_ci),
         ]
 
@@ -1272,37 +1269,6 @@ class Doctor:
             f"{self.repo} readable, {len(issues)} open issues (write access is asserted "
             f"by token shape, never probed - doctor writes nothing)",
         )
-
-    def check_labels(self) -> Check:
-        """Are the six `swarm:*` labels there? Reported, never created.
-
-        `POST /issues/{n}/labels` with an unknown name *invents* the label, so
-        a missing one is not a crash: the run proceeds and the ledger fills
-        with labels nobody chose, in colours nobody picked. That is why this is
-        a preflight and not an exception handler.
-        """
-        assert self.github is not None  # guarded by `_after(access, ...)`
-        try:
-            present = {name.casefold() for name in list_label_names(self.github)}
-        except GitHubError as exc:
-            return Check.failed(
-                CHECK_LABELS,
-                f"could not list the labels of {self.repo}: {exc}",
-                fix=self._access_fix(getattr(exc, "status", 0)),
-            )
-
-        missing = [spec.name for spec in SWARM_LABELS if spec.name.casefold() not in present]
-        if missing:
-            return Check.failed(
-                CHECK_LABELS,
-                f"{self.repo} is missing {', '.join(missing)}",
-                fix=(
-                    f"python -m swarm.github.labels {self.repo}  (creates only what is "
-                    f"missing and touches nothing that exists; doctor reports rather than "
-                    f"provisions, so that what it measured is what was there)"
-                ),
-            )
-        return Check.passed(CHECK_LABELS, f"all {len(SWARM_LABELS)} swarm:* labels present")
 
     def check_ci(self) -> Check:
         """Does anything gate a PR on this repo?

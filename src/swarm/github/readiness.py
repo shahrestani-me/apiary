@@ -79,8 +79,11 @@ from .client import GitHubClient, GitHubHTTPError
 from .ledger import Ledger, load_ledger
 from .refs import issue_number, task_ref
 
-READY = "swarm:ready"
-BLOCKED = "swarm:blocked"
+#: ADR 0001's two waiting states, in the internal vocabulary. They were the two
+#: `swarm:*` labels this module moved an issue between until #152; the strings
+#: changed, the rows of `docs/issue-contract.md` §4 did not.
+READY = "eligible"
+BLOCKED = "blocked"
 
 # The two labels this module is allowed to write, which is also the set it is
 # allowed to overwrite: everything else is another component's row of §4.
@@ -225,21 +228,27 @@ class UnmetRef:
 
 @dataclass(frozen=True)
 class Verdict:
-    """What one issue's label should be, and what it currently is."""
+    """What state one issue should be waiting in, and what it is waiting in now.
+
+    States rather than labels since #152. `current_state` is what the cycle's
+    belief holds, not what an issue carries - there is nothing on an issue to
+    carry it any more - so `changed` is "this readiness pass moved the task"
+    rather than "the label on GitHub is wrong".
+    """
 
     ref: TaskRef
     task_id: str
-    current_label: str
-    label: str
+    current_state: str
+    state: str
     unmet: tuple[UnmetRef, ...] = ()
 
     @property
     def ready(self) -> bool:
-        return self.label == READY
+        return self.state == READY
 
     @property
     def changed(self) -> bool:
-        return self.label != self.current_label
+        return self.state != self.current_state
 
     @property
     def errors(self) -> tuple[UnmetRef, ...]:
@@ -374,19 +383,24 @@ def compute_readiness(
     states: Mapping[TaskRef, IssueState],
     *,
     transitionable: Collection[str] | None = None,
+    current: Mapping[str, str] | None = None,
 ) -> ReadinessPlan:
-    """Decide each transitionable entry's label. Raises on a dependency cycle.
+    """Decide each waiting entry's state. Raises on a dependency cycle.
 
     Pure: `states` is every referenced issue's open/closed fact, already
     resolved. Keeping the I/O out of here is what lets the interesting graphs -
     a diamond, a ring, a ref to a cancelled issue - be tested as data.
 
     `transitionable` is the task ids this pass may speak about, as decided by
-    whoever holds the authority on state (#147). `None` falls back to the label,
-    which is what `APIARY_STATE_SOURCE=labels` produces and what a caller with
-    no resolver behind it - the `__main__` dry run below - has to use. Task ids
-    rather than refs, because that is the key `Belief` is built on and the join
-    to a ref happens once, where the belief is built, rather than here as well.
+    whoever holds the authority on state (#147). **Required in practice since
+    #152**: it used to fall back to the issue's label, and no label is written
+    any more, so `None` now speaks about nothing rather than about everything.
+    Task ids rather than refs, because that is the key `Belief` is built on and
+    the join to a ref happens once, where the belief is built.
+
+    `current` is what those tasks are believed to be waiting in, so a verdict can
+    say whether this pass *moved* anything. It was `entry.state_label` until
+    #152.
     """
     cycle = find_cycle(_live_edges(ledger, states))
     if cycle is not None:
@@ -397,6 +411,7 @@ def compute_readiness(
 
     verdicts: list[Verdict] = []
     errors: list[UnresolvableReferenceError] = []
+    current = current or {}
     for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
         unmet: list[UnmetRef] = []
         for ref in entry.blocked_by:
@@ -407,11 +422,11 @@ def compute_readiness(
             unmet.append(UnmetRef(ref, state.reason, error=unresolvable))
             if unresolvable:
                 errors.append(UnresolvableReferenceError(entry.ref, ref, state.reason))
-        mine = (
-            entry.state_label in TRANSITIONABLE
-            if transitionable is None
-            else entry.task_id in transitionable
-        )
+        # Which tasks are this module's row of §4 at all. The set is the
+        # caller's since #152: it used to fall back to `entry.state_label in
+        # TRANSITIONABLE`, and there is no label to read now, so a caller that
+        # does not say gets nothing rather than a silent everything.
+        mine = entry.task_id in (transitionable or ())
         if not mine or _state(states, entry.ref).closed:
             # Claimed, in review, done or failed - somebody else's row of §4.
             # Or closed: `docs/architecture-v2.md` makes "a human can close a
@@ -425,8 +440,8 @@ def compute_readiness(
             Verdict(
                 ref=entry.ref,
                 task_id=entry.task_id,
-                current_label=entry.state_label,
-                label=BLOCKED if unmet else READY,
+                current_state=current.get(entry.task_id, ""),
+                state=BLOCKED if unmet else READY,
                 unmet=tuple(unmet),
             )
         )
@@ -529,16 +544,21 @@ def apply_readiness(
     source: GitHubClient | str,
     *,
     ledger: Ledger | None = None,
-    dry_run: bool = False,
     transitionable: Collection[str] | None = None,
+    current: Mapping[str, str] | None = None,
 ) -> ReadinessPlan:
-    """Compute readiness against the live tracker and write the two labels.
+    """Compute readiness against the live tracker. **Writes nothing** since #152.
 
-    Returns the plan whether or not it wrote anything; `dry_run=True` computes
-    and reports without touching the repository, which is what the CLI's
-    preflight and any "what would this cycle do" call wants. A raised
-    `DependencyCycleError` means nothing was written - the cycle is detected
-    before the first API call.
+    `dry_run` is gone with the write it guarded: this module moved an issue
+    between `swarm:ready` and `swarm:blocked`, and those labels no longer exist.
+    Keeping the parameter would have been worse than removing it - a caller
+    passing `dry_run=True` would have been promised something the function no
+    longer has any way to violate, and the next reader would have to prove that
+    for themselves. The verdicts are the output; the cycle carries them into its
+    belief.
+
+    A raised `DependencyCycleError` still means nothing happened - the cycle is
+    detected before the first API call.
     """
     client = _as_client(source)
     if ledger is None:
@@ -548,26 +568,9 @@ def apply_readiness(
     # the issue rather than in the ledger.
     entries = tuple(entry.ref for entry in ledger.entries.values())
     states = resolve_states(client, (*referenced_refs(ledger), *entries))
-    plan = compute_readiness(ledger, states, transitionable=transitionable)
-
-    if not dry_run:
-        for verdict in plan.transitions:
-            _relabel(client, verdict)
-    return plan
-
-
-def _relabel(client: GitHubClient, verdict: Verdict) -> None:
-    """Move one issue between `swarm:ready` and `swarm:blocked`, adding first.
-
-    The order is the whole point. GitHub has no transaction across two label
-    calls, and a crash between them leaves either two state labels or none.
-    Two is repairable - §3's precedence puts `blocked` above `ready`, so the
-    conservative reading wins and the reconciler cleans it up. None puts the
-    issue outside the ledger entirely, where nothing ever looks at it again.
-    """
-    number = issue_number(verdict.ref)
-    client.add_labels(number, [verdict.label])
-    client.remove_label(number, verdict.current_label)
+    return compute_readiness(
+        ledger, states, transitionable=transitionable, current=current
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke test
