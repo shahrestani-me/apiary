@@ -64,7 +64,9 @@ run-scoped counters answer what apiary decided about its own execution. Neither
 alone is enough, and reading the label instead of either was what made it look
 as though one was.
 
-Each of ADR 0001's three, and what the orchestrator now does about it:
+Each of ADR 0001's four - three found while building the resolver (#145), the
+fourth by grouping what ten recorded runs actually produced (#289) - and what
+the orchestrator now does about it:
 
 **1. The infrastructure ceiling.** Not derivable at all: the artifacts reach a
 cycle as `summarise_dir(...).latest`, one record per task, so N mechanical
@@ -165,7 +167,21 @@ charge for an attempt the fleet refused to start, and
 `reconcile._dispatch_attempted` argues why: a rule that has to classify why an
 attempt did not run is a rule with an arm somebody forgot.
 
-None of the three is made derivable by making the resolver authoritative, and
+**4. A check gate that timed out.** The other three are states the code host
+shows too little of; this one it has no place to show at all.
+`checks._decide_empty` escalates a pull request that never grew a check run
+once `zero_check_grace_s` has passed, and that verdict is about *elapsed time*.
+There is no failing check run - a check run failing to appear is the finding -
+and neither retrying nor merging is the right answer, so the pull request and
+the issue both stay open. The resolver reads `review` and is **right about the
+host**; apiary is holding a judgment the host was never told about. The overlay
+below changes no state for it, because an open pull request outranks a
+timeout apiary can re-reach next cycle. What it does is give the divergence a
+`kind`: without one it left `events.jsonl` as an override reading `kind: ""`,
+indistinguishable from the resolver merely disagreeing with a stale memory, and
+ADR 0001's class list was read as exhaustive when it was one short.
+
+None of the four is made derivable by making the resolver authoritative, and
 pretending otherwise is how a cutover ships a run that cannot stop retrying.
 
 ## What the resolver is *not* asked to decide, and why
@@ -310,6 +326,7 @@ from .derived import (
 __all__ = [
     "BUDGET_RENEWED",
     "BUDGET_SPENT",
+    "CHECK_TIMEOUT",
     "DERIVED",
     "INFRASTRUCTURE_CEILING",
     "LANDED_STANDS",
@@ -344,13 +361,16 @@ DERIVED = "derived"
 #: the set `github/readiness.py` owns the split of. See the module docstring.
 WAITING: frozenset[str] = frozenset({ELIGIBLE, BLOCKED})
 
-#: Why a belief is not simply the resolver's verdict. The first three are ADR
-#: 0001's three non-derivable states. They were spelled to match the shadow
-#: window's classification kinds, which imported them from here, so that a
-#: divergence the shadow explained and an override this module applies read as
-#: the same phenomenon in `events.jsonl`. #152 removed the window; the spellings
-#: stay, because `events.jsonl` is append-only and `artifacts.DivergenceTally`
-#: still reads recorded runs by these names.
+#: Why a belief is not simply the resolver's verdict. The first three are the
+#: three non-derivable states ADR 0001 was written with; `CHECK_TIMEOUT` below is
+#: the fourth (#289), and it is below rather than here because it postdates the
+#: shadow window. These three were spelled to match that window's classification
+#: kinds, which imported them from here, so that a divergence the shadow
+#: explained and an override this module applies read as the same phenomenon in
+#: `events.jsonl`. #152 removed the window; the spellings stay, because
+#: `events.jsonl` is append-only and `artifacts.DivergenceTally` still reads
+#: recorded runs by these names. Adding a kind is safe for that reader; renaming
+#: one silently rewrites the history of every archived run.
 INFRASTRUCTURE_CEILING = "infrastructure-ceiling"
 BUDGET_RENEWED = "budget-renewed"
 REVIVED = "revived"
@@ -380,6 +400,37 @@ BUDGET_SPENT = "budget-spent"
 #: `DivergenceTally.overrides` into a measure of run length. See
 #: `Belief.announced`, which is how the next cycle knows it already spoke.
 LANDED_STANDS = "landed-stands"
+
+#: ADR 0001's **fourth** non-derivable state, found by grouping #152's ten
+#: recorded runs (#289). The check gate escalates a pull request that never grew
+#: a check run - `checks._decide_empty`, past `zero_check_grace_s` - and that
+#: escalation is a judgment about *elapsed time*, which is the one thing the code
+#: host does not record. There is no failing check run (a check run failing to
+#: appear is the finding), the pull request stays **open**, and the issue stays
+#: open. So `derived.resolve` reads `review` and is not wrong about the code
+#: host: an open pull request on the task's branch is exactly what `review`
+#: means. Only apiary knows a gate that was waited for never arrived - the same
+#: family as `INFRASTRUCTURE_CEILING`, a verdict reached from a sequence the host
+#: shows no trace of, and it is a kind of its own rather than folded into that
+#: one because a mechanical failure streak and an ungated pull request want
+#: different things from the human they are handed to.
+#:
+#: **The guard is the transition, not the sentence.** Nothing about check runs
+#: reaches here to match on: `Observation` deliberately carries no check sets
+#: (see its docstring - a gate verdict is not a lifecycle state), so the reason
+#: string `checks._decide_empty` writes is a level away and matching its prose
+#: would break on the next edit to it. What this module can see is
+#: `needs-human` stored and `review` derived - apiary escalated a task the host
+#: still shows an open pull request for. `_decide_failed`'s undeclared-file
+#: escalation reaches that same shape, and is the same phenomenon under a
+#: different trigger: apiary's own refusal, uncorroborated. Naming the kind for
+#: the case the corpus produced is not a claim that this arm can tell the two
+#: apart, and it must not be read as one.
+#:
+#: New to `events.jsonl`, so archived runs recorded before #289 keep reporting
+#: this case as `kind: ""` - which is what it was, and `DivergenceTally` should
+#: go on saying so rather than reclassifying history it did not observe.
+CHECK_TIMEOUT = "check-timeout"
 
 #: The last is not one of ADR 0001's: it is a task the resolver had no verdict
 #: for at all, which `Resolution.state` reports as `""` rather than as a state
@@ -1071,6 +1122,28 @@ def believe(
                 f"budget is not spent (streak={entry.streak}, attempt={entry.attempt}"
                 + (f", revived at attempt {outstanding.attempt}" if outstanding else "")
                 + f"). `_retry_or_give_up` gives up on the streak, so {believed} stands."
+            )
+        elif believed == REVIEW and was_stored == NEEDS_HUMAN:
+            # ADR 0001's fourth non-derivable state, and **the only arm here that
+            # changes nothing but the label on the event** (#289). The resolver
+            # keeps its verdict: an open pull request is an open pull request,
+            # and an overlay that answered "a human, please" here would pin every
+            # escalated-but-still-open task for the rest of the process on
+            # evidence that cannot go stale, which is the ratchet's licence and
+            # this is not the ratchet. What the arm buys is that the divergence
+            # is *classified* rather than emitted with `kind: ""` - the one
+            # remaining unclassified override in the recorded corpus, and an
+            # empty kind is indistinguishable from a plain disagreement the
+            # resolver simply read differently.
+            kind = CHECK_TIMEOUT
+            why = (
+                "apiary escalated this task and the code host records nothing about "
+                "it: the pull request is still open, so the resolver reads "
+                f"{verdict.state} and is right about the host. The check gate's "
+                "zero-check timeout (`checks._decide_empty`) is what produces this - "
+                "a judgment about elapsed time, and a check run that never appeared "
+                "leaves no check run to find. The belief is unchanged; the store "
+                "carries the consequence."
             )
 
         states[entry.task_id] = believed
