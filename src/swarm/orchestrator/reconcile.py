@@ -112,12 +112,10 @@ from ..containers.manager import ContainerError, Handle, StackImages
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import (
     ContractError,
-    LabelRepair,
     Ledger,
     LedgerEntry,
     load_ledger,
     render_marker,
-    resolve_state_label,
 )
 from ..github.readiness import (
     READY,
@@ -129,7 +127,7 @@ from ..github.readiness import (
 )
 from ..github.refs import issue_number, task_ref
 from ..mcp.tracker import TrackerError
-from ..run import TERMINAL_LABELS, Run, live_entries
+from ..run import Run, live_entries
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import TaskRef
 from ..worker.entrypoint import EXIT_OK
@@ -138,10 +136,8 @@ from .authority import (
     Belief,
     Grant,
     believe,
-    label_state,
     revived_tasks,
     state_of,
-    state_source,
 )
 # **The `_STATE` suffix is ADR 0001's internal vocabulary.** The convention came
 # from the shadow window, and is kept for its reason: the one time a state and
@@ -161,8 +157,6 @@ from .dispatcher import Capacity, DispatchReport, Spawner, dispatch
 #: `lifecycle.INTERNAL_STATE` needs all six labels in one place to map them, and
 #: `run.py` needs `TERMINAL_LABELS`, which decides what "finished" means and
 #: which resumption depends on. #152 deletes them along with the storage.
-DONE = "swarm:done"
-FAILED = "swarm:failed"
 
 #: Seconds between the *starts* of two cycles, not between one ending and the
 #: next beginning. A cycle that took longer than this does not then sleep on top
@@ -435,7 +429,7 @@ class Transition:
     once a human has hand-edited an issue: a task the resolver believes `claimed`
     while the issue carries `swarm:done` must have `swarm:done` taken off it, or
     it ends up wearing two. The construction sites therefore pass
-    `label_state(entry.state_label)` rather than the belief, and `write_labels`
+    `_now(entry, believed)` rather than the belief, and `write_labels`
     translates it back - losslessly, because `INTERNAL_STATE` is a bijection over
     the six labels and `tests/test_reconcile.py` pins that. The distinction dies
     with the labels; the field does not.
@@ -651,7 +645,6 @@ class ReconcilePlan:
 
     transitions: tuple[Transition, ...] = ()
     disposals: tuple[Disposal, ...] = ()
-    repairs: tuple[LabelRepair, ...] = ()
     errors: tuple[ContractError, ...] = ()
     #: True when PR state could not be read at all this cycle - see the module
     #: docstring. Rules that need it did not run; they did not fail.
@@ -659,7 +652,7 @@ class ReconcilePlan:
 
     @property
     def changed(self) -> bool:
-        return bool(self.transitions or self.disposals or self.repairs)
+        return bool(self.transitions or self.disposals)
 
     @property
     def refs(self) -> tuple[TaskRef, ...]:
@@ -669,7 +662,6 @@ class ReconcilePlan:
         parts = [
             f"{len(self.transitions)} transition(s)",
             f"{len(self.disposals)} disposal(s)",
-            f"{len(self.repairs)} label repair(s)",
             f"{len(self.errors)} malformed issue(s)",
         ]
         if self.blind:
@@ -914,6 +906,7 @@ def _retry_or_give_up(
     reason: str,
     max_attempts: int,
     *,
+    believed: Belief | None = None,
     verify_output: str = "",
     max_total_attempts: int | None = None,
 ) -> Transition:
@@ -979,7 +972,7 @@ def _retry_or_give_up(
     if attempt >= total_cap:
         return Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=_now(entry, believed),
             to_state=NEEDS_HUMAN,
             reason=f"{reason}; {attempt} attempt(s) made against a total cap of {total_cap}",
             task_id=entry.task_id,
@@ -1002,7 +995,7 @@ def _retry_or_give_up(
     if streak >= cap:
         return Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=_now(entry, believed),
             to_state=NEEDS_HUMAN,
             reason=(
                 f"{reason}; {attempt} attempt(s) made, the last {streak} failing the "
@@ -1030,7 +1023,7 @@ def _retry_or_give_up(
         )
     return Transition(
         ref=entry.ref,
-        from_state=label_state(entry.state_label),
+        from_state=_now(entry, believed),
         to_state=ELIGIBLE,
         reason=reason,
         task_id=entry.task_id,
@@ -1045,6 +1038,11 @@ def _retry_or_give_up(
 #: `TERMINAL_LABELS` in ADR 0001's vocabulary. Same two rows of §4, read through
 #: whichever control plane this cycle believes.
 FINISHED_STATES = frozenset({LANDED, NEEDS_HUMAN})
+
+#: The "no grant" answer for the live count, so the lookup has one shape. A task
+#: nobody revived is treated as a grant already spent - it is not being kept
+#: alive by one.
+_SPENT = Grant(attempt=0, dispatched=True)
 
 
 def _now(entry: LedgerEntry, believed: Belief | None) -> str:
@@ -1084,6 +1082,7 @@ def plan_reconcile(
     previous: Mapping[str, str] | None = None,
     max_attempts: int = SETTINGS.max_attempts_per_task,
     max_total_attempts: int = SETTINGS.max_total_attempts_per_task,
+    escalated: Collection[TaskRef] = (),
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_policy: InfrastructurePolicy = InfrastructurePolicy(),
     observed: Mapping[TaskRef, str] | None = None,
@@ -1121,7 +1120,7 @@ def plan_reconcile(
     `believed=None` reads the labels for both, which is `APIARY_STATE_SOURCE=labels`
     and is exactly what this function did before #147.
 
-    `from_state` on every transition below is `label_state(entry.state_label)`
+    `from_state` on every transition below is `_now(entry, believed)`
     whatever the source, and that is not an oversight: it names the label the
     write has to *remove*, so a hand-edited issue is relabelled correctly rather
     than left carrying two. `Transition` says the same thing at more length and
@@ -1164,7 +1163,7 @@ def plan_reconcile(
             transitions.append(
                 Transition(
                     ref=entry.ref,
-                    from_state=label_state(entry.state_label),
+                    from_state=_now(entry, believed),
                     to_state=verdict,
                     reason=reason,
                     task_id=entry.task_id,
@@ -1178,7 +1177,7 @@ def plan_reconcile(
         #    cycle finished, or one a human labelled `swarm:done` by hand.
         if terminal:
             if entry.ref in live:
-                disposals.append(Disposal(entry.ref, f"{entry.state_label} is terminal"))
+                disposals.append(Disposal(entry.ref, f"{_now(entry, believed)} is terminal"))
             continue
 
         # 3. A worker that finished and said so. The record is written last by
@@ -1200,6 +1199,7 @@ def plan_reconcile(
                 entry,
                 record,
                 max_attempts,
+                believed=believed,
                 max_total_attempts=max_total_attempts,
                 infrastructure_streak=infrastructure.get(entry.ref, 0),
                 policy=infrastructure_policy,
@@ -1228,6 +1228,7 @@ def plan_reconcile(
                     entry,
                     "its pull request was closed without merging",
                     max_attempts,
+                    believed=believed,
                     max_total_attempts=max_total_attempts,
                 )
             )
@@ -1249,14 +1250,23 @@ def plan_reconcile(
         # parse was handed; the ref is minted here rather than there, so the
         # plan speaks one vocabulary.
         error_ref = task_ref(error.number)
-        carried = labels.get(error_ref, frozenset())
-        current, _ = resolve_state_label(error.number, carried)
-        if current is None or current in TERMINAL_LABELS:
+        # Escalated once per run, not once per cycle. The guard used to be the
+        # issue's own label - `swarm:done` or `swarm:failed` meant "already
+        # dealt with" - and #152 took it away. A malformed issue never parses,
+        # so it has no task id, no belief entry and nothing on the code host
+        # that changes when apiary comments on it: without a memory this would
+        # comment every cycle forever.
+        #
+        # Run-scoped, which is `_infrastructure`'s bargain and fails the same
+        # safe way: a restart says it once more. The alternative - a row in
+        # apiary's store keyed on a task that has no id - would be inventing an
+        # identity for something whose defining property is that it has none.
+        if error_ref in escalated:
             continue
         transitions.append(
             Transition(
                 ref=error_ref,
-                from_state=label_state(current),
+                from_state="",
                 to_state=NEEDS_HUMAN,
                 reason=f"malformed contract: {error.reason}",
                 comment=f"apiary: this issue does not satisfy `docs/issue-contract.md`.\n\n{error}",
@@ -1275,7 +1285,6 @@ def plan_reconcile(
     return ReconcilePlan(
         transitions=tuple(transitions),
         disposals=tuple(disposals),
-        repairs=ledger.repairs,
         errors=ledger.errors,
         blind=open_branches is None,
     )
@@ -1286,6 +1295,7 @@ def _observe(
     record: ResultRecord,
     max_attempts: int,
     *,
+    believed: Belief | None = None,
     max_total_attempts: int | None = None,
     infrastructure_streak: int = 0,
     policy: InfrastructurePolicy = InfrastructurePolicy(),
@@ -1313,6 +1323,7 @@ def _observe(
         entry,
         record,
         max_attempts,
+        believed=believed,
         max_total_attempts=max_total_attempts,
         infrastructure_streak=infrastructure_streak,
         policy=policy,
@@ -1327,6 +1338,7 @@ def _verdict(
     record: ResultRecord,
     max_attempts: int,
     *,
+    believed: Belief | None = None,
     max_total_attempts: int | None = None,
     infrastructure_streak: int = 0,
     policy: InfrastructurePolicy = InfrastructurePolicy(),
@@ -1339,7 +1351,7 @@ def _verdict(
         return (
             Transition(
                 ref=entry.ref,
-                from_state=label_state(entry.state_label),
+                from_state=_now(entry, believed),
                 to_state=REVIEW_STATE,
                 reason="the worker published its pull request",
                 task_id=entry.task_id,
@@ -1354,6 +1366,7 @@ def _verdict(
                 entry,
                 f"worker exit {record.exit_code}: {detail}",
                 max_attempts,
+                believed=believed,
                 # The record is the only place the gate's own words survive the
                 # container, and they are what the retry comment - and through
                 # it, the next attempt's prompt - is made of. The failure
@@ -1379,7 +1392,7 @@ def _verdict(
         return (
             Transition(
                 ref=entry.ref,
-                from_state=label_state(entry.state_label),
+                from_state=_now(entry, believed),
                 to_state=NEEDS_HUMAN,
                 # The counter is deliberately left alone. The attempts were
                 # never consumed and saying otherwise now would rewrite history
@@ -1405,7 +1418,7 @@ def _verdict(
     return (
         Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=_now(entry, believed),
             to_state=ELIGIBLE,
             reason=f"infrastructure failure: {detail}; the attempt was not consumed",
             task_id=entry.task_id,
@@ -1435,7 +1448,6 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
             continue
         entries[task_id] = replace(
             entry,
-            state_label=state_label_for(transition.to_state),
             attempt=entry.attempt if transition.attempt is None else transition.attempt,
             # The signature record mirrors the store write exactly: a
             # transition that wrote the counter wrote (or cleared) the
@@ -1446,11 +1458,12 @@ def fold(ledger: Ledger, transitions: Iterable[Transition]) -> Ledger:
             blocker=entry.blocker if transition.attempt is None else transition.blocker,
             streak=entry.streak if transition.attempt is None else transition.streak,
             renewals=entry.renewals if transition.attempt is None else transition.renewals,
-            labels=frozenset(
-                entry.labels
-                - {state_label_for(transition.from_state)}
-                | {state_label_for(transition.to_state)}
-            ),
+            # The state is not folded onto the entry, because since #152 an entry
+            # does not carry one. A transition's consequence for the rest of the
+            # cycle travels on the belief (`authority.Belief.fold`), which is the
+            # one place a state lives now - and the counter and its judgment are
+            # folded here because those are facts about the *task*, which the
+            # entry does carry.
         )
     return replace(ledger, entries=entries)
 
@@ -1515,7 +1528,6 @@ class ReconcileReport:
     plan: ReconcilePlan
     applied: tuple[Transition, ...] = ()
     disposed: tuple[TaskRef, ...] = ()
-    repaired: tuple[TaskRef, ...] = ()
     failures: tuple[Failure, ...] = ()
     #: Comments §1.4 wanted posted and this client had no method for. Not a
     #: failure - the text was printed - but the gap is worth reporting rather
@@ -1531,7 +1543,6 @@ class ReconcileReport:
         parts = [
             f"applied {len(self.applied)}/{len(self.plan.transitions)} transition(s)",
             f"disposed {len(self.disposed)}",
-            f"repaired {len(self.repaired)}",
         ]
         if self.failures:
             detail = "; ".join(str(failure) for failure in self.failures)
@@ -1542,44 +1553,27 @@ class ReconcileReport:
         return ", ".join(parts)
 
 
-def state_label_for(state: str) -> str:
-    """`lifecycle.state_label`, reached through a local import.
-
-    `authority._internal`'s shape and its exact reason, in the other direction:
-    `lifecycle` imports this module, so a module-level import here is a cycle.
-    The indirection is one line and the alternative is a second copy of the
-    six-row table, which is the thing `STATE_LABEL` is inverted rather than
-    written out to avoid.
-    """
-    from .lifecycle import state_label
-
-    return state_label(state)
-
-
-def write_labels(client: Any, transition: Transition) -> None:
-    """Store one transition's state as the `swarm:*` labels. **The only writer.**
-
-    Three call sites had this same five lines - here, `checks._apply` and
-    `mergeability._apply` - and they are now one, which is most of what #152 has
-    left to delete: the transition path stops writing labels when this function
-    goes, rather than when three copies of it are each found and removed.
-
-    **Add before remove.** `readiness._relabel`'s rule, and load-bearing for its
-    reason: GitHub has no transaction across two label calls, and a crash between
-    them leaves either two state labels or none. Two is repairable - §3's
-    precedence puts the furthest-along first - while none puts the issue outside
-    the ledger entirely, where nothing looks at it again.
-
-    Raises whatever the client raises. Every caller already wraps this in a
-    `try` that lands one issue's failure in `Failure` and carries on with the
-    other nineteen, and swallowing here would take that decision away from them.
-    """
-    number = issue_number(transition.ref)
-    to_label = state_label_for(transition.to_state)
-    client.add_labels(number, [to_label])
-    from_label = state_label_for(transition.from_state) if transition.from_state else ""
-    if from_label and from_label != to_label:
-        client.remove_label(number, from_label)
+# The transition path writes nothing to the tracker
+# --------------------------------------------------------------------------
+#
+# `write_labels` stood here and was the only writer: three call sites - this
+# module, `checks._apply` and `mergeability._apply` - collapsed into one
+# function precisely so that #152 would be a deletion rather than a hunt. It
+# added the new `swarm:*` label and removed the old one, add-before-remove,
+# because a crash between two label calls could otherwise leave an issue with no
+# state label and outside the ledger entirely.
+#
+# There is no state label now. What a transition *is* - a task moved from one of
+# ADR 0001's internal states to another - is unchanged; what has gone is the
+# copy of it apiary wrote into the customer's tracker. The states are derived
+# from the code host, the containers, the run artifacts and apiary's own store
+# (`orchestrator/derived.py`, `docs/adr/0002-apiary-owns-a-thin-task-store.md`),
+# and a `Transition` is now the record of a decision rather than an instruction
+# to relabel.
+#
+# `state_label_for` went with it, and with it the last call into
+# `lifecycle.state_label` - so `lifecycle` no longer knows what a `swarm:*`
+# label is called either.
 
 
 def post_comment(client: Any, number: int, text: str) -> bool:
@@ -1639,23 +1633,11 @@ def apply_plan(
     handles = handles or {}
     applied: list[Transition] = []
     disposed: list[TaskRef] = []
-    repaired: list[TaskRef] = []
     failures: list[Failure] = []
     uncommented: list[TaskRef] = []
 
     if dry_run:
         return ReconcileReport(plan=plan)
-
-    for repair in plan.repairs:
-        try:
-            for label in repair.removed:
-                client.remove_label(repair.number, label)
-        except GitHubError as exc:
-            failures.append(Failure(repair.ref, f"repairing labels: {exc}"))
-            continue
-        repaired.append(repair.ref)
-        if not post_comment(client, repair.number, f"apiary: {repair}"):
-            uncommented.append(repair.ref)
 
     for transition in plan.transitions:
         # The one place this loop needs the tracker's own spelling: every call
@@ -1678,12 +1660,11 @@ def apply_plan(
                     streak=transition.streak,
                     renewals=transition.renewals,
                 )
-            write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
-            # A human deleting or relabelling this issue between the read and
-            # the write lands here, and so does a store that will not take the
-            # judgment. Either is a fact about one issue, not a reason to
-            # abandon the cycle - the next read sees whatever they did.
+            # A store that will not take the judgment. `GitHubError` stays in the
+            # tuple because `post_comment` below is still a tracker call and a
+            # future write may return here; either is a fact about one issue,
+            # not a reason to abandon the cycle.
             failures.append(Failure(transition.ref, f"{transition.to_state}: {exc}"))
             continue
         applied.append(transition)
@@ -1705,7 +1686,6 @@ def apply_plan(
         plan=plan,
         applied=tuple(applied),
         disposed=tuple(disposed),
-        repaired=tuple(repaired),
         failures=tuple(failures),
         uncommented=tuple(dict.fromkeys(uncommented)),
     )
@@ -1723,6 +1703,12 @@ class CycleReport:
     index: int
     ledger: Ledger
     result: ReconcileReport
+    #: What this cycle believed, task id -> ADR 0001 state. Carried since #152:
+    #: the states used to be readable off `LedgerEntry.state_label`, so a
+    #: projection over a finished report could recover them from the ledger it
+    #: already had. There is no label now, and a report without this is a report
+    #: nothing downstream can say what happened in.
+    belief: Any | None = None
     readiness: ReadinessPlan | None = None
     dispatched: DispatchReport | None = None
     #: The merge gate, in the order it runs: mergeability decides what may be
@@ -1767,7 +1753,6 @@ class CycleReport:
         return bool(
             self.result.applied
             or self.result.disposed
-            or self.result.repaired
             or (self.readiness is not None and self.readiness.transitions)
             or (self.dispatched is not None and self.dispatched.dispatched)
         )
@@ -2008,6 +1993,11 @@ class Reconciler:
     #: granting a clean slate is the safe direction for a counter whose job is
     #: bounding one run.
     _infrastructure: dict[TaskRef, int] = field(default_factory=dict, repr=False)
+    #: Malformed issues this run has already escalated. Run-scoped for
+    #: `_infrastructure`'s reason: the label that used to say "already dealt
+    #: with" is gone (#152), and an issue that does not parse has no task id to
+    #: key anything durable on.
+    _escalated: set[TaskRef] = field(default_factory=set, repr=False)
     #: The result record each task's last landed move was made from (#203).
     #: Run-scoped for `_infrastructure`'s reason, and failing the same safe
     #: way: a restart forgets which record it acted on, and the worst that buys
@@ -2025,11 +2015,6 @@ class Reconciler:
     #: next cycle for the same reason, and a traceback every fifteen seconds for
     #: the rest of the run buries the one line that mattered.
     _recorder_broken: bool = field(default=False, repr=False)
-    #: Which control plane this run believes (#147), read once at construction
-    #: so that a mid-run environment edit cannot make one cycle derive its state
-    #: and the next one read it off a label. `APIARY_STATE_SOURCE=labels` is the
-    #: escape hatch and `authority.state_source` is loud on anything else.
-    _source: str = field(default_factory=state_source, repr=False)
     #: What this process believed at the end of the previous cycle, by **work
     #: item**. `plan_reconcile` is incremental and the resolver is absolute;
     #: this is the "was" the label used to carry. Run-scoped, like
@@ -2063,6 +2048,14 @@ class Reconciler:
     #: is the predicate, and `authority`'s module docstring argues why no other
     #: counter bounds that input.
     _revived: dict[TaskRef, Grant] = field(default_factory=dict, repr=False)
+    #: Every task this run has *ever* revived, spent or not. Separate from
+    #: `_revived` because the two answer different questions: that one is the
+    #: live grant an override reads, and a spent grant has to stop overriding or
+    #: the task is believed `eligible` forever; this one is the bound, and it has
+    #: to outlive the grant or the gate revives the same task every cycle.
+    #: Collapsing them into one set gets one of the two wrong, and #152 is when
+    #: that started to matter - the label write used to hold the bound.
+    _ever_revived: set[TaskRef] = field(default_factory=set, repr=False)
 
     # --- one cycle -------------------------------------------------------
 
@@ -2076,11 +2069,13 @@ class Reconciler:
         self._cycles += 1
 
         snapshot = Snapshot(self.client)
-        # `adopt` writes a marker onto every hand-written issue (§2), which a
-        # dry run promised not to do.
+        # No `adopt=`: the loader wrote a marker onto every hand-written issue
+        # that carried a `swarm:*` label, and #152 removed both the label that
+        # selected them and the write. Membership is the marker itself now, so
+        # there is nothing to adopt - and nothing for a dry run to promise not
+        # to do either.
         ledger = load_ledger(
             snapshot,  # type: ignore[arg-type]
-            adopt=not self.dry_run,
             store=self.store,
         )
 
@@ -2141,7 +2136,6 @@ class Reconciler:
         belief = believe(
             ledger,
             observation,
-            source=self._source,
             infrastructure=self._infrastructure,
             infrastructure_cap=self.infrastructure_policy.cap,
             revived=self._revived,
@@ -2163,6 +2157,7 @@ class Reconciler:
             previous=belief.previous,
             max_attempts=self.max_attempts,
             max_total_attempts=self.max_total_attempts,
+            escalated=self._escalated,
             infrastructure=self._infrastructure,
             infrastructure_policy=self.infrastructure_policy,
             observed=self._observed_records,
@@ -2187,6 +2182,9 @@ class Reconciler:
         # it would escalate a task on the strength of a move that never
         # happened. Same rule `fold` follows one line up, for the same reason.
         self._infrastructure = infrastructure_streaks(self._infrastructure, result.applied)
+        self._escalated.update(
+            task_ref(error.number) for error in ledger.errors if error.number
+        )
         # Same input, same rule, same reason: a record whose move landed has
         # been accounted for and must not be accounted for again while its
         # retry - which §4 runs at the *same* attempt number - is in flight.
@@ -2310,11 +2308,12 @@ class Reconciler:
                 readiness = apply_readiness(
                     snapshot,  # type: ignore[arg-type]
                     ledger=ledger,
-                    dry_run=self.dry_run,
-                    # The one thing readiness used a label for: which entries
-                    # are its to speak about. Everything else it decides is a
-                    # question about the code host and is untouched (#147).
+                    # Which entries are readiness's to speak about, and what it
+                    # believes they are waiting in. Both were read off the
+                    # label until #152; the pass writes nothing now, so there is
+                    # no `dry_run` to pass either.
                     transitionable=belief.waiting(),
+                    current=belief.states,
                 )
             except DependencyCycleError as exc:
                 # Nothing was written - readiness detects the ring before its
@@ -2347,6 +2346,7 @@ class Reconciler:
                     )
 
         report = CycleReport(
+            belief=belief,
             index=index,
             ledger=ledger,
             result=result,
@@ -2356,7 +2356,28 @@ class Reconciler:
             checks=checks,
             recovered=recovered,
             cycle_error=cycle_error,
-            live=len(live_entries(ledger)),
+            # **From the belief, not from `live_entries`.** `run.live_entries`
+            # answers "not closed", which is the only terminal fact available at
+            # `start_run` - before any observation exists to resolve a state
+            # from. Inside a cycle there *is* one, and the difference is not
+            # cosmetic: a task that needs a human is **open**, so counting it as
+            # live would mean the ledger never exhausts, `close_the_loop` is
+            # never called, and the goal gate's revival - the one thing that
+            # could rescue that very task - becomes unreachable. Under the
+            # labels this worked because `swarm:failed` was terminal *and* open,
+            # and that combination is exactly what #152 removed.
+            # Over the *ledger*, asking the belief - not over the belief's own
+            # keys. A belief with no states is a cycle that resolved nothing
+            # (no observation yet), and every task in it reads `""`, which is
+            # not terminal and therefore live. Counting the belief's keys
+            # instead would read an unresolved cycle as a finished plan and end
+            # the run on its first pass.
+            live=sum(
+                1
+                for entry in ledger.entries.values()
+                if belief.state(entry.task_id) not in FINISHED_STATES
+                or entry.ref in self._revived
+            ),
         )
         # `belief`, as it stands *here* - folded by `apply_plan`, the recovery
         # sweep and the merge gate - rather than the one `believe` returned at
@@ -2467,11 +2488,22 @@ class Reconciler:
         is in `authority`.
         """
         folded = belief.fold(getattr(report.mergeability, "applied", ()) or ())
-        overlay: dict[str, str] = {task: ELIGIBLE for task in revived_tasks(report)}
+        # Only a revival this run is actually *holding a grant for* moves the
+        # belief. The gate reports a revival for as long as the task is
+        # abandoned and the plan exhausted, and after #152 that is every cycle
+        # once the granted attempt is spent - so an unguarded overlay would
+        # believe a capped task `eligible` for the rest of the run. The bound
+        # itself is `_ever_revived`; this is the belief half of it.
+        overlay: dict[str, str] = {
+            task: ELIGIBLE
+            for task in revived_tasks(report)
+            if (entry := report.ledger.entries.get(task)) is not None
+            and entry.ref in self._revived
+        }
         if report.readiness is not None:
             for verdict in report.readiness.verdicts:
                 if verdict.task_id:
-                    overlay[verdict.task_id] = label_state(verdict.label)
+                    overlay[verdict.task_id] = verdict.state
         if report.dispatched is not None:
             slugs = {entry.ref: entry.task_id for entry in report.ledger.entries.values()}
             for item in report.dispatched.dispatched:
@@ -2503,7 +2535,11 @@ class Reconciler:
         if not self._revived:
             return
         for one in _dispatch_attempted(report) & self._revived.keys():
-            self._revived[one] = self._revived[one].spend()
+            # Dropped rather than marked. A spent grant that stayed here would
+            # keep overriding the resolver's cap and the task would be believed
+            # `eligible` for the rest of the run; the *bound* is
+            # `_ever_revived`, which keeps it.
+            del self._revived[one]
 
     def _record_revivals(self, report: CycleReport) -> None:
         """Remember the one attempt each revival granted. See `_revived`.
@@ -2516,8 +2552,12 @@ class Reconciler:
         """
         for task in revived_tasks(report):
             entry = report.ledger.entries.get(task)
-            if entry is not None:
-                self._revived[entry.ref] = Grant(attempt=entry.attempt)
+            if entry is None:
+                continue
+            if entry.ref in self._ever_revived:
+                continue
+            self._ever_revived.add(entry.ref)
+            self._revived[entry.ref] = Grant(attempt=entry.attempt)
 
     # --- step 5 ----------------------------------------------------------
 
@@ -2610,7 +2650,11 @@ class Reconciler:
 
         from ..nodes.judge import Observation, judge
 
-        observation = Observation.of(report.ledger, results=results)
+        observation = Observation.of(
+            report.ledger,
+            results=results,
+            states=getattr(report.belief, "states", None),
+        )
 
         if report.exhausted:
             # The observation is still recorded: a follow-up round leaves the
@@ -2667,6 +2711,12 @@ class Reconciler:
             # `swarm:failed` typed onto merged work used to end the run asking
             # for a human about a task that had landed.
             believed=believed,
+            # Bounded at one revival per task per run. The grant buys one
+            # attempt and `planner.revive` resets nothing, so a task revived and
+            # spent caps again immediately - and would be revived again every
+            # cycle after that. See `close_the_loop` for why this used to be
+            # implicit and no longer can be.
+            already_revived=tuple(self._ever_revived),
         )
         self._goal_rounds = goal.rounds
         wrote = (
@@ -2854,6 +2904,4 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
         print(f"would {planned}")
     for gone in dry.plan.disposals:
         print(f"would {gone}")
-    for repair in dry.plan.repairs:
-        print(f"would repair {repair}")
     print(dry.summary())

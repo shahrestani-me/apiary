@@ -312,11 +312,9 @@ __all__ = [
     "BUDGET_SPENT",
     "DERIVED",
     "INFRASTRUCTURE_CEILING",
-    "LABELS",
     "LANDED_STANDS",
     "REVIVED",
     "SOURCES",
-    "STATE_SOURCE_ENV",
     "UNRESOLVED",
     "WAITING",
     "Belief",
@@ -325,20 +323,22 @@ __all__ = [
     "believe",
     "budget_spent",
     "in_review",
-    "label_state",
     "revived_tasks",
     "source_summary",
     "state_of",
-    "state_source",
 ]
 
-#: The switch, and the reason the rest of this module is safe to ship. Defaults
-#: to `derived`, which is the cutover; `labels` restores what #146 shipped.
-STATE_SOURCE_ENV = "APIARY_STATE_SOURCE"
-
+#: There is no switch any more. `APIARY_STATE_SOURCE=labels` stood here as the
+#: way back from #147's cutover, and it worked only while the labels were still
+#: being written - so #152 removed the flag in the same change that removed the
+#: writes. A flag that outlives its migration is a second code path nobody
+#: tests, and this one would have been worse than untested: it would have
+#: restored a control plane that no longer exists, silently reading every task
+#: as outside the ledger.
+#:
+#: `DERIVED` survives as the one answer `source_summary` reports, because a run
+#: whose control plane nobody printed is a run nobody chose.
 DERIVED = "derived"
-LABELS = "labels"
-SOURCES: tuple[str, ...] = (DERIVED, LABELS)
 
 #: The two states a task that is neither in flight nor finished can be in, and
 #: the set `github/readiness.py` owns the split of. See the module docstring.
@@ -396,28 +396,6 @@ UNRESOLVED = "unresolved"
 _UNBOUNDED = 1_000_000_000
 
 
-def state_source(env: Mapping[str, str] | None = None) -> str:
-    """Which control plane decides. **Loud on garbage.**
-
-    The shadow flag read a mistyped value as its default and argued the case:
-    that flag decided whether an *observer* ran, and a `ValueError` out of it
-    would have been a shadow taking down a cycle. This one decides who the
-    orchestrator believes, so it belongs with `checks._env_flag` and
-    `dispatcher._env_int` instead - an operator who typed `APIARY_STATE_SOURCE=lables`
-    to get back to the old behaviour after a bad cutover must not silently get
-    the new one.
-    """
-    raw = (env or os.environ).get(STATE_SOURCE_ENV)
-    if raw is None or not raw.strip():
-        return DERIVED
-    value = raw.strip().lower()
-    if value not in SOURCES:
-        raise ValueError(
-            f"{STATE_SOURCE_ENV}={raw!r} is not one of {', '.join(SOURCES)}"
-        )
-    return value
-
-
 def state_of(entry: Any, believed: Belief | None = None) -> str:
     """What state is this task in? **The** function this module's docstring means.
 
@@ -428,18 +406,22 @@ def state_of(entry: Any, believed: Belief | None = None) -> str:
     reimplementing the two-line branch. `in_review` below is the first caller
     and is now a comparison against this rather than a second copy of it.
 
-    `believed=None` reads the label, which is every caller outside
-    `Reconciler.cycle`: the `__main__` dry runs, and `APIARY_STATE_SOURCE=labels`
-    by way of a `Belief` whose states are the labels anyway.
+    **A belief is required, and that is what #152 changed here.** `believed=None`
+    used to read the issue's label, which was the honest answer while something
+    wrote one. Nothing does, so the fallback would now read `""` for every task
+    and every caller comparing against a state would silently take the other
+    branch. Raising instead is the difference between a caller that was not
+    updated failing loudly and a run that quietly decides nothing.
 
-    The answer is always in the **internal** vocabulary, both sides, which is
-    what makes a caller's comparison one comparison rather than one per source.
-    That is safe because `INTERNAL_STATE` is one-to-one over the six `swarm:*`
-    labels and `internal_state` falls back to the suffix, so no two labels a
-    caller could be distinguishing collapse into one state here.
+    The answer is always in ADR 0001's **internal** vocabulary, which is what
+    makes a caller's comparison one comparison rather than one per source.
     """
     if believed is None:
-        return _internal(entry.state_label)
+        raise ValueError(
+            f"no belief for {getattr(entry, 'task_id', entry)!r}: since #152 there is "
+            f"no label to fall back to, so a caller that reaches here has to be given "
+            f"the cycle's `Belief`"
+        )
     return believed.state(entry.task_id)
 
 
@@ -450,9 +432,8 @@ def in_review(entry: Any, believed: Belief | None = None) -> bool:
     being spelled a third and fourth time in `checks.py` and `mergeability.py`:
     #147's criterion is that a label a human edits mid-run does not change what
     the orchestrator does, and a gate that still read the label would merge, or
-    refuse to merge, on that edit. `believed=None` reads the label, which is
-    every existing caller, both `__main__` dry runs and
-    `APIARY_STATE_SOURCE=labels`.
+    refuse to merge, on that edit. Since #152 there is no label to read: the
+    belief is the only answer, and `state_of` raises without one.
 
     Both sides say the same thing in the ordinary case, and it is worth naming
     which fact each is: the label is a record of a cycle having *observed* a
@@ -470,16 +451,9 @@ def source_summary(source: str | None = None) -> str:
     setting is read at the same call site that chose it, so a run's transcript
     cannot claim one thing while the loop does another.
     """
-    chosen = state_source() if source is None else source
-    if chosen == LABELS:
-        return (
-            "state source: the `swarm:*` labels ("
-            f"{STATE_SOURCE_ENV}={LABELS}) - the pre-#147 behaviour, restored"
-        )
     return (
         "state source: derived from the code host, the containers and apiary's own "
-        f"store; the labels are written and compared but not believed "
-        f"({STATE_SOURCE_ENV}={LABELS} to go back)"
+        "store. There is no other; the label control plane is gone (#152)"
     )
 
 
@@ -567,7 +541,6 @@ class Belief:
     existed, which is the one failure `fold` exists to prevent.
     """
 
-    source: str = DERIVED
     #: task id -> the internal state this orchestrator acts on.
     states: Mapping[str, str] = field(default_factory=dict)
     #: task id -> the internal state the `swarm:*` label is storing. Kept so a
@@ -613,11 +586,6 @@ class Belief:
     #: question about the event log can never perturb the question about the
     #: merge; a key here is always a member of `landed`, never the reverse.
     announced: Mapping[TaskRef, str] = field(default_factory=dict)
-
-    @property
-    def derived(self) -> bool:
-        """Is the resolver being believed at all? The one branch that differs."""
-        return self.source == DERIVED
 
     def state(self, task_id: str) -> str:
         """This task's believed state, or `""` for a task not in the ledger.
@@ -777,12 +745,10 @@ class Belief:
         }
 
     def summary(self) -> str:
-        if not self.derived:
-            return f"state source: {self.source} ({STATE_SOURCE_ENV}={LABELS})"
         explained = sum(1 for one in self.overrides if one.kind)
         return (
             f"state source: the resolver over {len(self.states)} task(s), "
-            f"{len(self.overrides)} disagreeing with the label "
+            f"{len(self.overrides)} overridden by apiary's own record "
             f"({explained} accounted for)"
         )
 
@@ -796,7 +762,6 @@ def believe(
     ledger: Ledger,
     observation: Observation | None,
     *,
-    source: str = DERIVED,
     infrastructure: Mapping[TaskRef, int] | None = None,
     infrastructure_cap: int = 3,
     revived: Mapping[TaskRef, Grant] | None = None,
@@ -850,7 +815,6 @@ def believe(
     grants = dict(revived or {})
     entries = sorted(ledger.entries.values(), key=lambda entry: entry.ref)
 
-    by_label = {entry.task_id: _internal(entry.state_label) for entry in entries}
     refs = {entry.task_id: entry.ref for entry in entries}
     held_by_ref = dict(remembered or {})
     was_landed = frozenset(landed or ())
@@ -875,36 +839,31 @@ def believe(
         for entry in entries
         if entry.ref in held_by_ref
     }
-    previous = {**by_label, **seen}
+    # The remembered overlay alone. Until #152 this was `{**by_label, **seen}`,
+    # seeding cycle 0 from the label each issue carried so that an edge-triggered
+    # rule had a prior state on the first cycle of a resumed run. No label is
+    # written any more, so there is nothing to seed from and a task apiary has
+    # not seen this process is simply unknown to it.
+    #
+    # That is the safe direction and it is ADR 0001's: an edge fires on a
+    # *change*, so an empty `previous` means no edge fires on the first sight of
+    # a task, and the cycle after it acts on a transition this process watched
+    # rather than one it inferred from a label somebody may have typed.
+    previous = dict(seen)
 
-    if source != DERIVED or observation is None:
-        # `previous` is the labels alone here, deliberately, and not the
-        # `remembered` overlay the derived path uses.
+    if observation is None:
+        # Nothing to resolve from, so nothing is believed. This used to be the
+        # `APIARY_STATE_SOURCE=labels` arm as well, seeding every task from the
+        # label it carried; #152 removed both the flag and the labels, so a
+        # cycle with no observation now says so rather than inventing states
+        # from a control plane that is not there.
         #
-        # `APIARY_STATE_SOURCE=labels` has one job: restore what the
-        # orchestrator did before #147. Before #147 `plan_reconcile`'s rules 3
-        # and 4 read `entry.state_label` directly, every cycle. Carrying last
-        # cycle's belief over this cycle's label makes the remembered value win,
-        # and the one event that distinguishes them is a human editing a label
-        # mid-run - which is the single case the hatch exists for, and the
-        # action apiary's own give-up comment instructs ("move this back to
-        # `swarm:ready`"). Rule 4 would then fire on the remembered `review`,
-        # consume an attempt and post a failure for work a human had just
-        # rescheduled.
-        #
-        # `landed` and `announced` ride through unchanged rather than being
-        # dropped, and that is a deliberate strengthening (#214). Under
-        # `source=labels` nothing below reads them, so it is inert; the case it
-        # is not inert for is the *blind* cycle, where a run that could not list
-        # pull requests once used to lose every merge it had ratcheted for the
-        # rest of the process. "This cycle could not look" is not evidence that
-        # a merge was undone - the same sentence the no-verdict arm below is
-        # already decided by.
+        # `landed` and `announced` ride through unchanged (#214): "this cycle
+        # could not look" is not evidence that a merge was undone.
         return Belief(
-            source=LABELS,
-            states=dict(by_label),
-            stored=by_label,
-            previous=dict(by_label),
+            states={},
+            stored={},
+            previous=dict(previous),
             refs=refs,
             landed=was_landed,
             announced=spoken,
@@ -937,9 +896,12 @@ def believe(
     cap = max(int(infrastructure_cap), 0)
 
     for entry in entries:
-        # Shadowing the module-level `label_state` here would be a name a reader
-        # has to disambiguate in the one function that holds both sides.
-        was_stored = _internal(entry.state_label)
+        # What this task was last believed to be, which was the label it wore
+        # until #152. A task this process has not carried before has no entry
+        # here and reads `""` - it is genuinely unknown rather than `eligible`,
+        # and the arms below test membership rather than equality for that
+        # reason.
+        was_stored = previous.get(entry.task_id, "")
         stored[entry.task_id] = was_stored
         # **The ratchet's one input**, and the two problems #201 found in it are
         # both in this expression rather than in the arm below.
@@ -1157,7 +1119,6 @@ def believe(
             )
 
     return Belief(
-        source=DERIVED,
         states=states,
         stored=stored,
         previous=previous,
@@ -1247,17 +1208,6 @@ def budget_spent(
         return False
     streak = entry.attempt if entry.streak is None else entry.streak
     return int(streak) >= cap
-
-
-def label_state(label: str) -> str:
-    """The internal state a `swarm:*` label stores. `lifecycle.internal_state`.
-
-    Public because two modules need it *without* being able to import
-    `lifecycle` - `reconcile`, which `lifecycle` imports, and this one. It is the
-    translation, not a reading: a caller reaching for it is either advancing a
-    belief by a write apiary just made or falling back to the labels on purpose.
-    """
-    return _internal(label)
 
 
 def _internal(label: str) -> str:

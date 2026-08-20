@@ -14,12 +14,13 @@ same store and assert on the *issue numbers*: the same ids must land on the
 same issues, and a second set is the failure this whole design exists to
 prevent (`docs/issue-contract.md` §2).
 
-The third is #212: what a task's state *is* comes from the cycle's authority and
-no longer from its label. Those tests are the pair #147 and #198 were held to -
-one hand-edited label deciding nothing under `derived` and deciding again under
-`labels` - and every one of them asserts on the **selection**, because the
-failure they cover produces no error and no transition. A revival that should not
-happen just puts a worker back onto merged code.
+The third is #212, finished by #152: what a task's state *is* comes from the
+cycle's `Belief` and there is no longer a label it could come from instead.
+`authority.state_of` raises without a belief, so a test that is *about* a state
+declares it with `believing()` below rather than by typing a `swarm:*` label onto
+an issue. Each of those tests asserts on the **selection**, because the failure
+they cover produces no error and no transition: a revival that should not happen
+just puts a worker back onto merged code.
 
 No network and no token: the transport is the shared fake from
 `tests/fixtures/github.py`, and nothing in this file reaches the real tracker.
@@ -30,7 +31,7 @@ from __future__ import annotations
 import urllib.parse
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pytest
 
@@ -66,7 +67,7 @@ from swarm.nodes.planner import (
     size_label,
     write_plan,
 )
-from swarm.orchestrator.authority import LABELS, WAITING, Belief, believe
+from swarm.orchestrator.authority import WAITING, Belief, believe
 from swarm.orchestrator.derived import (
     ELIGIBLE,
     LANDED,
@@ -107,7 +108,7 @@ class Tracker:
         self,
         *,
         body: str,
-        labels: Sequence[str] = ("swarm:ready",),
+        labels: Sequence[str] = (),
         title: str = "a task",
         state: str = "open",
         state_reason: str | None = None,
@@ -214,7 +215,36 @@ def plan(*tasks: PlannedTask, reasoning: str = "one file each") -> Plan:
     return Plan(tasks=list(tasks), reasoning=reasoning)
 
 
-def write(client, *tasks: PlannedTask, **kwargs: Any):
+def believing(book: Any, states: Mapping[str, str] | None = None) -> Belief:
+    """The cycle's belief about `book`, with `states` declared on top of it.
+
+    Every test below used to declare a task's state by typing a `swarm:*` label
+    onto its issue, and `write_plan` read it back off `LedgerEntry.state_label`.
+    #152 removed that field - a state is derived per cycle and lives on the
+    cycle's `Belief`, and `authority.state_of` raises rather than falling back to
+    a label that no longer exists - so the declaration travels here instead.
+
+    Anything in the ledger the test does not name is `eligible`: a planned task
+    nothing has started, which is what those issues wore `swarm:ready` for.
+    """
+    declared = {task_id: ELIGIBLE for task_id in book.entries}
+    declared.update(states or {})
+    return Belief(
+        states=declared,
+        refs={task_id: entry.ref for task_id, entry in book.entries.items()},
+    )
+
+
+def write(client, *tasks: PlannedTask, states: Mapping[str, str] | None = None, **kwargs: Any):
+    """Write a plan, with the belief the cycle would have been holding.
+
+    `states` is what this test says the tasks already in the ledger are in; see
+    `believing`. A caller passing `believed=` outright is saying something more
+    specific and is left alone.
+    """
+    if "believed" not in kwargs:
+        book = kwargs.setdefault("ledger", load_ledger(client))
+        kwargs["believed"] = believing(book, states)
     return write_plan(client, plan(*tasks), verify=VERIFY, **kwargs)
 
 
@@ -254,19 +284,28 @@ def test_a_plan_becomes_issues_the_loader_reads_back_identically(github):
     # the ledger turns it into a task id: identity and addressing, both intact.
     assert entry.blocked_by == (ledger.entries["parse-headers"].ref,)
     assert entry.depends_on == ("parse-headers",)
-    assert ledger.errors == () and ledger.repairs == ()
+    # `ledger.repairs` stood here until #152 - there is no second state label to
+    # repair. `ignored` is the surviving question of the same shape: every issue
+    # the planner wrote carries the marker that puts it in the ledger, so nothing
+    # it just created may fall out of its own read.
+    assert ledger.errors == () and ledger.ignored == ()
 
 
-def test_creation_labels_ready_or_blocked_by_the_dependencies_it_wrote(github):
+def test_creation_says_eligible_or_blocked_by_the_dependencies_it_wrote(github):
+    """The same decision `state_label` used to be read back for, in ADR 0001's
+    own vocabulary: there is no label on the issue to assert on since #152, and
+    the report is where `_create` says which of the two it resolved."""
     client, store, _ = github()
 
-    write(client, task("root"), task("leaf", depends_on=["root"]))
+    report = write(client, task("root"), task("leaf", depends_on=["root"]))
 
-    ledger = load_ledger(client)
-    assert ledger.entries["root"].state_label == "swarm:ready"
-    # Its dependency exists and is open, so `blocked` is the only honest label;
-    # readiness (#11) owns every transition after this one.
-    assert ledger.entries["leaf"].state_label == "swarm:blocked"
+    assert [(action.task_id, action.reason) for action in report.created] == [
+        ("root", ELIGIBLE),
+        # Its dependency exists and is open, so `blocked` is the only honest
+        # answer; readiness (#11) owns every transition after this one.
+        ("leaf", BLOCKED_STATE),
+    ]
+    assert set(load_ledger(client).entries) == {"root", "leaf"}
 
 
 def test_routing_labels_are_applied_at_creation(github):
@@ -280,7 +319,13 @@ def test_routing_labels_are_applied_at_creation(github):
         ),
     )
 
-    assert store.label_names(1) == {"swarm:ready", "area/github", "size/S"}
+    # `area/*` and `size/*` are the planner's routing hints, and they are now the
+    # *only* labels anything writes. `_create` still resolves the state a fresh
+    # task starts in - it is the `reason` the previous test reads off the report
+    # - but it no longer stamps it onto the issue: a state apiary invented has no
+    # business in a customer's tracker (ADR 0001), and membership is the identity
+    # marker in the body, so nothing needs it there.
+    assert store.label_names(1) == {"area/github", "size/S"}
 
 
 @pytest.mark.parametrize(
@@ -470,21 +515,20 @@ def test_a_dropped_task_that_never_started_is_closed_as_not_planned(github):
 def test_a_dropped_task_with_an_open_pr_is_left_alone(github):
     client, store, transport = github()
     number = store.add(
-        body=render_body("in-review", goal="a goal", files=["src/a.py"], verify=VERIFY),
-        labels=("swarm:review",),
+        body=render_body("in-review", goal="a goal", files=["src/a.py"], verify=VERIFY)
     )
     written = len(transport.sent)
 
-    report = write(client, task("something-else"))
+    report = write(client, task("something-else"), states={"in-review": REVIEW_STATE})
 
     retained = report.retained
     assert [(action.task_id, action.number) for action in retained] == [("in-review", number)]
-    # `review`, not `swarm:review`: with no belief the state is still the label's,
-    # translated (#212), and the report speaks the run's own vocabulary.
+    # `review`, not `swarm:review`: the state is the belief's and the report
+    # speaks the run's own vocabulary.
     assert "review" in retained[0].reason
     assert "swarm:" not in retained[0].reason
     assert store.issues[number]["state"] == "open"
-    assert store.label_names(number) == {"swarm:review"}
+    assert store.label_names(number) == set()
     assert [call for call in transport.calls[written:] if call[1].endswith(f"/{number}")] == []
 
 
@@ -506,9 +550,13 @@ def test_a_task_in_flight_is_not_rewritten(github):
         files=["src/a.py"],
         verify=VERIFY,
     )
-    number = store.add(body=body, labels=("swarm:claimed",))
+    number = store.add(body=body)
 
-    report = write(client, task("claimed-task", goal="a different goal", files=["src/a.py"]))
+    report = write(
+        client,
+        task("claimed-task", goal="a different goal", files=["src/a.py"]),
+        states={"claimed-task": CLAIMED_STATE},
+    )
 
     assert [action.kind for action in report.actions] == ["retained"]
     assert store.issues[number]["body"] == body
@@ -532,7 +580,7 @@ def test_a_task_whose_issue_a_human_closed_is_not_resurrected(github):
 
 
 # --------------------------------------------------------------------------
-# Revival: a kept swarm:failed task goes back to ready
+# Revival: a kept `needs-human` task goes back to `eligible`
 # --------------------------------------------------------------------------
 
 
@@ -545,7 +593,13 @@ def failed_body(
     blocker: str = "",
     streak: int | None = None,
 ) -> str:
-    """A failed task's body: the marker carries the give-up's budget record."""
+    """A failed task's body: the marker carries the give-up's budget record.
+
+    The body is the whole record now. `swarm:failed` on the issue said the task
+    had given up until #152; the state is the cycle's belief, so every test below
+    declares `needs-human` through `states=` and the marker still carries the
+    budget the revival arithmetic runs on.
+    """
     body = render_body(task_id, goal=goal, files=list(files), verify=VERIFY, attempt=attempt)
     return body.replace(
         render_marker(task_id, attempt),
@@ -559,18 +613,21 @@ def test_a_kept_failed_task_is_revived_with_its_budget_intact(github):
     the run stayed 0-ready and re-stalled until a human relabelled it."""
     client, store, _ = github()
     body = failed_body("stuck", blocker="ab12cd34ef", streak=3)
-    number = store.add(body=body, labels=("swarm:failed",))
+    number = store.add(body=body)
 
     # The plan keeps the task unchanged - same goal, same files.
     report = write(
         client,
         task("stuck", goal="the goal", files=["src/a.py"]),
+        states={"stuck": NEEDS_HUMAN},
         max_attempts=3,
         max_total_attempts=9,
     )
 
     assert [action.kind for action in report.actions] == ["revived"]
-    assert store.label_names(number) == {"swarm:ready"}
+    # The revival is the comment and the report; #152 took the relabel off it,
+    # so a revived issue's labels are exactly the ones it already had.
+    assert store.label_names(number) == set()
     # Nothing is reset: attempt, blocker and streak survive verbatim, so a
     # retry that fails the same way again gives up on its first observation.
     assert store.issues[number]["body"] == body
@@ -579,24 +636,24 @@ def test_a_kept_failed_task_is_revived_with_its_budget_intact(github):
     issue_number, text = store.comments[0]
     assert issue_number == number
     assert text.startswith("apiary: the replan retained this task")
-    assert "returned to `swarm:ready`" in text
+    assert f"returned to `{ELIGIBLE}`" in text
     assert "streak 3 of 3, total 3 of 9" in text
 
 
 def test_a_kept_failed_task_is_revived_even_when_the_plan_updated_it(github):
     client, store, _ = github()
     body = failed_body("stuck", blocker="ab12cd34ef", streak=3)
-    number = store.add(body=body, labels=("swarm:failed",))
+    number = store.add(body=body)
 
     report = write(
         client,
         task("stuck", goal="a different decomposition of the same work", files=["src/a.py"]),
+        states={"stuck": NEEDS_HUMAN},
         max_attempts=3,
         max_total_attempts=9,
     )
 
     assert [action.kind for action in report.actions] == ["revived"]
-    assert store.label_names(number) == {"swarm:ready"}
     # The body is deliberately not rewritten: rendering it fresh would drop
     # the marker's signature record, which is the whole guard.
     assert store.issues[number]["body"] == body
@@ -605,18 +662,19 @@ def test_a_kept_failed_task_is_revived_even_when_the_plan_updated_it(github):
 def test_a_failed_task_with_the_total_budget_spent_stays_failed(github):
     client, store, _ = github()
     body = failed_body("spent", attempt=9, blocker="ab12cd34ef", streak=1)
-    number = store.add(body=body, labels=("swarm:failed",))
+    number = store.add(body=body)
 
     report = write(
         client,
         task("spent", goal="the goal", files=["src/a.py"]),
+        states={"spent": NEEDS_HUMAN},
         max_attempts=3,
         max_total_attempts=9,
     )
 
     assert [action.kind for action in report.actions] == ["retained"]
     assert "total retry budget spent" in report.actions[0].reason
-    assert store.label_names(number) == {"swarm:failed"}
+    assert store.issues[number]["body"] == body
     # No comment either: the give-up comment already told a human what to do,
     # and a replan that keeps refusing must not bury it under repetition.
     assert store.comments == []
@@ -627,30 +685,31 @@ def test_a_failed_marker_without_a_signature_record_still_revives(github):
     # back to the attempt counter, which is what it was then.
     client, store, _ = github()
     body = failed_body("old-style", attempt=3)
-    number = store.add(body=body, labels=("swarm:failed",))
+    number = store.add(body=body)
 
     report = write(
         client,
         task("old-style", goal="the goal", files=["src/a.py"]),
+        states={"old-style": NEEDS_HUMAN},
         max_attempts=3,
         max_total_attempts=9,
     )
 
     assert [action.kind for action in report.actions] == ["revived"]
-    assert store.label_names(number) == {"swarm:ready"}
+    assert store.issues[number]["body"] == body
     assert "streak 3 of 3, total 3 of 9" in store.comments[0][1]
 
 
 def test_a_dropped_failed_task_is_retired_as_superseded(github):
     """The user's rule: "if plan changed we can cancel old tickets" - a plan
     that dropped a failed task has already decided the work is not wanted, so
-    the ticket closes instead of wearing `swarm:failed` on the board forever.
+    the ticket closes instead of sitting `needs-human` on the board forever.
     Revival is for work the plan still wants; this is its complement."""
     client, store, _ = github()
     body = failed_body("abandoned", attempt=3, blocker="ab12cd34ef", streak=3)
-    number = store.add(body=body, labels=("swarm:failed",))
+    number = store.add(body=body)
 
-    report = write(client, task("something-else"))
+    report = write(client, task("something-else"), states={"abandoned": NEEDS_HUMAN})
 
     retired = [action for action in report.actions if action.kind == "retired"]
     assert [action.task_id for action in retired] == ["abandoned"]
@@ -659,9 +718,8 @@ def test_a_dropped_failed_task_is_retired_as_superseded(github):
     # `not_planned`, so readiness never reads this cancellation as a
     # dependency met - the same rule every other retirement follows.
     assert store.issues[number]["state_reason"] == "not_planned"
-    # The label and the marker are the record and stay exactly as the give-up
-    # left them: reopen + relabel resumes the budget arithmetic mid-count.
-    assert store.label_names(number) == {"swarm:failed"}
+    # The marker is the record and stays exactly as the give-up left them:
+    # reopening the issue resumes the budget arithmetic mid-count.
     assert store.issues[number]["body"] == body
     issue_number, text = store.comments[0]
     assert issue_number == number
@@ -676,12 +734,11 @@ def test_a_dropped_failed_task_a_human_closed_is_left_alone(github):
     client, store, _ = github()
     number = store.add(
         body=failed_body("abandoned"),
-        labels=("swarm:failed",),
         state="closed",
         state_reason="completed",
     )
 
-    report = write(client, task("something-else"))
+    report = write(client, task("something-else"), states={"abandoned": NEEDS_HUMAN})
 
     retained = [action for action in report.actions if action.kind == "retained"]
     assert [action.task_id for action in retained] == ["abandoned"]
@@ -693,9 +750,14 @@ def test_a_dropped_failed_task_stays_open_when_retiring_is_switched_off(github):
     # `retire_dropped=False` is the goal gate's whole safety argument for its
     # follow-up rounds; the failed case must not become an exception to it.
     client, store, _ = github()
-    number = store.add(body=failed_body("abandoned"), labels=("swarm:failed",))
+    number = store.add(body=failed_body("abandoned"))
 
-    report = write(client, task("something-else"), retire_dropped=False)
+    report = write(
+        client,
+        task("something-else"),
+        states={"abandoned": NEEDS_HUMAN},
+        retire_dropped=False,
+    )
 
     retained = [action for action in report.actions if action.kind == "retained"]
     assert [action.task_id for action in retained] == ["abandoned"]
@@ -704,15 +766,21 @@ def test_a_dropped_failed_task_stays_open_when_retiring_is_switched_off(github):
 
 
 # --------------------------------------------------------------------------
-# The state is the authority's, not the label's (#212)
+# The state is the authority's, and there is no label left to be it (#212, #152)
 # --------------------------------------------------------------------------
 #
 # `_update` and the drop path read `entry.state_label` and `write_plan` took no
 # belief at all, so a label a human edited mid-run decided a revival, a
 # retirement and a rewrite - which is the one thing #147's criterion says in as
-# many words must not happen. Each test below is the pair #147 and #198 were held
-# to: the wrong label produces byte-identical decisions under `derived`, and a
-# different decision under `labels`.
+# many words must not happen. #212 moved both decisions onto `authority.state_of`
+# and #152 removed the label they used to read, so the hand edit these tests make
+# is now a label that reaches no decision by construction.
+#
+# The tests stay, and what they pin has got stronger rather than weaker: an issue
+# can still be labelled by hand - `area/*`, `size/*`, `agent:*` and anything a
+# human types - and `LedgerEntry.labels` still carries every one of them. That a
+# label sitting on an issue changes nothing the planner does is exactly the
+# property, and it is a property somebody can still break.
 #
 # The failing direction produces no error and no transition. A revival that
 # should not happen simply puts a worker back onto merged code, so every
@@ -721,20 +789,19 @@ def test_a_dropped_failed_task_stays_open_when_retiring_is_switched_off(github):
 
 
 def a_task(github: Any, label: str, *, was: str = LANDED, **facts: Any) -> SimpleNamespace:
-    """One task wearing `label`, a world that disagrees, and both beliefs.
+    """One task wearing `label`, a world that disagrees, and the belief.
 
     The label is the hand edit and everything else is held fixed: one body, one
-    observation, one plan. Both beliefs come from that single observation, which
-    is what makes the comparisons below about who is believed rather than about
+    observation, one plan. The belief comes from that single observation, which
+    is what makes the comparisons below about what is believed rather than about
     two different runs (`shadow.py`'s rule, and `test_authority`'s §7).
 
-    `was` is what this process believed last cycle, and passing it is why these
-    are edits made *mid-run* rather than seeds: `believe` falls back to the label
-    for a task it has never carried, so a relabel asserted without it would be
-    establishing the belief instead of contradicting it. A `was` of `landed` goes
+    `was` is what this process believed last cycle, and passing it is what makes
+    these edits made *mid-run* rather than seeds: with no memory a task apiary
+    has not seen this process is simply unknown to it (`believe`'s `previous`),
+    and there is no label left for it to be seeded from. A `was` of `landed` goes
     into the ratchet's own set as well as into `remembered`, which is #214's split
-    - a state the label reached cannot enter that set, and only what this process
-    decided may.
+    - only what this process decided may enter that set.
     """
     client, store, transport = github()
     number = store.add(
@@ -755,7 +822,6 @@ def a_task(github: Any, label: str, *, was: str = LANDED, **facts: Any) -> Simpl
             remembered={ref: was},
             landed=frozenset({ref}) if was == LANDED else frozenset(),
         ),
-        obeyed=believe(book, seen, source=LABELS),
         mark=len(transport.sent),
     )
 
@@ -799,8 +865,14 @@ def test_the_planner_decides_in_the_authoritys_own_states():
     assert planner.WRITABLE == WAITING == {ELIGIBLE, BLOCKED_STATE}
     assert planner.IN_FLIGHT == {CLAIMED_STATE, REVIEW_STATE}
     assert (planner.NEEDS_HUMAN, planner.ELIGIBLE) == (NEEDS_HUMAN, ELIGIBLE)
-    # And no decision is left reading a label: the two that remain are writes.
-    assert planner.FAILED == "swarm:failed"
+    # And nothing is left spelling a state as a label: `FAILED` was
+    # `swarm:failed` until #152 and is the internal state now, like every other
+    # constant here.
+    assert planner.FAILED == NEEDS_HUMAN
+    assert not any(
+        name.startswith("swarm:")
+        for name in (planner.FAILED, planner.NEEDS_HUMAN, planner.ELIGIBLE, *planner.WRITABLE, *planner.IN_FLIGHT)
+    )
 
 
 def test_a_done_issue_relabelled_failed_mid_run_is_not_revived(github):
@@ -835,32 +907,14 @@ def test_a_done_issue_relabelled_failed_mid_run_is_not_revived(github):
     assert edited.transport.calls[edited.mark:] == [("GET", BASE)]
 
 
-def test_under_labels_that_relabel_revives_merged_work_again(github):
-    """The other half of the pair, and the reason the hatch is complete.
-
-    `APIARY_STATE_SOURCE=labels` restores the behaviour this ticket removed -
-    including the defect, which is the point: a hatch that fixed the bug on the
-    way back would not be the previous behaviour.
-    """
-    edited = a_merged_task(github, "swarm:failed")
-    kept = task("landed-work", goal="the goal", files=["src/a.py"])
-
-    report = write(
-        edited.client, kept, ledger=edited.ledger, believed=edited.obeyed, max_attempts=3, max_total_attempts=9
-    )
-
-    assert [action.kind for action in report.actions] == ["revived"]
-    assert edited.store.label_names(edited.number) == {"swarm:ready"}
-
-    # And `believed=None` - `plan_node`, the dry path, every caller outside a
-    # cycle - is the labels arm exactly, which is what "no existing caller
-    # changes" has to mean for a module whose other entry point runs before any
-    # belief exists.
-    fresh = a_merged_task(github, "swarm:failed")
-    unbelieving = write(
-        fresh.client, kept, ledger=fresh.ledger, max_attempts=3, max_total_attempts=9
-    )
-    assert decided(fresh, unbelieving) == decided(edited, report)
+# `test_under_labels_that_relabel_revives_merged_work_again` stood here. It was
+# the escape-hatch half of the pair above: `APIARY_STATE_SOURCE=labels` restored
+# the pre-#212 behaviour, defect included, by believing the `swarm:*` label a
+# human had typed. #152 removed the flag, the arm in `authority.believe` behind
+# it and the labels themselves, so there is no longer a way to ask for the old
+# behaviour and nothing left for this test to select. Its surviving half - that
+# the relabel decides nothing - is the test directly above, and "a caller with no
+# belief at all" is `test_a_task_the_belief_never_saw_is_retained_rather_than_rewritten`.
 
 
 def test_a_dropped_landed_task_relabelled_failed_is_not_retired(github):
@@ -887,33 +941,28 @@ def test_a_dropped_landed_task_relabelled_failed_is_not_retired(github):
     ]
     assert edited.store.issues[edited.number]["state"] == "open"
     assert edited.store.comments == []
-
-    # Under `labels` the same edit closes merged work as superseded.
-    obeying = a_merged_task(github, "swarm:failed")
-    under_labels = write(obeying.client, dropped, ledger=obeying.ledger, believed=obeying.obeyed)
-    assert [
-        action.kind for action in under_labels.actions if action.task_id == "landed-work"
-    ] == ["retired"]
-    assert obeying.store.issues[obeying.number]["state_reason"] == "not_planned"
+    # The edit is still on the issue and still says the opposite of what is
+    # believed - it simply reaches nothing.
+    assert edited.store.label_names(edited.number) == {"swarm:failed"}
 
 
-def test_a_ready_label_on_a_spent_task_is_revived_rather_than_rewritten(github):
-    """The direction #152 makes silent, and the reason this is a prerequisite.
+def test_a_spent_task_a_human_asked_for_back_is_revived_rather_than_rewritten(github):
+    """The direction #152 made silent, which is why the belief has to decide it.
 
     A human who reads apiary's own give-up comment does what it asks and moves
-    the issue back to `swarm:ready`. Selecting on the label, the planner read that
-    as ordinary waiting work and rewrote its body; the belief reads apiary's own
-    store instead - `authority.BUDGET_SPENT`, a streak already at its cap - and
-    revives it, which is the decision that actually grants the attempt the human
-    was asking for.
+    the issue back. Selecting on the label, the planner read that as ordinary
+    waiting work and rewrote its body - dropping the marker's signature record,
+    which is the arithmetic's whole input. The belief reads apiary's own store
+    instead - `authority.BUDGET_SPENT`, a streak already at its cap - and revives
+    it, which is the decision that actually grants the attempt that was asked for.
 
-    Once #152 removes the label writes, `entry.state_label == "swarm:failed"` is
-    never true again and the label arm below stops selecting anything at all -
-    with no error and no transition to show it.
+    Since #152 there is no `swarm:ready` for the human to type and no
+    `entry.state_label` for the planner to read, so the label arm this test was
+    the `derived` half of cannot select anything at all - with no error and no
+    transition to show it. The state below is declared where a state now lives.
     """
     spent = a_task(github, "swarm:ready", was=NEEDS_HUMAN)
     assert spent.held.state("landed-work") == NEEDS_HUMAN
-    assert spent.obeyed.state("landed-work") == ELIGIBLE
     kept = task("landed-work", goal="the goal", files=["src/a.py"])
 
     revived = write(
@@ -926,22 +975,25 @@ def test_a_ready_label_on_a_spent_task_is_revived_rather_than_rewritten(github):
     # Nothing is reset and nothing is rewritten: the marker's signature record is
     # the whole guard, and a revival that re-rendered the body would drop it.
     assert body == failed_body("landed-work", blocker="ab12cd34ef", streak=3)
-    # `revive` removes a label the issue is not wearing, which `remove_label`
-    # answers with a tolerated 404 - the belief can now select a revival the
-    # label never would, so that tolerance is load-bearing rather than defensive.
+    # And the hand-typed label is left exactly where the human put it. `revive`
+    # relabelled the issue until #152; a revival is a comment and a report now.
     assert spent.store.label_names(spent.number) == {"swarm:ready"}
 
-    # Under `labels` the relabel is obeyed: ordinary waiting work, so the body is
-    # rewritten - and the signature record the arithmetic runs on goes with it.
-    under_labels = a_task(github, "swarm:ready", was=NEEDS_HUMAN)
+    # The complement, and the reason the belief is asked at all: the same issue
+    # believed `eligible` is ordinary waiting work, so the body *is* rewritten -
+    # and the signature record the arithmetic runs on goes with it.
+    waiting = a_task(github, "swarm:ready", was=ELIGIBLE)
     assert [
         action.kind
         for action in write(
-            under_labels.client, kept, ledger=under_labels.ledger, believed=under_labels.obeyed
+            waiting.client,
+            kept,
+            ledger=waiting.ledger,
+            believed=Belief(states={"landed-work": ELIGIBLE}),
         ).actions
     ] == ["updated"]
-    assert under_labels.store.issues[under_labels.number]["body"] != body
-    assert under_labels.store.comments == []
+    assert waiting.store.issues[waiting.number]["body"] != body
+    assert waiting.store.comments == []
 
 
 def test_a_task_the_belief_never_saw_is_retained_rather_than_rewritten(github):
@@ -1220,7 +1272,7 @@ def test_plan_node_writes_the_verify_command_it_was_given(github, monkeypatch):
     assert result["tasks"]["root"]["status"] == "pending"
     # Read back through the loader, which is the only thing that says what an
     # issue means.
-    entry = load_ledger(client, adopt=False).entries["root"]
+    entry = load_ledger(client).entries["root"]
     assert entry.verify == "python3 -m unittest discover -q"
     assert store.issues[1]["body"].count("## Verify") == 1
 
@@ -1233,7 +1285,7 @@ def test_plan_node_falls_back_to_the_setting_when_nobody_says(github, monkeypatc
 
     plan_node({"objective": "make it work"}, source=client)
 
-    assert load_ledger(client, adopt=False).entries["root"].verify == SETTINGS.verify_command
+    assert load_ledger(client).entries["root"].verify == SETTINGS.verify_command
 
 
 def test_plan_node_without_a_target_keeps_the_v1_in_memory_ledger(monkeypatch):
@@ -1325,7 +1377,7 @@ def test_the_read_back_waits_for_issues_github_has_not_surfaced_yet():
             "number": number,
             "title": task_id,
             "state": "open",
-            "labels": [{"name": "swarm:ready"}],
+            "labels": [],
             "body": (
                 f"<!-- apiary:task id={task_id} attempt=0 -->\n\n"
                 "## Goal\ndo the thing\n\n## Files\n- a.py\n\n"
@@ -1401,8 +1453,10 @@ def entry_for(draft: Draft, *, stack: str = DEFAULT_STACK) -> LedgerEntry:
         verify=draft.verify,
         blocked_by=(),
         stack=stack,
-        state_label="swarm:ready",
-        labels=frozenset({"swarm:ready"}),
+        # A state is not a label any more (#152) and is not on the entry at all.
+        # `matches` compares the contract; the labels are the routing hints an
+        # issue happens to carry, and an empty set is what a `Draft` implies.
+        labels=frozenset(),
     )
 
 

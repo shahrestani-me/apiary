@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -74,8 +73,6 @@ from swarm.orchestrator.checks import PullState
 from swarm.github.readiness import READY
 from swarm.orchestrator.dispatcher import CLAIMED, REVIEW
 from swarm.orchestrator.reconcile import (
-    DONE,
-    FAILED,
     CycleReport,
     ReconcilePlan,
     ReconcileReport,
@@ -114,11 +111,7 @@ from swarm.worker.result import (
     record_path,
     write_result,
 )
-from swarm.orchestrator.derived import LANDED, NEEDS_HUMAN
 from swarm.orchestrator.derived import REVIEW as REVIEW_STATE
-
-BLOCKED = "swarm:blocked"
-
 
 @pytest.fixture(autouse=True)
 def store_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -160,21 +153,30 @@ def a_result(issue: int, *, attempt: int, exit_code: int, minute: int) -> Result
 def report(
     *entries: Any,
     index: int = 0,
+    belief: Any = None,
     readiness: Any = None,
     dispatched: Any = None,
     checks: Any = None,
 ) -> CycleReport:
     """A finished `CycleReport` carrying nothing but a ledger.
 
-    The shadow window is a projection of a cycle that has already decided, so
+    The recorder is a projection of a cycle that has already decided, so
     everything it reads is either on the report or was passed alongside it -
     which is what makes a report this bare a legitimate input rather than a
     stub with holes in it.
+
+    `belief` is the one field #152 added and the reason a bare report is now
+    *emptier* than it looks: the states used to be readable off
+    `LedgerEntry.state_label`, so a projection could recover them from the ledger
+    it already had. There is no label, so a report without a belief is a report
+    nothing downstream can say what happened in - which is exactly what
+    `control_labels` answers with below.
     """
     return CycleReport(
         index=index,
         ledger=ledger(*entries),
         result=ReconcileReport(plan=ReconcilePlan()),
+        belief=belief,
         readiness=readiness,
         dispatched=dispatched,
         checks=checks,
@@ -205,28 +207,15 @@ def pull(number: int, branch: str, *, sha: str = "") -> PullState:
     return PullState(number=pull_ref(number), branch=branch, sha=sha or f"{number:0>40x}")
 
 
-def divergences(seen: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    return [fields for name, fields in seen if name == STATE_DIVERGENCE]
-
-
 # --------------------------------------------------------------------------
-# 1. A divergence is named
+# 1. It costs no API call
 # --------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-# --------------------------------------------------------------------------
-# 2. The labels still decide
-# --------------------------------------------------------------------------
-
-
+#
+# Two banners stood here - "A divergence is named" and "The labels still decide"
+# - over the tests that ran the resolver beside the label control plane and
+# named what the two disagreed about. They went with the window (#245's split,
+# #152's deletion), and the headings are collapsed into this note rather than
+# left standing empty over a test about something else.
 
 
 def test_recording_adds_no_github_call():
@@ -261,106 +250,62 @@ def test_recording_adds_no_github_call():
 
 
 # --------------------------------------------------------------------------
-# 3. Which control plane, sampled when
+# 3. What fills the control slot now
 # --------------------------------------------------------------------------
+#
+# **Four tests stood here and are deleted (#152).** `control_labels` assembled
+# the `swarm:*` label each task wore when the cycle finished, walking five
+# writers in the order the cycle wrote them, and each of those tests pinned one
+# writer the cycle never folds back into its ledger:
+#
+# - `test_a_task_mergeability_escalated_is_in_the_control_map` - the fourth
+#   writer of a terminal label. A pull request that will not rebase inside its
+#   update budget is escalated by `apply_mergeability` alone.
+# - `test_the_check_gate_wins_over_mergeability_for_the_same_task` - the gate
+#   runs after mergeability, so the earlier writer must not overwrite the later.
+# - `test_a_dispatch_that_claimed_and_failed_to_spawn_still_counts_as_claimed` -
+#   `DispatchFailure.claimed` is "the label was written and no container is
+#   running under it", the case #35's sweep exists for.
+# - `test_a_revival_is_in_the_control_map` - the sixth writer, and the one that
+#   is not in `cycle` at all: `planner.revive` runs from `_judge`.
+#
+# None of them can fail. `control_labels` reads `CycleReport.belief` and nothing
+# else - there is no label plane to assemble, and assembling one from the
+# writers would be inventing a second opinion for a comparison that no longer
+# has two sides. The enumeration itself is not lost: `Reconciler._carry_forward`
+# still walks the same writers, because a task the dispatcher claimed this cycle
+# whose worker exits before the next one must not be remembered as never having
+# run, and `tests/test_reconcile.py` is where that is now pinned.
 
 
-def test_the_control_side_is_the_labels_this_cycle_left_not_the_ones_it_read():
-    """The module's central decision, made visible.
+def test_the_control_side_is_this_cycles_own_belief():
+    """The module's central decision, with its subject replaced rather than lost.
 
-    Readiness and the dispatcher both write labels the cycle never folds back
-    into its ledger. Diffing against the unfolded ledger would report every one
-    of those writes as a disagreement - which is the loop's own progress, not
-    evidence about anything.
+    What a reader of a *new* recording wants from that slot is "what did the
+    orchestrator think", and the belief is exactly that: honest as a record and
+    worthless as a comparison. `docs/recording-runs.md` §2 says the second half
+    in as many words - a run recorded from here on carries an empty `control` and
+    can never be part of #147's divergence gate - and the field is kept rather
+    than dropped because `observed.jsonl` is append-only and runs recorded
+    *before* this ticket still hold a real control plane in it.
     """
-    from swarm.github.readiness import Verdict
+    from swarm.orchestrator.authority import Belief
 
-    moved = report(
-        entry(4, label=BLOCKED),
-        readiness=type("Plan", (), {"verdicts": (
-            Verdict(ref=ref(4), task_id="task-4", current_label=BLOCKED, label=READY),
-        )})(),
+    believed = report(
+        entry(4, label=REVIEW), belief=Belief(states={"task-4": REVIEW_STATE})
     )
+    assert control_labels(believed) == {"task-4": REVIEW_STATE}
 
-    assert control_labels(moved) == {"task-4": READY}
+    # A task the cycle believed nothing about is left out rather than written as
+    # `""`. `Belief.state` answers the empty string for a task nothing has an
+    # opinion about, deliberately, and a recorder that wrote it would put a
+    # state into the corpus that means "no state".
+    blank = report(entry(4, label=REVIEW), belief=Belief(states={"task-4": ""}))
+    assert control_labels(blank) == {}
 
-
-def test_a_task_mergeability_escalated_is_in_the_control_map():
-    """The fourth writer of a terminal label, and the one the cycle never folds.
-
-    `lifecycle._landed_or_human` names all four - the reconciler, the recovery
-    sweep, mergeability and the check gate - and `Reconciler.cycle` folds three
-    of them. A pull request that will not rebase inside its update budget is
-    escalated by `apply_mergeability` alone, so a control map built without it
-    would report every starved task as a divergence the resolver invented.
-    """
-    from swarm.orchestrator.mergeability import MergeabilityPlan, MergeabilityReport
-    from swarm.orchestrator.reconcile import Transition
-
-    starved = report(
-        entry(4, label=REVIEW),
-        checks=None,
-    )
-    starved = replace(
-        starved,
-        mergeability=MergeabilityReport(
-            plan=MergeabilityPlan(),
-            applied=(
-                Transition(
-                    ref=ref(4),
-                    task_id="task-4",
-                    from_state=REVIEW_STATE,
-                    to_state=NEEDS_HUMAN,
-                    reason="its branch could not be updated within the round cap",
-                ),
-            ),
-        ),
-    )
-
-    assert control_labels(starved) == {"task-4": FAILED}
-
-
-def test_the_check_gate_wins_over_mergeability_for_the_same_task():
-    """The gate runs after mergeability, and step 1 already carries its answer -
-    so the earlier writer must not be allowed to overwrite the later one."""
-    from swarm.orchestrator.checks import ChecksPlan, ChecksReport
-    from swarm.orchestrator.mergeability import MergeabilityPlan, MergeabilityReport
-    from swarm.orchestrator.reconcile import Transition
-
-    def moved(to_state: str) -> Any:
-        return Transition(
-            ref=ref(4),
-            task_id="task-4",
-            from_state=REVIEW_STATE,
-            to_state=to_state,
-            reason="moved",
-        )
-
-    both = replace(
-        report(entry(4, label=DONE), checks=ChecksReport(
-            plan=ChecksPlan(), applied=(moved(LANDED),)
-        )),
-        mergeability=MergeabilityReport(plan=MergeabilityPlan(), applied=(moved(NEEDS_HUMAN),)),
-    )
-
-    assert control_labels(both) == {"task-4": DONE}
-
-
-def test_a_dispatch_that_claimed_and_failed_to_spawn_still_counts_as_claimed():
-    """`DispatchFailure.claimed` is exactly "the label was written and no
-    container is running under it" - a claim the control plane is holding
-    whether or not the spawn worked, and the case #35's sweep exists for."""
-    from swarm.orchestrator.dispatcher import DispatchFailure, DispatchPlan, DispatchReport
-
-    failed = report(
-        entry(4, label=READY),
-        dispatched=DispatchReport(
-            plan=DispatchPlan(),
-            failed=(DispatchFailure(number=4, reason="docker is not there", claimed=True),),
-        ),
-    )
-
-    assert control_labels(failed) == {"task-4": CLAIMED}
+    # And a report with no belief at all says nothing rather than guessing from
+    # the ledger, because there is no `state_label` on it left to guess from.
+    assert control_labels(report(entry(4, label=REVIEW))) == {}
 
 
 def test_a_cycle_that_could_not_list_pull_requests_records_nothing(tmp_path):
@@ -427,68 +372,16 @@ def test_two_containers_under_one_task_reach_the_recording(tmp_path):
 
 
 
-def test_a_revival_is_in_the_control_map():
-    """The sixth writer, and the one that is not in `cycle` at all.
-
-    `planner.revive` runs from `_judge` - before this window - and moves a task
-    `swarm:failed -> swarm:ready` on GitHub with nothing folding it back.
-    """
-    from swarm.nodes.planner import IssueAction, PlanReport
-    from swarm.orchestrator.replan import ReplanReport
-
-    revived = replace(
-        report(entry(4, label=FAILED)),
-        replanned=ReplanReport(
-            repo=REPO,
-            replanned=True,
-            plan=PlanReport(
-                repo=REPO, actions=(IssueAction("revived", "task-4", 4, reason="streak 1 of 3"),)
-            ),
-        ),
-    )
-
-    assert control_labels(revived) == {"task-4": READY}
-
-
 # --------------------------------------------------------------------------
-# 4. Expected against real
+# 4. Expected against real - deleted with the classifier (#152)
 # --------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- the negative shapes: an account must not absorb a wrong derived answer ---
 #
-# Each of these is a divergence whose *control* side and evidence match an
-# expected kind while its *derived* side contradicts that kind's own argument.
-# Before the classifier was two-sided every one of them was filed as expected
-# and dropped out of `unexplained` - the number #147's gate reads.
-
-
-
-
-
-
-
-
-
-
-
-
+# This section held the two-sided classifier's tests, including the negative
+# shapes: a divergence whose *control* side and evidence matched an expected kind
+# while its *derived* side contradicted that kind's own argument. They graded a
+# comparison between two sources of state and there is one, so the classifier and
+# every test of it went with the window. `swarm show` still reads what those runs
+# recorded, which is section 5.
 
 
 # --------------------------------------------------------------------------
@@ -641,18 +534,25 @@ def test_a_recorded_cycle_replays_to_the_line_it_was_recorded_from(tmp_path):
     assert replayed.observation.results
     assert replayed.index == written[-1]["cycle"]
 
-    # Everything but `control`, which is deliberately *not* symmetric: the
-    # recorder writes the label and `load_corpus` translates it to the internal
-    # state on the way in, because - as `observed_line` says - the day the labels
-    # go it is the translation that gets deleted and not the recorded data. So
-    # the two vocabularies are asserted separately rather than papered over with
-    # a round trip that would have to translate one of them back.
+    # Everything but `control`, which is asserted separately for a reason that
+    # changed with #152 rather than going away. It used to be an asymmetry of
+    # *vocabulary*: the recorder wrote the `swarm:*` label and `load_corpus`
+    # translated it to the internal state on the way in, so a round trip would
+    # have had to translate one of them back. It is now an asymmetry of
+    # *content* - `observed_line` keeps only values that are labels, and the
+    # cycle's belief holds none, so a run recorded from here on carries an empty
+    # control plane. `docs/recording-runs.md` §2 says exactly that and draws the
+    # consequence: such a run can never be part of #147's divergence gate.
+    #
+    # The key is still written, and the round trip below is why it has to be:
+    # runs recorded *before* this ticket hold a real control plane in it, and a
+    # loader that stopped parsing the field would make the archive unreadable.
     again = observed_line(replayed.observation, {})
     assert {k: v for k, v in again.items() if k != "control"} == {
         k: v for k, v in written[-1].items() if k != "control"
     }
-    assert written[-1]["control"] == {"task-4242": REVIEW}
-    assert replayed.control == {"task-4242": REVIEW_STATE}
+    assert written[-1]["control"] == {}
+    assert replayed.control == {}
 
 
 def test_a_recorded_line_names_the_file_the_cycle_read(tmp_path):
@@ -752,13 +652,36 @@ def test_the_recorder_writes_a_line_per_cycle_and_the_manifest_once(tmp_path):
     assert manifest["expected_divergences"] == []
 
 
-def test_a_recorded_line_carries_the_label_not_the_internal_state():
-    """The corpus's own decision, and its reason is good: the day epic #140
-    removes the labels it is the translation that gets deleted, not the data."""
+def test_a_recorded_line_carries_a_world_and_an_empty_control_plane():
+    """What a new recording is, stated once. **The day epic #140 removes the
+    labels has arrived**, and this is the test that used to describe the other
+    side of it.
+
+    It was `test_a_recorded_line_carries_the_label_not_the_internal_state`, and
+    the corpus's decision it pinned was a good one for as long as it had a
+    subject: the recorder wrote `swarm:review`, `load_corpus` translated it, and
+    so the day the labels went it was the translation that got deleted rather
+    than the recorded data. `observed_line` keeps only values that are labels and
+    the belief holds none, so the slot is empty now - which
+    `docs/recording-runs.md` §2 documents as the price of the removal and not as
+    a defect.
+
+    `test_a_label_the_loader_could_not_translate_is_dropped_rather_than_written`
+    stood beside it and is deleted rather than kept: it wrote `swarm:something-else`
+    onto an entry and required the recorder to drop it, so that `load_corpus`
+    could not be handed a label it refuses. Every value is dropped now, so the
+    test passes without exercising the filter it was written for - and a test
+    that cannot fail reads as coverage. The filter itself is what the first
+    assertion below is about.
+
+    The rest of the line is the half that carries all of the meaning now, and it
+    is asserted here rather than taken on trust from the round trip: the world
+    the cycle saw.
+    """
     cycle = report(entry(4, label=REVIEW))
     line = observed_line(observation_for(cycle), control_labels(cycle))
 
-    assert line["control"] == {"task-4": REVIEW}
+    assert line["control"] == {}
     assert line["tasks"] == [
         {
             "ref": "#4",
@@ -768,16 +691,6 @@ def test_a_recorded_line_carries_the_label_not_the_internal_state():
             "state_reason": None,
         }
     ]
-
-
-def test_a_label_the_loader_could_not_translate_is_dropped_rather_than_written():
-    """`load_corpus` refuses a label it cannot translate, correctly. A recorder
-    able to emit one would produce corpus runs that fail at the door for a
-    reason that has nothing to do with the resolver."""
-    cycle = report(entry(4, label="swarm:something-else"))
-    line = observed_line(observation_for(cycle), control_labels(cycle))
-
-    assert line["control"] == {}
 
 
 def test_the_recorder_never_raises_into_the_cycle(tmp_path, capsys):

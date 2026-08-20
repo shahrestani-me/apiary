@@ -329,10 +329,9 @@ class BoardReader:
                 f"it still wanted a human"
             )
         try:
-            # `adopt=False`: a board is a reader. Adoption writes markers onto
             # hand-written issues, and a page polling every few seconds must not
             # be the thing that edits somebody's backlog.
-            ledger = load_ledger(client, adopt=False, store=store)
+            ledger = load_ledger(client, store=store)
         finally:
             # The connection is this poll's, not the page's: a console holding
             # one open across every poll of every project would keep a lock on

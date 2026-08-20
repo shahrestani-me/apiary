@@ -493,7 +493,7 @@ IN_FLIGHT = frozenset({CLAIMED_STATE, REVIEW_STATE})
 # stops storing it at all. The same spelling as `reconcile.FAILED`; spelled here
 # rather than imported because `orchestrator` modules import this one, and the
 # dependency must not point back up.
-FAILED = "swarm:failed"
+FAILED = "needs-human"
 
 # Path segments that are packaging, not subject matter. `src/swarm/github/…` is
 # work on the github area; the `src` says nothing about what the task is.
@@ -1071,9 +1071,11 @@ def _state_of(entry: LedgerEntry, believed: Belief | None) -> str:
     `authority.state_of` and nothing else - "there is exactly one function in
     that package that answers this, and every decision path calls it" - reached
     through a local import for the reason the `TYPE_CHECKING` block at the top
-    of this module gives. `believed=None` reads the label, which is `plan_node`'s
-    path and `APIARY_STATE_SOURCE=labels` by way of a belief whose states are the
-    labels anyway.
+    of this module gives. It **raises** without a belief since #152 - there is no
+    label left to fall back to - so every caller passes one, and `plan_node`
+    passes an empty `Belief` deliberately: it has no cycle and no observation, so
+    it has no opinion about any existing task and says so rather than inventing
+    one.
 
     A task the belief has no opinion about answers `NO_BELIEF`, which is in
     neither `WRITABLE` nor `IN_FLIGHT` and is therefore retained rather than
@@ -1217,9 +1219,19 @@ def _create(
     if problem is not None:
         return IssueAction("rejected", draft.task_id, reason=problem)
 
-    label = READY if all(_met(states, ref) for ref in refs) else BLOCKED
-    issue = client.create_issue(draft.title, body=body, labels=[label, *draft.labels])
-    return IssueAction("created", draft.task_id, int(issue["number"]), reason=label)
+    # The state a fresh task starts in, computed and *reported* - not written.
+    # This used to be `swarm:ready` or `swarm:blocked` applied to the issue, and
+    # it was the last apiary-owned label anything created (#152). Membership is
+    # the identity marker in the body now, so nothing is lost by not writing it;
+    # what would be lost by writing it is ADR 0001's whole point, since a state
+    # apiary invented would be sitting in a customer's tracker again.
+    #
+    # `draft.labels` still go on, and they are a different kind of thing: the
+    # planner's own routing hints (`area/*`, `size/*`) that a human asked for
+    # and that decide nothing here.
+    state = READY if all(_met(states, ref) for ref in refs) else BLOCKED
+    issue = client.create_issue(draft.title, body=body, labels=list(draft.labels))
+    return IssueAction("created", draft.task_id, int(issue["number"]), reason=state)
 
 
 def _update(
@@ -1355,9 +1367,6 @@ def revive(
     # was before failures had signatures (`ledger.LedgerEntry.streak`).
     streak = entry.attempt if entry.streak is None else entry.streak
     budget = f"streak {streak} of {cap}, total {entry.attempt} of {total_cap}"
-
-    client.add_labels(entry.number, [READY])
-    client.remove_label(entry.number, FAILED)
 
     comment = (
         f"apiary: {because}, so it is returned to `{READY}`. "
@@ -1555,7 +1564,7 @@ def _read_back(
     for attempt in range(READ_BACK_ATTEMPTS):
         if invalidate is not None:
             invalidate()
-        ledger = load_ledger(client, adopt=False)
+        ledger = load_ledger(client)
         if expected <= set(ledger.entries):
             return ledger
         if attempt + 1 < READ_BACK_ATTEMPTS:
@@ -1683,7 +1692,19 @@ def plan_node(
         }
 
     client = _as_client(target)
-    report = write_plan(client, plan, verify=verify, stack=stack, bootstrap=bootstrap)
+    # An empty belief, explicitly. `plan_node` is the v1 path: it has no cycle
+    # behind it and therefore no observation to resolve states from, so every
+    # existing entry answers `NO_BELIEF` and is *retained* rather than revived or
+    # retired. That is the safe direction and it is the one this path could
+    # honestly take even before #152 - it simply used to reach it by reading a
+    # label instead of by admitting it did not know.
+    # Local import: the module-level one is under `TYPE_CHECKING` to keep this
+    # module out of `authority`'s import ring (see the block at the top).
+    from ..orchestrator.authority import Belief as _Belief
+
+    report = write_plan(
+        client, plan, verify=verify, stack=stack, bootstrap=bootstrap, believed=_Belief()
+    )
     # Re-read rather than project: `docs/architecture-v2.md`'s "on any
     # disagreement, GitHub wins" is only a rule that means anything if nothing
     # keeps a second copy. `adopt=False` because the write above just adopted
@@ -1709,5 +1730,5 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke test
     # somebody's tracker, which is exactly what `provision.py` refuses to do
     # for repositories and for the same reason.
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
-    for task_id, record in sorted(load_ledger(repo, adopt=False).tasks.items()):
+    for task_id, record in sorted(load_ledger(repo).tasks.items()):
         print(f"{task_id:<32} {record.get('status'):<10} {record.get('branch', '')}")

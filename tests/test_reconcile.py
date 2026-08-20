@@ -42,6 +42,10 @@ from types import SimpleNamespace
 
 import pytest
 
+FAILED = "needs-human"
+
+DONE = "landed"
+
 from fixtures.github import SentRequest, not_modified, page, response
 from fixtures.store import RecordingStore
 from swarm.containers.manager import RUNNING_STATE, DockerError, Handle
@@ -49,7 +53,6 @@ from swarm.github.branches import task_branch
 from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import (
     ContractError,
-    LabelRepair,
     Ledger,
     LedgerEntry,
     parse_contract,
@@ -72,8 +75,6 @@ from swarm.orchestrator.reconcile import (
     observed_records,
     COMMENT_METHOD,
     PULLS_METHOD,
-    DONE,
-    FAILED,
     READY,
     CycleReport,
     Reconciler,
@@ -87,11 +88,10 @@ from swarm.orchestrator.reconcile import (
     plan_reconcile,
     retry_comment,
     signature,
-    write_labels,
 )
 from swarm.orchestrator.lifecycle import internal_state, lifecycle_events
 from swarm.run import Run
-from swarm.store import STORE_DIR_ENV, SqliteTaskStore, TaskJudgement
+from swarm.store import STORE_DIR_ENV, SqliteTaskStore, StoreError, TaskJudgement
 from swarm.state import ProgressJudgement
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord, write_result
@@ -152,13 +152,46 @@ def entry(
         files=files or (f"src/mod{number}.py",),
         verify="python -m pytest -q",
         blocked_by=(),
-        state_label=label,
+        # The state this fixture declares the task to be in. It was
+        # `state_label=` until #152, and an entry carries no state now - so it
+        # is stashed here and `fixture_belief` turns it into the `Belief` the
+        # production code requires.
         labels=frozenset({label}),
     )
 
 
 def ledger(*entries: LedgerEntry, **kwargs: Any) -> Ledger:
     return Ledger(entries={item.task_id: item for item in entries}, **kwargs)
+
+
+def fixture_belief(book: Ledger, **kwargs: Any) -> Belief:
+    """The belief a fixture's declared states imply.
+
+    Every test here said what state a task was in by giving `entry()` a label,
+    and `plan_reconcile` read it back off `LedgerEntry.state_label`. #152
+    removed that field - a state is derived per cycle and lives on the cycle's
+    `Belief` - so the fixture's declaration has to become one. Done here once
+    rather than at the hundred call sites, and `reconcile_plan` supplies it
+    automatically so a test that does not care about the authority reads as it
+    always did.
+    """
+    states = {task_id: next(iter(item.labels), "") for task_id, item in book.entries.items()}
+    kwargs.setdefault("states", states)
+    kwargs.setdefault("stored", dict(states))
+    kwargs.setdefault("previous", dict(states))
+    kwargs.setdefault("refs", {task_id: item.ref for task_id, item in book.entries.items()})
+    return Belief(**kwargs)
+
+
+def reconcile_plan(book: Ledger, **kwargs: Any) -> Any:
+    """`plan_reconcile` with the fixture's belief filled in.
+
+    Not optional in production any more - `authority.state_of` raises without a
+    belief - so a harness that let it default would exercise a path no run can
+    reach.
+    """
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_reconcile(book, **kwargs)
 
 
 def closed(number: int, reason: str | None = "completed") -> IssueState:
@@ -223,6 +256,19 @@ def issue_payload(
         "labels": [{"name": label}],
         "body": body_text if body_text is not None else body(task_id, attempt=attempt),
     }
+
+
+def landed_payload(number: int, **kwargs: Any) -> dict[str, Any]:
+    """An issue that is out of the run - the fixture `swarm:done` used to be.
+
+    `run.live_entries` decided what a cycle still had to do by reading
+    `swarm:done` / `swarm:failed` off each entry, and #152 removed both. It asks
+    the one terminal fact the code host still carries at the moment the loop
+    asks - before any observation exists to resolve a state from - so an issue is
+    out of the run when it is *closed*, which is what `Closes #<n>` does to it
+    when the task's pull request merges.
+    """
+    return issue_payload(number, state="closed", state_reason="completed", **kwargs)
 
 
 @dataclass
@@ -351,8 +397,19 @@ class FakeFleet:
 
 
 def running(*issues: int) -> dict[TaskRef, Handle]:
-    """The handle map a cycle holds: keyed by task, valued by container."""
-    return {ref(n): Handle(id=f"{n:0>64x}", run_id=RUN_ID, issue=n) for n in issues}
+    """The handle map a cycle holds: keyed by task, valued by container.
+
+    `state=RUNNING_STATE` is load-bearing since #152 and was inert before it.
+    A claim used to be a `swarm:claimed` label, so a handle here only had to
+    exist; the state is derived now and `derived._claiming_container` filters on
+    `Handle.running`, which reads the daemon's own word and defaults to false.
+    A handle without it is a container this suite calls running and the resolver
+    reads as a corpse.
+    """
+    return {
+        ref(n): Handle(id=f"{n:0>64x}", run_id=RUN_ID, issue=n, state=RUNNING_STATE)
+        for n in issues
+    }
 
 
 class ModelCalled(BaseException):
@@ -423,7 +480,7 @@ def reconciler(client: Any, fleet: Any = None, **kwargs: Any) -> Reconciler:
 
 
 def test_an_issue_closed_by_hand_is_taken_out_of_the_run_and_its_worker_disposed():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)),
         states={ref(4): closed(4)},
         running=[ref(4)],
@@ -438,7 +495,7 @@ def test_an_issue_closed_by_hand_is_taken_out_of_the_run_and_its_worker_disposed
 
 
 def test_a_merged_pull_request_is_read_from_the_issue_it_closed():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=REVIEW)), states={ref(4): closed(4)}, running=[ref(4)]
     )
 
@@ -449,7 +506,7 @@ def test_a_merged_pull_request_is_read_from_the_issue_it_closed():
 
 
 def test_an_issue_closed_as_not_planned_is_failed_rather_than_done():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)),
         states={ref(4): closed(4, "not_planned")},
         running=[ref(4)],
@@ -462,7 +519,7 @@ def test_an_issue_closed_as_not_planned_is_failed_rather_than_done():
 
 
 def test_an_issue_a_human_already_marked_done_keeps_no_container():
-    plan = plan_reconcile(ledger(entry(4, label=DONE)), running=[ref(4)])
+    plan = reconcile_plan(ledger(entry(4, label=DONE)), running=[ref(4)])
 
     assert plan.transitions == ()
     assert [d.ref for d in plan.disposals] == [ref(4)]
@@ -471,7 +528,7 @@ def test_an_issue_a_human_already_marked_done_keeps_no_container():
 def test_a_container_whose_issue_left_the_ledger_is_disposed():
     # A human deleted the issue, or stripped its `swarm:*` label - either way
     # nothing will look at that work again and the clone is held for nobody.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4), ref(9)]
     )
 
@@ -479,23 +536,17 @@ def test_a_container_whose_issue_left_the_ledger_is_disposed():
     assert "no longer in the ledger" in next(d for d in plan.disposals if d.ref == ref(9)).reason
 
 
-def test_two_state_labels_are_repaired_from_what_the_loader_reported():
-    repair = LabelRepair(number=4, kept=DONE, removed=(CLAIMED,))
-
-    plan = plan_reconcile(ledger(entry(4, label=DONE), repairs=(repair,)))
-
-    # The loader only reports the fault (§3); removing the losing label is a
-    # write, and writes are this module's.
-    assert plan.repairs == (repair,)
-
-
+# The label-repair test stood here. Two state labels on one issue was a real
+# fault - GitHub has no transaction across two label calls - and §3's
+# precedence resolved it. #152 removed the labels, so the fault it repaired
+# cannot occur and `LabelRepair` went with it.
 # --------------------------------------------------------------------------
 # Finished workers
 # --------------------------------------------------------------------------
 
 
 def test_a_failed_worker_consumes_an_attempt_and_goes_back_to_ready():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=0)),
         results={ref(4): record(4, 1)},
         running=[ref(4)],
@@ -508,7 +559,7 @@ def test_a_failed_worker_consumes_an_attempt_and_goes_back_to_ready():
 
 
 def test_a_failed_worker_at_the_cap_is_handed_to_a_human():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2)),
         results={ref(4): record(4, 1, attempt=2)},
         max_attempts=3,
@@ -523,7 +574,7 @@ def test_a_failed_worker_at_the_cap_is_handed_to_a_human():
 
 
 def test_an_infrastructure_failure_does_not_consume_an_attempt():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results={ref(4): record(4, 2, attempt=1, reason="ollama refused the connection")},
         max_attempts=3,
@@ -538,7 +589,7 @@ def test_an_infrastructure_failure_does_not_consume_an_attempt():
 def test_an_unknown_exit_code_is_charged_like_a_failure():
     # 137 from the OOM killer, 143 from a stop. `ResultRecord.consumes_attempt`
     # already settled this; the reconciler must not re-decide it.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 137)},
         max_attempts=3,
@@ -548,7 +599,7 @@ def test_an_unknown_exit_code_is_charged_like_a_failure():
 
 
 def test_a_worker_that_published_is_moved_to_review_here():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 0)},
         running=[ref(4)],
@@ -572,7 +623,7 @@ def test_a_worker_that_published_is_moved_to_review_here():
 def test_a_records_verdict_is_not_applied_twice():
     # The counter moves and the artifact does not, so the record of attempt 0
     # must stop counting once the issue is on attempt 1.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=READY, attempt=1)),
         results={ref(4): record(4, 1, attempt=0)},
     )
@@ -590,7 +641,7 @@ def test_a_record_behind_the_counter_is_discarded_and_the_claim_stands():
     learn to tell the truth (`worker/entrypoint.py` stamps the real attempt,
     and `worker/result.py` files an unknowable one under the next free index,
     which is never behind the counter)."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2)),
         results={
             ref(4): record(4, 2, attempt=0, reason="model call failed: OutputParserException")
@@ -606,7 +657,7 @@ def test_the_corrected_record_is_observed_and_costs_no_attempt():
     the issue is re-readied, the container is disposed - and the budget is
     untouched, because an infrastructure verdict never consumes an attempt
     however late in the retry sequence it lands."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2)),
         results={
             ref(4): record(4, 2, attempt=2, reason="model call failed: OutputParserException")
@@ -741,7 +792,7 @@ def test_a_retried_issue_carries_the_failure_as_a_comment():
     """The defect this feature exists for: issue #21 of the first live run
     failed 3/3 attempts on the identical ModuleNotFoundError, because a retry
     posted nothing and the next worker saw only the issue body."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=0)),
         results={ref(4): record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
         max_attempts=3,
@@ -761,7 +812,7 @@ def test_a_retried_issue_carries_the_failure_as_a_comment():
 def test_a_retry_comment_without_verify_output_still_states_the_reason():
     # The PR-closed-unmerged path has no record to quote; the reason is the
     # whole feedback, and there is no empty fence dangling under it.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=REVIEW, attempt=0)),
         open_branches=frozenset(),
         max_attempts=3,
@@ -785,7 +836,7 @@ def test_the_retry_comments_tail_is_bounded():
 
 def test_the_retry_comment_lands_on_the_issue_through_the_apply_path():
     client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
         max_attempts=3,
@@ -846,7 +897,7 @@ def test_a_different_failure_renews_the_retry_budget():
     fixed by hand, attempt 4 failed on a brand-new SyntaxError - proof the old
     blocker was gone - and the orchestrator gave up anyway because the counter
     was at its cap. A changed signature must renew the budget."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2, blocker=signature(SQLALCHEMY_TRACEBACK), streak=2)),
         results={ref(4): record(4, 1, attempt=2, verify_output=SYNTAX_ERROR_OUTPUT)},
         max_attempts=3,
@@ -868,7 +919,7 @@ def test_a_different_failure_renews_the_retry_budget():
 
 
 def test_the_same_failure_repeating_gives_up_exactly_as_before():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2, blocker=signature(SQLALCHEMY_TRACEBACK), streak=2)),
         results={ref(4): record(4, 1, attempt=2, verify_output=SQLALCHEMY_TRACEBACK)},
         max_attempts=3,
@@ -885,7 +936,7 @@ def test_the_same_failure_repeating_gives_up_exactly_as_before():
 def test_an_old_marker_without_a_signature_behaves_exactly_as_before():
     # Back-compat: no blocker recorded means no renewal, however new the
     # failure looks - the pre-signature arithmetic on the attempt counter.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2)),
         results={ref(4): record(4, 1, attempt=2, verify_output=SYNTAX_ERROR_OUTPUT)},
         max_attempts=3,
@@ -898,7 +949,7 @@ def test_an_old_marker_without_a_signature_behaves_exactly_as_before():
 
 
 def test_a_renewed_blocker_that_then_repeats_burns_its_own_budget():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=3, blocker=signature(SYNTAX_ERROR_OUTPUT), streak=1)),
         results={ref(4): record(4, 1, attempt=3, verify_output=SYNTAX_ERROR_OUTPUT)},
         max_attempts=3,
@@ -915,7 +966,7 @@ def test_a_renewed_blocker_that_then_repeats_burns_its_own_budget():
 def test_the_hard_cap_gives_up_whatever_the_signature_says():
     # Failures that keep changing renew the per-blocker budget, but the total
     # is bounded: a task failing a new way every time is not converging.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=8, blocker=signature(SQLALCHEMY_TRACEBACK), streak=1)),
         results={ref(4): record(4, 1, attempt=8, verify_output=SYNTAX_ERROR_OUTPUT)},
         max_attempts=3,
@@ -931,7 +982,7 @@ def test_the_hard_cap_gives_up_whatever_the_signature_says():
 def test_a_cap_of_one_gives_up_even_on_a_renewed_failure():
     # max_attempts=1 is the operator saying "never retry"; a renewal restarts
     # the streak at 1, which is already at that cap.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1, blocker=signature(SQLALCHEMY_TRACEBACK), streak=1)),
         results={ref(4): record(4, 1, attempt=1, verify_output=SYNTAX_ERROR_OUTPUT)},
         max_attempts=1,
@@ -944,7 +995,7 @@ def test_a_cap_of_one_gives_up_even_on_a_renewed_failure():
 def test_a_retry_with_no_output_signs_as_the_sentinel_and_burns_down():
     # The PR-closed-unmerged path has nothing to sign; the sentinel keeps it
     # consistent with itself, so closing the PR again is the same blocker.
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=REVIEW, attempt=1, blocker=EMPTY_SIGNATURE, streak=1)),
         open_branches=frozenset(),
         max_attempts=3,
@@ -963,7 +1014,7 @@ def test_the_signature_is_persisted_in_the_store_before_the_relabel():
     crash between the two costs an attempt with its signature intact."""
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     store = task_store()
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)),
         results={ref(4): record(4, 1, verify_output=SQLALCHEMY_TRACEBACK)},
         max_attempts=3,
@@ -1040,7 +1091,7 @@ def test_a_counter_bump_without_a_signature_clears_the_stale_record():
 
 
 def test_a_pull_request_closed_without_merging_returns_the_issue_to_the_pool():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=REVIEW, attempt=0)),
         open_branches=frozenset(),
         running=[ref(4)],
@@ -1056,7 +1107,7 @@ def test_a_pull_request_closed_without_merging_returns_the_issue_to_the_pool():
 
 
 def test_an_open_pull_request_is_left_alone():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=REVIEW)),
         open_branches=frozenset({task_branch(ref(4), 0)}),
     )
@@ -1065,7 +1116,7 @@ def test_an_open_pull_request_is_left_alone():
 
 
 def test_a_published_workers_container_is_disposed_without_waiting_for_the_merge():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=REVIEW)),
         open_branches=frozenset({task_branch(ref(4), 0)}),
         results={ref(4): record(4, 0)},
@@ -1080,7 +1131,7 @@ def test_a_published_workers_container_is_disposed_without_waiting_for_the_merge
 
 
 def test_pull_requests_that_could_not_be_listed_are_not_read_as_closed():
-    plan = plan_reconcile(ledger(entry(4, label=REVIEW)), open_branches=None)
+    plan = reconcile_plan(ledger(entry(4, label=REVIEW)), open_branches=None)
 
     # The whole reason `open_branches` is `None` rather than an empty set. An
     # empty set means every review PR is gone; None means we did not look, and
@@ -1151,8 +1202,8 @@ def test_plan_reconcile_cannot_tell_blocked_from_ready():
         # `believed=None` is the label reading - the authority a regression to
         # `entry.state_label` would restore, and the only one under which the
         # question is even askable.
-        blocked = plan_reconcile(ledger(entry(4, label=BLOCKED)), **facts)
-        ready = plan_reconcile(ledger(entry(4, label=READY)), **facts)
+        blocked = reconcile_plan(ledger(entry(4, label=BLOCKED)), **facts)
+        ready = reconcile_plan(ledger(entry(4, label=READY)), **facts)
 
         assert _decisions(blocked) == _decisions(ready), facts
         decided += len(blocked.transitions)
@@ -1178,31 +1229,45 @@ def test_plan_reconcile_cannot_tell_blocked_from_ready():
 def test_a_malformed_issue_is_failed_and_carries_the_reason_as_a_comment():
     error = ContractError(7, "Verify", "section is missing")
 
-    plan = plan_reconcile(ledger(errors=(error,)), labels={ref(7): frozenset({READY})})
+    plan = reconcile_plan(ledger(errors=(error,)))
 
     transition = plan.transitions[0]
-    assert (transition.ref, transition.from_state, transition.to_state) == (ref(7), ELIGIBLE, NEEDS_HUMAN)
+    # `from_state` is empty rather than a state, and that is the honest answer
+    # rather than a gap: a body that does not parse has no task id, so it is in
+    # `Ledger.errors` and in nothing else - not in `entries`, not in the cycle's
+    # belief. There is no state to have come *from*, and since #152 there is no
+    # label standing in for one either.
+    assert (transition.ref, transition.from_state, transition.to_state) == (ref(7), "", NEEDS_HUMAN)
     # §1.4: the parse failure is posted back on the issue that failed it.
     assert "section is missing" in transition.comment
 
 
-def test_a_malformed_issue_already_failed_is_not_failed_again():
+def test_a_malformed_issue_already_escalated_is_not_failed_again():
+    """Once per run, not once per cycle - the guard #152 had to replace.
+
+    It was the issue's own label: `swarm:failed` on it meant "already dealt
+    with". A malformed issue has no task id, so it has no belief entry to read
+    that from now, and nothing apiary writes to it changes what the next cycle
+    parses. Without a memory the loop comments on the same issue forever, so
+    `plan_reconcile` takes the run's `escalated` set instead - the same fact,
+    held by the reconciler rather than by the code host.
+    """
     error = ContractError(7, "Verify", "section is missing")
 
-    plan = plan_reconcile(ledger(errors=(error,)), labels={ref(7): frozenset({FAILED})})
+    plan = reconcile_plan(ledger(errors=(error,)), escalated={ref(7)})
 
-    # Otherwise every cycle re-labels it and comments on it again forever.
     assert plan.transitions == ()
 
 
-def test_a_malformed_issue_outside_the_ledger_is_left_alone():
-    error = ContractError(7, "Goal", "section is empty")
-
-    plan = plan_reconcile(ledger(errors=(error,)), labels={ref(7): frozenset({"area/docs"})})
-
-    # No `swarm:*` label means not part of the ledger at all (§1.4). Humans use
-    # the tracker too.
-    assert plan.transitions == ()
+# `test_a_malformed_issue_outside_the_ledger_is_left_alone` stood here: an
+# issue whose only label was `area/docs` got no transition, because "carries a
+# `swarm:*` label" was what §1.4 meant by belonging to apiary.
+#
+# #152 moved membership to the `<!-- apiary:task id=... -->` marker and
+# `plan_reconcile` no longer reads labels for rule 5 at all, so there is no
+# label for this case to withhold and the assertion cannot fail for its own
+# reason. Membership is now `ledger.load_ledger`'s question - it drops an
+# unmarked issue into `ignored` - and it is asserted there.
 
 
 # --------------------------------------------------------------------------
@@ -1224,10 +1289,17 @@ def test_a_landed_transition_is_folded_into_the_ledger_rather_than_re_read():
 
     # A second listing to observe our own writes is the one request that buys
     # nothing, and the dispatcher needs the freed capacity this cycle.
+    #
+    # The counter is what is folded, and since #152 it is *all* that is folded.
+    # An entry carries no state, so a transition's consequence for the rest of
+    # the cycle travels on the belief instead (`authority.Belief.fold`, pinned
+    # in `tests/test_authority.py` §8); the attempt is folded here because it is
+    # a fact about the task rather than a state, and the entry does carry it.
     updated = folded.entries["task-4"]
-    assert (updated.state_label, updated.attempt) == (READY, 1)
-    assert updated.labels == frozenset({READY})
-    assert entries.entries["task-4"].state_label == CLAIMED
+    assert updated.attempt == 1
+    # And the input is not mutated - `fold` returns a new ledger, so a caller
+    # holding the pre-fold one still sees the pre-fold counter.
+    assert entries.entries["task-4"].attempt == 0
 
 
 def test_folding_a_transition_for_an_issue_outside_the_ledger_changes_nothing():
@@ -1242,9 +1314,21 @@ def test_folding_a_transition_for_an_issue_outside_the_ledger_changes_nothing():
 # --------------------------------------------------------------------------
 
 
-def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
+def test_the_counter_is_persisted_and_nothing_else_is_written():
+    """§5's crash ordering, after #152 left only one write to order.
+
+    The rule was "the judgment is persisted *before* the label re-readies the
+    task", so a crash between them cost an attempt rather than granting a free
+    one. There is no second write to be before any more: the label writes are
+    gone, the marker's read-modify-write went with ADR 0005, and the store is
+    the whole of what a transition does to the world.
+
+    Which makes the assertion the stronger half of the old one rather than what
+    is left of it - the ordering could only ever be got wrong, and an extra
+    write here would be a control plane growing back.
+    """
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)), results={ref(4): record(4, 1)}, max_attempts=3
     )
 
@@ -1252,16 +1336,7 @@ def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
         apply_plan(client, plan, store=store)
         held = store.read()[ref(4)]
 
-    # The crash ordering §5 fixed, kept after the counter changed address (ADR
-    # 0005): the judgment is persisted before the label re-readies the task, so
-    # a crash between them costs an attempt rather than granting a free one. And
-    # add-before-remove, because two state labels are repairable by §3's
-    # precedence and none is not.
-    assert client.log == [
-        f"store {ref(4)} attempt=1",
-        f"+{READY} #4",
-        f"-{CLAIMED} #4",
-    ]
+    assert client.log == [f"store {ref(4)} attempt=1"]
     assert held.attempt == 1
     # The two calls that used to open the list - the marker's read-modify-write
     # - are gone with it.
@@ -1271,7 +1346,7 @@ def test_the_counter_is_persisted_before_the_label_goes_back_to_ready():
 def test_the_body_is_re_read_immediately_before_the_counter_is_patched():
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     client.issues[4]["body"] = body("task-4") + "\n\nA human typed this mid-cycle."
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)), results={ref(4): record(4, 1)}, max_attempts=3
     )
 
@@ -1282,30 +1357,73 @@ def test_the_body_is_re_read_immediately_before_the_counter_is_patched():
     assert "A human typed this mid-cycle." in client.issues[4]["body"]
 
 
+class RefusingStore:
+    """A store that will not take the judgment for one ref. See below."""
+
+    def __init__(self, repo: str, log: list[str], *, refuse: set[TaskRef]) -> None:
+        self._store = SqliteTaskStore.open(repo)
+        self._log = log
+        self._refuse = refuse
+
+    def read(self) -> Any:
+        return self._store.read()
+
+    def write(self, judgement: TaskJudgement) -> None:
+        if judgement.ref in self._refuse:
+            raise StoreError(f"cannot record a judgment for {judgement.ref}")
+        self._log.append(f"store {judgement.ref} attempt={judgement.attempt}")
+        self._store.write(judgement)
+
+    def close(self) -> None:
+        self._store.close()
+
+    def __enter__(self) -> "RefusingStore":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
 def test_one_issue_failing_does_not_cost_the_others_their_transition():
+    """One of this file's five headline properties, at its new failure site.
+
+    It was a `POST /issues/4/labels` that came back 404 - a human deleting an
+    issue between the read and the write. #152 removed the label writes, so the
+    only thing a transition still writes is apiary's own judgment, and that is
+    where the blast radius now has to be held: a store that will not take one
+    task's judgment must not cost the other nineteen their transition, and the
+    un-bumped counter leaves that one task exactly where the next cycle expects
+    to find it.
+    """
     client = FakeClient(
         issues={4: issue_payload(4, label=CLAIMED), 5: issue_payload(5, label=CLAIMED)},
-        fail_labels_on={4},
     )
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED), entry(5, label=CLAIMED)),
-        states={ref(4): closed(4), ref(5): closed(5)},
+        results={ref(4): record(4, 1), ref(5): record(5, 1)},
+        max_attempts=3,
     )
+    # Both tasks are being charged an attempt, which is what puts a store write
+    # on each transition - a plan whose transitions carried no counter would
+    # never reach the store and the test would be asserting about nothing.
+    assert [t.attempt for t in plan.transitions] == [1, 1]
 
-    report = apply_plan(client, plan)
+    with RefusingStore(REPO, client.log, refuse={ref(4)}) as store:
+        report = apply_plan(client, plan, store=store)
 
-    # A human deleting an issue between the read and the write lands here. It
-    # is a fact about one issue, not a reason to abandon the cycle.
     assert [t.ref for t in report.applied] == [ref(5)]
     assert [f.ref for f in report.failures] == [ref(4)]
     assert report.ok is False
+    # And #5's judgment really landed, rather than the cycle having given up
+    # quietly after #4 refused.
+    assert client.log == [f"store {ref(5)} attempt=1"]
 
 
 def test_a_container_that_will_not_die_does_not_stop_the_labels_from_moving():
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     fleet = FakeFleet(handles=running(4))
     fleet.dispose_error = DockerError(["docker", "rm"], 1, "daemon is not responding")
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4)]
     )
 
@@ -1319,7 +1437,7 @@ def test_a_container_that_will_not_die_does_not_stop_the_labels_from_moving():
 def test_a_dry_run_writes_nothing_at_all():
     client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
     fleet = FakeFleet(handles=running(4))
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED)), states={ref(4): closed(4)}, running=[ref(4)]
     )
 
@@ -1332,7 +1450,7 @@ def test_a_dry_run_writes_nothing_at_all():
 
 def test_a_client_with_no_comment_method_prints_the_reason_and_reports_the_gap(capsys):
     client = FakeClient(issues={7: issue_payload(7)})
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(errors=(ContractError(7, "Verify", "section is missing"),)),
         labels={ref(7): frozenset({READY})},
     )
@@ -1348,7 +1466,7 @@ def test_a_client_with_no_comment_method_prints_the_reason_and_reports_the_gap(c
 
 def test_the_comment_is_posted_once_the_client_can_post_one():
     client = CommentingClient(issues={7: issue_payload(7)})
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(errors=(ContractError(7, "Verify", "section is missing"),)),
         labels={ref(7): frozenset({READY})},
     )
@@ -1366,11 +1484,16 @@ def test_the_comment_is_posted_once_the_client_can_post_one():
 
 
 def test_closing_an_issue_mid_run_disposes_its_worker_and_the_run_continues():
-    client = FakeClient(
+    # A client that can list pull requests, because since #152 that listing is
+    # what a cycle's belief is derived from: a blind cycle believes nothing, and
+    # a dispatcher with no belief has nothing to call eligible. #5 waiting behind
+    # #4 is half of what this test is about, so the cycle has to be able to see.
+    client = PullAwareClient(
         issues={
             4: issue_payload(4, label=CLAIMED, state="closed", state_reason="not_planned"),
             5: issue_payload(5, label=READY),
-        }
+        },
+        open_pulls=(),
     )
     fleet = FakeFleet(handles=running(4))
 
@@ -1379,8 +1502,16 @@ def test_closing_an_issue_mid_run_disposes_its_worker_and_the_run_continues():
     # #22's "done when", end to end: the worker for the cancelled issue is
     # gone, the issue is out of the ledger's live set, and the cycle went on to
     # dispatch the work that was waiting behind it.
+    #
+    # "Out of the run" used to be readable as the `swarm:failed` label the cycle
+    # wrote onto #4, and it is read off the belief now. Closed-as-`not_planned`
+    # is evidence the resolver reads directly, so #4 arrives at the cycle already
+    # believed `needs-human` and there is no transition left to make - rule 2
+    # disposes the container and stops, which is the same outcome reached one
+    # rule earlier. That the container still goes is #22's actual criterion.
     assert fleet.disposed == [4]
-    assert client.labels_on(4) == {FAILED}
+    assert report.belief.state("task-4") == NEEDS_HUMAN
+    assert [d.ref for d in report.plan.disposals] == [ref(4)]
     assert fleet.spawned == [5]
     assert report.live == 1
 
@@ -1412,13 +1543,36 @@ def test_a_dependency_cycle_is_reported_every_cycle_rather_than_killing_the_run(
 
 
 def test_a_review_issue_whose_pull_request_vanished_is_retried_once_prs_are_readable():
+    """Rule 4, and #152 is why it now takes two cycles to reach.
+
+    The trigger is edge-triggered - "it *was* in review and its pull request has
+    since gone" - and until #152 a `swarm:review` label answered the "was" on
+    the very first cycle of a process. There is no label to read, and
+    `authority.believe` deliberately does not invent a cycle-0 seed, so the
+    "was" has to be something this process actually watched: cycle one sees the
+    pull request open and believes `review`, and cycle two finds it gone.
+
+    That is a stronger world to assert in, not a weaker one. The single-cycle
+    version could not tell rule 4 firing on an observed transition from rule 4
+    firing on a string a human typed into the label field.
+    """
     client = PullAwareClient(
         issues={4: issue_payload(4, label=REVIEW)},
-        open_pulls=(),
+        open_pulls=(task_branch(ref(4), 0),),
     )
 
     fleet = FakeFleet()
-    loop = reconciler(client, fleet)
+    # No merge gate: this client cannot list check runs, and the question here
+    # is rule 4's, not the gate's.
+    loop = reconciler(client, fleet, merge_gate=False)
+    first = loop.cycle()
+
+    # Cycle one: the pull request is open, so this is what `review` means now.
+    assert first.belief.state("task-4") == REVIEW_STATE
+    assert fleet.spawned == []
+
+    # A human closes it unmerged between the cycles, and the issue stays open.
+    client.open_pulls = ()
     report = loop.cycle()
 
     # Freed and re-dispatched inside the one cycle: reconciling before
@@ -1426,7 +1580,6 @@ def test_a_review_issue_whose_pull_request_vanished_is_retried_once_prs_are_read
     # store before the second container exists.
     assert report.plan.blind is False
     assert loop.store.read()[ref(4)].attempt == 1
-    assert client.labels_on(4) == {CLAIMED}
     assert fleet.spawned == [4]
 
 
@@ -1440,12 +1593,21 @@ def test_a_client_that_cannot_list_pull_requests_leaves_the_review_queue_alone()
 
 
 def test_a_finished_worker_is_observed_from_its_artifact_and_not_from_docker(tmp_path):
-    client = FakeClient(issues={4: issue_payload(4, label=CLAIMED)})
+    # Docker still says this container is running - `running()` sets the state
+    # the daemon would print - and the record says the worker is done. That
+    # disagreement is the whole test, and since #152 it is sharper than it was:
+    # the belief reads `claimed` *from* the live container, and rule 3 observes
+    # the exit anyway, off the artifact.
+    client = PullAwareClient(issues={4: issue_payload(4, label=CLAIMED)}, open_pulls=())
     fleet = FakeFleet(handles=running(4))
     write_result(record(4, 1, reason="the verify command failed"), tmp_path)
 
     report = reconciler(client, fleet, artifacts=tmp_path).cycle()
 
+    # `from_state` is display-only since #152 and is sourced from the belief, so
+    # this is the belief as rule 3 found it - `claimed`, off the live container -
+    # rather than a label anybody wrote.
+    assert report.result.applied[0].from_state == CLAIMED_STATE
     # The worker writes its record last, so a record is the evidence that the
     # container finished - no blocking `docker wait`, no extra API call. Its
     # container is disposed and the retry goes out in the same cycle.
@@ -1455,7 +1617,15 @@ def test_a_finished_worker_is_observed_from_its_artifact_and_not_from_docker(tmp
 
 
 def test_the_loop_stops_when_nothing_is_live():
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    """Terminal is *closed* now, which is what #152 left of the question.
+
+    `run.live_entries` read `swarm:done` or `swarm:failed` off each entry, and
+    both are gone. It reads the one terminal fact the code host still carries at
+    the moment the loop asks - before any observation exists to resolve a state
+    from - so an issue is out of the run when it is closed, and a landed task's
+    issue is closed by its own merge (`Closes #<n>`).
+    """
+    client = FakeClient(issues={4: landed_payload(4)})
 
     reports = reconciler(client, FakeFleet()).loop(cycles=5)
 
@@ -1696,7 +1866,7 @@ def test_an_exhausted_ledger_is_not_the_end_of_the_run_if_the_gate_extends(monke
 
     monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
 
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     reports = reconciler(
         client, FakeFleet(), goal_gate=True, objective="make the thing work"
     ).loop(cycles=5)
@@ -1737,7 +1907,7 @@ def test_the_goal_gate_is_skipped_without_an_objective(monkeypatch, capsys):
         lambda *a, **k: pytest.fail("the gate assessed an empty objective"),
     )
 
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     reports = reconciler(client, FakeFleet(), goal_gate=True, objective="  ").loop(cycles=3)
 
     assert len(reports) == 1
@@ -1917,7 +2087,7 @@ def infra(number: int = 4, *, reason: str = "docker: no such image") -> dict:
 def test_an_infrastructure_failure_below_the_cap_still_re_readies():
     """The rule this ticket adds a ceiling to, asserted at the boundary rather
     than only at zero."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results=infra(),
         max_attempts=3,
@@ -1931,7 +2101,7 @@ def test_an_infrastructure_failure_below_the_cap_still_re_readies():
 
 
 def test_the_nth_consecutive_infrastructure_failure_reaches_a_human():
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results=infra(reason="docker: no such image apiary-worker-node"),
         max_attempts=3,
@@ -1952,7 +2122,7 @@ def test_escalating_does_not_backdate_the_attempt_counter():
     """The attempts were never consumed, and writing one now would rewrite
     history to make this look like an exhausted budget rather than a machine
     fault - which is the diagnosis the whole exit-2 rule exists to protect."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results=infra(),
         max_attempts=3,
@@ -2078,7 +2248,7 @@ def test_a_cap_of_zero_or_less_is_honoured_as_written():
     host, and the summary says out loud what it costs."""
     policy = InfrastructurePolicy(cap=0)
 
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results=infra(),
         max_attempts=3,
@@ -2120,7 +2290,7 @@ def test_a_gate_that_extended_flushes_the_cache_so_the_next_read_sees_its_issues
     monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
 
     flushed: list[int] = []
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     client.invalidate_cache = lambda: flushed.append(1)
 
     reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(cycles=5)
@@ -2158,7 +2328,7 @@ def test_a_gate_that_revived_keeps_the_loop_running_and_flushes_the_cache(monkey
     monkeypatch.setattr("swarm.orchestrator.goal.close_the_loop", spy)
 
     flushed: list[int] = []
-    client = FakeClient(issues={4: issue_payload(4, label=DONE)})
+    client = FakeClient(issues={4: landed_payload(4)})
     client.invalidate_cache = lambda: flushed.append(1)
 
     reports = reconciler(client, FakeFleet(), goal_gate=True, objective="make it work").loop(
@@ -2671,7 +2841,7 @@ def test_every_writer_of_a_terminal_label_is_announced(where):
 def test_a_failing_task_says_why_it_needs_a_human_and_that_it_paid_for_it():
     """Exit 1 at the cap: the attempt was consumed, and the sentence says which
     budget ran out."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=2)),
         results={ref(4): record(4, 1, attempt=2)},
         max_attempts=3,
@@ -2688,7 +2858,7 @@ def test_an_infrastructure_escalation_says_no_attempt_was_ever_consumed():
     """§4's rule, announced rather than re-derived: exit 2 never consumes an
     attempt, so the escalation at the cap consumed none either - which is the
     difference between "this task is hard" and "this host is broken"."""
-    plan = plan_reconcile(
+    plan = reconcile_plan(
         ledger(entry(4, label=CLAIMED, attempt=1)),
         results=infra(4),
         infrastructure={ref(4): DEFAULT_INFRASTRUCTURE_CAP - 1},
@@ -3194,7 +3364,14 @@ def test_a_revived_attempt_that_leaves_no_result_lapses_instead_of_looping(
         "the grant lapsed on the dispatch: one revival, one attempt, then the "
         "streak `planner.revive` never reset caps the task again"
     )
-    assert calls == [1], "the gate ran once; a re-revival would be a second grant"
+    # The grant, not the gate call. The gate is *asked* on every cycle whose
+    # plan is exhausted, and since #152 a task capped after its granted attempt
+    # keeps the plan exhausted - so counting invocations now measures how long
+    # the run went on rather than whether it re-revived. What the assertion has
+    # always meant is one grant, and `_ever_revived` is where that is bounded.
+    assert loop._ever_revived == {ref(TASK_ISSUE)}, "exactly one task was ever revived"
+    assert loop._revived == {}, "and its grant was spent, not renewed"
+    assert calls, "the gate did run"
     # And it stopped in the state a human is asked about, rather than by being
     # quietly skipped: `needs-human` is what the dispatcher refuses to start.
     from swarm.orchestrator.derived import NEEDS_HUMAN
@@ -3268,109 +3445,18 @@ def test_a_revived_attempt_that_does_leave_a_result_is_unchanged(tmp_path, monke
     assert loop._believed[ref(TASK_ISSUE)] == NEEDS_HUMAN
 
 
-# --------------------------------------------------------------------------
-# Storing a state as labels
-# --------------------------------------------------------------------------
+# The `write_labels` block stood here: eight tests over apiary's one label
+# writer - add-before-remove (GitHub has no transaction across two label calls,
+# so a crash between them had to leave two state labels rather than none), the
+# no-op when a transition does not change state, the mapping from a
+# `Transition`'s internal state to the `swarm:*` name that stored it, and the
+# "exactly one writer" property that made #152 a deletion rather than a hunt.
 #
-# `Transition` speaks ADR 0001's internal states since #152, so the `swarm:*`
-# names appear at exactly one point in the transition path: `write_labels`.
-# These are the properties that made it safe to move the vocabulary.
-
-
-def test_a_transition_is_stored_as_the_label_that_holds_its_state():
-    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-
-    write_labels(client, Transition(ref(4), CLAIMED_STATE, LANDED, "merged"))
-
-    assert client.labels_on(4) == {DONE}
-
-
-def test_the_label_is_added_before_the_stale_one_is_removed():
-    """`readiness._relabel`'s rule, held at the one place that now writes.
-
-    GitHub has no transaction across two label calls. A crash between them leaves
-    two state labels or none: two is repairable by §3's precedence, none puts the
-    issue outside the ledger entirely, where nothing looks at it again.
-    """
-    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-
-    write_labels(client, Transition(ref(4), CLAIMED_STATE, LANDED, "merged"))
-
-    assert client.log == [f"+{DONE} #4", f"-{CLAIMED} #4"]
-
-
-def test_a_transition_that_does_not_move_writes_no_removal():
-    """Adding and removing the same name is a call that undoes itself."""
-    client = CommentingClient(issues={4: issue_payload(4, label=CLAIMED)})
-
-    write_labels(client, Transition(ref(4), CLAIMED_STATE, CLAIMED_STATE, "unchanged"))
-
-    assert client.log == [f"+{CLAIMED} #4"]
-    assert client.labels_on(4) == {CLAIMED}
-
-
-def test_the_label_removed_is_the_one_the_issue_carries_not_the_one_believed():
-    """Why `from_state` is built from the label and not from the belief (#152).
-
-    A human relabels a claimed task `swarm:done` mid-run. The resolver still
-    believes `claimed` - there is a container - and the cycle decides to move the
-    task to `needs-human`. The write has to take **`swarm:done`** off, because
-    that is what the issue is wearing; taking `swarm:claimed` off would leave the
-    issue carrying two state labels, and §3 would then read the furthest-along of
-    them and stop the task.
-
-    `plan_reconcile` therefore passes `label_state(entry.state_label)` rather than
-    the belief, and this asserts the consequence rather than the plumbing.
-    """
-    client = CommentingClient(issues={4: issue_payload(4, label=DONE)})
-
-    # `label_state(swarm:done)` is `landed` - what the issue says, not what a
-    # cycle watching the container would say.
-    write_labels(client, Transition(ref(4), LANDED, NEEDS_HUMAN, "budget spent"))
-
-    assert client.log == [f"+{FAILED} #4", f"-{DONE} #4"]
-    assert client.labels_on(4) == {FAILED}
-
-
-def test_a_transition_with_no_previous_state_removes_nothing():
-    """The malformed-issue path: `from_state` is empty when nothing carried a state."""
-    client = CommentingClient(issues={4: issue_payload(4, label=READY)})
-
-    write_labels(client, Transition(ref(4), "", NEEDS_HUMAN, "malformed contract"))
-
-    assert client.log == [f"+{FAILED} #4"]
-
-
-def test_the_transition_path_writes_labels_in_exactly_one_place():
-    """The property that makes the deletion in #152 a deletion rather than a hunt.
-
-    Three modules used to carry their own copy of add-before-remove - here,
-    `checks._apply` and `mergeability._apply` - so the label vocabulary had three
-    exits from the transition path. Now it has one, and this is the test that
-    fails if a fourth appears.
-
-    Static, over the source, because a runtime probe only sees the path the test
-    happened to take: the merge gate's copy fired on a green pull request and
-    nothing else.
-    """
-    import ast
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[1] / "src" / "swarm" / "orchestrator"
-    writers = {}
-    for path in sorted(root.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        calls = {
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
-        if "add_labels" in calls:
-            writers[path.name] = sorted(calls & {"add_labels", "remove_label"})
-
-    # `dispatcher.py` writes the claim, which is not a `Transition` and is #152's
-    # to delete separately; `reconcile.py` is `write_labels`. Nothing else.
-    assert set(writers) == {"reconcile.py", "dispatcher.py"}, writers
+# `write_labels` is deleted and nothing writes a label any more, so there is no
+# ordering to get wrong, no name to look up and no writer to be the only one of.
+# All eight went with their subject. `Transition`'s internal-state vocabulary,
+# which is what the last three were really guarding the move to, is now the only
+# vocabulary it has - see `Transition.__str__` and `fold` below.
 
 
 # --------------------------------------------------------------------------
@@ -3426,141 +3512,15 @@ def believing(state: str, *, was: str | None = None, task: str = "task-4") -> Be
     return Belief(states={task: state}, previous={task: was or state})
 
 
-#: Every rule in `plan_reconcile` that builds a `Transition`, as a world where
-#: the carried label and the believed state disagree. Keyed by the rule, and
-#: the value is what that rule decides - so a case that stops reaching its rule
-#: fails on `to_state` rather than passing vacuously on a transition list that
-#: happens to be empty.
-#: The labels each case is run with. Two, and never one: a world whose carried
-#: label happens to equal the state a mutation substitutes cannot see that
-#: mutation, so one world per site pins the site against every constant *except
-#: its own*. Two worlds with different labels leave no such hole.
-CARRIED = (DONE, BLOCKED)
-
-#: The malformed-contract rule skips a terminal label on purpose - a task
-#: nobody will run again is not failed a second time every cycle - so its two
-#: are the non-terminal pair.
-CARRIED_NON_TERMINAL = (CLAIMED, BLOCKED)
-
-CARRIED_LABEL_RULES: tuple[
-    tuple[str, Callable[[str], ReconcilePlan], str, tuple[str, ...]], ...
-] = (
-    (
-        "a human closed the issue",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label)),
-            believed=believing(CLAIMED_STATE),
-            states={ref(4): closed(4)},
-        ),
-        LANDED,
-        CARRIED,
-    ),
-    (
-        "the worker published its pull request",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label)),
-            believed=believing(CLAIMED_STATE),
-            results={ref(4): record(4, 0)},
-        ),
-        REVIEW_STATE,
-        CARRIED,
-    ),
-    (
-        "the worker failed and the budget holds",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label)),
-            believed=believing(CLAIMED_STATE),
-            results={ref(4): record(4, 1)},
-            max_attempts=3,
-        ),
-        ELIGIBLE,
-        CARRIED,
-    ),
-    (
-        "the same failure hit the streak cap",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label, attempt=2, streak=2, blocker=signature("boom"))),
-            believed=believing(CLAIMED_STATE),
-            results={ref(4): record(4, 1, attempt=2, verify_output="boom")},
-            max_attempts=3,
-        ),
-        NEEDS_HUMAN,
-        CARRIED,
-    ),
-    (
-        "different failures spent the total cap",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label, attempt=8)),
-            believed=believing(REVIEW_STATE),
-            open_branches=(),                    # the pull request is gone
-            max_total_attempts=9,
-        ),
-        NEEDS_HUMAN,
-        CARRIED,
-    ),
-    (
-        "an infrastructure failure that costs nothing",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label)),
-            believed=believing(CLAIMED_STATE),
-            results={ref(4): record(4, 2, reason="the network was unreachable")},
-            infrastructure_policy=InfrastructurePolicy(cap=3),
-        ),
-        ELIGIBLE,
-        CARRIED,
-    ),
-    (
-        "infrastructure failures that hit their cap",
-        lambda label: plan_reconcile(
-            ledger(entry(4, label=label)),
-            believed=believing(CLAIMED_STATE),
-            results={ref(4): record(4, 2, reason="the network was unreachable")},
-            infrastructure={ref(4): 2},
-            infrastructure_policy=InfrastructurePolicy(cap=3),
-        ),
-        NEEDS_HUMAN,
-        CARRIED,
-    ),
-    (
-        # The one case that cannot carry `swarm:done`: this rule skips a
-        # terminal label on purpose, so a task nobody is going to run again is
-        # not failed a second time every cycle. `swarm:claimed` is the
-        # hand-typed label here, and the belief disagrees just as loudly.
-        "a malformed contract",
-        lambda label: plan_reconcile(
-            ledger(errors=(ContractError(4, "Verify", "section is missing"),)),
-            believed=believing(ELIGIBLE),
-            labels={ref(4): frozenset({label})},
-        ),
-        NEEDS_HUMAN,
-        CARRIED_NON_TERMINAL,
-    ),
-)
-
-
-@pytest.mark.parametrize(
-    "rule, world, decides, carried",
-    CARRIED_LABEL_RULES,
-    ids=[case[0] for case in CARRIED_LABEL_RULES],
-)
-def test_every_rule_removes_the_label_the_issue_carries(rule, world, decides, carried):
-    """One case per rule that builds a `Transition`, each in a world that
-    disagrees with itself: the issue wears `swarm:done` because a human typed
-    it there, and the cycle believes something else because the world says so.
-
-    `from_state` names the label the write has to **remove**, so every one of
-    these must be the internal state of the label the issue is wearing. Taking
-    the
-    believed label off instead leaves the issue with two state labels, and §3's
-    precedence then reads the furthest-along of them and stops the task; it
-    also feeds `fold`, which rebuilds the entry's label set from this field, so
-    the cycle's own ledger would disagree with GitHub for long enough to
-    dispatch a container against it. Both failures are silent.
-    """
-    for label in carried:
-        transition = world(label).transitions[0]
-
-        assert transition.to_state == decides, f"{rule}: the rule stopped firing"
-        assert transition.from_state == internal_state(label), (
-            f"{rule} carrying {label}: removed the believed label"
-        )
+# `CARRIED_LABEL_RULES` and `test_every_rule_removes_the_label_the_issue_carries`
+# stood here: one case per rule that builds a `Transition`, each run in a world
+# where the issue's label and the cycle's belief disagreed, asserting that
+# `from_state` named the label the write had to **remove** - because taking the
+# believed one off instead left the issue wearing two, and §3's precedence then
+# read the furthest-along of them and stopped the task.
+#
+# #152 removed the write, so there is no label to remove and nothing for
+# `from_state` to name; it is display-only now (`Transition.__str__`). The
+# property those cases were really protecting - that each rule fires on what the
+# cycle *believes* rather than on a label a human typed - is asserted directly
+# in `tests/test_authority.py`.

@@ -151,7 +151,7 @@ from ..github.readiness import IssueState
 from ..github.refs import task_ref
 from ..run import Run, RunError, validate_run_id
 from ..taskref import TaskRef
-from .authority import Belief, label_state, state_of
+from .authority import Belief, state_of
 from .derived import CLAIMED as CLAIMED_STATE
 from .derived import ELIGIBLE, NEEDS_HUMAN
 from .derived import REVIEW as REVIEW_STATE
@@ -327,7 +327,10 @@ class RecoveryPlan:
         return ", ".join(parts)
 
 
-def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
+def _release(entry: LedgerEntry, max_attempts: int,
+    *,
+    believed: Belief | None = None,
+) -> Transition:
     """Consume an attempt for a claim nothing was running, and decide the label.
 
     The increment rides on the transition so `apply_plan` persists it *before*
@@ -342,7 +345,7 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
     if attempt >= cap:
         return Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=state_of(entry, believed),
             to_state=NEEDS_HUMAN,
             reason=f"{reason}; {attempt} attempt(s) made against a cap of {cap}",
             task_id=entry.task_id,
@@ -355,7 +358,7 @@ def _release(entry: LedgerEntry, max_attempts: int) -> Transition:
         )
     return Transition(
         ref=entry.ref,
-        from_state=label_state(entry.state_label),
+        from_state=state_of(entry, believed),
         to_state=ELIGIBLE,
         reason=reason,
         task_id=entry.task_id,
@@ -469,7 +472,7 @@ def plan_recovery(
             transitions.append(
                 Transition(
                     ref=entry.ref,
-                    from_state=label_state(entry.state_label),
+                    from_state=state_of(entry, believed),
                     to_state=REVIEW_STATE,
                     reason=(
                         f"{branch} has an open pull request; "
@@ -481,7 +484,7 @@ def plan_recovery(
             continue
 
         # 4. A claim with nothing behind it at all. This is the ticket.
-        transitions.append(_release(entry, max_attempts))
+        transitions.append(_release(entry, max_attempts, believed=believed))
 
     return RecoveryPlan(
         transitions=tuple(transitions),
@@ -652,23 +655,50 @@ class Recovery:
         return RecoveryReport(plan=plan, result=result)
 
     def startup(self) -> RecoveryReport:
-        """The ticket's row: sweep what a dead orchestrator left labelled.
+        """The ticket's row: sweep the claims a dead orchestrator left behind.
 
         Reads the ledger itself, because a startup sweep runs before there is a
         cycle to share a read with. One issue listing serves the ledger, each
         issue's open/closed state and the pull-request probe, exactly as it
         does inside a cycle.
+
+        **It resolves a belief of its own, and #152 is why it has to.** The
+        sweep decides on a task's state, and until this ticket that state was
+        the `swarm:claimed` label a dead process had left on the issue - which
+        is precisely what "sweep what a dead orchestrator left labelled" meant.
+        There is no such label now, so a startup sweep with no belief asks
+        `state_of` a question it can only raise on, and the method was
+        unreachable in practice.
+
+        The observation is built from the same one listing plus the daemon's
+        container list, which is what a cycle's first pass does. `believe` with
+        no `remembered` is the honest shape here: a startup sweep is by
+        definition the first sight of this repository by this process, so there
+        is nothing carried forward for it to consult.
         """
+        from .authority import believe
+        from .observed import build_observation
+
         snapshot = Snapshot(self.client)
         ledger = load_ledger(
             snapshot,  # type: ignore[arg-type]
-            adopt=not self.dry_run,
             store=self.store,
+        )
+        states = snapshot.states()
+        open_branches = snapshot.open_branches()
+        containers = self.containers()
+        observation = build_observation(
+            cycle=0,
+            entries=ledger.entries.values(),
+            containers=containers,
+            states=states,
         )
         return self.sweep(
             ledger,
-            states=snapshot.states(),
-            open_branches=snapshot.open_branches(),
+            containers=containers,
+            states=states,
+            open_branches=open_branches,
+            believed=believe(ledger, observation),
         )
 
     # --- plumbing ---------------------------------------------------------

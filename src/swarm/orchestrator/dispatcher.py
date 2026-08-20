@@ -88,7 +88,6 @@ from ..containers.manager import (
 from ..github.client import GitHubClient, GitHubError
 from ..github.ledger import Ledger, LedgerEntry, load_ledger
 from ..github.readiness import READY
-from ..run import TERMINAL_LABELS
 from ..taskref import TaskRef
 from .authority import Belief
 from .derived import BLOCKED as BLOCKED_STATE
@@ -99,7 +98,7 @@ from .derived import REVIEW as REVIEW_STATE
 #: The label this module writes, and the one it writes it over. `READY` is
 #: imported rather than respelled because readiness (#11) owns that string; no
 #: module owns the other two, and `ledger.LABEL_PRECEDENCE` has the full six.
-CLAIMED = "swarm:claimed"
+CLAIMED = "claimed"
 
 #: The daemon is not there at all, as opposed to this one spawn going wrong.
 #:
@@ -133,7 +132,7 @@ def daemon_is_down(error: ContainerError) -> bool:
     plain `ContainerError` that a missing binary raises.
     """
     return bool(DAEMON_DOWN_RE.search(str(error)))
-REVIEW = "swarm:review"
+REVIEW = "review"
 
 #: Issues whose `## Files` are spoken for. `swarm:claimed` is the obvious half -
 #: a container is editing them right now. `swarm:review` is the half worth
@@ -142,7 +141,6 @@ REVIEW = "swarm:review"
 #: merge conflict this rule exists to prevent. The hold is temporary either way
 #: - the PR merges to `swarm:done` or falls back to `swarm:ready` (§4) - so
 #: reserving cannot deadlock, it can only defer.
-RESERVING_LABELS = frozenset({CLAIMED, REVIEW})
 
 #: The same two sets in ADR 0001's vocabulary, which is what this module reads
 #: since #147. The `_STATE` suffixes are the shadow window's convention and exist for
@@ -346,11 +344,18 @@ class Capacity:
 
 
 class Labeller(Protocol):
-    """The two label calls a claim is made of. `GitHubClient` satisfies it."""
+    """Nothing, now that a claim writes nothing to the tracker (#152).
 
-    def add_labels(self, number: int, labels: Iterable[str]) -> Any: ...
+    It named the two label calls a claim was made of. Kept as an empty protocol
+    rather than deleted because `claim` and `release` still take a client
+    positionally and every caller still passes one - a signature change would
+    have rippled through the dispatcher, the recovery sweep and their tests for
+    no behavioural reason, in a ticket whose whole subject is removing writes.
 
-    def remove_label(self, number: int, label: str) -> bool: ...
+    The name is deliberately not renamed to something vaguer. It is the seam a
+    tracker-side claim would go back into if a customer's workflow ever needed
+    one, and calling it what it was makes that findable.
+    """
 
 
 class Spawner(Protocol):
@@ -512,17 +517,20 @@ def plan_dispatch(
     """
     limit = capacity if capacity is not None else Capacity.detect(provider=_worker_provider())
     allowed = None if ready is None else set(ready)
-    derived = believed is not None and believed.derived
     startable = WAITING_STATES if allowed is not None else frozenset({ELIGIBLE})
-    held_by_a_container = set(holding) if derived else set()
+    held_by_a_container = set(holding)
 
     in_flight: list[LedgerEntry] = []
     candidates: list[LedgerEntry] = []
     for entry in sorted(ledger.entries.values(), key=lambda entry: entry.ref):
+        # One reading, not two. The `else` arms were the label fallback and
+        # `APIARY_STATE_SOURCE=labels`; #152 removed both, and a task with no
+        # belief is simply in no state - which falls through every test below
+        # and is neither dispatched nor counted as in flight.
         state = believed.state(entry.task_id) if believed is not None else ""
-        reserving = state in RESERVING_STATES if derived else entry.state_label in RESERVING_LABELS
-        finished = state in FINISHED_STATES if derived else entry.state_label in TERMINAL_LABELS
-        may_start = state in startable if derived else entry.state_label == READY
+        reserving = state in RESERVING_STATES
+        finished = state in FINISHED_STATES
+        may_start = state in startable
         if reserving:
             in_flight.append(entry)
             continue
@@ -659,16 +667,21 @@ class DispatchReport:
 
 
 def claim(client: Labeller, entry: LedgerEntry) -> None:
-    """Move one issue `ready -> claimed`, adding the new label first.
+    """The claim is the container, and nothing is written to the tracker (#152).
 
-    The order is `readiness._relabel`'s and is load-bearing for the same reason:
-    GitHub has no transaction across two label calls, and a crash between them
-    leaves either two state labels or none. Two is repairable - §3's precedence
-    puts `claimed` above `ready`, so the conservative reading wins. None puts
-    the issue outside the ledger, where nothing looks at it again.
+    This moved an issue `swarm:ready -> swarm:claimed`, add-before-remove,
+    because a crash between two label calls could otherwise leave the issue with
+    no state label and outside the ledger entirely. There is no state label now,
+    so there is nothing to lose in the gap - and the thing that actually says
+    "this task is claimed" was always the running container
+    (`derived._claiming_container`), which the resolver reads directly.
+
+    Kept as a function rather than deleted at its call site: the dispatcher
+    still has a claim *step* in its sequence, and #35's stale-claim sweep is
+    written about the window between claiming and spawning. A no-op with a name
+    keeps that sequence readable, and keeps the one place a future adapter would
+    put a tracker-side claim if a customer's workflow needed one.
     """
-    client.add_labels(entry.number, [CLAIMED])
-    client.remove_label(entry.number, READY)
 
 
 def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
@@ -706,11 +719,9 @@ def release(client: Labeller, manager: Spawner, entry: LedgerEntry) -> bool:
         # The probe itself could not answer. "Do not release" is the reading
         # that cannot produce two workers.
         return False
-    try:
-        client.add_labels(entry.number, [READY])
-        client.remove_label(entry.number, CLAIMED)
-    except GitHubError:
-        return False
+    # Nothing to un-write: the claim was the container and the container is
+    # gone, so releasing it is the absence of a container plus this cycle's
+    # belief. The label pair that used to move here went with #152.
     return True
 
 
@@ -833,7 +844,7 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
 
     repo = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GITHUB_REPOSITORY", "")
     # Read-only on every path: no adoption write, no label, no container.
-    report = plan_dispatch(load_ledger(GitHubClient.from_env(repo), adopt=False))
+    report = plan_dispatch(load_ledger(GitHubClient.from_env(repo)))
     print(Capacity.detect(provider=_worker_provider()).summary())
     for chosen in report.dispatch:
         print(f"dispatch #{chosen.number} {chosen.task_id}: {', '.join(chosen.files)}")

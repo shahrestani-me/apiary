@@ -3,7 +3,7 @@
 This is the "prompt in, project out" entry point of
 `docs/architecture-v2.md`'s greenfield mode. One command creates the
 repository, pushes a single initial commit carrying a README, a LICENSE and a
-CI workflow, provisions the `swarm:*` labels (#8) and protects the default
+CI workflow and protects the default
 branch:
 
     GITHUB_TOKEN=... python -m swarm.greenfield.provision \\
@@ -78,7 +78,6 @@ from typing import Any, Callable, Sequence
 
 from ..github.client import GitHubClient, GitHubError, GitHubHTTPError
 from ..security import PROVISION_TOKEN_ENV, assert_provision_token
-from ..github.labels import SWARM_LABELS, LabelReport, ensure_labels
 from .stacks import REACT_TOOLCHAIN
 
 # The ruleset this module writes. Named, so a second run can recognise its own
@@ -113,7 +112,6 @@ PLACEHOLDER_VERIFY = "test -f README.md"
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _MAX_SLUG = 48
 
-_LABEL_COUNT = len(SWARM_LABELS)
 
 
 class ProvisionError(GitHubError):
@@ -319,7 +317,6 @@ class ProvisionPlan:
         lines.append("  initial commit")
         for path, content in sorted(self.files().items()):
             lines.append(f"                 - {path}  ({len(content.encode('utf-8'))} bytes)")
-        lines.append(f"  labels       the {_LABEL_COUNT} swarm:* state labels")
         return "\n".join(lines)
 
 
@@ -387,7 +384,6 @@ class ProvisionReport:
     html_url: str
     default_branch: str
     commit_sha: str
-    labels: LabelReport
     protection: tuple[str, ...]
     #: The command the workflow in that commit actually runs. Reported rather
     #: than left for the caller to re-derive from its own copy of the plan: the
@@ -402,7 +398,6 @@ class ProvisionReport:
             f"  {self.default_branch} @ {self.commit_sha[:7]}, "
             f"protected by {', '.join(self.protection) or 'nothing'}\n"
             f"  verified by {self.verify_command}\n"
-            f"  {self.labels.summary()}"
         )
 
 
@@ -468,9 +463,6 @@ def provision(
     commit_sha = _push_initial_commit(client, plan, branch, html_url)
     out(f"pushed the initial commit to {branch} @ {commit_sha[:7]}")
 
-    labels = ensure_labels(client)
-    out(labels.summary())
-
     protection = _apply_protection(client, plan, html_url)
     out(f"protected {branch} with: {', '.join(protection)}")
 
@@ -479,7 +471,6 @@ def provision(
         html_url=html_url,
         default_branch=branch,
         commit_sha=commit_sha,
-        labels=labels,
         protection=protection,
         verify_command=plan.verify_command,
     )
@@ -617,7 +608,7 @@ def _apply_protection(
         )
     except GitHubHTTPError as exc:
         raise ProvisionError(
-            f"{html_url} exists with its initial commit and labels, but is UNPROTECTED: "
+            f"{html_url} exists with its initial commit, but is UNPROTECTED: "
             f"{_explain(exc)}"
         ) from exc
     return tuple(rule["type"] for rule in plan.rules())

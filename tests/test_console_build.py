@@ -34,8 +34,8 @@ from swarm.console import DEFAULT_HOST, DEFAULT_PORT, Console, Job
 from swarm.console_build import BUILD_SITE, BuildError, Builder, plan_from_result
 from swarm.console_runs import SwarmRuns
 from swarm.doctor import Check, Diagnosis
+from swarm.github.readiness import BLOCKED, READY
 from swarm.greenfield.provision import ProvisionReport
-from swarm.github.labels import LabelReport
 
 from fixtures.procs import FakeProc, settle, spawner
 
@@ -138,7 +138,6 @@ class FakeProvisioner:
             html_url=f"https://github.com/{plan.full_name}",
             default_branch=self.branch,
             commit_sha="0" * 40,
-            labels=LabelReport(repo=plan.full_name),
             protection=("required status checks",),
             verify_command=plan.verify_command,
         )
@@ -868,12 +867,21 @@ def test_the_scaffold_leads_and_every_task_blocks_on_it():
 
     scaffold, *theirs = issues.created
     assert "id=bootstrap-the-project" in scaffold["body"]
-    assert "swarm:ready" in scaffold["labels"]          # nothing blocks it
-    # The section is always rendered; what matters is that it names no issue.
+    # Read off the body, not off a label. The ordering used to be asserted as
+    # `swarm:ready` on the scaffold and `swarm:blocked` on everything else; #152
+    # stopped `_create` writing either, so what carries the dependency is the
+    # thing that always really carried it - `## Blocked by` in the contract.
+    # The section is always rendered; what matters is which issue it names.
     assert "_none._" in scaffold["body"]
     for created in theirs:
-        assert "swarm:blocked" in created["labels"]
         assert f"#{scaffold['number']}" in created["body"]
+    # And no state of apiary's reaches the tracker as a label at all.
+    assert not [
+        name
+        for created in issues.created
+        for name in created["labels"]
+        if name in (READY, BLOCKED)
+    ]
 
 
 def test_unticking_the_scaffold_writes_the_decomposition_and_nothing_else():
@@ -1115,7 +1123,18 @@ def test_a_second_build_is_refused_while_the_swarm_it_started_is_live():
     something, somewhere, is busy.
     """
     proc = FakeProc()
-    console, provisioner, _ = console_with(runs=swarm_runs(proc))
+    # A build provisions a *new* repository, so each one writes its backlog
+    # into an empty tracker. The shared double of `console_with` would hand the
+    # second build the first build's issues - a repository that already carries
+    # apiary's markers, which is a state greenfield never reaches and which
+    # `write_plan` rightly refuses without a cycle's `Belief` behind it.
+    trackers: list[FakeIssues] = []
+
+    def fresh(repo: str) -> FakeIssues:
+        trackers.append(FakeIssues(repo=repo))
+        return trackers[-1]
+
+    console, provisioner, _ = console_with(runs=swarm_runs(proc), client_for=fresh)
 
     _, first = build(console, planned(console))
     assert first["state"] == "done", first.get("error")
@@ -1133,6 +1152,9 @@ def test_a_second_build_is_refused_while_the_swarm_it_started_is_live():
     settle(console.runs.jobs[first["result"]["run"]["id"]])
     again, second = build(console, planned(console))
     assert again.status == 202 and second["state"] == "done", second.get("error")
+    assert len(provisioner.calls) == 2                   # and this one did create
+    assert [c["title"] for c in trackers[0].created] == [
+        c["title"] for c in trackers[-1].created]        # the same backlog, again
 
 
 def test_a_run_that_will_not_start_does_not_turn_a_finished_build_into_a_failure():

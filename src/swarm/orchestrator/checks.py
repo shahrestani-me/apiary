@@ -121,7 +121,7 @@ from ..github.refs import issue_number, pull_number, pull_ref, task_ref
 from ..store import StoreError, TaskStore, record_judgement
 from ..taskref import PullRef, TaskRef
 from ..worker.result import tail
-from .authority import Belief, in_review, label_state
+from .authority import Belief, in_review, state_of
 from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN
 from .dispatcher import normalise
 from .reconcile import (
@@ -130,7 +130,6 @@ from .reconcile import (
     Transition,
     post_comment,
     retry_comment,
-    write_labels,
 )
 
 #: The client methods this module probes for. Named because the probe and the
@@ -890,7 +889,7 @@ def plan_checks(
                 f"which escalates this issue to swarm:failed. Keys held: "
                 f"{render_keys(str(key) for key in checks)}"
             ) from None
-        outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment))
+        outcomes.append(_decide(entry, pull, found, rules, max_attempts, moment, believed=believed))
 
     return ChecksPlan(outcomes=tuple(outcomes), blind=pulls is None, policy=rules)
 
@@ -902,6 +901,8 @@ def _decide(
     policy: MergePolicy,
     max_attempts: int,
     now: dt.datetime,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """One issue's verdict. The order of the branches is the priority."""
     verdict = checks.verdict
@@ -913,10 +914,10 @@ def _decide(
         return Outcome(entry.number, PENDING, checks.summary())
 
     if verdict == EMPTY:
-        return _decide_empty(entry, pull, policy, now)
+        return _decide_empty(entry, pull, policy, now, believed=believed)
 
     if verdict == PASSED:
-        return _decide_passed(entry, pull, checks, policy)
+        return _decide_passed(entry, pull, checks, policy, believed=believed)
 
     outside = foreign_failure(entry, checks.output)
     feedback = tail(checks.output, FEEDBACK_CHARS)
@@ -932,7 +933,7 @@ def _decide(
             detail=f"CI failed in {names}, outside this issue's ## Files",
             transition=Transition(
                 ref=entry.ref,
-                from_state=label_state(entry.state_label),
+                from_state=state_of(entry, believed),
                 to_state=NEEDS_HUMAN,
                 reason=(
                     f"CI failed in {names}, which is outside this issue's ## Files - "
@@ -950,11 +951,13 @@ def _decide(
             escalated=True,
         )
 
-    return _retry_or_give_up(entry, checks, max_attempts, feedback)
+    return _retry_or_give_up(entry, checks, max_attempts, feedback, believed=believed)
 
 
 def _decide_empty(
-    entry: LedgerEntry, pull: PullState, policy: MergePolicy, now: dt.datetime
+    entry: LedgerEntry, pull: PullState, policy: MergePolicy, now: dt.datetime,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """No checks at all: pending until the grace runs out, then a human's.
 
@@ -979,7 +982,7 @@ def _decide_empty(
         detail=reason,
         transition=Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=state_of(entry, believed),
             to_state=NEEDS_HUMAN,
             reason=reason,
             task_id=entry.task_id,
@@ -995,7 +998,9 @@ def _decide_empty(
 
 
 def _decide_passed(
-    entry: LedgerEntry, pull: PullState, checks: CheckSet, policy: MergePolicy
+    entry: LedgerEntry, pull: PullState, checks: CheckSet, policy: MergePolicy,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """Green. Merge it, unless a human was asked to be the one who does.
 
@@ -1018,7 +1023,7 @@ def _decide_passed(
         detail=f"{checks.summary()}; merging PR {pull.number}",
         transition=Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=state_of(entry, believed),
             to_state=LANDED,
             reason=f"PR {pull.number} merged: {checks.summary()}",
             task_id=entry.task_id,
@@ -1040,7 +1045,9 @@ def _decide_passed(
 
 
 def _retry_or_give_up(
-    entry: LedgerEntry, checks: CheckSet, max_attempts: int, feedback: str
+    entry: LedgerEntry, checks: CheckSet, max_attempts: int, feedback: str,
+    *,
+    believed: Belief | None = None,
 ) -> Outcome:
     """Consume an attempt, and decide whether any remain.
 
@@ -1069,7 +1076,7 @@ def _retry_or_give_up(
             detail=f"{named} failed; {attempt} attempt(s) against a cap of {cap}",
             transition=Transition(
                 ref=entry.ref,
-                from_state=label_state(entry.state_label),
+                from_state=state_of(entry, believed),
                 to_state=NEEDS_HUMAN,
                 reason=f"{named} failed; {attempt} attempt(s) made against a cap of {cap}",
                 task_id=entry.task_id,
@@ -1088,7 +1095,7 @@ def _retry_or_give_up(
         detail=f"{named} failed; retrying as attempt {attempt} of {cap}",
         transition=Transition(
             ref=entry.ref,
-            from_state=label_state(entry.state_label),
+            from_state=state_of(entry, believed),
             to_state=ELIGIBLE,
             reason=reason,
             task_id=entry.task_id,
@@ -1361,11 +1368,6 @@ def apply_checks(
                     streak=transition.streak,
                     renewals=transition.renewals,
                 )
-            # One writer for the whole transition path (#152): the label names
-            # are `reconcile.write_labels`'s business and not this module's, and
-            # three copies of add-before-remove were three places to find when
-            # the labels go.
-            write_labels(client, transition)
         except (GitHubError, StoreError) as exc:
             failures.append(Failure(outcome.number, f"{transition.to_state}: {exc}"))
             continue
@@ -1399,6 +1401,7 @@ def run_checks(
     now: dt.datetime | None = None,
     store: TaskStore | None = None,
     dry_run: bool = False,
+    believed: Belief | None = None,
 ) -> ChecksReport:
     """Read, decide, write. The whole module in one call.
 
@@ -1415,11 +1418,12 @@ def run_checks(
     checks: dict[TaskRef, CheckSet] = {}
     if pulls is not None:
         for entry in ledger.entries.values():
-            pull = pulls.get(entry.branch) if in_review(entry) else None
+            pull = pulls.get(entry.branch) if in_review(entry, believed) else None
             if pull is not None:
                 checks[entry.ref] = read_checks(client, pull.ref)
     plan = plan_checks(
         ledger,
+        believed=believed,
         pulls=pulls,
         checks=checks,
         policy=policy,
@@ -1435,7 +1439,7 @@ if __name__ == "__main__":  # pragma: no cover - manual dry run, see module docs
     gh = GitHubClient.from_env(repo)
     rules = MergePolicy.from_env()
     print(rules.summary())
-    dry = run_checks(gh, load_ledger(gh, adopt=False), policy=rules, dry_run=True)
+    dry = run_checks(gh, load_ledger(gh), policy=rules, dry_run=True)
     for row in dry.plan.outcomes:
         print(f"  {row}")
     for planned in dry.plan.merges:

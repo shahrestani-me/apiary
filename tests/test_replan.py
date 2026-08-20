@@ -36,6 +36,7 @@ from typing import Any, Sequence
 
 import pytest
 
+from fixtures.belief import fixture_belief
 from fixtures.github import REPO, response
 from fixtures.markers import legacy_marker
 from swarm.github.client import GitHubError
@@ -66,12 +67,17 @@ from swarm.state import Plan, PlannedTask, ProgressJudgement, TaskRecord
 from swarm.taskref import TaskRef
 from swarm.worker.result import ResultRecord
 
-READY = "swarm:ready"
-BLOCKED = "swarm:blocked"
-CLAIMED = "swarm:claimed"
-REVIEW = "swarm:review"
-DONE = "swarm:done"
-FAILED = "swarm:failed"
+# ADR 0001's internal states, which is what a fixture declares since #152 took
+# the `swarm:*` control plane away. A state is derived per cycle and lives on
+# the cycle's `Belief`; each `entry(label=...)` below stashes the declared state
+# on `LedgerEntry.labels`, and `fixtures.belief.fixture_belief` turns the whole
+# ledger's declarations into the `Belief` production now requires.
+READY = "eligible"
+BLOCKED = "blocked"
+CLAIMED = "claimed"
+REVIEW = "review"
+DONE = "landed"
+FAILED = "needs-human"
 
 RUN_ID = "apiary-20260814-142530-k3f9qz"
 VERIFY = "python -m pytest -q"
@@ -102,13 +108,36 @@ def entry(
         files=tuple(files) or (f"src/swarm/mod{number}.py",),
         verify=VERIFY,
         blocked_by=(),
-        state_label=label,
         labels=frozenset({label}),
     )
 
 
 def ledger(*entries: LedgerEntry) -> Ledger:
     return Ledger(entries={item.task_id: item for item in entries})
+
+
+# The three seams #152 opened. A ledger no longer carries a state, so the state
+# every one of these reads has to be handed in: `Observation.of` projects it
+# through §3's table, and `replan`/`brief` ask `authority.state_of`, which
+# raises rather than falling back to a label that is not written any more. Each
+# wrapper supplies the belief the fixture's own declarations imply and changes
+# nothing else, so a test that is not about the authority reads as it did.
+
+
+def observe(book: Ledger, **kwargs: Any) -> Observation:
+    """`Observation.of` over the states this ledger's fixtures declared."""
+    kwargs.setdefault("states", fixture_belief(book).states)
+    return Observation.of(book, **kwargs)
+
+
+def _replan_(client: Any, book: Ledger, *args: Any, **kwargs: Any) -> Any:
+    kwargs.setdefault("believed", fixture_belief(book))
+    return replan(client, book, *args, **kwargs)
+
+
+def _brief_(book: Ledger, *args: Any, **kwargs: Any) -> tuple[str, str]:
+    kwargs.setdefault("believed", fixture_belief(book))
+    return brief(book, *args, **kwargs)
 
 
 def record(
@@ -185,10 +214,10 @@ def verdict_of(
     before = (
         None
         if previous is None
-        else Observation.of(previous, results=prior_results, churn=prior_churn)
+        else observe(previous, results=prior_results, churn=prior_churn)
     )
     return judge(
-        Observation.of(current, results=results, churn=churn),
+        observe(current, results=results, churn=churn),
         before,
         objective=OBJECTIVE,
         stalls=stalls,
@@ -290,7 +319,7 @@ def test_an_infrastructure_failure_is_not_the_tasks_failure():
     # Exit 2 does not consume an attempt (§4) and says nothing about the task,
     # so it must not become the signature two cycles are compared on.
     broken = record(1, exit_code=2, reason="ollama is unreachable")
-    observation = Observation.of(ledger(entry(1)), results={ref(1): broken})
+    observation = observe(ledger(entry(1)), results={ref(1): broken})
 
     assert observation.signals["task-1"].failure == ""
 
@@ -365,8 +394,8 @@ def test_the_model_cannot_declare_a_run_finished_while_issues_are_open():
     )
 
     verdict = judge(
-        Observation.of(open_work),
-        Observation.of(open_work),
+        observe(open_work),
+        observe(open_work),
         objective=OBJECTIVE,
         oracle=oracle,
     )
@@ -387,8 +416,8 @@ def test_an_unreachable_model_is_not_a_stall():
 def test_stalls_accumulate_until_a_replan_is_earned():
     empty = ledger()
 
-    first = judge(Observation.of(empty), stalls=0)
-    second = judge(Observation.of(empty), stalls=first.stalls)
+    first = judge(observe(empty), stalls=0)
+    second = judge(observe(empty), stalls=first.stalls)
 
     assert (first.stalls, second.stalls) == (1, 2)
     assert not first.should_replan(max_stalls=2)
@@ -428,7 +457,7 @@ def test_a_failure_inside_the_file_set_is_the_tasks_own_problem():
         1, attempt=1, reason="assert failed", output="src/swarm/nodes/judge.py:88: AssertionError"
     )
 
-    assert Observation.of(own, results={ref(1): inside}).blockers == ()
+    assert observe(own, results={ref(1): inside}).blockers == ()
 
 
 def test_one_attempt_is_not_yet_evidence_of_a_wall():
@@ -437,7 +466,7 @@ def test_one_attempt_is_not_yet_evidence_of_a_wall():
     early = ledger(entry(1, attempt=1, files=("src/swarm/nodes/judge.py",)))
     outside = record(1, attempt=0, output="src/swarm/github/client.py:4: ImportError")
 
-    assert Observation.of(early, results={ref(1): outside}).blockers == ()
+    assert observe(early, results={ref(1): outside}).blockers == ()
 
 
 def test_only_paths_the_repository_could_own_are_evidence():
@@ -508,7 +537,7 @@ def test_interpreter_paths_alone_are_not_evidence_of_a_wall():
         output='File "/usr/local/lib/python3.12/importlib/__init__.py", line 90, in import_module',
     )
 
-    assert Observation.of(stuck, results={ref(40): noisy}).blockers == ()
+    assert observe(stuck, results={ref(40): noisy}).blockers == ()
 
 
 def test_a_declared_file_failing_behind_the_workspace_prefix_does_not_veto():
@@ -526,7 +555,7 @@ def test_a_declared_file_failing_behind_the_workspace_prefix_does_not_veto():
         ),
     )
 
-    assert Observation.of(declared, results={ref(40): failing}).blockers == ()
+    assert observe(declared, results={ref(40): failing}).blockers == ()
 
 
 def test_an_undeclared_repo_file_behind_the_workspace_prefix_still_vetoes():
@@ -542,7 +571,7 @@ def test_an_undeclared_repo_file_behind_the_workspace_prefix_still_vetoes():
         ),
     )
 
-    observation = Observation.of(stuck, results={ref(40): failing})
+    observation = observe(stuck, results={ref(40): failing})
 
     assert len(observation.blockers) == 1
     assert observation.blockers[0].paths == ("src/settings.py",)
@@ -700,18 +729,13 @@ class Tracker:
                 issue.update(payload)
                 return response(200, dict(issue))
         elif parts[1] == "labels":
-            # The revival path relabels failed -> ready through the same client.
-            if request.method == "POST":
-                names = {label["name"] for label in issue["labels"]}
-                issue["labels"].extend(
-                    {"name": name} for name in payload["labels"] if name not in names
-                )
-                return response(200, list(issue["labels"]))
-            if request.method == "DELETE":
-                issue["labels"] = [
-                    label for label in issue["labels"] if label["name"] != parts[2]
-                ]
-                return response(200, list(issue["labels"]))
+            # The revival path used to relabel failed -> ready through this
+            # client. #152 removed every label write in the package, so the
+            # handler is gone too: reaching it is the control plane growing
+            # back, which is a louder failure than quietly recording the write.
+            raise AssertionError(
+                f"a label write reached the tracker: {request.method} {request.path}"
+            )
         elif parts[1] == "comments" and request.method == "POST":
             self.comments.append((issue["number"], payload["body"]))
             return response(201, {"id": len(self.comments)})
@@ -786,9 +810,9 @@ def test_a_stalled_run_rewrites_its_issues_without_duplicating_them(tracker):
         body=render_body("drop-me", goal="Drop me", files=["src/swarm/b.py"], verify=VERIFY),
         labels=[READY],
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
-    report = replan(
+    report = _replan_(
         client,
         before,
         OBJECTIVE,
@@ -804,7 +828,7 @@ def test_a_stalled_run_rewrites_its_issues_without_duplicating_them(tracker):
     )
 
     assert report.replanned
-    after = load_ledger(client, adopt=False)
+    after = load_ledger(client)
     # The surviving id kept its issue - a second issue for work that already
     # has one is the failure §2 exists to prevent.
     assert after.entries["keep-me"].number == keep
@@ -822,9 +846,9 @@ def test_a_dropped_task_with_a_worker_on_it_is_left_alone_and_reported(tracker):
         body=render_body("in-flight", goal="Being worked on", files=["src/swarm/d.py"], verify=VERIFY),
         labels=[CLAIMED],
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
-    report = replan(
+    report = _replan_(
         client,
         before,
         OBJECTIVE,
@@ -854,9 +878,9 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
         render_marker("stuck", 3), legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3)
     )
     number = store.add(body=body, labels=[FAILED])
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
-    report = replan(
+    report = _replan_(
         client,
         before,
         OBJECTIVE,
@@ -868,8 +892,12 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
 
     assert report.replanned
     assert [action.number for action in report.revived] == [number]
-    labels = {label["name"] for label in store.issues[number]["labels"]}
-    assert labels == {READY}
+    # The revival is the report and the comment, and since #152 nothing else:
+    # this used to assert the issue had been relabelled `swarm:failed` ->
+    # `swarm:ready`, and there is no label plane left to move it on. What the
+    # next cycle acts on is the state it derives, so the issue is left exactly
+    # as it was - a write here would be the control plane growing back.
+    assert {label["name"] for label in store.issues[number]["labels"]} == {FAILED}
     # The marker survives verbatim: nothing is reset, the arithmetic guards.
     assert legacy_marker("stuck", 3, blocker="ab12cd34ef", streak=3) in store.issues[number]["body"]
     assert store.comments[0][0] == number
@@ -879,9 +907,9 @@ def test_a_kept_failed_task_is_revived_by_the_replan_that_kept_it(tracker):
 
 def test_a_replan_resets_the_stall_count_and_counts_itself(tracker):
     client, _ = tracker()
-    client_ledger = load_ledger(client, adopt=False)
+    client_ledger = load_ledger(client)
 
-    report = replan(
+    report = _replan_(
         client,
         client_ledger,
         OBJECTIVE,
@@ -911,7 +939,7 @@ def test_the_prompt_carries_the_failures_and_every_existing_id():
         oracle=stall,
     )
 
-    failures, tracked = brief(tasks, verdict)
+    failures, tracked = _brief_(tasks, verdict)
 
     assert "broken" in failures and "ZeroDivisionError" in failures
     # Every id, not only the failing one: an id the model never sees is an id
@@ -927,11 +955,11 @@ def test_the_replan_shows_the_model_the_repositorys_tree(tracker):
     store.add(
         body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY)
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
     client.list_tree = lambda ref=None: ["src/swarm/a.py", "README.md"]
     proposer = Proposal(Plan(tasks=[task("existing", files=["src/swarm/a.py"])]))
 
-    report = replan(client, before, OBJECTIVE, stalled(), proposer=proposer, verify=VERIFY)
+    report = _replan_(client, before, OBJECTIVE, stalled(), proposer=proposer, verify=VERIFY)
 
     assert report.replanned
     human = dict(proposer.asked[0])["human"]
@@ -947,7 +975,7 @@ def test_a_tree_read_failure_does_not_fail_the_replan(tracker):
     store.add(
         body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY)
     )
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
     def boom(ref=None):
         raise GitHubError("GET /git/trees/main -> 502")
@@ -955,7 +983,7 @@ def test_a_tree_read_failure_does_not_fail_the_replan(tracker):
     client.list_tree = boom
     proposer = Proposal(Plan(tasks=[task("existing", files=["src/swarm/a.py"])]))
 
-    report = replan(client, before, OBJECTIVE, stalled(), proposer=proposer, verify=VERIFY)
+    report = _replan_(client, before, OBJECTIVE, stalled(), proposer=proposer, verify=VERIFY)
 
     assert report.replanned
     assert dict(proposer.asked[0])["human"] == f"Objective:\n{OBJECTIVE}"
@@ -979,7 +1007,7 @@ def test_a_refusal_writes_nothing_and_asks_nobody(verdict: Verdict, expected: st
     spy = Spy()
     proposer = Proposal(Plan(tasks=[task("never-written")]))
 
-    report = replan(
+    report = _replan_(
         object(), ledger(entry(1)), OBJECTIVE, verdict, proposer=proposer, writer=spy
     )
 
@@ -992,7 +1020,7 @@ def test_a_plan_with_nothing_writable_in_it_is_refused_before_the_write():
     # answer would close the whole tracker in one call.
     spy = Spy()
 
-    report = replan(
+    report = _replan_(
         object(),
         ledger(entry(1), entry(2)),
         OBJECTIVE,
@@ -1008,7 +1036,7 @@ def test_a_plan_with_nothing_writable_in_it_is_refused_before_the_write():
 def test_a_planner_that_cannot_be_reached_leaves_the_stall_standing():
     spy = Spy()
 
-    report = replan(
+    report = _replan_(
         object(), ledger(entry(1)), OBJECTIVE, stalled(3), proposer=NoPlanner(), writer=spy
     )
 
@@ -1022,9 +1050,9 @@ def test_a_planner_that_cannot_be_reached_leaves_the_stall_standing():
 def test_a_ring_in_the_proposed_plan_leaves_the_tracker_alone(tracker):
     client, store = tracker()
     store.add(body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY))
-    before = load_ledger(client, adopt=False)
+    before = load_ledger(client)
 
-    report = replan(
+    report = _replan_(
         client,
         before,
         OBJECTIVE,
@@ -1057,9 +1085,9 @@ def test_a_rewritten_issue_keeps_the_runs_own_verify_command(tracker):
     store.add(body=render_body("existing", goal="Existing", files=["src/swarm/a.py"], verify=VERIFY))
     scaffolded = "python3 -m unittest discover -q"
 
-    report = replan(
+    report = _replan_(
         client,
-        load_ledger(client, adopt=False),
+        load_ledger(client),
         OBJECTIVE,
         stalled(),
         verify=scaffolded,
@@ -1067,7 +1095,7 @@ def test_a_rewritten_issue_keeps_the_runs_own_verify_command(tracker):
     )
 
     assert report.replanned
-    after = load_ledger(client, adopt=False)
+    after = load_ledger(client)
     assert {entry.verify for entry in after.entries.values()} == {scaffolded}
 
 
@@ -1112,7 +1140,7 @@ def test_a_repeatedly_failing_run_replans_instead_of_retrying_forever(tracker):
     previous: Observation | None = None
     stalls = 0
     for current, results in cycles:
-        observation = Observation.of(current, results=results)
+        observation = observe(current, results=results)
         verdict = judge(observation, previous, objective=OBJECTIVE, stalls=stalls, oracle=oracle)
         previous, stalls = observation, verdict.stalls
 
@@ -1120,9 +1148,9 @@ def test_a_repeatedly_failing_run_replans_instead_of_retrying_forever(tracker):
     assert verdict is not None and verdict.judgement.in_loop and verdict.stalls == 2
     assert verdict.should_replan(max_stalls=2)
 
-    report = replan(
+    report = _replan_(
         client,
-        load_ledger(client, adopt=False),
+        load_ledger(client),
         OBJECTIVE,
         verdict,
         proposer=Proposal(
@@ -1136,7 +1164,7 @@ def test_a_repeatedly_failing_run_replans_instead_of_retrying_forever(tracker):
     )
 
     assert report.replanned
-    after = load_ledger(client, adopt=False)
+    after = load_ledger(client)
     assert set(after.entries) == {"parse-headers", "header-fixtures"}
     # The attempt counter survives the rewrite: a replan is not a free retry.
     assert after.entries["parse-headers"].number == 1
@@ -1151,12 +1179,12 @@ def test_a_run_whose_pull_requests_are_only_being_rebased_never_replans():
     previous: Observation | None = None
     verdict = None
     for cycle in range(4):
-        observation = Observation.of(review, churn={ref(1): cycle, ref(2): cycle})
+        observation = observe(review, churn={ref(1): cycle, ref(2): cycle})
         verdict = judge(observation, previous, objective=OBJECTIVE, stalls=stalls, oracle=Never())
         previous, stalls = observation, verdict.stalls
 
     assert verdict is not None and not verdict.stalled and verdict.stalls == 0
-    report = replan(object(), review, OBJECTIVE, verdict, proposer=Proposal(Plan(tasks=[])), writer=spy)
+    report = _replan_(object(), review, OBJECTIVE, verdict, proposer=Proposal(Plan(tasks=[])), writer=spy)
     assert not report.replanned and report.reason == PROGRESSING
     assert spy.calls == []
 

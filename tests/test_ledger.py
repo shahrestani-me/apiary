@@ -30,9 +30,8 @@ from swarm.github.ledger import (
     DEFAULT_STACK,
     GENERATED_FILES,
     KNOWN_STACKS,
-    LABEL_PRECEDENCE,
     REQUIRED_SECTIONS,
-    STATUS_BY_LABEL,
+    STATUS_BY_STATE,
     generated_for,
     ContractError,
     DuplicateTaskIdError,
@@ -40,10 +39,10 @@ from swarm.github.ledger import (
     load_tasks,
     parse_contract,
     render_marker,
-    resolve_state_label,
     slugify,
 )
 from swarm.github.refs import task_ref as ref
+from swarm.orchestrator.derived import STATES
 
 
 # --------------------------------------------------------------------------
@@ -73,8 +72,11 @@ def issue(
     body: str,
     *,
     title: str = "A task",
-    labels: Sequence[str] = ("swarm:ready",),
+    labels: Sequence[str] = (),
 ) -> dict[str, Any]:
+    """One issue payload. `labels` defaults to none because since #152 a label
+    decides nothing here: membership is the marker and the state is the cycle's
+    belief, so the only labels an issue carries are a customer's own."""
     return {
         "number": number,
         "title": title,
@@ -510,68 +512,88 @@ def test_slugify_matches_planned_task_id_shape():
 
 
 # --------------------------------------------------------------------------
-# Labels → status
+# States → status
 # --------------------------------------------------------------------------
+#
+# `STATUS_BY_LABEL` keyed this table on the six `swarm:*` labels until #152.
+# The rows did not change; what they are keyed on did, and a state is now the
+# cycle's, passed in, rather than something read off the entry.
 
 
-def test_every_state_label_has_a_status():
-    assert set(STATUS_BY_LABEL) == set(LABEL_PRECEDENCE)
+def test_every_state_has_a_status():
+    """The projection has to answer for every state ADR 0001 has, or a task in
+    the missing one would silently take `to_task_record`'s `pending` default."""
+    assert set(STATUS_BY_STATE) == set(STATES)
 
 
 @pytest.mark.parametrize(
-    "label,status",
+    "state,status",
     [
-        ("swarm:ready", "pending"),
-        ("swarm:blocked", "pending"),
-        ("swarm:claimed", "running"),
-        ("swarm:review", "running"),
-        ("swarm:done", "verified"),
-        ("swarm:failed", "abandoned"),
+        ("eligible", "pending"),
+        ("blocked", "pending"),
+        ("claimed", "running"),
+        ("review", "running"),
+        ("landed", "verified"),
+        ("needs-human", "abandoned"),
     ],
 )
-def test_label_maps_to_the_documented_status(label, status):
+def test_state_maps_to_the_documented_status(state, status):
     """§3's table, both of its counter-intuitive rows included.
 
     `review` is `running` because a PR in review can still fail CI - mapping it
     to `verified` would let the judge call a run finished while its output sits
-    in open PRs. `failed` is `abandoned` because v2's `failed` label means
-    "attempts exhausted, needs a human", which is v1's `abandoned` exactly.
+    in open PRs. `needs-human` is `abandoned` because it means "attempts
+    exhausted, needs a human", which is v1's `abandoned` exactly.
     """
-    client = FakeClient([issue(20, contract_body(), labels=[label])])
+    client = FakeClient([issue(20, contract_body())])
 
     entry = load_ledger(client).entries["add-retry-logic"]
 
-    assert entry.status == status
-    assert entry.state_label == label
+    # The state is the caller's since #152: the entry does not carry one, so the
+    # projection is asked for a particular state rather than read off the issue.
+    assert entry.to_task_record(state)["status"] == status
 
 
-def test_two_state_labels_are_repaired_by_precedence():
-    client = FakeClient(
-        [issue(21, contract_body(), labels=["swarm:claimed", "swarm:done", "area/ops"])]
-    )
+def test_a_state_the_table_does_not_have_projects_as_pending():
+    """`to_task_record` takes a string, so this is reachable. `pending` is the
+    safe reading - it dispatches nothing and finishes nothing."""
+    client = FakeClient([issue(20, contract_body())])
 
-    ledger = load_ledger(client)
-    entry = ledger.entries["add-retry-logic"]
+    entry = load_ledger(client).entries["add-retry-logic"]
 
-    assert (entry.state_label, entry.status) == ("swarm:done", "verified")
-    assert [(r.number, r.kept, r.removed) for r in ledger.repairs] == [
-        (21, "swarm:done", ("swarm:claimed",))
-    ]
-    # Reporting only: removing the losing label is the reconciler's write.
-    assert client.patched == []
+    assert entry.to_task_record("something-else")["status"] == "pending"
+    # And the default is the state a plan that has just been written is in.
+    assert entry.to_task_record()["status"] == STATUS_BY_STATE["eligible"]
 
 
-def test_routing_labels_are_not_state_labels():
-    assert resolve_state_label(1, ["area/control-plane", "size/M"]) == (None, None)
+# `test_two_state_labels_are_repaired_by_precedence` stood here. Its subject was
+# `LABEL_PRECEDENCE` and `Ledger.repairs`: an issue carrying two `swarm:*` state
+# labels was reported as needing repair, with the conservative label winning.
+# #152 deleted the labels, the precedence table and `repairs` alike - nothing
+# writes a state label, so no issue can carry two and there is no failure left.
+
+# `test_routing_labels_are_not_state_labels` stood here, asserting that
+# `resolve_state_label` returned nothing for `area/*` and `size/*`. There is no
+# `resolve_state_label` and no state label for a routing label to be mistaken
+# for; that routing labels survive on the entry untouched is
+# `test_the_labels_an_issue_carries_survive_on_the_entry` below.
 
 
 # --------------------------------------------------------------------------
-# Ledger membership
+# Ledger membership: the marker, and nothing else (§2)
 # --------------------------------------------------------------------------
+#
+# Membership was "carries exactly one `swarm:*` state label" until #152. Nothing
+# writes such a label any more, so the identity marker is the whole rule: an
+# issue is apiary's iff `parse_contract` finds one. Both directions are pinned,
+# because the two failures are opposite and both silent - a marked issue falling
+# out of the ledger is work apiary planned and then forgot, and an unmarked one
+# falling in is apiary dispatching a worker onto somebody else's ticket.
 
 
-def test_an_issue_without_a_swarm_label_is_not_in_the_ledger():
-    """This repository's own backlog is the live example."""
+def test_an_issue_without_a_marker_is_not_in_the_ledger():
+    """This repository's own backlog is the live example: hand-written issues,
+    fully contract-shaped, that nobody minted a marker for."""
     client = FakeClient(
         [
             issue(11, REAL_ISSUE_11, title="Compute readiness", labels=["area/control-plane"]),
@@ -582,17 +604,58 @@ def test_an_issue_without_a_swarm_label_is_not_in_the_ledger():
     ledger = load_ledger(client)
 
     assert ledger.entries == {}
+    # Ignored, not refused: both bodies parse, they are simply not apiary's.
     assert ledger.errors == ()
     assert ledger.ignored == (6, 11)
+    # And nothing is written to them, which is the half adoption used to fail.
     assert client.patched == []
+
+
+def test_an_issue_with_a_marker_is_in_the_ledger():
+    """The other direction, and the one #152 had to move in the same change as
+    the writes: `planner._create` stopped applying a state label, so a rule that
+    still asked for one would have dropped every issue apiary planned."""
+    client = FakeClient([issue(12, contract_body(), title="Add retry logic")])
+
+    ledger = load_ledger(client)
+
+    assert list(ledger.entries) == ["add-retry-logic"]
+    assert ledger.entries["add-retry-logic"].number == 12
+    assert ledger.ignored == ()
+    assert client.patched == []
+
+
+def test_a_marked_issue_wearing_no_label_at_all_is_in_the_ledger():
+    """Zero labels was "outside the ledger entirely" under §3's old rule. It is
+    the ordinary case now - the planner writes routing hints and a customer may
+    write none - and reading it as absence would lose the whole plan."""
+    client = FakeClient([issue(13, contract_body(), labels=[])])
+
+    ledger = load_ledger(client)
+
+    assert list(ledger.entries) == ["add-retry-logic"]
+    assert ledger.entries["add-retry-logic"].labels == frozenset()
+
+
+def test_the_labels_an_issue_carries_survive_on_the_entry():
+    """Read, never written (#152). `area/*` and `size/*` are the planner's
+    routing hints and `agent:*` is the `issue` skill's, so a projection that
+    wants them still has them - and none of them decides anything here."""
+    client = FakeClient(
+        [issue(14, contract_body(), labels=["area/control-plane", "size/M", "agent:claude"])]
+    )
+
+    entry = load_ledger(client).entries["add-retry-logic"]
+
+    assert entry.labels == frozenset({"area/control-plane", "size/M", "agent:claude"})
 
 
 def test_an_unparseable_issue_is_reported_and_never_dispatched():
     """§1.4: one bad hand-written issue must not stop a cycle."""
     client = FakeClient(
         [
-            issue(30, "no contract here at all", labels=["swarm:ready"]),
-            issue(31, contract_body(), labels=["swarm:ready"]),
+            issue(30, "no contract here at all"),
+            issue(31, contract_body()),
         ]
     )
 
@@ -605,7 +668,7 @@ def test_an_unparseable_issue_is_reported_and_never_dispatched():
 
 
 def test_load_tasks_raises_on_a_malformed_issue_by_default():
-    client = FakeClient([issue(30, "no contract here at all", labels=["swarm:ready"])])
+    client = FakeClient([issue(30, "no contract here at all")])
 
     with pytest.raises(ContractError):
         load_tasks(client)
@@ -613,8 +676,10 @@ def test_load_tasks_raises_on_a_malformed_issue_by_default():
     assert load_tasks(client, strict=False) == {}
 
 
-def test_closed_done_issues_stay_in_the_ledger():
-    client = FakeClient([issue(32, contract_body(), labels=["swarm:done"])])
+def test_closed_landed_issues_stay_in_the_ledger():
+    """`state="all"`: a landed task's issue is closed, and a ledger that forgot
+    its finished work would lose the dependency edges pointing at it."""
+    client = FakeClient([issue(32, contract_body())])
 
     load_ledger(client)
 
@@ -622,50 +687,39 @@ def test_closed_done_issues_stay_in_the_ledger():
 
 
 # --------------------------------------------------------------------------
-# Adoption
+# What adoption was
 # --------------------------------------------------------------------------
-
-
-def test_an_issue_without_a_marker_is_adopted():
-    body = contract_body(marker=None)
-    client = FakeClient([issue(40, body, title="Compute readiness!", labels=["swarm:ready"])])
-
-    ledger = load_ledger(client)
-    entry = ledger.entries["compute-readiness"]
-
-    assert entry.adopted is True
-    assert entry.attempt == 0
-    # One invisible line, prepended, with every other byte preserved.
-    assert client.patched == [(40, f"{render_marker('compute-readiness', 0)}\n\n{body}")]
-
-
-def test_adoption_can_be_suppressed_for_a_read_only_caller():
-    client = FakeClient([issue(41, contract_body(marker=None), labels=["swarm:ready"])])
-
-    ledger = load_ledger(client, adopt=False)
-
-    assert list(ledger.entries) == ["a-task"]
-    assert client.patched == []
-
-
-def test_adopted_ids_that_collide_get_the_issue_number():
-    client = FakeClient(
-        [
-            issue(42, contract_body(marker=None), title="A task", labels=["swarm:ready"]),
-            issue(43, contract_body(marker=None), title="A task", labels=["swarm:ready"]),
-        ]
-    )
-
-    ledger = load_ledger(client)
-
-    assert sorted(ledger.entries) == ["a-task", "a-task-43"]
+#
+# A hand-written issue used to join the ledger by being labelled `swarm:ready`,
+# and the loader wrote a marker into it on the way past - minting an id from the
+# title, suffixing the issue number when two titles collided, and PATCHing the
+# body. `load_ledger(adopt=False)` was the read-only caller's way out.
+#
+# #152 ends all of it. There is no label to say "adopt this", so an unmarked
+# issue is never in the ledger and therefore never adopted, `adopt=` is gone from
+# the signature, and the way in for an existing repository is the tracker's own
+# intake filter (`intake.args`) in the customer's vocabulary rather than apiary's.
+# Three tests stood here:
+#
+#   `test_an_issue_without_a_marker_is_adopted` - the loader minted an id and
+#   patched the body. It cannot fail: the marker-less issue is ignored, which
+#   `test_an_issue_without_a_marker_is_not_in_the_ledger` asserts, body and all.
+#
+#   `test_adoption_can_be_suppressed_for_a_read_only_caller` - `adopt=False`.
+#   There is no parameter and no write to suppress; every read is read-only now,
+#   which the same test's `client.patched == []` pins.
+#
+#   `test_adopted_ids_that_collide_get_the_issue_number` - `a-task` and
+#   `a-task-43` from two identical titles. No id is minted from a title any more;
+#   an id comes from the marker the planner wrote, and two issues claiming one id
+#   is `DuplicateTaskIdError` below rather than something to disambiguate.
 
 
 def test_two_issues_with_the_same_marker_id_abort_the_cycle():
     client = FakeClient(
         [
-            issue(50, contract_body(), labels=["swarm:ready"]),
-            issue(51, contract_body(), labels=["swarm:claimed"]),
+            issue(50, contract_body()),
+            issue(51, contract_body()),
         ]
     )
 
@@ -689,7 +743,6 @@ def test_task_records_have_the_v1_shape():
                 contract_body(
                     marker=render_marker("add-retry-logic", 2), blocked_by="- #61"
                 ),
-                labels=["swarm:blocked"],
             ),
             issue(
                 61,
@@ -698,7 +751,6 @@ def test_task_records_have_the_v1_shape():
                     files="- src/swarm/github/client.py",
                     blocked_by="_none._",
                 ),
-                labels=["swarm:done"],
             ),
         ]
     )
@@ -712,13 +764,21 @@ def test_task_records_have_the_v1_shape():
         # Task ids, not issue numbers: v1's graph intersects this against the
         # set of verified task ids, and an integer would never match.
         "depends_on": ["add-the-client"],
+        # `Ledger.tasks` projects every entry at `to_task_record`'s default,
+        # which is `eligible` - the state a plan that has just been read is in.
+        # It came off each issue's own state label until #152; a state is the
+        # cycle's now, and the projection has nowhere to get a per-task one.
         "status": "pending",
         "attempts": 2,
         # The branch carries the ref and the attempt (#144), so the same
         # counter that says "attempts: 2" is in the name the worker pushes.
         "branch": task_branch(ref(60), 2),
     }
-    assert tasks["add-the-client"]["status"] == "verified"
+    # The lossy half of §3's table is still there to be asked for, one entry at
+    # a time, by a caller that holds a state (`nodes/judge.py` is the live one).
+    ledger = load_ledger(client)
+    assert ledger.entries["add-the-client"].to_task_record("landed")["status"] == "verified"
+    assert ledger.entries["add-retry-logic"].to_task_record("claimed")["status"] == "running"
 
 
 def test_dependencies_outside_the_ledger_are_dropped_from_the_projection():
@@ -728,7 +788,7 @@ def test_dependencies_outside_the_ledger_are_dropped_from_the_projection():
     it resolves the issue's state, and "closed as not planned" is a fact the
     v1 projection cannot represent at all.
     """
-    client = FakeClient([issue(70, contract_body(blocked_by="- #999"), labels=["swarm:ready"])])
+    client = FakeClient([issue(70, contract_body(blocked_by="- #999"))])
 
     ledger = load_ledger(client)
     entry = ledger.entries["add-retry-logic"]
@@ -740,7 +800,7 @@ def test_dependencies_outside_the_ledger_are_dropped_from_the_projection():
 
 def test_the_verify_command_survives_only_on_the_entry():
     """`TaskRecord` has nowhere to put it, which is why `LedgerEntry` exists."""
-    client = FakeClient([issue(80, contract_body(), labels=["swarm:review"])])
+    client = FakeClient([issue(80, contract_body())])
 
     ledger = load_ledger(client)
 

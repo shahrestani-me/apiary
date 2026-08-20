@@ -3,10 +3,15 @@
 Four properties carry this file, and each is a way the swarm loses work rather
 than a way it computes something wrong.
 
-**The claim precedes the container.** Every ordering assertion here is about
-which of two crash windows the code chose. Claimed-with-no-container is a
-stuck label #35 sweeps up; container-with-no-claim is the same issue dispatched
-twice next cycle, and one of the two pushes is lost.
+**The container is the claim.** It used to be a `swarm:claimed` label written
+immediately before the spawn, and the ordering assertions here were about which
+of two crash windows that write chose. #152 removed the write: the thing that
+says a task is claimed is the running container, which the resolver reads
+directly. So what is asserted now is that a dispatch writes nothing to the
+tracker at all, and that a spawn which failed gives its claim back only when the
+daemon says there is no container to give it back to - releasing on any other
+reading buys the issue a second worker next cycle, and one of the two pushes is
+lost.
 
 **Overlapping file sets never run at once.** Against work already in flight and
 against each other, case-insensitively, whatever the planner promised.
@@ -19,10 +24,16 @@ memory - not the host's - is what a container can have.
 dispatcher reaches for no model on any path, and says so in the one bit the
 reconcile loop needs to decide whether this cycle is worth a swap.
 
-Entirely hermetic. Both collaborators are `Protocol`s (`Labeller`, `Spawner`),
-so the doubles below record into one shared log - which is what makes the
-ordering across the two observable at all - and no test needs a token or a
-daemon.
+Entirely hermetic. `Spawner` is a `Protocol` and the double below records into a
+log, so every ordering assertion is data; `Labeller` is the empty protocol #152
+left behind and the same double stands in for it, so that the two-argument
+signature the dispatcher still has is exercised by these tests as well.
+
+Each fixture says what state its task is in by passing `entry(state=...)`, which
+is stashed on `LedgerEntry.labels` and turned into the cycle's `Belief` by
+`fixtures.belief`. That is the same declaration the tests always made - it was
+read back off `LedgerEntry.state_label` until #152 - moved to where production
+now reads it from.
 """
 
 from __future__ import annotations
@@ -31,7 +42,6 @@ import ast
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
 
 import pytest
 
@@ -43,10 +53,10 @@ from swarm.containers.manager import (
     Handle,
     StackImages,
 )
-from swarm.github.client import GitHubHTTPError
 from swarm.github.ledger import Ledger, LedgerEntry
 from swarm.github.refs import issue_number, task_ref
 from swarm.orchestrator import dispatcher
+from swarm.orchestrator.derived import BLOCKED, ELIGIBLE, LANDED, NEEDS_HUMAN
 from swarm.orchestrator.dispatcher import (
     CLAIMED,
     ORCHESTRATOR_SLOTS,
@@ -58,11 +68,26 @@ from swarm.orchestrator.dispatcher import (
     plan_dispatch,
 )
 from swarm.taskref import TaskRef
+from fixtures.belief import fixture_belief
 
-READY = "swarm:ready"
-BLOCKED = "swarm:blocked"
-DONE = "swarm:done"
-FAILED = "swarm:failed"
+
+# The cycle's belief, supplied from what each fixture declares (see
+# `fixtures.belief`). It was read off `LedgerEntry.state_label` until #152.
+def _plan_dispatch_(book, *args, **kwargs):
+    kwargs.setdefault("believed", fixture_belief(book))
+    return plan_dispatch(book, *args, **kwargs)
+
+
+def _dispatch_(client, manager, book, *args, **kwargs):
+    """`dispatch`, with the same belief `_plan_dispatch_` supplies.
+
+    `dispatch` plans before it spawns, so a cycle with no belief believes every
+    task to be in no state at all and spawns nothing - which would make most of
+    the tests below pass for the wrong reason.
+    """
+    kwargs.setdefault("believed", fixture_belief(book))
+    return dispatch(client, manager, book, *args, **kwargs)
+
 
 BASE_COMMIT = "9f2c1ab3d4e5f60718293a4b5c6d7e8f90a1b2c3"
 
@@ -77,8 +102,13 @@ DAEMON_GB = 7.6
 # --------------------------------------------------------------------------
 
 
-def entry(number: int, *files: str, label: str = READY, attempt: int = 0) -> LedgerEntry:
-    """One ledger entry. Files default to one nobody else touches."""
+def entry(number: int, *files: str, state: str = ELIGIBLE, attempt: int = 0) -> LedgerEntry:
+    """One ledger entry, and the state this fixture says its task is in.
+
+    The state goes on `labels` because that is where `fixtures.belief` reads a
+    fixture's declaration from. Nothing in production reads it back from there:
+    the belief built out of it is what the dispatcher is given.
+    """
     return LedgerEntry(
         number=number,
         title=f"issue {number}",
@@ -88,8 +118,7 @@ def entry(number: int, *files: str, label: str = READY, attempt: int = 0) -> Led
         files=files or (f"src/mod{number}.py",),
         verify="python -m pytest -q",
         blocked_by=(),
-        state_label=label,
-        labels=frozenset({label}),
+        labels=frozenset({state}),
     )
 
 
@@ -110,13 +139,14 @@ def capacity(workers: int) -> Capacity:
 class FakeSwarm:
     """`Labeller` and `Spawner` in one object, recording into one log.
 
-    One log rather than two, because every interesting assertion in this file
-    is about the order of a label call *relative to* a spawn - and two
-    independent recorders cannot answer that.
+    The log outlived the reason it was one log. It existed so that a label call
+    and a spawn could be ordered against each other; `Labeller` is empty since
+    #152 and this double satisfies it by having no methods it needs, so the only
+    things in the log now are the daemon calls - which is itself the assertion
+    several tests below make.
     """
 
     log: list[str] = field(default_factory=list)
-    label_error: Exception | None = None
     spawn_error: Exception | None = None
     #: Per-issue spawn failures, which is what #94 is about: one image is
     #: missing and seventeen other issues are fine. `spawn_error` stays for the
@@ -132,16 +162,10 @@ class FakeSwarm:
     find_error: Exception | None = None
 
     # --- Labeller -------------------------------------------------------
-
-    def add_labels(self, number: int, labels: Iterable[str]) -> Any:
-        self.log.append(f"+{','.join(labels)} #{number}")
-        if self.label_error is not None:
-            raise self.label_error
-        return []
-
-    def remove_label(self, number: int, label: str) -> bool:
-        self.log.append(f"-{label} #{number}")
-        return True
+    #
+    # `add_labels` and `remove_label` stood here and recorded the two calls a
+    # claim was made of. #152 deleted both calls, and the protocol they
+    # satisfied is empty now, so a double with nothing here satisfies it.
 
     # --- Spawner --------------------------------------------------------
 
@@ -199,17 +223,16 @@ class FakeSwarm:
         ]
 
     @property
-    def claimed(self) -> list[int]:
-        return [int(line.split("#")[1]) for line in self.log if line.startswith(f"+{CLAIMED}")]
+    def probed(self) -> list[int]:
+        """Issues the daemon was asked about before a claim was given back.
 
-    @property
-    def released(self) -> list[int]:
-        """Issues put back to `swarm:ready` after being claimed."""
-        return [int(line.split("#")[1]) for line in self.log if line.startswith(f"-{CLAIMED}")]
-
-
-def rate_limited() -> GitHubHTTPError:
-    return GitHubHTTPError(503, "POST", "https://api.github.com/labels", b'{"message":"down"}')
+        This replaces `claimed` and `released`, which read the two label calls
+        out of the log. There is no such call to read: what a release does now
+        is ask `find` and answer, so the question this double can still answer
+        is which issues were asked about, and `DispatchFailure.claimed` carries
+        the answer.
+        """
+        return [int(line.split("#")[1]) for line in self.log if line.startswith("find")]
 
 
 def daemon_down() -> DockerError:
@@ -302,7 +325,7 @@ def test_the_capacity_summary_names_the_constraint_a_human_would_change():
 
 
 def test_more_ready_issues_than_the_cap_dispatches_exactly_the_cap():
-    plan = plan_dispatch(ledger(entry(4), entry(5), entry(6), entry(7)), capacity=capacity(2))
+    plan = _plan_dispatch_(ledger(entry(4), entry(5), entry(6), entry(7)), capacity=capacity(2))
 
     # #21's acceptance criterion, and the oldest-first rule with it: issue
     # numbers ascend with creation, so this is arrival order.
@@ -312,8 +335,8 @@ def test_more_ready_issues_than_the_cap_dispatches_exactly_the_cap():
 
 
 def test_containers_already_running_spend_the_same_cap():
-    plan = plan_dispatch(
-        ledger(entry(4, label=CLAIMED), entry(5), entry(6)),
+    plan = _plan_dispatch_(
+        ledger(entry(4, state=CLAIMED), entry(5), entry(6)),
         capacity=capacity(2),
     )
 
@@ -324,8 +347,8 @@ def test_containers_already_running_spend_the_same_cap():
 
 
 def test_a_cap_already_full_dispatches_nothing_and_says_why():
-    plan = plan_dispatch(
-        ledger(entry(4, label=CLAIMED), entry(5, label=CLAIMED), entry(6)),
+    plan = _plan_dispatch_(
+        ledger(entry(4, state=CLAIMED), entry(5, state=CLAIMED), entry(6)),
         capacity=capacity(2),
     )
 
@@ -334,11 +357,11 @@ def test_a_cap_already_full_dispatches_nothing_and_says_why():
 
 
 def test_only_ready_issues_are_candidates():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(
-            entry(1, label=BLOCKED),
-            entry(2, label=DONE),
-            entry(3, label=FAILED),
+            entry(1, state=BLOCKED),
+            entry(2, state=LANDED),
+            entry(3, state=NEEDS_HUMAN),
             entry(4),
         ),
         capacity=capacity(4),
@@ -351,14 +374,33 @@ def test_only_ready_issues_are_candidates():
 
 
 def test_a_readiness_verdict_narrows_the_candidates_but_never_promotes_one():
-    entries = ledger(entry(4), entry(5), entry(6, label=BLOCKED))
+    entries = ledger(entry(4), entry(5), entry(6, state=LANDED))
 
-    plan = plan_dispatch(entries, capacity=capacity(4), ready=[task_ref(5), task_ref(6)])
+    plan = _plan_dispatch_(entries, capacity=capacity(4), ready=[task_ref(5), task_ref(6)])
 
-    # The readiness pass just wrote these labels, so passing its verdict saves
-    # reading them back. It is a filter, not an authority: §3 makes the label
-    # set the thing that decides, so #6 stays put whatever the list says.
+    # The readiness pass ran this cycle, so passing its verdict saves resolving
+    # the same question twice. It is a filter, not an authority: #4 is believed
+    # eligible and is not on the list, #6 is on the list and is believed done
+    # with, and the dispatch is the intersection - both have to agree.
     assert plan.numbers == (5,)
+
+
+def test_a_blocked_task_the_readiness_pass_called_ready_is_dispatched():
+    """The one state a verdict *does* admit, and it is not a promotion.
+
+    Readiness sees things the resolver cannot - dependency rings, unresolvable
+    refs, dependencies that are not tasks in the plan - so between `eligible`
+    and `blocked` its verdict is the better one. The resolver's own half would
+    hold every task waiting on a hand-written issue blocked forever.
+    """
+    entries = ledger(entry(4, state=BLOCKED), entry(5, state=CLAIMED))
+
+    plan = _plan_dispatch_(entries, capacity=capacity(4), ready=[task_ref(4), task_ref(5)])
+
+    # And it stops at waiting: #5 is on the same list and a container is
+    # editing its files, which no verdict overrules.
+    assert plan.numbers == (4,)
+    assert [item.number for item in plan.in_flight] == [5]
 
 
 # --------------------------------------------------------------------------
@@ -367,7 +409,7 @@ def test_a_readiness_verdict_narrows_the_candidates_but_never_promotes_one():
 
 
 def test_two_ready_issues_over_one_file_serialize():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(
             entry(4, "src/swarm/graph.py", "tests/test_graph.py"),
             entry(5, "src/swarm/graph.py", "docs/graph.md"),
@@ -383,9 +425,9 @@ def test_two_ready_issues_over_one_file_serialize():
 
 
 def test_a_running_container_holds_its_files_against_the_whole_backlog():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(
-            entry(4, "src/swarm/graph.py", label=CLAIMED),
+            entry(4, "src/swarm/graph.py", state=CLAIMED),
             entry(5, "src/swarm/graph.py"),
             entry(6, "src/swarm/state.py"),
         ),
@@ -397,8 +439,8 @@ def test_a_running_container_holds_its_files_against_the_whole_backlog():
 
 
 def test_an_open_pr_holds_its_files_too():
-    plan = plan_dispatch(
-        ledger(entry(4, "src/swarm/graph.py", label=REVIEW), entry(5, "src/swarm/graph.py")),
+    plan = _plan_dispatch_(
+        ledger(entry(4, "src/swarm/graph.py", state=REVIEW), entry(5, "src/swarm/graph.py")),
         capacity=capacity(4),
     )
 
@@ -410,7 +452,7 @@ def test_an_open_pr_holds_its_files_too():
 
 
 def test_overlap_is_case_insensitive_because_this_filesystem_is():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, "src/Thing.py"), entry(5, "src/thing.py")),
         capacity=capacity(4),
     )
@@ -422,7 +464,7 @@ def test_overlap_is_case_insensitive_because_this_filesystem_is():
 
 
 def test_disjoint_issues_run_together_up_to_the_cap():
-    plan = plan_dispatch(
+    plan = _plan_dispatch_(
         ledger(entry(4, "src/a.py"), entry(5, "src/b.py"), entry(6, "src/c.py")),
         capacity=capacity(3),
     )
@@ -432,9 +474,10 @@ def test_disjoint_issues_run_together_up_to_the_cap():
 
 
 def test_a_file_claimed_by_two_in_flight_issues_reports_the_older_one():
-    # Not a state the system creates, but a human relabelling two issues
-    # `swarm:claimed` does. Refusing to dispatch is the decision that matters;
-    # which number is named is only diagnostics, and it must be stable.
+    # Not a state the system creates, but two live containers over one file set
+    # - however they came to exist - do. Refusing to dispatch is the decision
+    # that matters; which number is named is only diagnostics, and it must be
+    # stable.
     assert held_files([entry(9, "src/a.py"), entry(4, "src/a.py")]) == {"src/a.py": 4}
 
 
@@ -443,14 +486,17 @@ def test_a_file_claimed_by_two_in_flight_issues_reports_the_older_one():
 # --------------------------------------------------------------------------
 
 
-def test_the_claim_is_written_before_the_container_is_spawned():
+def test_dispatching_an_issue_writes_nothing_and_spawns_a_container():
     swarm = FakeSwarm()
 
-    dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
-    # Both orders have a crash window; this one strands a label #35 can sweep,
-    # and the other one dispatches the issue twice.
-    assert swarm.log == [f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7 [apiary-worker]"]
+    # This asserted `+swarm:claimed`, `-swarm:ready`, spawn - in that order,
+    # because the label was the claim and the order chose which crash window the
+    # cycle lived with. The container is the claim now, so the whole of what a
+    # successful dispatch does is the last line, and a human watching the
+    # repository sees the swarm start work without the issue changing.
+    assert swarm.log == ["spawn #7 [apiary-worker]"]
 
 
 def test_a_spawned_worker_is_told_which_attempt_it_is():
@@ -464,7 +510,7 @@ def test_a_spawned_worker_is_told_which_attempt_it_is():
     """
     swarm = FakeSwarm()
 
-    dispatch(swarm, swarm, ledger(entry(7, attempt=2)), BASE_COMMIT, capacity=capacity(1))
+    _dispatch_(swarm, swarm, ledger(entry(7, attempt=2)), BASE_COMMIT, capacity=capacity(1))
 
     assert swarm.attempts == {7: 2}
 
@@ -478,7 +524,7 @@ def test_each_worker_is_told_its_own_attempt_and_not_the_fleets():
     """
     swarm = FakeSwarm()
 
-    dispatch(
+    _dispatch_(
         swarm, swarm, ledger(entry(4, attempt=0), entry(5, attempt=3)),
         BASE_COMMIT, capacity=capacity(2),
     )
@@ -486,34 +532,26 @@ def test_each_worker_is_told_its_own_attempt_and_not_the_fleets():
     assert swarm.attempts == {4: 0, 5: 3}
 
 
-def test_the_new_label_is_added_before_the_old_one_is_removed():
-    swarm = FakeSwarm()
-
-    dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
-
-    # Two state labels are repairable by §3's precedence, which puts `claimed`
-    # above `ready`. Zero puts the issue outside the ledger, where nothing looks
-    # at it again.
-    assert swarm.log.index(f"+{CLAIMED} #7") < swarm.log.index(f"-{READY} #7")
-
-
-def test_each_issue_is_claimed_immediately_before_its_own_spawn():
-    swarm = FakeSwarm()
-
-    dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
-
-    # Interleaved, not claim-them-all-then-spawn-them-all: an outage between the
-    # two phases would otherwise strand every issue in the cycle at once.
-    assert swarm.log == [
-        f"+{CLAIMED} #4", f"-{READY} #4", "spawn #4 [apiary-worker]",
-        f"+{CLAIMED} #5", f"-{READY} #5", "spawn #5 [apiary-worker]",
-    ]
+# `test_the_new_label_is_added_before_the_old_one_is_removed` stood here. It
+# asserted that a claim added `swarm:claimed` before it removed `swarm:ready`,
+# so that a crash between the two calls left an issue with two state labels
+# (which §3's precedence repairs) rather than none (which puts it outside the
+# ledger). #152 removed both calls: there is no add, no remove, and no gap
+# between them for a crash to land in, so nothing here can fail.
+#
+# `test_each_issue_is_claimed_immediately_before_its_own_spawn` stood here too,
+# asserting that the claim/spawn pairs were interleaved per issue rather than
+# claimed in one phase and spawned in another. With the claim a no-op there is
+# one call per issue left and no second phase to interleave it with; that a
+# failed spawn strands only its own issue is still asserted, by
+# `test_one_failed_spawn_does_not_stop_the_other_issues_in_the_cycle` and
+# `test_a_daemon_that_is_not_there_stops_the_cycle_rather_than_burning_every_claim`.
 
 
 def test_a_dispatched_issue_reports_the_container_holding_it():
     swarm = FakeSwarm()
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
     assert [item.number for item in report.dispatched] == [7]
     assert report.handles[0].issue == 7
@@ -523,29 +561,26 @@ def test_a_dispatched_issue_reports_the_container_holding_it():
 def test_a_spawn_that_failed_on_a_dead_daemon_keeps_its_claim():
     swarm = FakeSwarm(spawn_error=daemon_down())
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
     # Releasing it looks tidier and is wrong: a `docker start` whose reply this
-    # process never read may still have started a container, and putting the
-    # issue back to ready would give it a second one next cycle. #35 resolves
+    # process never read may still have started a container, and treating the
+    # issue as unclaimed would give it a second one next cycle. #35 resolves
     # that by looking for a live container first - and with the daemon down,
     # `find` could not answer that question either, so nothing is asked.
     assert report.failed[0].claimed is True
-    assert f"-{READY} #7" in swarm.log
-    assert swarm.claimed == [7]
-    assert "find #7" not in swarm.log
+    assert swarm.probed == []
 
 
 def test_a_daemon_that_is_not_there_stops_the_cycle_rather_than_burning_every_claim():
     swarm = FakeSwarm(spawn_error=daemon_down())
 
-    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+    report = _dispatch_(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
 
     # If the daemon is down the second spawn fails exactly like the first, and
-    # each attempt costs one more stuck claim. #5 is untouched and still ready.
-    # This is the case the `break` was always right about, and it is the only
-    # one left that still halts a cycle.
-    assert swarm.claimed == [4]
+    # each attempt costs one more stuck claim. #5 is never reached and stays
+    # eligible. This is the case the `break` was always right about, and it is
+    # the only one left that still halts a cycle.
     assert swarm.spawned == [4]
     assert [failure.number for failure in report.failed] == [4]
     assert report.failed[0].fatal is True
@@ -574,7 +609,7 @@ def test_one_failed_spawn_does_not_stop_the_other_issues_in_the_cycle():
     """The ticket's first criterion, and the reason it exists."""
     swarm = FakeSwarm(spawn_errors={4: missing_image()})
 
-    report = dispatch(
+    report = _dispatch_(
         swarm, swarm, ledger(entry(4), entry(5), entry(6)), BASE_COMMIT, capacity=capacity(3)
     )
 
@@ -589,17 +624,13 @@ def test_a_deferred_issue_does_not_stay_claimed_with_no_container():
     it."""
     swarm = FakeSwarm(spawn_errors={7: missing_image()})
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
     assert report.failed[0].claimed is False
-    assert swarm.released == [7]
-    # Asked before written, and `ready` added before `claimed` is removed - a
-    # crash between the two leaves the conservative reading, exactly as `claim`
-    # does in the other direction.
-    assert swarm.log == [
-        f"+{CLAIMED} #7", f"-{READY} #7", "spawn #7 [apiary-worker]",
-        "find #7", f"+{READY} #7", f"-{CLAIMED} #7",
-    ]
+    # The release is the daemon's answer and nothing else: asked after the spawn
+    # failed, answered "no container", and with no label pair to write behind it
+    # the whole of the cycle's dealings with #7 is these two lines.
+    assert swarm.log == ["spawn #7 [apiary-worker]", "find #7"]
 
 
 def test_a_deferred_issue_keeps_its_claim_when_a_container_did_start():
@@ -611,33 +642,34 @@ def test_a_deferred_issue_keeps_its_claim_when_a_container_did_start():
         running={7: [Handle(id="f" * 64, run_id="apiary-test", issue=7)]},
     )
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
+    # Asked, and the answer is what keeps the claim standing for #35 to resolve.
+    assert swarm.probed == [7]
     assert report.failed[0].claimed is True
-    assert swarm.released == []
 
 
 def test_a_probe_that_cannot_answer_keeps_the_claim():
     """False is the safe answer: a claim #35 sweeps beats two containers."""
     swarm = FakeSwarm(spawn_errors={7: missing_image()}, find_error=daemon_down())
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
+    assert swarm.probed == [7]
     assert report.failed[0].claimed is True
-    assert swarm.released == []
 
 
 def test_an_unrecognised_spawn_failure_defers_rather_than_halting():
     """`DAEMON_DOWN_RE` is narrow and the default is to keep going.
 
-    Being wrong that way costs one label round-trip per issue and no attempts.
-    Being wrong the other way is the bug this ticket fixes.
+    Being wrong that way costs one wasted spawn attempt per issue and no
+    attempt counters. Being wrong the other way is the bug this ticket fixes.
     """
     swarm = FakeSwarm(
         spawn_errors={4: DockerError(["docker", "create"], 125, "something nobody has seen")}
     )
 
-    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+    report = _dispatch_(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
 
     assert swarm.spawned == [4, 5]
     assert report.failed[0].fatal is False
@@ -654,7 +686,7 @@ def test_an_unrecognised_spawn_failure_defers_rather_than_halting():
 def test_every_daemon_signature_stops_the_cycle(output):
     swarm = FakeSwarm(spawn_error=DockerError(["docker", "create"], 125, output))
 
-    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+    report = _dispatch_(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
 
     assert swarm.spawned == [4]
     assert report.failed[0].fatal is True
@@ -668,7 +700,7 @@ def test_a_docker_binary_that_is_not_on_path_is_a_daemon_level_failure():
         spawn_error=ContainerError("'docker' is not on PATH; the orchestrator reaches the daemon")
     )
 
-    report = dispatch(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
+    report = _dispatch_(swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2))
 
     assert swarm.spawned == [4]
     assert report.failed[0].fatal is True
@@ -680,8 +712,8 @@ def test_the_two_kinds_of_failure_are_distinguishable_in_the_log():
     halted = FakeSwarm(spawn_error=daemon_down())
     deferred = FakeSwarm(spawn_errors={7: missing_image()})
 
-    fatal = dispatch(halted, halted, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1)).failed[0]
-    local = dispatch(
+    fatal = _dispatch_(halted, halted, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1)).failed[0]
+    local = _dispatch_(
         deferred, deferred, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1)
     ).failed[0]
 
@@ -690,23 +722,20 @@ def test_the_two_kinds_of_failure_are_distinguishable_in_the_log():
     assert str(fatal) != str(local)
 
 
-def test_a_claim_that_could_not_be_written_spawns_nothing():
-    swarm = FakeSwarm(label_error=rate_limited())
-
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
-
-    # A container running against an issue that still reads `swarm:ready` is
-    # the failure the ordering exists to prevent, and a GitHub outage must not
-    # produce it by the back door.
-    assert swarm.spawned == []
-    assert report.failed[0].claimed is False
-    assert "claim failed" in report.failed[0].reason
+# `test_a_claim_that_could_not_be_written_spawns_nothing` stood here, with a
+# `rate_limited()` helper that made the fake's `add_labels` raise a 503. It
+# asserted that a claim GitHub refused stopped the cycle before any spawn, so
+# that a rate limit could not produce a container running against an issue still
+# reading `swarm:ready`. `claim` writes nothing to GitHub now, so there is no
+# request left to rate-limit and no `claim failed` branch to reach: the label
+# write it was about is the one #152 removed. `DispatchFailure.claimed` and
+# `fatal` are still asserted, by the spawn-failure tests above.
 
 
 def test_a_dry_run_writes_nothing_at_all():
     swarm = FakeSwarm()
 
-    report = dispatch(
+    report = _dispatch_(
         swarm, swarm, ledger(entry(4), entry(5)), BASE_COMMIT, capacity=capacity(2), dry_run=True
     )
 
@@ -719,7 +748,7 @@ def test_a_dry_run_writes_nothing_at_all():
 def test_nothing_is_dispatched_when_the_ledger_has_nothing_ready():
     swarm = FakeSwarm()
 
-    report = dispatch(swarm, swarm, ledger(entry(4, label=DONE)), BASE_COMMIT, capacity=capacity(2))
+    report = _dispatch_(swarm, swarm, ledger(entry(4, state=LANDED)), BASE_COMMIT, capacity=capacity(2))
 
     assert swarm.log == []
     assert report.dispatched == ()
@@ -733,7 +762,7 @@ def test_nothing_is_dispatched_when_the_ledger_has_nothing_ready():
 def test_a_cycle_that_dispatched_does_not_ask_the_judge():
     swarm = FakeSwarm()
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
     # The judge call is a dense-model call, which under OLLAMA_MAX_LOADED_MODELS=1
     # evicts the worker model: ~6.7 s of swap, then another to load it back.
@@ -745,8 +774,8 @@ def test_a_cycle_that_dispatched_does_not_ask_the_judge():
 def test_a_cycle_at_the_cap_does_not_ask_the_judge_either():
     swarm = FakeSwarm()
 
-    report = dispatch(
-        swarm, swarm, ledger(entry(4, label=CLAIMED), entry(5)), BASE_COMMIT, capacity=capacity(1)
+    report = _dispatch_(
+        swarm, swarm, ledger(entry(4, state=CLAIMED), entry(5)), BASE_COMMIT, capacity=capacity(1)
     )
 
     # Nothing new started, but a container is running: waiting for it is not a
@@ -758,7 +787,7 @@ def test_a_cycle_at_the_cap_does_not_ask_the_judge_either():
 def test_a_cycle_that_could_do_nothing_at_all_is_worth_a_judgement():
     swarm = FakeSwarm()
 
-    report = dispatch(swarm, swarm, ledger(entry(4, label=FAILED)), BASE_COMMIT, capacity=capacity(2))
+    report = _dispatch_(swarm, swarm, ledger(entry(4, state=NEEDS_HUMAN)), BASE_COMMIT, capacity=capacity(2))
 
     # Nothing dispatched and nothing running is a stall, which is exactly what
     # the judge exists to diagnose (architecture-v2, step 5).
@@ -768,7 +797,7 @@ def test_a_cycle_that_could_do_nothing_at_all_is_worth_a_judgement():
 def test_an_infrastructure_failure_is_not_a_stall_to_judge():
     swarm = FakeSwarm(spawn_error=daemon_down())
 
-    report = dispatch(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(entry(7)), BASE_COMMIT, capacity=capacity(1))
 
     # Docker being unreachable is a fact, not a question, and replanning around
     # it would rewrite a backlog that was never the problem.
@@ -803,7 +832,7 @@ def test_a_task_is_spawned_in_its_own_stacks_image():
     node = entry(4)
     node = dataclasses.replace(node, stack="node")
 
-    dispatch(swarm, swarm, ledger(node, entry(5)), BASE_COMMIT, capacity=capacity(2))
+    _dispatch_(swarm, swarm, ledger(node, entry(5)), BASE_COMMIT, capacity=capacity(2))
 
     assert swarm.images == ["apiary-worker-node", "apiary-worker"]
 
@@ -815,7 +844,7 @@ def test_a_stack_with_no_image_is_refused_before_it_is_claimed():
     swarm = FakeSwarm()
     unrunnable = dataclasses.replace(entry(4), stack="rust")
 
-    report = dispatch(swarm, swarm, ledger(unrunnable), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(unrunnable), BASE_COMMIT, capacity=capacity(1))
 
     assert swarm.log == []  # not claimed, not spawned
     assert report.failed[0].claimed is False
@@ -827,7 +856,7 @@ def test_one_unrunnable_stack_does_not_stop_the_others():
     swarm = FakeSwarm()
     unrunnable = dataclasses.replace(entry(4), stack="rust")
 
-    report = dispatch(
+    report = _dispatch_(
         swarm, swarm, ledger(unrunnable, entry(5)), BASE_COMMIT, capacity=capacity(2)
     )
 
@@ -847,7 +876,7 @@ def test_an_image_that_was_never_built_says_which_command_builds_it():
     )
     node = dataclasses.replace(entry(4), stack="node")
 
-    report = dispatch(swarm, swarm, ledger(node), BASE_COMMIT, capacity=capacity(1))
+    report = _dispatch_(swarm, swarm, ledger(node), BASE_COMMIT, capacity=capacity(1))
 
     assert "docker build -f Dockerfile.worker.node" in report.failed[0].reason
     # And it is still a per-issue defer, not a halted cycle.
@@ -858,7 +887,7 @@ def test_an_override_reaches_the_spawn():
     swarm = FakeSwarm()
     node = dataclasses.replace(entry(4), stack="node")
 
-    dispatch(
+    _dispatch_(
         swarm,
         swarm,
         ledger(node),

@@ -36,6 +36,9 @@ from typing import Any, Mapping
 
 import pytest
 
+FAILED = "needs-human"
+
+from fixtures.belief import fixture_belief
 from fixtures.markers import legacy_marker
 from swarm.github.branches import task_branch
 from swarm.github.ledger import (
@@ -48,7 +51,6 @@ from swarm.github.ledger import (
 from swarm.github.refs import task_ref as ref
 from swarm.orchestrator.dispatcher import CLAIMED
 from swarm.orchestrator.reconcile import (
-    FAILED,
     READY,
     apply_plan,
     plan_reconcile,
@@ -244,7 +246,7 @@ def test_an_in_memory_backend_satisfies_the_seam_and_no_caller_notices():
     memory.write(TaskJudgement(ref=ref(4), attempt=2, blocker="ab12cd34ef", streak=2))
     client = FakeClient({4: issue(4, label=READY, task_id="task-4", marker=render_marker("task-4", 2))})
 
-    ledger = load_ledger(client, adopt=False, store=memory)
+    ledger = load_ledger(client, store=memory)
 
     entry = ledger.entries["task-4"]
     assert (entry.attempt, entry.blocker, entry.streak) == (2, "ab12cd34ef", 2)
@@ -458,7 +460,7 @@ def test_a_task_the_store_has_never_judged_keeps_the_legacy_marker_record():
     )
 
     with SqliteTaskStore.open(REPO) as store:
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     entry = ledger.entries["task-4"]
     assert (entry.attempt, entry.blocker, entry.streak) == (2, "ab12cd34ef", 2)
@@ -481,7 +483,7 @@ def test_a_judgment_about_this_attempt_wins_over_the_body():
 
     with SqliteTaskStore.open(REPO) as store:
         store.write(TaskJudgement(ref=ref(4), attempt=2, blocker="ffffffffff", streak=1, renewals=1))
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     entry = ledger.entries["task-4"]
     assert (entry.blocker, entry.streak, entry.renewals) == ("ffffffffff", 1, 1)
@@ -506,7 +508,7 @@ def test_the_stored_counter_wins_over_a_marker_that_still_carries_one():
 
     with SqliteTaskStore.open(REPO) as store:
         store.write(TaskJudgement(ref=ref(4), attempt=3, blocker="ab12cd34ef", streak=3, renewals=2))
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     entry = ledger.entries["task-4"]
     assert (entry.attempt, entry.blocker, entry.streak, entry.renewals) == (
@@ -531,7 +533,7 @@ def test_a_loader_with_no_store_reads_exactly_what_it_read_before():
         }
     )
 
-    ledger = load_ledger(client, adopt=False)
+    ledger = load_ledger(client)
 
     assert ledger.entries["task-4"].blocker == "ab12cd34ef"
 
@@ -545,24 +547,32 @@ def test_record_judgement_without_a_store_writes_nothing_rather_than_raising():
 # --------------------------------------------------------------------------
 
 
-def cycle(client: FakeClient, store: SqliteTaskStore, verify_output: str) -> Ledger:
+def cycle(client: FakeClient, store: SqliteTaskStore, verify_output: str) -> str:
     """One observe-and-write pass: read the ledger, judge a failed worker, write.
 
     Deliberately assembled from the real functions rather than from
     `Reconciler`, so what is exercised is the counter-and-judgment path and not
     a container, a pull request or a model.
+
+    Returns the state the pass decided, because since #152 that is the only
+    place it is legible: the pass wrote it to an issue as a `swarm:*` label and
+    the next cycle read it back, and now the label is gone and the belief is
+    the cycle's. Each pass here declares the claim again for the same reason -
+    the fixture's own `Belief`, not a label `apply_plan` left behind, is what
+    says the task is claimed.
     """
-    ledger = load_ledger(client, adopt=False, store=store)
+    ledger = load_ledger(client, store=store)
     entry = next(iter(ledger.entries.values()))
     plan = plan_reconcile(
         ledger,
         results={entry.ref: record(entry.number, attempt=entry.attempt, verify_output=verify_output)},
         max_attempts=3,
+        believed=fixture_belief(ledger),
     )
-    apply_plan(client, plan, store=store)
-    # The label the transition wrote is what the next `load_ledger` reads, and
-    # `FakeClient` already applied it; re-reading is the point.
-    return ledger
+    report = apply_plan(client, plan, store=store)
+    # The counter the transition persisted is what the next `load_ledger`
+    # reads back out of the store; re-reading is the point.
+    return report.applied[-1].to_state if report.applied else ""
 
 
 def test_the_same_failure_three_times_still_gives_up_at_the_cap():
@@ -572,13 +582,11 @@ def test_the_same_failure_three_times_still_gives_up_at_the_cap():
     client = FakeClient({4: issue(4, label=CLAIMED, task_id="task-4")})
 
     with SqliteTaskStore.open(REPO) as store:
-        for _ in range(3):
-            client.issues[4]["labels"] = [{"name": CLAIMED}]
-            cycle(client, store, IMPORT_FAILURE)
+        decided = [cycle(client, store, IMPORT_FAILURE) for _ in range(3)]
 
         held = store.read()[ref(4)]
 
-    assert {label["name"] for label in client.issues[4]["labels"]} == {FAILED}
+    assert decided == [READY, READY, FAILED]
     assert (held.attempt, held.streak, held.renewals) == (3, 3, 0)
     assert held.blocker == signature(IMPORT_FAILURE)
 
@@ -591,16 +599,14 @@ def test_a_failure_that_changes_renews_the_budget_and_the_store_counts_it():
 
     with SqliteTaskStore.open(REPO) as store:
         for _ in range(2):
-            client.issues[4]["labels"] = [{"name": CLAIMED}]
             cycle(client, store, IMPORT_FAILURE)
-        client.issues[4]["labels"] = [{"name": CLAIMED}]
-        cycle(client, store, ASSERT_FAILURE)
+        decided = cycle(client, store, ASSERT_FAILURE)
 
         held = store.read()[ref(4)]
 
     # Still ready: the third failure was a different one, so the per-blocker
     # streak restarted rather than the task being given up.
-    assert {label["name"] for label in client.issues[4]["labels"]} == {READY}
+    assert decided == READY
     assert (held.attempt, held.streak, held.renewals) == (3, 1, 1)
     assert held.blocker == signature(ASSERT_FAILURE)
 
@@ -728,7 +734,7 @@ def test_a_seeded_floor_is_what_the_ledger_then_reads_as_the_counter():
 
     with SqliteTaskStore.open(REPO) as store:
         seed_attempt_floor(store, [task_branch(ref(4), 3)])
-        ledger = load_ledger(client, adopt=False, store=store)
+        ledger = load_ledger(client, store=store)
 
     assert ledger.entries["task-4"].attempt == 3
 

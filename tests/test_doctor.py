@@ -57,7 +57,6 @@ from swarm.doctor import (
     CHECK_CI,
     CHECK_DOCKER_CLI,
     CHECK_DOCKER_DAEMON,
-    CHECK_LABELS,
     CHECK_MODEL_AVAILABLE,
     CHECK_MODEL_REACHABLE,
     CHECK_MODEL_SCHEMA,
@@ -82,7 +81,6 @@ from swarm.doctor import (
     main,
     stack_check,
 )
-from swarm.github.labels import SWARM_LABELS
 from swarm.mcp.contract import ContractError, parse_tracker
 
 REPO = "shahrestani-me/apiary"
@@ -240,13 +238,6 @@ class LeakingRunner(RecordingRunner):
         return self._done(1, "", f"denied: bad credential {TOKEN}")
 
 
-def label_page(*, missing: Sequence[str] = ()) -> Any:
-    """The repo's labels, minus whichever `swarm:*` names a test removed."""
-    absent = {name.casefold() for name in missing}
-    names = [spec.name for spec in SWARM_LABELS if spec.name.casefold() not in absent]
-    return page([{"name": name} for name in ["bug", "area/ops", *names]])
-
-
 def check_runs(*names: str) -> Any:
     """A `GET /commits/{ref}/check-runs` body, in its envelope."""
     return response(200, {"total_count": len(names), "check_runs": [{"name": n} for n in names]})
@@ -256,16 +247,16 @@ def issue_page(count: int = 3) -> Any:
     return page([{"number": n, "title": f"issue {n}"} for n in range(1, count + 1)])
 
 
-def github_script(
-    *,
-    issues: Any = None,
-    labels: Any = None,
-    ci: Any = None,
-) -> list[Any]:
-    """The three reads a healthy run makes, in the order `run` makes them."""
+def github_script(*, issues: Any = None, ci: Any = None) -> list[Any]:
+    """The two reads a healthy run makes, in the order `run` makes them.
+
+    Three until #152. The middle one was `GET /labels`, for the check that the
+    six `swarm:*` state labels were present - a repo missing one was a repo
+    where a transition could not be written. There are no state labels now, so
+    there is nothing to be missing and nothing to read.
+    """
     return [
         issues if issues is not None else issue_page(),
-        labels if labels is not None else label_page(),
         ci if ci is not None else check_runs("test"),
     ]
 
@@ -389,7 +380,6 @@ def test_a_healthy_environment_passes_every_check(doctor):
         CHECK_TOKEN,
         CHECK_BOOT_TOKEN,
         CHECK_REPO,
-        CHECK_LABELS,
         CHECK_CI,
         CHECK_TIMEOUTS,
         CHECK_DOCKER_CLI,
@@ -434,7 +424,7 @@ def test_the_report_is_readable(doctor):
     subject, _, _, _ = doctor()
     report = subject.run().report()
 
-    assert "all 19 preconditions met" in report
+    assert "all 18 preconditions met" in report
     for name in (CHECK_MODEL_SCHEMA, CHECK_TOKEN, stack_check("python")):
         assert name in report
 
@@ -574,7 +564,7 @@ def test_a_missing_token_stops_the_github_checks_rather_than_the_run(doctor):
     diagnosis = subject.run()
 
     assert diagnosis.by_name(CHECK_TOKEN).status == FAIL
-    for name in (CHECK_REPO, CHECK_LABELS, CHECK_CI):
+    for name in (CHECK_REPO, CHECK_CI, CHECK_CI):
         assert diagnosis.by_name(name).status == SKIP
     # The rest of the environment is still reported: an operator who has two
     # problems should learn about both on the first run.
@@ -612,27 +602,6 @@ def test_a_malformed_repo_is_refused_without_a_request(doctor):
     assert transport.sent == []
 
 
-def test_missing_labels_are_reported_never_created(doctor):
-    subject, transport, _, _ = doctor(
-        script=github_script(labels=label_page(missing=["swarm:review", "swarm:done"]))
-    )
-    verdict = subject.run().by_name(CHECK_LABELS)
-
-    assert verdict.status == FAIL
-    assert "swarm:review" in verdict.detail and "swarm:done" in verdict.detail
-    assert "python -m swarm.github.labels" in verdict.fix
-    assert {method for method, _ in transport.calls} == {"GET"}
-
-
-def test_a_case_variant_label_counts_as_present(doctor):
-    """GitHub's label uniqueness is case-insensitive; so is this comparison.
-
-    A repo carrying `Swarm:Ready` answers a `POST` of `swarm:ready` with a 422,
-    so reporting it missing would send the operator to a command that fails.
-    """
-    labels = page([{"name": spec.name.title()} for spec in SWARM_LABELS])
-    subject, _, _, _ = doctor(script=github_script(labels=labels))
-    assert subject.run().by_name(CHECK_LABELS).ok
 
 
 def test_a_repo_with_no_ci_is_refused(doctor):
@@ -1041,7 +1010,6 @@ def provoked_failures(doctor) -> list[Check]:
         (CHECK_MODEL_SCHEMA, {"inference": FakeInference(schema_failures=("orchestrator",))}),
         (CHECK_TOKEN, {"env": {}}),
         (CHECK_REPO, {"script": github_script(issues=response(404, {"message": "Not Found"}))}),
-        (CHECK_LABELS, {"script": github_script(labels=label_page(missing=["swarm:ready"]))}),
         (CHECK_CI, {"script": github_script(ci=check_runs())}),
         (CHECK_TIMEOUTS, {"settings": settings(verify_timeout_s=1800)}),
         (CHECK_DOCKER_CLI, {"which": lambda name: None}),
@@ -1065,7 +1033,7 @@ def provoked_failures(doctor) -> list[Check]:
 def test_every_check_can_be_provoked_to_fail(doctor):
     """The first clause of the ticket's "done when", for every check."""
     names = [check.name for check in provoked_failures(doctor)]
-    assert len(names) == len(set(names)) == 16
+    assert len(names) == len(set(names)) == 15
 
 
 def test_every_failure_names_a_command(doctor):
@@ -1089,7 +1057,7 @@ def test_every_failure_names_a_command(doctor):
 def test_main_exits_non_zero_when_something_is_wrong(doctor, capsys):
     healthy, _, _, _ = doctor()
     assert main([REPO], doctor=healthy) == 0
-    assert "all 19 preconditions met" in capsys.readouterr().out
+    assert "all 18 preconditions met" in capsys.readouterr().out
 
     broken, _, _, _ = doctor(runner=RecordingRunner(images=()))
     assert main([REPO], doctor=broken) == 1
