@@ -106,12 +106,20 @@ state, and a merge *is* done. The code host was already holding this.
 Only `needs-human` is reported outbound, because it is the one state the
 customer's own integration cannot infer.
 
-### Three of these are not derivable from the code host alone (#145)
+### Four of these are not derivable from the code host alone (#145, #289)
 
 The table above says "derived from" and names the code host and the containers.
 Building the resolver found that incomplete in three specific ways, and they are
 recorded here because #146's shadow window will surface them as divergences and
 somebody has to know in advance which divergences are *expected*.
+
+**Three was the count this section was written with; it is four.** The fourth
+was found by grouping the divergences of #152's ten recorded runs (#289) — a
+year after the other three, and by looking at what a run actually produced
+rather than at what building the resolver suggested it would. The count is worth
+correcting rather than quietly leaving stale: this list is read as though it were
+exhaustive, and a reader who takes it that way concludes that anything else the
+resolver cannot see is a bug.
 
 **The infrastructure ceiling is not derivable at all.** `needs-human` is listed
 above as "attempts exhausted, or the infrastructure cap hit". The second half is
@@ -142,13 +150,36 @@ does not rescue it.
 ready. It converges on merge, which is what the `landed > needs-human`
 precedence exists for — but it diverges for the cycles in between.
 
+**A check gate that timed out is not derivable, because nothing happened.** The
+other three are states the host shows too little of; this one is a state the host
+has no place to show at all. `checks._decide_empty` escalates a pull request that
+never grew a check run once `zero_check_grace_s` has passed — "no check run was
+ever created … nothing gated this pull request, so nothing verified it" — and
+that verdict is about *elapsed time*. There is no failing check run, because a
+check run failing to appear is the whole of the finding; the pull request stays
+open and the issue stays open, because neither retrying nor merging is the right
+answer. So `derived.resolve` reads `review` and is **correct about the code
+host**: an open pull request on the task's branch is exactly what `review` means.
+The disagreement is not about a fact either party got wrong. It is apiary
+holding a judgment the host was never told about, which is the infrastructure
+ceiling's family — and it is `authority.CHECK_TIMEOUT` rather than a fold into
+`INFRASTRUCTURE_CEILING` because the two hand a human different problems: a
+broken host, or a repository whose workflows do not run on these paths.
+
+It is currently harmless — the store carries the consequence, and the gate
+re-reaches the same verdict next cycle — which is precisely why it went
+unnamed for so long, and why naming it is the whole of the fix.
+
 The honest statement is therefore narrower than the one above: **the five
 lifecycle states are derived from the code host, the containers, the run
 artifacts, and apiary's own store.** ADR 0002's store is not an addition beside
 the derivation; two of the five states need it. That does not weaken the
 decision — the store holds only apiary's own judgments, so nothing here is a
 fact the tracker owns — but a reader who took the original table literally would
-build a resolver that reads three states wrong.
+build a resolver that reads three states wrong, and the fourth teaches the
+sharper form of the same lesson: apiary's own store also has to hold the
+judgments apiary reached about things that *did not happen*, which no amount of
+reading the host will ever recover.
 
 ### And three more that the shadow window found (#146)
 

@@ -256,6 +256,7 @@ the ones that only appear when things go **wrong**:
 | `infrastructure-ceiling` | mechanical failures — a missing image, a dead daemon, a pulled network |
 | `budget-renewed` | a task that exhausts its retries and gets a renewed per-blocker budget |
 | `revived` | `planner.revive` on a task that was given up on |
+| `check-timeout` | a pull request that never grew a check run — a repository with no workflow on those paths, or a CI provider that never reported. The gate escalates on elapsed time, the pull request stays **open**, and the resolver correctly reads `review`: nothing on the code host records that a check run failed to appear (#289) |
 | `dispatched-this-cycle` | ordinary, and the one you will see most |
 | `merged-this-cycle` | the merge gate landing something after the world was read |
 
@@ -264,8 +265,15 @@ to need several cycles and a rebase, and at least one run where you deliberately
 break the infrastructure mid-run (stop the Docker daemon for a cycle, or remove
 `apiary-worker-node` before a node task dispatches). **A deliberately broken run
 is worth more here than a clean one**, because the infrastructure ceiling is one
-of ADR 0001's three states that is not derivable at all, and it is the one the
+of ADR 0001's four states that is not derivable at all, and it is the one the
 overlays exist to handle.
+
+`check-timeout` is the cheapest of the four to provoke and the easiest to
+provoke *by accident*: point a brief at a repository whose workflows do not
+trigger on the paths the plan touches and every task in it ends there. Worth one
+deliberate run, because it is the class an operator is most likely to misread —
+the pull request is open and green-looking, the resolver says `review`, and only
+the override's `kind` says a human was asked.
 
 Bigger plans also help the number that matters: the independent share tends to
 `(N - O(1)) / N` and rises with plan size, so a ten-task plan produces far

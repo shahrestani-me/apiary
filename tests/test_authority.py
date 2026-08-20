@@ -67,6 +67,7 @@ from swarm.github.refs import pull_ref, task_ref as ref
 from swarm.orchestrator.authority import (
     BUDGET_RENEWED,
     BUDGET_SPENT,
+    CHECK_TIMEOUT,
     INFRASTRUCTURE_CEILING,
     LANDED_STANDS,
     REVIVED,
@@ -559,7 +560,7 @@ def test_the_infrastructure_streak_is_counted_once_and_costs_no_attempt(
 
 
 # --------------------------------------------------------------------------
-# 4. ADR 0001's three, which stayed non-derivable
+# 4. ADR 0001's non-derivable states - three, and a fourth (#289)
 # --------------------------------------------------------------------------
 
 
@@ -875,6 +876,33 @@ def test_the_previous_belief_is_the_remembered_overlay_alone():
 
     remembered = believe(ledger(task), world(task), remembered={ref(4): CLAIMED_STATE})
     assert remembered.previous == {"task-4": CLAIMED_STATE}
+
+
+def test_an_escalation_the_code_host_does_not_corroborate_carries_a_kind():
+    """ADR 0001's fourth, found by grouping #152's ten recorded runs (#289).
+
+    The check gate escalates a pull request that never grew a check run, and the
+    pull request **stays open**. So the resolver reads `review` and is right
+    about the code host - which is exactly why the divergence is not a resolver
+    mistake and must not be reported as one. Nothing on the host records the
+    escalation: no check run (a check run failing to appear is the finding), no
+    closed pull request, no closed issue.
+
+    The assertion is on the `kind`, not on the state, because the state is
+    deliberately unchanged: this arm classifies an event, it does not overrule
+    the resolver. Before #289 the override came out with `kind: ""`, which
+    `DivergenceTally` cannot tell apart from a plain disagreement - and ADR
+    0001's class list was being read as exhaustive when it was one short.
+    """
+    task = entry(4)
+    seen = world(task, pulls=(PullFact(number=pull_ref(900), ref=ref(4)),))
+    held = believe(ledger(task), seen, remembered={ref(4): NEEDS_HUMAN})
+
+    assert held.state("task-4") == REVIEW_STATE, "the resolver keeps its verdict"
+    assert [one.kind for one in held.overrides] == [CHECK_TIMEOUT]
+    assert held.overrides[0].stored == NEEDS_HUMAN
+    assert held.overrides[0].derived == REVIEW_STATE
+    assert "still open" in held.overrides[0].why
 
 
 # --------------------------------------------------------------------------
