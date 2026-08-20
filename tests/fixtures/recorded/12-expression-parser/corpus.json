@@ -135,7 +135,7 @@
       "task": "parser",
       "derived": "needs-human",
       "control": "landed",
-      "why": "the same, on a task the gate had already merged."
+      "why": "the gate merged this task's pull request in the same cycle the resolver read the world, and the resolver's own arithmetic had already spent the budget - so the two disagree about a task that is simultaneously landed and out of retries. ADR 0001 names the budget as not derivable from the code host; the merge is the ordinary same-cycle write."
     },
     {
       "cycle": 76,
