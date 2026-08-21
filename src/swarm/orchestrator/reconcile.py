@@ -125,6 +125,7 @@ from ..github.readiness import (
     ReadinessPlan,
     apply_readiness,
 )
+from ..github.branches import parse_task_branch
 from ..github.refs import issue_number, task_ref
 from ..mcp.tracker import TrackerError
 from ..run import Run, live_entries
@@ -1071,6 +1072,38 @@ def _was(
     return previous.get(entry.task_id) or _now(entry, believed)
 
 
+def _refs_with_open_pull(open_branches: Collection[str] | None) -> frozenset[TaskRef] | None:
+    """Which *tasks* have an open pull request, not which attempts do.
+
+    Rule 4 below asks "was this work rejected", and the honest reading of that
+    is per task: a worker pushes `apiary/<ref>-attempt-<n>`, so a task whose
+    counter has since moved has an open PR under a name that is no longer
+    `entry.branch`. Comparing the exact string called that a closed PR and
+    consumed an attempt for work that was still in review - #299, measured on
+    run `to-do-react-generated-app-20260821-151111-95rff7`, where #3 was
+    escalated as "closed without merging" at cycle 4 and its pull request was
+    still open sixty cycles later when CI finally reported on it.
+
+    `branches.parse_task_branch` is what makes the per-task question askable at
+    all, and that is the reason the encoding was made reversible (see its module
+    docstring: an orchestrator that has lost every scrap of local memory can
+    list the remote's branches and know what was in flight). Names the parser
+    rejects are somebody else's branches and are not counted, exactly as that
+    module says its callers should treat them.
+
+    None in, None out: "we could not list pull requests" must never read as
+    "the pull request is gone".
+    """
+    if open_branches is None:
+        return None
+    found = set()
+    for name in open_branches:
+        parsed = parse_task_branch(name)
+        if parsed is not None:
+            found.add(parsed.ref)
+    return frozenset(found)
+
+
 def plan_reconcile(
     ledger: Ledger,
     *,
@@ -1144,6 +1177,7 @@ def plan_reconcile(
     # `observed_records` is a function, and a parameter shadowing it inside this
     # body would make a later call to it read as "Mapping not callable".
     seen_records = observed or {}
+    with_open_pull = _refs_with_open_pull(open_branches)
     live = set(running)
 
     transitions: list[Transition] = []
@@ -1214,15 +1248,22 @@ def plan_reconcile(
         if now != REVIEW_STATE and was != REVIEW_STATE:
             continue
 
-        # 4. A PR that is no longer open, on an issue that is not closed - so it
-        #    was closed unmerged, by a human or by #23. The attempt is consumed:
-        #    the work was done and rejected, and a retry that costs nothing can
-        #    be rejected forever. Skipped entirely when `open_branches` is None,
-        #    because "we could not list PRs" must never read as "the PR is gone".
+        # 4. This task has no open PR at all, and its issue is not closed - so
+        #    the PR was closed unmerged, by a human or by #23. The attempt is
+        #    consumed: the work was done and rejected, and a retry that costs
+        #    nothing can be rejected forever. Skipped entirely when
+        #    `open_branches` is None, because "we could not list PRs" must never
+        #    read as "the PR is gone".
+        #
+        #    Per *task*, not per attempt (`_refs_with_open_pull`). Comparing
+        #    `entry.branch` - the current attempt's name - consumed attempts for
+        #    work that was still in review whenever the counter and the pushed
+        #    branch drifted apart, which is #299: the task was escalated before
+        #    CI had reported the one failure a worker could have fixed.
         if (
             was == REVIEW_STATE
-            and open_branches is not None
-            and entry.branch not in open_branches
+            and with_open_pull is not None
+            and entry.ref not in with_open_pull
         ):
             transitions.append(
                 _retry_or_give_up(
