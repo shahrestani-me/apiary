@@ -69,12 +69,16 @@ how the project is already written.
 Return the COMPLETE new contents of every file you change - never a diff,
 never a fragment, never "... rest unchanged".
 
-Edit ONLY the files listed as editable. The read-only context is there to be
-imitated, not modified: an edit to any other path is discarded and the task
-fails. If a file should be created, include it with its full contents. To
-DELETE a file, return it with empty content - removing an obsolete file is
-often the right edit for a cleanup goal. Keep changes minimal and focused on
-the goal.
+Edit ONLY the files listed as editable, at exactly the paths given, including
+their extensions. That list is the task's contract and nothing here overrides
+it: if a rule below seems to forbid a path the list names, the list wins - write
+it and say so in your reasoning. An edit to any other path is discarded and the
+task fails, so a file you were not given is a file you cannot create.
+
+The read-only context is there to be imitated, not modified. If a file should be
+created, include it with its full contents. To DELETE a file, return it with
+empty content - removing an obsolete file is often the right edit for a cleanup
+goal. Keep changes minimal and focused on the goal.
 
 Every relative import must resolve. It may name a file you are editing, or a
 file already in the repository - never a path you merely wish existed. You
@@ -120,6 +124,20 @@ result. That is the only channel you have and the only one you need."""
 #: orchestrator's. The stack a task targets is still declared on the work item -
 #: `## Stack` is a fact about the task - but what that stack *permits* is handed
 #: down at dispatch, from `system_for`.
+#:
+#: **Authority over *how* is not authority over *which files*.** The orchestrator
+#: says how to work; the work item's `## Files` says what this task may touch,
+#: and `apply_edits` enforces exactly that list. Those two must never disagree,
+#: and when #293 first moved `STACK_RULE` here they did: a stack rule saying
+#: "never .ts or .tsx" outranked a task whose `## Files` declared
+#: `src/components/TodoForm.tsx`. The model obeyed the prompt, wrote `.jsx`, and
+#: every edit was refused for being undeclared - `written` empty, three
+#: identical failures, escalated. Twice, on two tasks, for a rule that was also
+#: factually wrong.
+#:
+#: So `SYSTEM` says the list wins, in the same paragraph that grants the
+#: orchestrator everything else. A stack rule may narrow what a worker *writes
+#: into* a declared file; it may not argue with the path.
 #:
 #: **A worker talks to its orchestrator and to nothing else.** No peer, no other
 #: task, no service of its own choosing. Said in the prompt because the prompt is

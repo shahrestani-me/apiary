@@ -93,6 +93,17 @@ CAUSES: tuple[tuple[str, str], ...] = (
         "its pull request was closed by hand",
     ),
     (
+        # Ahead of the generic gate line, because it is a different failure with
+        # a different fix and it reached a real report reading "escalated for a
+        # reason this report has no summary for" (#293). Nothing was written at
+        # all: the model answered and every path it chose was refused for being
+        # undeclared, so the plan and the generation disagree about where the
+        # code goes. Retrying cannot resolve that - one of the two has to move.
+        "no edit landed inside the declared file set",
+        "the model wrote paths this task does not declare, so every edit was "
+        "refused; the plan's ## Files and the code it asks for disagree",
+    ),
+    (
         "the verify command failed",
         "the gate went red the same way every time; the plan is the suspect",
     ),

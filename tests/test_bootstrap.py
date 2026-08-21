@@ -1016,3 +1016,34 @@ def test_the_worker_is_told_that_an_unresolvable_import_fails_the_task():
 
     assert "Every relative import must resolve" in SYSTEM
     assert "zero tests" in SYSTEM
+
+
+def test_a_stack_rule_never_argues_with_the_declared_paths():
+    """The regression that cost six attempts across two tasks (#293).
+
+    Authority over *how* to work is not authority over *which files*. The
+    orchestrator's prompt outranks the work item - that is the point of moving
+    `STACK_RULE` there - but the work item's `## Files` is the contract
+    `apply_edits` enforces, and a rule that contradicts it makes the task
+    unsatisfiable rather than better-behaved.
+
+    Measured: a stack rule saying "never .ts or .tsx" against tasks declaring
+    `src/components/TodoForm.tsx`. The model obeyed the prompt, wrote `.jsx`,
+    every edit was refused for being undeclared, `written` came back empty three
+    times, escalated. The rule was also false - vite transpiles both.
+    """
+    system = system_for("react")
+
+    assert "never .ts" not in system
+    assert "only, never" not in system
+    # And the prompt says outright which side wins when they seem to disagree.
+    assert "the list wins" in system
+
+
+def test_the_worker_is_told_the_declared_paths_include_their_extensions():
+    """`.tsx` and `.jsx` are different paths to `apply_edits`, and a model that
+    "helpfully" changes the extension has written a file it was not given."""
+    from swarm.worker.edit import SYSTEM
+
+    assert "including" in SYSTEM and "extensions" in SYSTEM
+    assert "a file you were not given is a file you cannot create" in SYSTEM

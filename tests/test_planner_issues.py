@@ -1646,13 +1646,23 @@ def test_every_shipped_stacks_gate_reaches_this_repair(stack):
 
 def test_the_planner_prompt_carries_the_stacks_own_constraints():
     """"Plausible for a react project" is a statement about paths, and the model
-    read it as one: it planned "Define a TypeScript interface" against an image
-    with no TypeScript in it and no network to fetch one. The bootstrap task was
-    already told; the planner deciding what the tasks *are* was not."""
+    read it as one: it planned against packages the image does not have. The
+    bootstrap task was already told; the planner deciding what the tasks *are*
+    was not.
+
+    **This asserted the opposite for one revision and passed anyway**, which is
+    why it now pins the sentence rather than the word. The rule used to forbid
+    `.ts`/`.tsx`; that was wrong on the facts - vite transpiles both through
+    esbuild, measured green in the image - and harmful, because it outranked a
+    task whose `## Files` declared `.tsx` and made every edit undeclared. The
+    replacement mentions `.tsx` too, so `".tsx" in prompt` went on passing while
+    guarding nothing.
+    """
     prompt = planner.system_prompt(verify=STACK_VERIFY["react"], stack="react")
 
-    assert "TypeScript" in prompt
-    assert ".tsx" in prompt
+    assert "not type-checked" in prompt
+    assert "no `typescript` package" in prompt
+    assert "never .ts" not in prompt
     assert "@testing-library/react" in prompt
 
 

@@ -119,14 +119,30 @@ STACK_RULE: dict[str, str] = {
         "import \"@testing-library/jest-dom/vitest\"; - without it, matchers "
         "such as toBeInTheDocument() do not exist - and must render components "
         "with @testing-library/react. "
-        # Said outright, because "these are the only packages available" was not
-        # read as forbidding it (#293): a react run was planned with "Define a
-        # TypeScript interface for Todo items" and "Initialize a React project
-        # with Vite, TypeScript, and Vitest", neither of which any worker in
-        # this image could ever satisfy. A prohibition costs one sentence; an
-        # unbuildable plan costs the whole run.
-        "There is no TypeScript and no build step: write plain JavaScript and "
-        "JSX in .js and .jsx files only, never .ts or .tsx, and do not add a "
-        "bundler, a compiler or a type checker."
+        # **This said "never .ts or .tsx" and it was wrong twice** (#293).
+        #
+        # Wrong on the facts: vite transpiles TypeScript through esbuild, so
+        # `.ts` and `.tsx` run under `vitest run` in this image without the
+        # `typescript` package. Measured both ways - a task that shipped
+        # `src/types/todo.ts` passed its gate and merged, and a `.tsx` component
+        # with a `@testing-library/react` test passes in the image directly.
+        # What is missing is the type *checker*, not the syntax.
+        #
+        # Wrong in effect, and worse: the prohibition moved into the worker's
+        # system prompt, where it outranks the work item - so a task whose
+        # `## Files` declared `src/components/TodoForm.tsx` told the model to
+        # write that path and the system prompt told it not to. The model obeyed
+        # the prompt, `apply_edits` refused the undeclared `.jsx` it wrote
+        # instead, and `written` came back empty three times over. Six attempts
+        # across two tasks, both escalated, for a rule that was not even true.
+        #
+        # So it states what is actually absent and leaves the paths to the
+        # contract that owns them - `SYSTEM`'s "write exactly the paths listed"
+        # is the rule that matters here, and a stack rule must never contradict
+        # it.
+        "TypeScript is transpiled but not type-checked: `.ts` and `.tsx` run "
+        "under vitest through vite's esbuild, there is no `tsc` and no "
+        "`typescript` package, so type errors will not be reported. Do not add "
+        "a bundler, a compiler or a type checker."
     ),
 }
