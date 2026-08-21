@@ -245,6 +245,35 @@ class Recorder:
     written: list[Path] = field(default_factory=list)
 
     @classmethod
+    def for_worker(cls, log_path: Path, *, cap: int | None = None) -> "Recorder":
+        """A recorder inside a worker container, writing one named log (#297).
+
+        Separate from `for_run` because the worker cannot use its shape twice
+        over. `for_run` derives `llm.jsonl` from a *run directory*, and a worker
+        has no run directory: `RunArtifacts.mount_flags` deliberately mounts only
+        `results/`, so the one thing a worker may write to is the directory its
+        result records go in. Widening that mount to the run root would let
+        model-generated code overwrite `events.jsonl`, which is the log the
+        orchestrator's own account of the run lives in.
+
+        So the caller passes the whole path, and passes a per-attempt one, for
+        the reason `RESULT_GLOB` gives about result records: a retry must not
+        overwrite the evidence of what the previous attempt did. That evidence is
+        the entire point here - the interesting case is three attempts that
+        failed *differently*, and one log per issue would keep only the last.
+
+        `cap` defaults to `max_chars()` exactly as `for_run` does, and it matters
+        more here: `propose_edits` sends whole file bodies and receives whole file
+        bodies, so an uncapped record of six attempts is a large amount of disk in
+        a directory that is kept forever.
+        """
+        return cls(
+            directory=Path(log_path).parent,
+            log=EventLog(Path(log_path), redact=_default_redactor()),
+            cap=max_chars() if cap is None else cap,
+        )
+
+    @classmethod
     def for_run(cls, run_directory: Path, *, cap: int | None = None) -> "Recorder":
         redactor = _default_redactor()
         return cls(

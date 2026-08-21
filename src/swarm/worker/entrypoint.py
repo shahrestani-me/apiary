@@ -1058,6 +1058,40 @@ def run_worker(
                 print(f"  · attempt {attempt + 1}; folding in the failure report")
                 goal = _with_feedback(goal, feedback)
 
+        # **Record the model call, if the operator asked for one** (#297).
+        #
+        # Installed here rather than in `main` so it lands after the attempt
+        # number is known: the log is named per attempt, because the failure
+        # worth reading is three attempts that failed *differently* and one log
+        # per issue would keep only the last.
+        #
+        # `propose_edits` is the one call in this system that writes the code and
+        # was the one call nobody could inspect. The orchestrator has recorded
+        # its own calls since #29 (`cli.main` installs a recorder); a worker is a
+        # different process in a different container and had no reader for the
+        # flag it was already being handed. A task that escalated after six
+        # attempts of "the model produced no edit inside the declared file set"
+        # is unanswerable without this - the gate never ran, so nothing else in
+        # the run directory says what the model chose.
+        #
+        # Into the results directory because that is the only thing mounted
+        # (`RunArtifacts.mount_flags`), and deliberately so: a wider mount would
+        # let model-generated code overwrite the run's own `events.jsonl`.
+        # Imported here, not at module scope, and the cycle is why: `capture`
+        # imports `artifacts`, which imports `worker.result`, which imports
+        # this module. That is the same reason `run_verify` reaches for
+        # `from .result import tail` locally rather than at the top.
+        from ..capture import Recorder as CaptureRecorder  # noqa: PLC0415
+        from ..capture import enabled as capture_enabled  # noqa: PLC0415
+        from ..capture import set_recorder as capture_install  # noqa: PLC0415
+
+        from .result import capture_path, result_dir  # noqa: PLC0415
+
+        if capture_enabled():
+            capture_install(
+                CaptureRecorder.for_worker(capture_path(result_dir(), issue, attempt))
+            )
+
         root = prepare_checkout(clone_url, workspace / f"issue-{issue}", base_commit, branch)
 
         writable = read_writable(root, contract.files)

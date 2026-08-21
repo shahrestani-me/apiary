@@ -589,6 +589,22 @@ def record_path(directory: str | Path, issue: int, attempt: int) -> Path:
     return Path(directory) / f"issue-{int(issue)}-attempt-{int(attempt)}.json"
 
 
+def capture_path(directory: str | Path, issue: int, attempt: int) -> Path:
+    """`<dir>/issue-<n>-attempt-<k>.llm.jsonl` - the model calls of one attempt.
+
+    Named here rather than in `capture.py` because this module owns the
+    `issue-<n>-attempt-<k>` shape and a second speller of it is how the two
+    drift. Per attempt for `RESULT_GLOB`'s reason, and it matters more for this
+    file than for the record beside it: the interesting failure is three attempts
+    that failed *differently*, and one log per issue would keep only the last.
+
+    `.llm.jsonl` rather than `.jsonl`, so `RESULT_GLOB` - `issue-*-attempt-*.json`
+    - cannot match it. A capture read as a result record would be a malformed
+    record, and the reconciler reads that directory every cycle.
+    """
+    return Path(directory) / f"issue-{int(issue)}-attempt-{int(attempt)}.llm.jsonl"
+
+
 def has_result(directory: str | Path, issue: int, attempt: int) -> bool:
     return record_path(directory, issue, attempt).exists()
 
