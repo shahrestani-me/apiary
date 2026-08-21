@@ -830,13 +830,57 @@ def test_a_denied_index_names_the_operator_fix(tmp_path, monkeypatch):
         _pip(1, stderr="ERROR: HTTP error 403 while getting flask: 403 Filtered"),
     )
 
-    failure = entrypoint.install_dependencies(tmp_path)
+    # Exit 2 now, not a failed task: an index this run cannot reach is not
+    # something an attempt can fix, and charging attempts for it hands a human a
+    # task no worker could have completed. The hint still rides along, because
+    # the operator reading the exit-2 record is the person who can fix it.
+    with pytest.raises(entrypoint.InfrastructureError) as raised:
+        entrypoint.install_dependencies(tmp_path)
 
-    assert failure is not None
+    failure = str(raised.value)
     assert "APIARY_EGRESS_ALLOW=<host>" in failure
     assert "allowed by default" in failure
     # The old text sent the reader to allow the two hosts that now ship allowed.
     assert "pypi.org,files.pythonhosted.org" not in failure
+
+
+def test_a_registry_that_answered_badly_costs_no_attempt(tmp_path, monkeypatch):
+    """A 503 is the registry's problem by definition, and the next attempt may
+    well clear it. Charging an attempt for it is how three transient blips hand
+    a human a task no worker could have failed at.
+
+    This is only worth defending because installing moved per task: while the
+    react toolchain was baked into the image a react task installed nothing, and
+    a registry could not fail it at all.
+    """
+    (tmp_path / "requirements.txt").write_text("flask\n")
+    monkeypatch.setattr(
+        entrypoint.subprocess,
+        "run",
+        _pip(1, stderr="ERROR: 503 Service Unavailable for url: https://pypi.org/simple/flask/"),
+    )
+
+    with pytest.raises(entrypoint.InfrastructureError):
+        entrypoint.install_dependencies(tmp_path)
+
+
+def test_a_dependency_that_does_not_exist_is_still_the_tasks_fault(tmp_path, monkeypatch):
+    """The other side of the split, and the one that must not drift: a wrong pin
+    in a manifest is the task's own defect, the error text is exactly the
+    feedback the next attempt needs, and an attempt is the right price. An
+    infrastructure verdict here would retry a typo until the ceiling stopped
+    it and then tell a human the registry was down."""
+    (tmp_path / "requirements.txt").write_text("flsk\n")
+    monkeypatch.setattr(
+        entrypoint.subprocess,
+        "run",
+        _pip(1, stderr="ERROR: No matching distribution found for flsk"),
+    )
+
+    failure = entrypoint.install_dependencies(tmp_path)
+
+    assert failure is not None
+    assert "No matching distribution" in failure
 
 
 def test_a_hung_install_is_a_failure_not_a_wait(tmp_path, monkeypatch):
@@ -847,10 +891,13 @@ def test_a_hung_install_is_a_failure_not_a_wait(tmp_path, monkeypatch):
 
     monkeypatch.setattr(entrypoint.subprocess, "run", hang)
 
-    failure = entrypoint.install_dependencies(tmp_path)
+    # Infrastructure: the timeout is far more install than a generated manifest
+    # needs, so hitting it means a registry stopped answering rather than a
+    # dependency tree the task should have made smaller.
+    with pytest.raises(entrypoint.InfrastructureError) as raised:
+        entrypoint.install_dependencies(tmp_path)
 
-    assert failure is not None
-    assert "timed out" in failure
+    assert "timed out" in str(raised.value)
 
 
 # --------------------------------------------------------------------------
