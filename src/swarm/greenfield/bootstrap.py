@@ -115,31 +115,40 @@ BOOTSTRAP_FILES: dict[str, tuple[str, ...]] = {
         "src/index.js",
         "test/index.test.js",
     ),
+    # TypeScript throughout, and eight files rather than seven (#295). The extra
+    # one is `src/lib/utils.ts`, and it is the reason the rest of the stack's
+    # promise holds: every shadcn component imports `cn` from there, so a project
+    # without it is a project where the first component task has to invent its own
+    # class-merging helper - or import one that does not exist, which is the
+    # unresolvable-import failure #293 was about.
     "react": (
         "package.json",
-        # Declared even though nothing but the gate reads it, and precisely
-        # because of that: `vitest run` cannot transform JSX without
-        # `@vitejs/plugin-react`, and the config is where that is turned on. A
-        # bootstrap that left it undeclared would write a project whose gate
-        # cannot parse its own source.
-        "vitest.config.js",
+        # The compiler's config. Nothing in the gate reads it - vite transpiles
+        # without it and `tsc` never runs - but an editor does, and a TypeScript
+        # project whose types resolve nowhere is one every human who clones it has
+        # to repair before reading it.
+        "tsconfig.json",
+        # `.ts`, not `.js`, and declared even though only the gate reads it: this
+        # config is where `@vitejs/plugin-react` and `@tailwindcss/vite` are
+        # registered, and a bootstrap that left it undeclared would write a
+        # project whose gate cannot parse its own source or resolve a utility
+        # class.
+        "vite.config.ts",
         "index.html",
-        "src/main.jsx",
-        "src/App.jsx",
-        # **A stylesheet, because the model writes one whether it is declared or
-        # not** (#293). Observed live: asked for "a beautiful list of to do", the
-        # bootstrap emitted `import "./App.css"` from an undeclared path. It was
-        # obeying the rule it had - it did not *write* the file - and the task was
-        # unwinnable anyway: vite cannot resolve the import, the test file never
-        # loads, and the gate reports zero tests. Three identical attempts, then a
-        # human.
-        #
-        # `worker/edit.SYSTEM` now forbids importing a path that cannot resolve,
-        # which is the general fix. This is the other half: for a stack whose
-        # briefs routinely ask for something that looks good, "do without styles"
-        # is a worse answer than one declared file.
-        "src/App.css",
-        "test/App.test.jsx",
+        "src/main.tsx",
+        "src/App.tsx",
+        # One stylesheet, holding `@import "tailwindcss";` and nothing else.
+        # Declared because the model writes a stylesheet whether it is declared or
+        # not - observed live: asked for "a beautiful list of to do", the bootstrap
+        # emitted `import "./App.css"` from an undeclared path, vite could not
+        # resolve it, the test file never loaded, and three identical attempts
+        # later a human was asked about a CSS file (#293). Naming it `index.css`
+        # rather than `App.css` because it is the Tailwind entrypoint for the whole
+        # application, not one component's rules.
+        "src/index.css",
+        # The `cn` helper: `twMerge(clsx(inputs))`. See the note above the tuple.
+        "src/lib/utils.ts",
+        "test/App.test.tsx",
     ),
 }
 
@@ -209,6 +218,8 @@ Answer with exactly one of: python, node, react.
 
 - react means React on the web: anything with a user interface, a dashboard,
   a page, a form, a visualisation, something a person looks at in a browser.
+  The words "frontend", "front end", "web app", "web application", "UI" and
+  "single-page app" all mean this one, whether or not React is named.
 - node means a JavaScript program with no user interface.
 - python means a service, an API, a CLI, a library, a script, a data pipeline -
   anything whose users are other programs or a terminal.

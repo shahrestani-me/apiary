@@ -103,7 +103,10 @@ def test_react_means_react_web():
     model that answered "react" meaning Native would get a Node image."""
     assert "react" in KNOWN_STACKS
     assert BOOTSTRAP_FILES["react"] != BOOTSTRAP_FILES["node"]
-    assert any(path.endswith(".jsx") for path in BOOTSTRAP_FILES["react"])
+    # `.tsx`, not `.jsx` (#295): the stack generates TypeScript now. Still a
+    # React-on-the-web assertion - what distinguishes it from `node` is a
+    # component file, whichever extension the ecosystem is on this year.
+    assert any(path.endswith(".tsx") for path in BOOTSTRAP_FILES["react"])
 
 
 def test_an_unreachable_model_falls_back_rather_than_failing_the_run():
@@ -816,7 +819,9 @@ def test_the_react_bootstrap_declares_the_config_its_gate_needs():
     `vitest.config.js` is where that is turned on. Undeclared, the bootstrap
     would write a project whose gate cannot parse its own source - and
     `apply_edits` would refuse the file if the model wrote it anyway."""
-    assert "vitest.config.js" in BOOTSTRAP_FILES["react"]
+    # `vite.config.ts` since #295 - one config registering both the react and
+    # the tailwind plugin, in the language the rest of the project is in.
+    assert "vite.config.ts" in BOOTSTRAP_FILES["react"]
 
 
 def _npm_specs(text: str) -> set[str]:
@@ -1003,7 +1008,9 @@ def test_the_react_bootstrap_declares_the_stylesheet_it_will_import():
     """
     files = BOOTSTRAP_FILES["react"]
 
-    assert "src/App.css" in files
+    # `src/index.css` since #295: it holds `@import "tailwindcss";` and is the
+    # entrypoint for the whole application rather than one component's rules.
+    assert "src/index.css" in files
     assert len(files) <= MAX_BOOTSTRAP_FILES
 
 
@@ -1047,3 +1054,97 @@ def test_the_worker_is_told_the_declared_paths_include_their_extensions():
 
     assert "including" in SYSTEM and "extensions" in SYSTEM
     assert "a file you were not given is a file you cannot create" in SYSTEM
+
+
+# --------------------------------------------------------------------------
+# The modern react stack (#295)
+# --------------------------------------------------------------------------
+
+
+def test_the_react_stack_ships_typescript_and_tailwind():
+    """The stack generated plain JSX with a hand-written stylesheet, so a brief
+    asking for something that looks good got whatever CSS the model invented
+    that day. Both were already reachable in the image and neither was offered."""
+    names = package_names()
+
+    assert "typescript" in names
+    assert "tailwindcss" in names and "@tailwindcss/vite" in names
+    # Types packages are the one kind whose absence is invisible to CI - vite
+    # does not need them and `tsc` is not in the gate - and obvious to a human.
+    assert "@types/react" in names
+
+
+def test_the_react_stack_ships_the_shadcn_vocabulary():
+    """shadcn/ui cannot be a dependency: it is a CLI that copies source into the
+    project, and running it needs the registry a worker is denied. What ships is
+    everything its components are built from, so the generator can write the
+    idiom rather than fetch it."""
+    names = package_names()
+
+    for package in ("class-variance-authority", "clsx", "tailwind-merge",
+                    "lucide-react", "@radix-ui/react-slot"):
+        assert package in names, package
+
+
+def test_shadcn_itself_is_not_in_the_toolchain():
+    """The trap this guards: `shadcn` and `shadcn-ui` both exist on npm, and
+    installing either gets you the CLI - which needs a network to do the one
+    thing it does. A worker that ran it would fail with a denied egress and a
+    confusing message about a registry."""
+    names = package_names()
+
+    assert not any("shadcn" in name for name in names)
+
+
+def test_the_bootstrap_ships_the_cn_helper_the_idiom_depends_on():
+    """Every shadcn component imports `cn` from `src/lib/utils.ts`. Without it in
+    the first commit, the first component task either invents its own helper or
+    imports one that does not exist - and an unresolvable import is the failure
+    #293 was about."""
+    files = BOOTSTRAP_FILES["react"]
+
+    assert "src/lib/utils.ts" in files
+    assert len(files) <= MAX_BOOTSTRAP_FILES
+
+
+def test_the_react_bootstrap_is_typescript_throughout():
+    """A project whose entrypoint is `.jsx` and whose components are `.tsx` is
+    one the planner has to guess about."""
+    files = BOOTSTRAP_FILES["react"]
+
+    assert not any(path.endswith((".jsx", ".js")) for path in files), files
+    for expected in ("tsconfig.json", "vite.config.ts", "src/main.tsx", "src/App.tsx"):
+        assert expected in files, expected
+
+
+def test_the_react_prompt_names_the_idiom_concretely_enough_to_reproduce():
+    """"Use shadcn" is not an instruction a model can follow offline. The parts
+    are: merge with `cn`, vary with `cva`, type with `VariantProps`, pass through
+    with `asChild`."""
+    rule = STACK_RULE["react"]
+
+    for part in ("cn", "cva", "VariantProps", "asChild", "lucide-react"):
+        assert part in rule, part
+    # And it says the CLI is unavailable, because that is the first thing a model
+    # reaches for when told "shadcn".
+    assert "npx shadcn" in rule
+
+
+def test_the_react_prompt_forbids_the_tailwind_config_files_that_are_not_needed():
+    """Tailwind 4 is CSS-first. A model that writes `tailwind.config.js` and
+    `postcss.config.js` anyway has written two files it was not given, which
+    `apply_edits` refuses - so the prompt says not to rather than letting the
+    refusal teach it."""
+    rule = STACK_RULE["react"]
+
+    assert "tailwind.config.js" in rule and "Never write" in rule
+    assert '@import \\"tailwindcss\\";' in rule or '@import "tailwindcss";' in rule
+
+
+def test_frontend_and_web_resolve_to_the_react_stack():
+    """The words an operator actually types. Relying on the model to infer that
+    "a frontend for X" means React is a coin flip the vocabulary can remove."""
+    from swarm.greenfield.bootstrap import SYSTEM as CHOOSE_SYSTEM
+
+    for word in ("frontend", "web app", "UI"):
+        assert word in CHOOSE_SYSTEM, word

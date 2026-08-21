@@ -62,9 +62,19 @@ FROM node:22-bookworm-slim AS deps
 RUN mkdir -p /deps && chown node:node /deps
 USER node
 WORKDIR /deps
+#
+# Kept in the same order as `REACT_TOOLCHAIN` and grouped the way it is grouped,
+# so the drift test's failure is readable when it fires: runtime, then types and
+# the compiler, then the build and styling plugins, then the shadcn/ui
+# vocabulary, then the test tooling.
 RUN npm install --no-audit --no-fund --ignore-scripts --loglevel=error \
-      react@18 react-dom@18 vitest@2 @vitejs/plugin-react@4 jsdom@25 \
-      @testing-library/react@16 @testing-library/jest-dom@6
+      react@19 react-dom@19 \
+      @types/react@19 @types/react-dom@19 typescript@5 \
+      vite@6 @vitejs/plugin-react@4 tailwindcss@4 @tailwindcss/vite@4 \
+      class-variance-authority@0.7 clsx@2 tailwind-merge@3 lucide-react@0 \
+      @radix-ui/react-slot@1 @radix-ui/react-dialog@1 @radix-ui/react-label@2 \
+      vitest@2 jsdom@25 @testing-library/react@16 \
+      @testing-library/jest-dom@6 @testing-library/user-event@14
 
 
 FROM python:3.12-slim AS build
