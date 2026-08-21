@@ -899,3 +899,28 @@ def test_from_worker_reports_the_gate_and_the_verdict(tmp_path):
         WorkerResult(**{**vars(result), "commit": None}), run_id=RUN_ID, attempt=2
     )
     assert nothing.exit_code == EXIT_TASK_FAILED and "changed nothing" in nothing.reason
+
+
+def test_a_capture_is_named_per_attempt_beside_its_record():
+    """#297. The failure worth reading is three attempts that failed *differently*,
+    and one log per issue would keep only the last - the same argument
+    `RESULT_GLOB` makes about result records."""
+    from swarm.worker.result import capture_path, record_path
+
+    first = capture_path("/artifacts", 12, 0)
+    second = capture_path("/artifacts", 12, 1)
+
+    assert first.name == "issue-12-attempt-0.llm.jsonl"
+    assert first != second
+    assert first.parent == record_path("/artifacts", 12, 0).parent
+
+
+def test_a_capture_can_never_be_read_as_a_result_record():
+    """`.llm.jsonl`, so `RESULT_GLOB` cannot match it. The reconciler globs that
+    directory every cycle, and a capture parsed as a record is a malformed record
+    on the path that decides what the run believes."""
+    import fnmatch
+
+    from swarm.worker.result import RESULT_GLOB, capture_path
+
+    assert not fnmatch.fnmatch(capture_path(".", 12, 0).name, RESULT_GLOB)
