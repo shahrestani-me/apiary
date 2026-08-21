@@ -67,3 +67,82 @@ def package_names(specs: tuple[str, ...] = REACT_TOOLCHAIN) -> tuple[str, ...]:
     scoped package into an empty string.
     """
     return tuple(spec.rpartition("@")[0] for spec in specs)
+#: Everything a stack's bootstrap must be told beyond "write these files",
+#: spliced into the goal the worker is handed.
+#:
+#: **Named for the stack and not for dependencies**, because for one stack it
+#: is only about dependencies and for another it is not. It began as a single
+#: sentence - "no dependencies beyond the language's standard library" - which
+#: is the correct instruction for Python and for `node --test` and an
+#: impossible one for React: react and react-dom *are* dependencies, and a
+#: model obeying the rule literally would write no React at all. Whatever the
+#: next stack needs said belongs here, whether or not it is about packages.
+#:
+#: React's entry names the packages, because that list is the whole contract
+#: with the image: a worker has no route to a registry (docs/security.md §3),
+#: so a package outside this set is not slow to add, it is unobtainable.
+#:
+#: **The `@testing-library/jest-dom` import line is not decoration.**
+#: Installing that package supplies nothing on its own - `expect` learns
+#: `toBeInTheDocument` only once the registration module has run - and
+#: `toBeInTheDocument()` is what a model writes whether or not anything told it
+#: to. So the package is in the image *and* the prompt demands the import. One
+#: without the other produces exactly the failure the package is there to
+#: prevent, on a project that is otherwise correct.
+#:
+#: **It has to be an import in the test file; `setupFiles` does not work.**
+#: Measured: `setupFiles: ["@testing-library/jest-dom/vitest"]` resolves to
+#: `/node_modules/@testing-library/jest-dom/dist/vitest.mjs`, which Vite then
+#: reads as a root-*relative URL* under the project root and fails to load -
+#: "Does the file exist?", about a file that does. It is the second consequence
+#: of putting the toolchain at `/` (see `Dockerfile.worker.react` on why
+#: `NODE_PATH` was not an option either): a bare specifier inside a source file
+#: resolves by walking parent directories and works, an absolute path handed to
+#: Vite's config does not.
+#:
+#: The package list hangs off "already installed", never off a prohibition.
+#: Written the other way - "do not add any others: react, react-dom, ..." - the
+#: colon binds to the nearest clause, and a plausible reading is that React
+#: itself is the forbidden thing.
+STACK_RULE: dict[str, str] = {
+    "python": "Use no dependencies beyond the language's standard library.",
+    "node": "Use no dependencies beyond the language's standard library.",
+    "react": (
+        "This is React on the web, not React Native. "
+        "These packages are already installed and are the only ones available: "
+        + ", ".join(package_names())
+        + ". There is no network, so do not import or declare anything else. "
+        "package.json must set \"type\": \"module\" and list exactly those "
+        "packages. vitest.config.js must export a config that uses the "
+        "@vitejs/plugin-react plugin and sets test.environment to \"jsdom\" and "
+        "test.globals to true. Every test file must begin with the line "
+        "import \"@testing-library/jest-dom/vitest\"; - without it, matchers "
+        "such as toBeInTheDocument() do not exist - and must render components "
+        "with @testing-library/react. "
+        # **This said "never .ts or .tsx" and it was wrong twice** (#293).
+        #
+        # Wrong on the facts: vite transpiles TypeScript through esbuild, so
+        # `.ts` and `.tsx` run under `vitest run` in this image without the
+        # `typescript` package. Measured both ways - a task that shipped
+        # `src/types/todo.ts` passed its gate and merged, and a `.tsx` component
+        # with a `@testing-library/react` test passes in the image directly.
+        # What is missing is the type *checker*, not the syntax.
+        #
+        # Wrong in effect, and worse: the prohibition moved into the worker's
+        # system prompt, where it outranks the work item - so a task whose
+        # `## Files` declared `src/components/TodoForm.tsx` told the model to
+        # write that path and the system prompt told it not to. The model obeyed
+        # the prompt, `apply_edits` refused the undeclared `.jsx` it wrote
+        # instead, and `written` came back empty three times over. Six attempts
+        # across two tasks, both escalated, for a rule that was not even true.
+        #
+        # So it states what is actually absent and leaves the paths to the
+        # contract that owns them - `SYSTEM`'s "write exactly the paths listed"
+        # is the rule that matters here, and a stack rule must never contradict
+        # it.
+        "TypeScript is transpiled but not type-checked: `.ts` and `.tsx` run "
+        "under vitest through vite's esbuild, there is no `tsc` and no "
+        "`typescript` package, so type errors will not be reported. Do not add "
+        "a bundler, a compiler or a type checker."
+    ),
+}

@@ -150,6 +150,7 @@ from .derived import CLAIMED as CLAIMED_STATE
 from .derived import ELIGIBLE, LANDED, NEEDS_HUMAN, Budget
 from .derived import REVIEW as REVIEW_STATE
 from .dispatcher import Capacity, DispatchReport, Spawner, dispatch
+from .reachable import stranded
 
 #: The two labels no other module owns, and therefore the only two spelled out
 #: here. Nothing in this module decides on them any more - transitions carry
@@ -1780,6 +1781,24 @@ class CycleReport:
         return self.goal is None or self.goal.done
 
     @property
+    def escalated(self) -> tuple[Transition, ...]:
+        """The transitions this cycle *landed* onto `needs-human`.
+
+        From what landed rather than what was planned - `fold`'s rule, for
+        `fold`'s reason. Read from all three writers, because an escalation is
+        reached from three different places and a property that knew about only
+        one would be silently right most of the time: the give-up in this
+        module's own counter, the recovery sweep's stale-claim cap, and the
+        merge gate's `_retry_or_give_up`, which is where most of them come from.
+        """
+        landed = [*self.result.applied]
+        if self.recovered is not None:
+            landed += [*self.recovered.result.applied]
+        if self.checks is not None:
+            landed += [*self.checks.applied]
+        return tuple(item for item in landed if item.to_state == NEEDS_HUMAN)
+
+    @property
     def needs_judgement(self) -> bool:
         """Is this cycle worth paying the judge's model swap for?
 
@@ -1790,8 +1809,28 @@ class CycleReport:
         An exhausted ledger is excluded because it has its own question and its
         own model call: the goal gate. Judging it as well would spend two swaps
         to be told twice that there is nothing left to move.
+
+        **An escalation is the exception, and #293 is why it has to be.** A task
+        reaching `needs-human` is the single most informative thing that happens
+        in a run and it is also, unavoidably, a `changed` cycle - so the one
+        event most worth judging was the one event guaranteed to be skipped.
+        Over sixteen recorded runs the stall counter reached `max_stalls` six
+        times in 1,211 cycles and *never* on the cycle a task died, which is why
+        no replan ever followed a failure. The model swap is affordable here for
+        the reason the rest of this docstring rejects it elsewhere: the
+        arithmetic has genuinely run out of things to say, and the alternative is
+        a plan nobody re-examines.
+
+        Order matters. `exhausted` still wins, and now usually applies: with the
+        liveness fix an escalation tends to drain the ledger, and the goal gate
+        is the better of the two questions - it can revive the failed task,
+        which the judge cannot.
         """
-        if self.changed or self.exhausted:
+        if self.exhausted:
+            return False
+        if self.escalated:
+            return True
+        if self.changed:
             return False
         return self.dispatched is None or self.dispatched.needs_judgement
 
@@ -2345,6 +2384,13 @@ class Reconciler:
                         holding=tuple(set(handles) - disposed_this_cycle),
                     )
 
+        # Computed here rather than inside `CycleReport` because it needs the
+        # belief as it stands at the *end* of the cycle - folded by `apply_plan`,
+        # the recovery sweep and the merge gate - which is `fold`'s rule and the
+        # same reason the goal gate below is handed this belief and not the one
+        # `believe` returned at the top.
+        unreachable = stranded(ledger, belief)
+
         report = CycleReport(
             belief=belief,
             index=index,
@@ -2372,11 +2418,27 @@ class Reconciler:
             # not terminal and therefore live. Counting the belief's keys
             # instead would read an unresolved cycle as a finished plan and end
             # the run on its first pass.
+            # **Over the reachable plan, not the whole ledger** (#293). The
+            # paragraph above is about which *source* answers "is this task
+            # terminal"; this clause is about a task that is not terminal and
+            # not reachable either. A task held at `blocked` behind a
+            # `needs-human` dependency can never become eligible - readiness
+            # discharges a dependency only when its issue is closed as
+            # completed, and an escalated issue stays open - so counting it as
+            # live meant the ledger never exhausted, `close_the_loop` was never
+            # called, and the revival that could have rescued the failure was
+            # unreachable *because of* the failure. Measured: 1,211 cycles
+            # across sixteen runs, zero goal-gate calls, every run ending with
+            # live work outstanding. `reachable.py` carries the argument and the
+            # rule that in-flight work is never stranded.
             live=sum(
                 1
                 for entry in ledger.entries.values()
-                if belief.state(entry.task_id) not in FINISHED_STATES
-                or entry.ref in self._revived
+                if entry.ref in self._revived
+                or (
+                    belief.state(entry.task_id) not in FINISHED_STATES
+                    and entry.task_id not in unreachable
+                )
             ),
         )
         # `belief`, as it stands *here* - folded by `apply_plan`, the recovery

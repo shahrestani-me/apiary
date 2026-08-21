@@ -447,8 +447,50 @@ def test_a_failure_outside_the_file_set_needs_a_human_not_a_replan():
     blocker = verdict.blockers[0]
     assert blocker.task_id == "task-1" and blocker.number == 1
     assert blocker.paths == ("src/swarm/orchestrator/reconcile.py",)
-    assert not verdict.should_replan(max_stalls=1)
+    # The refusal still holds - #1 is the only task not already finished, so
+    # there is nothing a new decomposition could move - but it is `decide`'s to
+    # make now rather than `should_replan`'s (#293). The stall budget *is* spent,
+    # which is all that property answers.
+    assert verdict.should_replan(max_stalls=1)
     assert decide(verdict) == NEEDS_HUMAN
+
+
+def test_one_unhelpable_task_no_longer_vetoes_replanning_the_others():
+    """The narrowing, as the case that used to be indistinguishable.
+
+    #1 is failing on a file it may not edit, exactly as above, and no replan can
+    help it. #3 is an ordinary stalled task, and a replan is precisely what it
+    needs. The old rule read "some task is unhelpable" and refused the whole
+    run, so #3 was never re-cut - and because a stalled run nearly always has
+    one #1 in it, that made the replan close to unreachable.
+    """
+    stuck = ledger(
+        entry(1, attempt=2, files=("src/swarm/nodes/judge.py",)),
+        entry(3, attempt=2, files=("src/swarm/other.py",)),
+    )
+    outside = record(
+        1,
+        attempt=1,
+        reason="ImportError: cannot import name 'Verdict'",
+        output="src/swarm/orchestrator/reconcile.py:12: ImportError",
+    )
+    inside = record(
+        3,
+        attempt=1,
+        reason="AssertionError",
+        output="src/swarm/other.py:8: AssertionError",
+    )
+
+    verdict = verdict_of(
+        stuck,
+        stuck,
+        results={ref(1): outside, ref(3): inside},
+        prior_results={ref(1): outside, ref(3): inside},
+    )
+
+    assert verdict.needs_human
+    assert [b.task_id for b in verdict.blockers] == ["task-1"]
+    assert decide(verdict, max_stalls=1) == ""
 
 
 def test_a_failure_inside_the_file_set_is_the_tasks_own_problem():

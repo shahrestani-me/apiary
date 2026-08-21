@@ -27,10 +27,10 @@ import pytest
 from swarm.github.ledger import DEFAULT_STACK, KNOWN_STACKS, parse_contract
 from swarm.config import SETTINGS
 from swarm.greenfield.provision import CI_SETUP, PLACEHOLDER_VERIFY
-from swarm.greenfield.stacks import REACT_TOOLCHAIN, package_names
+from swarm.greenfield.stacks import STACK_RULE, REACT_TOOLCHAIN, package_names
+from swarm.worker.edit import system_for
 from swarm.greenfield.bootstrap import (
     BOOTSTRAP_FILES,
-    STACK_RULE,
     STACK_VERIFY,
     FALSIFY_TIMEOUT_S,
     ProposedGate,
@@ -868,22 +868,35 @@ def test_the_react_toolchain_is_pinned_identically_everywhere():
     assert _npm_specs(ci) == set(REACT_TOOLCHAIN)
 
 
-def test_the_react_bootstrap_is_not_told_to_use_the_standard_library_only():
+def test_the_react_worker_is_not_told_to_use_the_standard_library_only():
     """Every bootstrap used to be, and for React the instruction is impossible:
     react and react-dom *are* dependencies, so a model obeying it literally
     would write no React at all. The React text names the packages instead,
     because a worker has no route to a registry - anything outside that set is
-    not slow to add, it is unobtainable."""
-    goal = Bootstrap(prompt="a dashboard", stack="react", files=()).goal
+    not slow to add, it is unobtainable.
 
-    assert "standard library" not in goal
-    assert "React Native" in goal
+    **Asserted on the system prompt, not the goal** (#293). The rule used to be
+    spliced into the issue body, which made it an instruction on the one channel
+    the orchestrator does not control - anyone with repository access can edit a
+    work item. It is handed down at dispatch now; `system_for` is the whole of
+    what the orchestrator says.
+    """
+    system = system_for("react")
+
+    # The *python* rule, not the phrase. `SYSTEM` has always carried a general
+    # "prefer the standard library when it suffices", which is a preference and
+    # reaches every stack; what must never reach react is the flat prohibition,
+    # because react and react-dom are dependencies by definition. Asserting on
+    # the phrase alone passed only while the rule lived in a stack-specific goal.
+    assert STACK_RULE["python"] not in system
+    assert "no dependencies beyond" not in system
+    assert "React Native" in system
     for name in ("react", "vitest", "@testing-library/react"):
-        assert name in goal
+        assert name in system
     # The version pins belong to the image and the workflow, not to a prompt: a
     # model asked to reproduce them would put them in `package.json` and be
     # graded on typing accuracy.
-    assert "react@18" not in goal
+    assert "react@18" not in system
 
 
 def test_a_scoped_package_survives_having_its_version_stripped():
@@ -932,13 +945,34 @@ def test_the_react_rule_never_hangs_the_package_list_off_a_prohibition():
     assert "do not" not in before_list
 
 
-def test_the_python_bootstrap_still_gets_the_standard_library_rule():
+def test_the_python_worker_still_gets_the_standard_library_rule():
     """The per-stack split must not have quietly relaxed the stacks it was not
-    about. Python's gate is `python3 -m unittest` in an image with no installer
-    reachable, so the rule is as load-bearing as it ever was."""
-    goal = Bootstrap(prompt="a CLI", stack="python", files=()).goal
+    about, and neither must the move to the system prompt: a worker image has no
+    installer reachable, so the rule is as load-bearing as it ever was."""
+    assert "standard library" in system_for("python")
 
-    assert "standard library" in goal
+
+def test_the_task_goal_carries_no_behavioural_rules_at_all():
+    """The property the move exists for (#293).
+
+    `docs/issue-contract.md` says what a goal is - "one sentence: what must be
+    true when this is done" - a specification. A work item is a document anyone
+    with repository access can edit and its comments are a channel anyone can
+    write to, so a rule that lives there is a rule set by whoever typed last.
+    Instructions come from the orchestrator; the work item is data.
+    """
+    goal = Bootstrap(prompt="a beautiful to-do list", stack="react", files=()).goal
+
+    for directive in ("TypeScript", "jsdom", "standard library", "@testing-library",
+                      "do not add", "never .ts"):
+        assert directive not in goal, f"the goal is carrying an instruction: {directive!r}"
+
+
+def test_an_unknown_stack_is_told_nothing_it_cannot_act_on():
+    """A `--repo` run against someone else's repository has no entry in the
+    table, and inventing one would be the orchestrator asserting a constraint it
+    has no evidence for."""
+    assert system_for("cobol") == system_for(None)
 
 
 def test_the_python_workflow_installs_the_gates_tool():
@@ -951,3 +985,65 @@ def test_the_python_workflow_installs_the_gates_tool():
     steps = "\n".join(CI_SETUP["python"])
 
     assert "pip install" in steps and "pytest" in steps
+
+
+def test_the_react_bootstrap_declares_the_stylesheet_it_will_import():
+    """Observed live (#293): asked for "a beautiful list of to do", the react
+    bootstrap emitted `import "./App.css"` from an undeclared path.
+
+    It was obeying the rule it had - a worker may only *write* declared files, and
+    it wrote none it should not have. The task was unwinnable anyway: vite cannot
+    resolve the import, `test/App.test.jsx` never loads, `vitest run` reports zero
+    tests, and three identical attempts later a human is asked about a CSS file.
+
+    Two fixes, and this is the enabling half. `worker/edit.SYSTEM` forbids
+    importing a path that cannot resolve, which is the general rule for every
+    stack; for a stack whose briefs routinely ask for something that looks good,
+    "do without styles" is a worse answer than one declared file.
+    """
+    files = BOOTSTRAP_FILES["react"]
+
+    assert "src/App.css" in files
+    assert len(files) <= MAX_BOOTSTRAP_FILES
+
+
+def test_the_worker_is_told_that_an_unresolvable_import_fails_the_task():
+    """The prompt said "edit ONLY the files listed as editable" and nothing about
+    *importing* a path that is neither editable nor already there - so a model
+    could follow its instructions exactly and still write a task that cannot
+    pass. Stack-agnostic: `from .helpers import x` fails the same way."""
+    from swarm.worker.edit import SYSTEM
+
+    assert "Every relative import must resolve" in SYSTEM
+    assert "zero tests" in SYSTEM
+
+
+def test_a_stack_rule_never_argues_with_the_declared_paths():
+    """The regression that cost six attempts across two tasks (#293).
+
+    Authority over *how* to work is not authority over *which files*. The
+    orchestrator's prompt outranks the work item - that is the point of moving
+    `STACK_RULE` there - but the work item's `## Files` is the contract
+    `apply_edits` enforces, and a rule that contradicts it makes the task
+    unsatisfiable rather than better-behaved.
+
+    Measured: a stack rule saying "never .ts or .tsx" against tasks declaring
+    `src/components/TodoForm.tsx`. The model obeyed the prompt, wrote `.jsx`,
+    every edit was refused for being undeclared, `written` came back empty three
+    times, escalated. The rule was also false - vite transpiles both.
+    """
+    system = system_for("react")
+
+    assert "never .ts" not in system
+    assert "only, never" not in system
+    # And the prompt says outright which side wins when they seem to disagree.
+    assert "the list wins" in system
+
+
+def test_the_worker_is_told_the_declared_paths_include_their_extensions():
+    """`.tsx` and `.jsx` are different paths to `apply_edits`, and a model that
+    "helpfully" changes the extension has written a file it was not given."""
+    from swarm.worker.edit import SYSTEM
+
+    assert "including" in SYSTEM and "extensions" in SYSTEM
+    assert "a file you were not given is a file you cannot create" in SYSTEM

@@ -96,6 +96,7 @@ from .artifacts import (
     show_text,
 )
 from .nodes.planner import plan_node
+from .orchestrator.decision import decisions
 from .run import Attachment, RunError, start_run
 from .runners import capability_table
 
@@ -535,50 +536,38 @@ def _reset(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     `renewals` is preserved, because it is a history of the task rather than a
     claim about one attempt (`store.TaskJudgement`), and nothing branches on it.
+
+    **The decision itself moved to `store.reset`** (#293), because the console
+    grew a button for it, and two implementations of "what a reset is" would
+    diverge on exactly the subtleties above - `store/reset.py` carries them now,
+    and this reads them back rather than restating them. What stays here is the
+    terminal's half: the numbers printed before the write, and the confirmation.
     """
-    from .store import SqliteTaskStore, TaskJudgement
+    from .store.reset import reset_budget
     from .taskref import TaskRef
 
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "").strip()
     if not repo:
         parser.error("pass --repo owner/name, or export GITHUB_REPOSITORY")
-    if args.attempt < 0:
-        parser.error(f"--attempt {args.attempt} is negative; a counter starts at 0")
     try:
         ref = TaskRef(args.task.strip())
     except ValueError as exc:
         parser.error(str(exc))
 
-    with SqliteTaskStore.open(repo) as store:
-        held = store.read()
-        judgement = held.get(ref)
-        if judgement is None:
-            print(
-                f"{ref} has no judgment in {repo}'s store, so it already has a full "
-                f"budget - or it is spelled differently here."
-            )
-            if held:
-                print(f"  the store holds: {', '.join(str(one) for one in sorted(held))}")
-            return 0
-        print(
-            f"{ref} in {repo}: attempt {judgement.attempt} -> {args.attempt}, "
-            f"blocker {judgement.blocker or 'none'} -> none, "
-            f"streak {judgement.streak if judgement.streak is not None else 'none'} -> none, "
-            f"renewals {judgement.renewals} (kept)"
-        )
-        if not args.yes and not _confirm("reset this task's budget?"):
-            print("nothing written")
-            return 1
-        store.write(
-            TaskJudgement(
-                ref=ref,
-                attempt=args.attempt,
-                blocker="",
-                streak=None,
-                renewals=judgement.renewals,
-                updated_at=dt.datetime.now(dt.timezone.utc),
-            )
-        )
+    # Read first, so the confirmation describes a write that has not happened -
+    # `apply=False` exists for this call and no other.
+    try:
+        preview = reset_budget(repo, ref, attempt=args.attempt, apply=False)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(preview.sentence())
+    if not preview.found:
+        return 0
+    if not args.yes and not _confirm("reset this task's budget?"):
+        print("nothing written")
+        return 1
+
+    reset_budget(repo, ref, attempt=args.attempt)
     print(f"» {ref} reset; the next run may dispatch it again")
     return 0
 
@@ -1039,7 +1028,7 @@ def _loop(args, attachment: Attachment, *, source, verify: str = "") -> int:
 
     print()
     print(f"» artifacts in {artifacts.path}")
-    return _report_outcome(reports, outcome)
+    return _report_outcome(reports, outcome, repo=attachment.run.repo)
 
 
 def _report_cycle(artifacts: RunArtifacts):
@@ -1168,7 +1157,7 @@ def _merged(reports) -> tuple[int, ...]:
     return tuple(sorted(merged))
 
 
-def _report_outcome(reports, outcome: RunOutcome | None = None) -> int:
+def _report_outcome(reports, outcome: RunOutcome | None = None, *, repo: str = "") -> int:
     """The last word: was the objective met, and what is left if it was not.
 
     Non-zero when the run stopped short, because a swarm that gave up is a
@@ -1186,6 +1175,15 @@ def _report_outcome(reports, outcome: RunOutcome | None = None) -> int:
         return 0
     ending = outcome if outcome is not None else _outcome(reports)
     print(f"» {ending.reason}")
+    # **Printed whatever the ending was** (#293). An escalation is worth a
+    # decision whether the run then hit its cap, met the rest of its objective,
+    # or gave up - and the two readings this separates are "apiary is stuck" and
+    # "apiary is waiting for you", which used to produce the same one line.
+    # Before the early return for that reason: a capped run is the *most* likely
+    # one to be hiding a task nobody was told about.
+    if block := decisions(reports, repo=repo).text():
+        print()
+        print(block)
     if ending.kind != "failed":
         # The cap or `until` ended this, not the ledger. Whatever is still open
         # is still open, and the next invocation attaches to it.
@@ -1288,10 +1286,28 @@ def _target(
         # So the generated workflow sets up the right toolchain (#96) and the
         # first worker runs in the right image (#99).
         stack=bootstrap.stack,
-        # `--verify` is the operator's, and it is authoritative: #102 does not
-        # falsify a command they chose, because an escape hatch that can be
-        # refused is not one.
-        **({"verify_command": args.verify} if args.verify else {}),
+        # **The stack's real gate, not the placeholder** (#293). `provision`'s
+        # own docstring already said this was the design - "nothing the swarm
+        # creates uses [PLACEHOLDER_VERIFY] any more: `cli` provisions a plan
+        # carrying the stack the prompt implies, whose command is what the
+        # planner writes into every issue's `## Verify`" - but nothing passed
+        # it, so the dataclass default won and every greenfield repository was
+        # gated by `test -f README.md` forever.
+        #
+        # Forever is the word that matters. The claim that made the placeholder
+        # safe was that "the bootstrap's PR replaces both the files and the
+        # gate before any other task runs", and it cannot: rewriting
+        # `.github/workflows` needs the `workflows` permission and the work key
+        # is forbidden it (`console_build`'s field label says so), and
+        # `BOOTSTRAP_FILES` does not declare the workflow either. So the gate a
+        # repository is created with is the gate it dies with, and a run whose
+        # tasks demand comprehensive unit tests was grading them on whether a
+        # README exists - observed live on `fantasy-bestiary-2`.
+        #
+        # `--verify` still wins outright: #102 does not falsify a command the
+        # operator chose, because an escape hatch that can be refused is not
+        # one.
+        verify_command=args.verify or bootstrap.verify,
     )
     report = provision(plan, client, assume_yes=args.yes)
     print()

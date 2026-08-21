@@ -226,7 +226,7 @@ Constraints:
 - Two tasks must NEVER list the same file. If they would, merge them into one task.
 - Each task must be completable by editing only the files it lists.
 - Every path must be plausible for {stack}. Do not invent a stack the project
-  does not use.
+  does not use.{stack_rule}
 - Use depends_on only when a task literally cannot start before another finishes.
 - There is no target number of tasks, no minimum and no maximum. The count is
   whatever falls out of the rule below.
@@ -263,13 +263,36 @@ def system_prompt(*, verify: str | None = None, stack: str | None = None) -> str
     pass straight through to the writer. Putting them in front of the model
     costs nothing and is the difference between a plan whose tasks can pass and
     one whose tasks cannot.
+
+    **The stack's own constraints go in too, and #293 is why.** "Every path must
+    be plausible for a react project" is a statement about paths, and the model
+    read it as one: asked for a to-do app it planned "Define a TypeScript
+    interface for Todo items" and "Initialize a React project with Vite,
+    TypeScript, and Vitest". There is no TypeScript in the react image, no
+    network to fetch one, and no way for any worker to satisfy either task - a
+    whole plan that was unbuildable before the first container started.
+
+    The bootstrap task was already told exactly this (`STACK_RULE`), because it
+    is the task that writes `package.json`. Nothing told the planner, which is
+    the one deciding what the tasks *are*.
     """
+    # From `greenfield.stacks`, which imports nothing at all - the table moved
+    # there when the worker started reading it too (#293), because
+    # `greenfield.bootstrap` imports the LLM module and `worker/` may not.
+    # Lazy for the reason `reconcile` gives about `checks` and `goal`: an
+    # importer of this module should not pay for a graph it will not use.
+    from ..greenfield.stacks import STACK_RULE  # noqa: PLC0415
+
     # The same collapse `_one_line` does, inlined: that helper is defined far
     # below, and `SYSTEM` is built at import time.
     command = " ".join((verify or SETTINGS.verify_command or "").split())
+    rule = STACK_RULE.get(stack or "", "") if stack else ""
     return SYSTEM_RULES.format(
         verify=command,
         stack=f"a {stack} project" if stack else "the project's existing stack",
+        # Indented onto its own line so it reads as part of the bullet it
+        # qualifies rather than running on from the sentence above it.
+        stack_rule=f"\n  {rule}" if rule else "",
     )
 
 
@@ -892,6 +915,49 @@ def with_bootstrap(
 #: to the basename: `contest_rules.py` must not count as a test file.
 _TEST_FILE = re.compile(r"(^|/)(test_[^/]+\.py|[^/]+_test\.py)$")
 
+#: The same question for the JavaScript stacks: what `node --test` and `vitest
+#: run` collect. Both take `*.test.js`; vitest also takes `.jsx`, and the react
+#: scaffold's own suite is `test/App.test.jsx`.
+_TEST_FILE_JS = re.compile(r"(^|/)[^/]+\.test\.(js|jsx|mjs)$")
+
+#: How a repaired test file is named, per gate family: the marker that says the
+#: gate belongs to this family, the source extensions it tests, and how to build
+#: the test path from a module path.
+#:
+#: **A table rather than three branches, because the pytest-only version of this
+#: repair was silently doing nothing for two of three stacks** (#293). It keyed
+#: on the substring `pytest`, which is right for python and matches neither
+#: `node --test` nor `vitest run` - so a react task declaring one component and
+#: no test got no repair, and `vitest run` then passed on the *bootstrap's*
+#: suite and reported green without testing the new component. That is the false
+#: green, which is worse than the red it replaced.
+#: Each entry is (gate markers, source extensions, collection pattern, namer).
+#: The namer keeps the module's own extension for the JS stacks on purpose: a
+#: `.jsx` component tested from a `.js` file is not transformed by
+#: `@vitejs/plugin-react`, so the repair would add a file whose first JSX token
+#: is a syntax error.
+_REPAIRS: tuple[tuple[tuple[str, ...], tuple[str, ...], Any, Any], ...] = (
+    (
+        ("pytest",),
+        (".py",),
+        _TEST_FILE,
+        lambda directory, stem, ext: f"{directory}test_{stem}{ext}",
+    ),
+    (
+        ("node --test", "vitest"),
+        (".js", ".jsx", ".mjs"),
+        _TEST_FILE_JS,
+        # `test/`, not beside the module, and the node gate is why: it reads
+        # `test -n "$(ls test/*.test.js)" && node --test`, so a test written
+        # anywhere else is not merely uncollected - the guard sees no test files
+        # at all and the gate exits non-zero having run nothing. `vitest run`
+        # collects either location, and both scaffolds already write `test/`
+        # (`test/index.test.js`, `test/App.test.jsx`), so one directory serves
+        # both stacks and matches what the bootstrap laid down.
+        lambda directory, stem, ext: f"test/{stem}.test{ext}",
+    ),
+)
+
 
 def _with_test_file(files: tuple[str, ...], command: str) -> tuple[str, ...]:
     """A pytest gate with nothing to collect is exit 5, forever.
@@ -904,21 +970,36 @@ def _with_test_file(files: tuple[str, ...], command: str) -> tuple[str, ...]:
     contract that was unwinnable when it was written. Three attempts, one
     human reset, and a second identical failure - this repair is cheaper.
 
-    Deterministic and minimal: when the gate runs pytest and no listed file
-    matches pytest's default collection conventions, add `test_<module>.py`
-    beside the first listed module. A task with no `.py` file at all is left
-    alone - there is nothing sane to derive, and `parse_contract` will still
-    accept it, so refusing here would reject tasks (docs, configs) that some
-    other task's tests already cover.
+    Deterministic and minimal: when the gate is one this understands and no
+    listed file matches that gate's collection conventions, add one test file
+    beside the first listed module. A task with no source file the gate could
+    collect against is left alone - there is nothing sane to derive, and
+    `parse_contract` will still accept it, so refusing here would reject tasks
+    (docs, configs) that some other task's tests already cover.
+
+    **All three stacks, since #293.** This keyed on the substring `pytest` and
+    was therefore inert for `node --test` and `vitest run`. The python half of
+    that was already load-bearing - 57 of 66 recorded gate failures were a task
+    whose `## Files` could not satisfy its own gate - and the JS half fails
+    quieter and worse: `vitest run` collects the scaffold's suite, passes, and
+    merges an untested component. `_REPAIRS` is the table; a gate this table
+    does not recognise is still left alone.
     """
-    if "pytest" not in command or any(_TEST_FILE.search(path) for path in files):
-        return files
-    module = next((path for path in files if path.endswith(".py")), None)
-    if module is None:
-        return files
-    directory, _, name = module.rpartition("/")
-    prefix = f"{directory}/" if directory else ""
-    return (*files, f"{prefix}test_{name[:-3]}.py")
+    for markers, extensions, pattern, name_for in _REPAIRS:
+        if not any(marker in command for marker in markers):
+            continue
+        if any(pattern.search(path) for path in files):
+            return files
+        module = next(
+            (path for path in files if path.endswith(extensions)), None
+        )
+        if module is None:
+            return files
+        directory, _, name = module.rpartition("/")
+        stem, _, extension = name.rpartition(".")
+        prefix = f"{directory}/" if directory else ""
+        return (*files, name_for(prefix, stem, f".{extension}"))
+    return files
 
 
 def normalise(

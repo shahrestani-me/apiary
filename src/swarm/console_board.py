@@ -470,6 +470,14 @@ class BoardReader:
             "title": entry.title,
             "task_id": entry.task_id,
             "attempt": entry.attempt,
+            # **The ref as the store spells it**, so the page can hand it back
+            # verbatim (#293). The needs-human strip grew a button that resets a
+            # task's retry budget, and the store is keyed by ref - `#12` here,
+            # `ENG-123` on Linear. Sending the *number* instead would make the
+            # page mint a ref, which is the GitHub adapter leaking into the
+            # browser; `cli._reset` refuses to do it for the same reason and
+            # `tests/test_framework_boundary.py` enforces it one layer down.
+            "ref": str(entry.ref),
             "url": f"https://github.com/{repo}/issues/{entry.number}",
             # The fact that decided the column, in the resolver's own sentence.
             # `Verdict.because` is written for a human from the start; a card

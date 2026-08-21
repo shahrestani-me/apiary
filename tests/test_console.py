@@ -1063,3 +1063,59 @@ def test_a_missing_provider_extra_is_answered_with_the_install(console):
     ))
 
     assert "pip install" in fix
+
+
+def test_a_past_prompt_can_be_reused_without_retyping_it():
+    """The objective box opens empty on purpose - it is the *next* prompt, and
+    the requirement is immutable history. But "continue the run I just stopped"
+    was then a retyping exercise, and a brief is paragraphs: `cli._text` says a
+    phrase "gives a 31B model nothing to decompose", so an operator retyping from
+    memory types something shorter and quietly changes the run.
+
+    The button fills the box and nothing else - no firing, no writing - so the
+    prompt stays editable and the history stays read-only. The design the test
+    above pins is untouched: the box still *opens* empty.
+    """
+    script = asset("app.js")
+
+    assert "Use this prompt" in script
+    assert "setValues({ objective: p.objective })" in script
+    # In the summary row, not the collapsed body: a control nobody can see
+    # is a control that does not exist, which is how it was first shipped
+    # and first reported.
+    assert "s.appendChild(reuse)" in script
+    assert "e.stopPropagation()" in script
+    # Still opens empty; reuse is a deliberate press, not a default.
+    assert 'objective: ""' in script
+
+
+def test_the_needs_human_strip_offers_the_reset_the_report_prints():
+    """ADR 0002's gesture, on the row that says the task is stuck rather than in
+    a terminal the operator has to switch to. The ref travels verbatim from the
+    card - minting one from an issue number would put the GitHub adapter in the
+    browser."""
+    script = asset("app.js")
+
+    assert "Another attempt" in script
+    assert '"/swarm/reset"' in script
+    assert "{ reset: true, repo: b.repo }" in script
+
+
+def test_nothing_the_console_serves_may_be_cached():
+    """`asset()` re-reads its file per request so that editing `app.js` and
+    reloading shows the change - and the browser then cached `/app.js` at a
+    stable URL and defeated it. Observed live: three new controls shipped,
+    verified being served by curl, and invisible on the page through several
+    restarts of the server.
+
+    Asserted on the handler rather than through a socket: the header is written
+    in `_respond`, which every route shares, and that sharing is the property
+    worth pinning - every other route is live state too.
+    """
+    import inspect
+
+    import swarm.console
+
+    source = inspect.getsource(swarm.console)
+
+    assert 'send_header("Cache-Control", "no-store, must-revalidate")' in source

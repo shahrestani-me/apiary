@@ -74,7 +74,14 @@ from .console_board import BoardError, BoardReader
 from .console_build import BUILD_SITE, BUILD_SITE_KEY, BuildError, Builder
 from .console_intake import QUESTIONS as INTAKE_QUESTIONS
 from .console_projects import ProjectError, ProjectStore
-from .console_runs import SWARM_SITE, SwarmRunError, SwarmRuns, check_run_values
+from .console_runs import (
+    REPO_RE,
+    SWARM_SITE,
+    SwarmRunError,
+    SwarmRuns,
+    check_run_values,
+)
+from .store import StoreError
 
 __all__ = [
     "ASSETS",
@@ -516,6 +523,8 @@ class Console:
             return self._swarm_start(body)
         if method == "POST" and route == "/swarm/stop":
             return self._swarm_stop(body)
+        if method == "POST" and route == "/swarm/reset":
+            return self._swarm_reset(body)
         if method == "GET" and route == "/swarm/latest":
             latest = self.runs.latest()
             return Response.json(latest) if latest else Response.error("no runs yet", 404)
@@ -986,6 +995,54 @@ class Console:
             return Response.error(f"bad request body: {exc}", 400)
         return Response.json(job.to_dict())
 
+    def _swarm_reset(self, body: bytes) -> Response:
+        """Give one task its retry budget back, from the board (#293).
+
+        The gesture ADR 0002 describes and ADR 0005 moved into `swarm reset`,
+        moved once more - to where the operator actually is when they learn they
+        are needed. The run's decision report ends by printing a command, and a
+        board that says "needs a human" beside a button is one fewer context
+        switch than a board that says it beside an instruction.
+
+        **The ref is taken verbatim from the card that offered it.** The store is
+        keyed by ref, the board already carries it, and minting one here from an
+        issue number would put the GitHub adapter in this handler - the thing
+        `cli._reset` refuses to do and `test_framework_boundary` enforces below.
+        `TaskRef` still validates it, because it arrives over HTTP.
+
+        Refused while a run is live. A reset writes the counter the dispatcher
+        is reading, and the cycle that read it a moment ago would dispatch on a
+        budget the operator has since changed - the same single-flight argument
+        `_swarm_build` makes, and the same answer: stop the run, reset, continue.
+        """
+        from .store.reset import reset_budget
+        from .taskref import TaskRef
+
+        try:
+            asked = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            return Response.error(f"bad request body: {exc}", 400)
+        if (live := self.runs.live()) is not None:
+            return Response.error(
+                f"{live.id} is in flight; a reset now would change a counter it is reading",
+                409,
+                fix="stop the run, reset the task, then continue it",
+            )
+        repo = str(asked.get("repo", "")).strip()
+        if not REPO_RE.match(repo):
+            return Response.error("a reset needs the repository the task is in", 400,
+                                  fix="owner/name, as the board shows it")
+        try:
+            ref = TaskRef(str(asked.get("ref", "")).strip())
+        except ValueError as exc:
+            return Response.error(str(exc), 400,
+                                  fix="the ref as the board shows it, like #12")
+        try:
+            outcome = reset_budget(repo, ref)
+        except (StoreError, ValueError) as exc:
+            return Response.error(f"could not reset {ref}: {exc}", 400)
+        return Response.json({"ok": outcome.changed, "message": outcome.sentence()})
+
     def _swarm_status(self, path: str) -> Response:
         _, _, query = path.partition("?")
         wanted = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
@@ -1283,6 +1340,22 @@ def _handler(console: Console) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(response.body)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            #: **Nothing this console serves may be cached** (#293), and the
+            #: assets are the reason. `asset()` deliberately re-reads its file
+            #: per request "so that editing `app.js` and reloading the browser
+            #: shows the change - the console is a developer tool"; the browser
+            #: then cached `/app.js` at a stable URL and defeated the whole
+            #: point. Observed live: three new controls shipped, verified being
+            #: served by `curl`, and invisible on the page through several
+            #: restarts of the server.
+            #:
+            #: On every response rather than only the assets, because the same
+            #: argument covers the rest of it: every other route is live state -
+            #: a run's log, a board, a project list - and a cached answer about
+            #: any of them is a page reporting a past that has moved on. There
+            #: is no response here worth caching and no bandwidth to save on
+            #: loopback.
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(response.body)
 

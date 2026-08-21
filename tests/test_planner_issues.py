@@ -48,6 +48,7 @@ from swarm.github.ledger import (
     render_marker,
 )
 from swarm.github.refs import pull_ref, task_ref
+from swarm.greenfield.bootstrap import STACK_VERIFY
 from swarm.nodes import planner
 from swarm.nodes.planner import (
     NO_DEPENDENCIES,
@@ -1597,6 +1598,103 @@ def test_a_non_pytest_gate_is_not_repaired():
     )
 
     assert drafts[0].files == ("app.js",)
+
+
+def test_a_react_gate_keeps_the_modules_own_extension():
+    """`.test.jsx`, not `.test.js` (#293). A `.jsx` component tested from a `.js`
+    file is not transformed by `@vitejs/plugin-react`, so a repair that dropped
+    the `x` would add a file whose first JSX token is a syntax error - a task
+    made unwinnable by the thing meant to rescue it."""
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["src/TodoList.jsx"])],
+        verify=STACK_VERIFY["react"],
+    )
+
+    assert drafts[0].files == ("src/TodoList.jsx", "test/TodoList.test.jsx")
+
+
+def test_a_node_gate_gains_a_test_its_guard_can_actually_find():
+    """`test/`, not beside the module, and the node gate is the reason.
+
+    It reads `test -n "$(ls test/*.test.js)" && node --test`, so a test written
+    anywhere else does not merely go uncollected - the guard finds no test files,
+    short-circuits, and the gate exits non-zero having run nothing. Asserting the
+    directory is asserting that the repaired task can pass.
+    """
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=["src/todo.js"])],
+        verify=STACK_VERIFY["node"],
+    )
+
+    assert drafts[0].files == ("src/todo.js", "test/todo.test.js")
+
+
+@pytest.mark.parametrize("stack", ["python", "node", "react"])
+def test_every_shipped_stacks_gate_reaches_this_repair(stack):
+    """The wiring assertion, generalised. The repair keyed on the substring
+    `pytest`, so it was inert for two of the three stacks it shipped with - and
+    the JS half fails quietly: `vitest run` collects the scaffold's suite,
+    passes, and merges an untested component."""
+    source = {"python": "mod.py", "node": "mod.js", "react": "mod.jsx"}[stack]
+
+    drafts, _ = normalise(
+        [PlannedTask(id="t", goal="g", files=[source])], verify=STACK_VERIFY[stack]
+    )
+
+    assert len(drafts[0].files) == 2, f"{stack} was not repaired"
+
+
+def test_the_planner_prompt_carries_the_stacks_own_constraints():
+    """"Plausible for a react project" is a statement about paths, and the model
+    read it as one: it planned against packages the image does not have. The
+    bootstrap task was already told; the planner deciding what the tasks *are*
+    was not.
+
+    **This asserted the opposite for one revision and passed anyway**, which is
+    why it now pins the sentence rather than the word. The rule used to forbid
+    `.ts`/`.tsx`; that was wrong on the facts - vite transpiles both through
+    esbuild, measured green in the image - and harmful, because it outranked a
+    task whose `## Files` declared `.tsx` and made every edit undeclared. The
+    replacement mentions `.tsx` too, so `".tsx" in prompt` went on passing while
+    guarding nothing.
+    """
+    prompt = planner.system_prompt(verify=STACK_VERIFY["react"], stack="react")
+
+    assert "not type-checked" in prompt
+    assert "no `typescript` package" in prompt
+    assert "never .ts" not in prompt
+    assert "@testing-library/react" in prompt
+
+
+def test_the_planner_prompt_says_nothing_extra_when_the_stack_is_unknown():
+    """A `--repo` run against someone else's repository has no stack table entry
+    and must not be told about one."""
+    prompt = planner.system_prompt(verify="make check")
+
+    assert "TypeScript" not in prompt
+    assert "the project's existing stack" in prompt
+
+
+def test_the_greenfield_python_gate_reaches_this_repair(monkeypatch):
+    """The repair above was correct and, for two months, unreachable (#293).
+
+    Every test in this section passes a pytest command in by hand, and the
+    repair keys on the literal substring `pytest`. The gate a *greenfield python
+    run* actually shipped was `python3 -m unittest discover -q`, which contains
+    no such substring - so on the runs that needed the repair most, it was dead
+    code. `create-bestiary-module` was planned live with a Goal demanding
+    comprehensive unit tests over a `## Files` of one module, got no test file,
+    and burned its budget exactly as the docstring above predicts.
+
+    So this asserts the wiring rather than the behaviour: the table and the
+    repair have to keep agreeing, and the two live one import apart.
+    """
+    drafts, _ = normalise(
+        [PlannedTask(id="create-bestiary-module", goal="store creatures", files=["bestiary.py"])],
+        verify=STACK_VERIFY["python"],
+    )
+
+    assert drafts[0].files == ("bestiary.py", "test_bestiary.py")
 
 
 def test_a_task_with_no_python_file_is_left_alone():

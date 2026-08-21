@@ -293,7 +293,7 @@ BUILD_SITE: dict[str, Any] = {
          "kind": "check", "value": "1"},
         {"name": "bootstrap", "label": "Write the project-scaffold issue first — one extra issue that creates the initial project, with every task above blocked on it. Without it the first cycle dispatches every task against an empty repository, each worker inventing its own project.",
          "kind": "check", "value": "1"},
-        {"name": "verify", "label": "Verify command — CI runs exactly this and only its exit code is believed. Leave it blank and the repository keeps the placeholder gate (`test -f README.md`), which no worker can ever replace: rewriting `.github/workflows` needs the `workflows` permission, and the work key is forbidden it.",
+        {"name": "verify", "label": "Verify command — CI runs exactly this and only its exit code is believed. Leave it blank and the repository gets the stack's own gate (`python3 -m pytest -q` for python). Whatever it is, it is permanent: no worker can ever replace it, because rewriting `.github/workflows` needs the `workflows` permission and the work key is forbidden it. So a gate that cannot fail here is one this repository never gets back.",
          "kind": "text", "placeholder": "python -m pytest -q", "value": ""},
         # The two fields that belong to the *run*, not to the repository, and
         # they are here rather than on a second form because #130 made this one
@@ -479,8 +479,8 @@ class Builder:
 
     def run(self, result: Any, values: Mapping[str, str]) -> BuildReport:
         """The whole action, in the order that makes each refusal free."""
-        from .greenfield.bootstrap import Bootstrap
-        from .greenfield.provision import PLACEHOLDER_VERIFY, ProvisionPlan
+        from .greenfield.bootstrap import STACK_VERIFY, Bootstrap
+        from .greenfield.provision import ProvisionPlan
         from .nodes.planner import normalise, order_drafts, with_bootstrap, write_plan
 
         plan = plan_from_result(result)
@@ -506,18 +506,29 @@ class Builder:
         # Pure, and therefore first. A ring or an unwritable task refuses here
         # with nothing created anywhere. `write_plan` reaches the same verdicts
         # on the same tasks a moment later; the point is that this time being
-        # wrong costs nothing. The gate string is the placeholder rather than
-        # the form's, because the real one is not known until the commit that
-        # carries it exists — and `normalise` rejects every task when it is
-        # given an empty command, which would make a blank optional field look
-        # like eight broken tasks.
+        # wrong costs nothing.
+        #
+        # **The gate is the stack's, not the placeholder** (#293). It used to be
+        # the placeholder, on the grounds that "the real one is not known until
+        # the commit that carries it exists" - true when a created repository
+        # kept `test -f README.md` forever, and false now that `cli` provisions
+        # with `Bootstrap.verify`. Keeping it would make this pass lie in a way
+        # that matters rather than a way that does not: `normalise`'s
+        # `_with_test_file` repair keys on the command containing `pytest`, so a
+        # preview computed against the placeholder shows file sets the real plan
+        # will not write. A preview that disagrees with the plan is worse than
+        # no preview.
+        #
+        # Still `or`, and still never empty: `normalise` rejects every task when
+        # it is given an empty command, which would make a blank optional field
+        # look like eight broken tasks.
         # `with_bootstrap` first, exactly as `write_plan` will do it: the ring
         # check and the rejection list have to be computed over the task set
         # that is actually written, or this pass would bless a plan the real one
         # refuses - which is the failure it exists to prevent.
         tasks = plan.tasks if scaffold is None else list(with_bootstrap(plan.tasks, scaffold))
         drafts, rejected = normalise(
-            tasks, verify=verify or PLACEHOLDER_VERIFY, stack=stack
+            tasks, verify=verify or STACK_VERIFY[stack], stack=stack
         )
         # The operator's own drafts, with the scaffold discounted. A scaffold is
         # always writable, so counting it here would let a plan whose every real

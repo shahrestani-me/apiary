@@ -545,13 +545,26 @@ class Verdict:
     def should_replan(self, *, max_stalls: int = SETTINGS.max_stalls) -> bool:
         """Has this run earned a replan? `replan.py` is the caller.
 
-        Four ways to answer no, and each of them is a way a replan makes things
-        worse: the run is finished, the run is moving, the model that would
-        write the new plan is unreachable, or the thing standing in the way is
-        a file the plan cannot hand anybody. Only after `max_stalls` cycles of
+        Three ways to answer no, and each of them is a way a replan makes things
+        worse: the run is finished, the run is moving, or the model that would
+        write the new plan is unreachable. Only after `max_stalls` cycles of
         genuine stall does rewriting the tracker beat waiting one more cycle.
+
+        **There was a fourth, and #293 moved it rather than removing it.** "The
+        thing standing in the way is a file the plan cannot hand anybody" is a
+        true statement about *one task* - `blockers` names them individually -
+        and it was being answered for the whole run, so one task a replan could
+        not help vetoed replanning every task it could. Since a stalled run
+        usually has exactly one such task, the veto was close to unconditional:
+        six replans in 1,211 recorded cycles, none after a failure.
+
+        It now lives in `replan.decide`, which refuses only when the blockers
+        account for *everything* still moving (`replan._replannable`). This
+        property keeps the questions that really are about the whole run, which
+        is what makes it the single authority on the stall budget that `decide`
+        defers to.
         """
-        if self.satisfied or self.unresolved or self.needs_human or not self.stalled:
+        if self.satisfied or self.unresolved or not self.stalled:
             return False
         return self.stalls >= max(int(max_stalls), 1)
 

@@ -35,6 +35,7 @@ from swarm.console_build import BUILD_SITE, BuildError, Builder, plan_from_resul
 from swarm.console_runs import SwarmRuns
 from swarm.doctor import Check, Diagnosis
 from swarm.github.readiness import BLOCKED, READY
+from swarm.greenfield.bootstrap import STACK_VERIFY
 from swarm.greenfield.provision import ProvisionReport
 
 from fixtures.procs import FakeProc, settle, spawner
@@ -1068,12 +1069,22 @@ def test_the_verify_label_does_not_promise_a_gate_that_can_be_replaced():
     """It used to say the placeholder is "replaced by the first pull request".
     No worker can replace it - `workflows` is forbidden to the work key - so an
     operator who left the field blank on that promise got a repository whose
-    required check asserts a README exists, permanently."""
+    required check asserts a README exists, permanently.
+
+    The permanence is still the point and still asserted. What changed with #293
+    is the default it applies to: a blank field now yields the stack's real gate
+    rather than the placeholder, so the label has to name *that*, and warning
+    about `test -f README.md` would be describing a default this form no longer
+    has. The old assertion is inverted rather than dropped - a label that still
+    advertised the placeholder would be the new way to mislead.
+    """
     field = next(f for f in BUILD_SITE["fields"] if f["name"] == "verify")
 
     assert "replaces" not in field["label"]
-    assert "test -f README.md" in field["label"]
+    assert "test -f README.md" not in field["label"]
+    assert STACK_VERIFY["python"] in field["label"]
     assert "workflows" in field["label"]
+    assert "never gets back" in field["label"]
 
 
 @pytest.mark.parametrize("values, expected", [
