@@ -142,6 +142,42 @@ DENIED_EGRESS_SIGNATURES: tuple[str, ...] = (
     "tunnel connection failed",
 )
 
+#: What makes a *dependency install* failure infrastructure rather than the
+#: task's fault. `DENIED_EGRESS_SIGNATURES` plus the transient ones, and the
+#: split from that tuple is deliberate: it stays narrow because a verify command
+#: runs the task's own code and can print anything, while an install's output
+#: comes from pip or npm and is predictable enough to read.
+#:
+#: **Why this matters more than it used to.** While the react toolchain was
+#: baked into the worker image, a react task installed nothing and this path was
+#: nearly dead. Installing per task puts a registry round trip on *every
+#: attempt* of every task, which turns a transient 503 or a dropped socket into
+#: a consumed attempt - three of them and a task no worker could have fixed is
+#: handed to a human. Exit 2 costs no attempt and is bounded by
+#: `APIARY_MAX_INFRASTRUCTURE`, which is the whole reason that ceiling exists.
+#:
+#: A package that does not resolve - `E404`, no matching version - is **not**
+#: here, and must not be: the manifest is the task's own work, a wrong pin is a
+#: real defect, and the error text is exactly the feedback the next attempt
+#: needs. That is the default, and the default is still the task's fault.
+INSTALL_INFRASTRUCTURE_SIGNATURES: tuple[str, ...] = DENIED_EGRESS_SIGNATURES + (
+    # npm's and pip's transport failures, as they actually appear in output.
+    "etimedout",
+    "econnreset",
+    "econnrefused",
+    "esockettimedout",
+    "socket hang up",
+    "network timeout",
+    "read econnreset",
+    # A registry that answered, badly. 5xx is the server's problem by
+    # definition; 429 is rate limiting, which the next attempt may well clear.
+    "503 service unavailable",
+    "502 bad gateway",
+    "504 gateway timeout",
+    "429 too many requests",
+    "registry returned 5",
+)
+
 #: The verdicts `classify_verify` returns. Strings for the reason the check
 #: statuses in `orchestrator/checks.py` are strings: they are printed, logged
 #: and asserted on far more often than they are matched.
@@ -600,7 +636,9 @@ def classify_verify(
     return Verdict(TASK_FAILED, f"the verify command failed (exit {returncode})")
 
 
-def verify_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+def verify_env(
+    environ: Mapping[str, str] | None = None, *, root: Path | None = None
+) -> dict[str, str]:
     """The environment the verify command gets: this one, minus the credentials.
 
     **Filtered, never rebuilt.** A fresh dict is how this goes wrong: a worker
@@ -632,11 +670,30 @@ def verify_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     would actually make this safe, and it is a follow-up on #87, not this.
     """
     source = os.environ if environ is None else environ
-    return {
+    env = {
         name: value
         for name, value in source.items()
         if name not in VERIFY_ENV_DENY and not SECRET_NAME_RE.search(name)
     }
+    # The checkout's own `node_modules/.bin`, when it has one. This is what a
+    # gate spelled as a bare `vitest run` resolves through now that the react
+    # image carries no toolchain of its own: the tools come from the project's
+    # manifest, so they land in the project, not at the filesystem root.
+    #
+    # **Appended, not prepended**, and the reason is the one
+    # `Dockerfile.worker.react` already gave for appending its own: npm fills
+    # `.bin` from every installed package's `bin` field, so a prefix would let
+    # any one of ~170 transitive packages ship a file called `git` and have it
+    # run instead of the real one - inside a process holding a push token with
+    # an allowlisted route to github.com. Appending keeps the toolchain
+    # reachable and shadows nothing: `vitest` exists nowhere else, and `git`,
+    # `node`, `npm` and `python3` keep resolving to the image's copies.
+    if root is not None:
+        local_bin = root / "node_modules" / ".bin"
+        if local_bin.is_dir():
+            existing = env.get("PATH", "")
+            env["PATH"] = f"{existing}{os.pathsep}{local_bin}" if existing else str(local_bin)
+    return env
 
 
 def run_verify(root: Path, command: str) -> tuple[bool, str]:
@@ -675,7 +732,7 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
             # Filtered from this process's environment, never rebuilt - see
             # `verify_env`. Rebuilding drops the proxy variables, and a worker
             # with no route out does not fail, it hangs.
-            env=verify_env(),
+            env=verify_env(root=root),
         )
     except subprocess.TimeoutExpired:
         return False, f"verify timed out after {SETTINGS.verify_timeout_s}s"
@@ -743,14 +800,29 @@ def install_dependencies(root: Path) -> str | None:
 
     Returns `None` when there is nothing to install or the install succeeded,
     and the failure text otherwise - which the caller folds into the run as a
-    FAILED verify. **Deliberately not `classify_verify`, and deliberately not
-    infrastructure.** A pip denied the network matches
-    `DENIED_EGRESS_SIGNATURES`, and classifying that as exit 2 would retry a
-    task forever whose real blocker never changes; the deny-by-default egress
-    is the operator's standing decision (`security.EGRESS_EXTRA_ENV`'s
-    rationale), so the failure is the task's to report and the retry comment's
-    to explain. The one thing this does add is the fix by name, because "403
-    Filtered" on its own tells an operator nothing about which knob exists.
+    FAILED verify. A failure the task cannot fix raises `InfrastructureError`
+    instead, which is exit 2 and costs no attempt.
+
+    **That split replaced "never infrastructure", and the reason it had to.**
+    This used to return text for every failure, arguing that a denied network is
+    the operator's standing decision and so the task's to report - and that exit
+    2 would retry forever on a blocker that never changes. Two things were wrong
+    with it. `APIARY_MAX_INFRASTRUCTURE` already bounds that retry, which is the
+    entire reason the ceiling exists. And it was inconsistent with the gate: the
+    identical 403 reaching `run_verify` is `INFRASTRUCTURE` via
+    `DENIED_EGRESS_SIGNATURES`, so one network failure cost an attempt and the
+    other did not, depending only on which command happened to hit it.
+
+    It mattered little while the react toolchain lived in the worker image,
+    because a react task installed nothing. Installing per task puts a registry
+    round trip on every attempt of every task, and a transient 503 then eats one
+    of three attempts. Three of those and a human is handed a task no worker
+    could have fixed - the exact failure mode this whole line of work is about.
+
+    `INSTALL_INFRASTRUCTURE_SIGNATURES` is what makes the distinction, and the
+    default is still the task's fault: a package that does not resolve is a
+    wrong pin in a manifest the task wrote, and the error text is the next
+    attempt's feedback.
 
     Same execution shape as `run_verify` - shell, repo root, the filtered
     environment - because the install must land in exactly the interpreter and
@@ -771,7 +843,12 @@ def install_dependencies(root: Path) -> str | None:
             env=verify_env(),
         )
     except subprocess.TimeoutExpired:
-        return f"dependency install timed out after {INSTALL_TIMEOUT_S}s: {command}"
+        # Infrastructure, not a failed task: the timeout is far more install
+        # than any generated manifest needs, so reaching it means a registry
+        # stopped answering rather than a dependency tree that is too big.
+        raise InfrastructureError(
+            f"dependency install timed out after {INSTALL_TIMEOUT_S}s: {command}"
+        ) from None
     except OSError as exc:
         # The shell itself could not be started - the same verdict, for the
         # same reason, as `run_verify`'s: nothing about the task ran.
@@ -796,6 +873,11 @@ def install_dependencies(root: Path) -> str | None:
             f"default; a private or mirrored one is added with "
             f"{EGRESS_EXTRA_ENV}=<host> exported before the run."
         )
+    if any(signature in haystack for signature in INSTALL_INFRASTRUCTURE_SIGNATURES):
+        # Nothing about the task is wrong, so it must not pay an attempt for
+        # this. The hint above still rides along when there is one, because the
+        # operator reading the exit-2 record is the person who can fix it.
+        raise InfrastructureError(failure)
     return failure
 
 
@@ -854,7 +936,7 @@ def audit_collection(root: Path, command: str, written: Sequence[str]) -> str | 
             capture_output=True,
             text=True,
             timeout=AUDIT_TIMEOUT_S,
-            env=verify_env(),
+            env=verify_env(root=root),
         )
     except subprocess.TimeoutExpired:
         missing = tests

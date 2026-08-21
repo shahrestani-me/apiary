@@ -832,70 +832,46 @@ def test_the_react_bootstrap_declares_the_config_its_gate_needs():
     assert "vite.config.ts" in BOOTSTRAP_FILES["react"]
 
 
-def _npm_specs(text: str) -> set[str]:
-    """The `name@version` arguments of the one `npm install` in `text`.
+def test_the_react_worker_image_declares_no_toolchain_of_its_own():
+    """The invariant that replaced pinning three copies of the toolchain
+    together, and a stronger one than the pinning was.
 
-    Everything from `npm install` to the shell operator that ends it, minus the
-    flags. Bounded that way rather than by scanning the whole file, because a
-    Dockerfile is full of `@` - `worker@apiary.invalid` in the git identity
-    would otherwise read as a package.
+    The image used to install `REACT_TOOLCHAIN` at build time and copy it to
+    `/node_modules`, and a test held that copy, the workflow's copy and the
+    constant in agreement. It could not hold the thing that actually broke:
+    node's resolver walks parent directories, so a package at the filesystem
+    root resolves from any checkout below it **whether or not the project
+    declares it**. A worker could import a package, never declare it, pass its
+    own gate, and open a pull request CI could not build - which is a green
+    worker and a red runner arrived at without any drift at all.
 
-    Comments go first, and they have to: `Dockerfile.worker.react` explains at
-    length why `npm install --prefix /` does not work, and prose about a
-    command is not the command.
-    """
-    code = "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
-    # Checked, not assumed: a *second* `RUN npm install` layer would be
-    # invisible to a parser that reads the first one and stops, which is
-    # precisely the "package in the image that the workflow never installs"
-    # drift the caller advertises catching.
-    assert code.count("npm install") == 1, "expected exactly one npm install"
-    body = code.split("npm install", 1)[1]
-    for terminator in ("&&", "\n\n", "|"):
-        body = body.split(terminator, 1)[0]
-    return {
-        word
-        for word in body.split()
-        if "@" in word.lstrip("@") and not word.startswith("-")
-    }
+    Measured on run `to-do-react-generated-app-20260821-151111-95rff7` PR 11: 34
+    tests passing in the worker, one suite on the runner unable to resolve
+    `@testing-library/user-event` - in the image, absent from the manifest.
 
-
-def test_the_react_toolchain_is_pinned_identically_everywhere():
-    """Two copies that cannot import each other, and the constant behind both.
-
-    The image installs the toolchain at build time; the generated
-    `package.json` declares it to everything that reads a manifest - the
-    runner's `npm ci`, the worker's install, a human's `npm install` alike; and
-    `stacks.REACT_TOOLCHAIN` is what both are checked against. Drift is silent
-    and its symptom is a red CI run on a green worker, which is the one result
-    that makes the whole gate untrustworthy.
-
-    **The workflow is no longer one of the copies, and that is the point of the
-    change this test moved for.** It used to interpolate `REACT_TOOLCHAIN`
-    directly, which made it undriftable - and also made CI blind to any
-    dependency the project itself declared. A worker that added an import,
-    declared it honestly, and passed its own gate then got a red check it had no
-    way to fix, because the file it would have fixed was not a file CI read.
-    Measured: `@testing-library/user-event`, present in the image and absent
-    from the workflow's list, on run
-    `to-do-react-generated-app-20260821-151111-95rff7` PR 11 - 34 tests passing
-    and one suite unable to resolve its import. CI now installs the manifest, so
-    the pins still reach the runner, one hop further along, through a file both
-    sides read.
+    So there is one declaration, `package.json`, generated from the constant by
+    `stacks.react_manifest`; the worker installs it before the gate
+    (`entrypoint.install_dependencies`) and CI installs it too
+    (`provision.CI_SETUP`). Worker-green and CI-green are then statements about
+    the same dependency set. This test is what keeps a baked layer from coming
+    back as a fix for a slow task.
     """
     dockerfile = (REPO_ROOT / "Dockerfile.worker.react").read_text(encoding="utf-8")
-    manifest = json.loads(react_manifest("some-generated-app"))
-
-    # Set equality in both directions, not a substring sweep: an image carrying
-    # a package the manifest does not declare is a green worker and a red
-    # runner, which is the failure this test exists for.
-    declared = {**manifest["dependencies"], **manifest["devDependencies"]}
-    assert {f"{name}@{spec.lstrip('^')}" for name, spec in declared.items()} == set(
-        REACT_TOOLCHAIN
+    # Comments first: this file argues at length about the layer it used to
+    # have, and prose about an install is not an install.
+    code = "\n".join(
+        line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
     )
-    assert _npm_specs(dockerfile) == set(REACT_TOOLCHAIN)
+
+    assert "npm install" not in code, "the toolchain is back in the image"
+    assert "npm ci" not in code
+    assert "COPY --from=deps" not in code, "the throwaway deps stage is back"
+    # `NODE_PATH` is ESM-invisible and was never a way to do this; the Dockerfile
+    # keeps the note saying so, and this keeps the note honest.
+    assert "NODE_PATH" not in code
+    # What it must still carry: the runtime, its installer, and the interpreter.
+    assert "/usr/local/bin/node" in code
+    assert "/usr/local/bin/npm" in code
 
 
 def test_the_generated_react_manifest_splits_runtime_from_tooling():

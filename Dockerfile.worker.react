@@ -8,73 +8,54 @@
 #
 # **Why React does not share the Node image.** It did, and it could not work:
 # `node --test` has no JSX transform, so the shared image could run a React
-# project's files only as syntax errors. The stack needed react, react-dom, a
-# transform and a DOM before it needed anything else, and none of those are in
-# the Node image.
+# project's files only as syntax errors. What React needs is a transform and a
+# DOM, and neither is in the Node image.
 #
-# **Why this needs no widened egress, which #106 was filed believing it would.**
-# The epic's plan was to reach npmjs.org from the worker, which means widening
-# the enforced allowlist and taking the exfiltration surface from GitHub-only
-# to GitHub-plus-a-registry-that-accepts-uploads. It is not necessary. The
-# argument docs/security.md already makes for the Node image - "an image with a
-# toolchain in it needs no registry at run time" - covers React too, as long as
-# the toolchain is installed *here*, at build time, where the network is
-# allowed and where SETUP.md step 4 already puts a human. Measured: the gate
-# below runs green in a container started with `--network none`.
+# **Why the toolchain is no longer baked in here, which reverses what this file
+# used to argue.** It used to install `REACT_TOOLCHAIN` at build time and copy
+# the result to `/node_modules`, on the reasoning that an image with a toolchain
+# needs no registry at run time - true, and it cost more than it saved. The
+# resolver walks parent directories, so a package baked at the filesystem root
+# resolves from any checkout below it *whether or not the project declares it*.
+# A worker could import a package, never declare it, pass its own gate, and open
+# a pull request that CI - which installs what the project declares - could not
+# build. Measured on run `to-do-react-generated-app-20260821-151111-95rff7`, PR
+# 11: 34 tests passing in the worker, and one suite on the runner unable to
+# resolve `@testing-library/user-event`, a package this image had and the
+# project's manifest did not. The worker had written correct code and was told
+# it had failed, three times, until a human was called.
 #
-# **The one non-obvious mechanic: NODE_PATH does not work.** Node's ESM
-# resolver ignores it - it is CJS-only - so `ENV NODE_PATH=/opt/react/node_modules`
-# fails with `ERR_MODULE_NOT_FOUND: Cannot find package '@vitejs/plugin-react'`
-# on a `"type": "module"` project, which is what a modern React project is.
-# What works is putting the dependencies at the **filesystem root**: the ESM
-# resolver walks parent directories looking for `node_modules`, so
-# `/node_modules` resolves from any working directory below `/` - a worker's
-# clone, or the falsifier's `/w` - with no symlink, no environment variable,
-# and nothing for the generated project to declare.
+# So the image ships node, npm and git, and nothing about React at all. The
+# project's `package.json` - generated from `stacks.REACT_TOOLCHAIN` by
+# `greenfield.provision`, not invented by a model - is the single declaration,
+# and `worker.entrypoint.install_dependencies` installs it before the gate runs.
+# Worker-green and CI-green are then statements about the same dependency set,
+# which is the only way either of them means anything.
 #
-# **No npm cache warming, and no NPM_CONFIG_PREFER_OFFLINE.** #106 asked for
-# both, on the theory that the verify command would install. It does not - the
-# gate is `vitest run` and `tests/test_bootstrap.py` fails if any stack's gate
-# names an installer - so a cache tuned for a command that never runs would be
-# a knob describing a design that was abandoned.
+# **What it costs, stated plainly.** Every attempt of every react task now pays
+# a registry round trip instead of a build-time one. That is why the public
+# registries are on the egress allowlist (`security.REGISTRY_HOSTS`, #295) and
+# why an install failure that is not the manifest's fault is exit 2 and costs no
+# attempt (`entrypoint.INSTALL_INFRASTRUCTURE_SIGNATURES`) - a transient 503
+# must not spend one of three attempts on a task that was never broken.
+#
+# Measured on this image, on the `apiary-egress` network through the tinyproxy
+# the worker actually uses, installing exactly what `stacks.react_manifest`
+# declares: **21s**, and `vitest run` green afterwards with the project's
+# `node_modules/.bin` appended to PATH. The image itself went from 887MB to
+# 723MB. And the property the whole change is for, in the same container: a test
+# importing a package the manifest does not declare fails the gate with
+# **exit 1** and the message `Failed to resolve import "date-fns"` - the
+# identical failure CI used to report after the worker had already passed. The
+# worker now sees it on its own attempt, where it can fix it by declaring it.
+#
+# **`NODE_PATH` is not the way back.** Node's ESM resolver ignores it - it is
+# CJS-only - so it could never have served a `"type": "module"` project, which
+# is what a modern React project is. That was the reason the baked copy had to
+# live at `/`, and it is worth keeping written down so nobody reintroduces the
+# root install as a "fix" for a slow task.
 
 FROM node:22-bookworm-slim AS node
-
-
-# The React toolchain, resolved in a stage that is thrown away.
-#
-# **Not in the runtime stage, and not as root.** `npm install` runs package
-# lifecycle scripts, and this image exists to hold model output at arm's
-# length - installing ~170 transitive packages as uid 0 in the final image's
-# own build would let any one of their `postinstall` hooks write to
-# `/opt/venv`, which is the orchestrator package the worker imports. So the
-# resolution happens here, as the base image's unprivileged `node` user, with
-# `--ignore-scripts`, and the runtime stage takes only the resulting directory
-# via `COPY` - which copies files and executes nothing.
-#
-# `--ignore-scripts` is not free of consequence and was measured rather than
-# assumed: this set installs and the gate runs green without any of them,
-# because esbuild ships its platform binary as an optional dependency rather
-# than fetching it in a hook. A future addition that genuinely needs its
-# postinstall will fail loudly here, at build time, on the host, which is the
-# right place to have that argument.
-FROM node:22-bookworm-slim AS deps
-RUN mkdir -p /deps && chown node:node /deps
-USER node
-WORKDIR /deps
-#
-# Kept in the same order as `REACT_TOOLCHAIN` and grouped the way it is grouped,
-# so the drift test's failure is readable when it fires: runtime, then types and
-# the compiler, then the build and styling plugins, then the shadcn/ui
-# vocabulary, then the test tooling.
-RUN npm install --no-audit --no-fund --ignore-scripts --loglevel=error \
-      react@19 react-dom@19 \
-      @types/react@19 @types/react-dom@19 typescript@5 \
-      vite@6 @vitejs/plugin-react@4 tailwindcss@4 @tailwindcss/vite@4 \
-      class-variance-authority@0.7 clsx@2 tailwind-merge@3 lucide-react@0 \
-      @radix-ui/react-slot@1 @radix-ui/react-dialog@1 @radix-ui/react-label@2 \
-      vitest@2 jsdom@25 @testing-library/react@16 \
-      @testing-library/jest-dom@6 @testing-library/user-event@14
 
 
 FROM python:3.12-slim AS build
@@ -118,30 +99,17 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-# The toolchain, at the filesystem root - see the header note on why NODE_PATH
-# is not an option. Root-owned and not writable by uid 10001, deliberately:
-# the gate reads it and has no business changing it.
-#
-# The versions live in the `deps` stage above, and also in
-# `greenfield/stacks.py`'s `REACT_TOOLCHAIN` and in the install step of the
-# generated CI workflow.
-# `tests/test_bootstrap.py::test_the_react_toolchain_is_pinned_identically_everywhere`
-# fails if the three drift. That test is the only thing keeping worker-green
-# and CI-green statements about the same versions: the worker gets its
-# toolchain from this layer and a GitHub runner cannot.
-COPY --from=deps /deps/node_modules /node_modules
-
 COPY --from=build /opt/venv /opt/venv
 
-# `/node_modules/.bin` goes **last**, and that ordering is load-bearing rather
-# than stylistic. npm fills `.bin` from every installed package's `bin` field,
-# so a prefix would let any one of ~170 transitive packages ship a file called
-# `git` and have the worker's clone/branch/commit/push cycle - a process
-# holding a push token, with an allowlisted route to github.com - run it
-# instead of the real one. Appending means the toolchain is reachable and
-# shadows nothing: `vitest` exists nowhere else, and `git`, `node`, `npm` and
-# `python3` keep resolving to the system copies this image installed.
-ENV PATH="/opt/venv/bin:$PATH:/node_modules/.bin" \
+# No `/node_modules/.bin` here any more: there is no toolchain at the
+# filesystem root to reach. The project's own `node_modules/.bin` is appended to
+# `PATH` at gate time by `worker.entrypoint.verify_env`, which is where the
+# checkout's path is known - and appended rather than prefixed for the reason
+# this line used to give: npm fills `.bin` from every installed package's `bin`
+# field, so a prefix would let any one of ~170 transitive packages ship a file
+# called `git` and have the clone/branch/commit/push cycle - a process holding a
+# push token - run it instead of the real one.
+ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
