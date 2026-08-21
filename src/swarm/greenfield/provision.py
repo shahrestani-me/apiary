@@ -835,6 +835,12 @@ the swarm plans carries the same command as its own `## Verify`. It is one
 string in three places - this file, the workflow, and each issue - because
 three that can disagree is a repository where the answer depends on which one
 you happened to read.
+
+**The first run of this workflow is red, and that is correct.** There is no code
+here yet, so the command finds no tests and refuses to call that a pass. The
+first pull request writes the first test and turns it green. A command that
+passed on this commit would be a command that passes on any commit, which is
+not a gate.
 """
     )
     return f"""\

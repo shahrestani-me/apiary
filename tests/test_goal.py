@@ -32,6 +32,7 @@ or planning follow-ups from a verdict nobody gave.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Sequence, cast
@@ -282,6 +283,29 @@ def test_work_in_flight_is_not_assessed() -> None:
     assert not verdict.consulted
     assert IN_FLIGHT in verdict.reason
     assert "#2" in verdict.reason
+
+
+def test_a_task_stranded_behind_an_abandoned_one_is_not_work_in_flight() -> None:
+    """The failure drill's finding, as the sentence the gate got wrong (#293).
+
+    #3 waits on #1, and #1 was abandoned, so #3 can never run. Counting it as
+    live was not merely a mislabel: `IN_FLIGHT` is checked *before* `FAILED`, so
+    the gate refused with "work is still in flight: #3" - which is false - and
+    the abandonment that actually ended the run went unreported. Observed on the
+    first run that ever reached this gate.
+
+    `IN_FLIGHT` first is right and stays: an assessment taken mid-run would
+    depend on which cycle called it. What was wrong was the count, and both
+    counts read `reachable.stranded` now.
+    """
+    stranded_behind = dataclasses.replace(entry(3, label=READY), depends_on=("task-1",))
+    book = ledger(entry(1, label=FAILED), stranded_behind)
+
+    verdict = _assess_(OBJECTIVE, book, oracle=Never())
+
+    assert IN_FLIGHT not in verdict.reason
+    assert verdict.reason == FAILED_REASON
+    assert verdict.abandoned == (task_ref(1),)
 
 
 def test_an_abandoned_task_stops_the_gate_and_is_named() -> None:

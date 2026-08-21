@@ -73,6 +73,27 @@
     return out;
   }
 
+  //: `values()`' inverse: put a remembered form back on the screen.
+  //:
+  //: Writes the `typed` cache as well as the nodes, and writes it under the
+  //: swarm site's own key rather than `current.key` - a restore triggered from
+  //: a run card must not land in whichever site's slot happens to be selected.
+  //: Nodes that are not on screen are skipped exactly as `values()` skips them;
+  //: the cache still carries the answer, so switching back to the swarm tab
+  //: shows it.
+  function setValues(vals) {
+    if (!vals) return;
+    var out = typed["swarm"] || {};
+    Object.keys(vals).forEach(function (name) {
+      out[name] = vals[name];
+      var node = document.querySelector('[name="' + name + '"]');
+      if (!node) return;
+      if (node.type === "checkbox") node.checked = vals[name] === "1";
+      else node.value = vals[name];
+    });
+    typed["swarm"] = out;
+  }
+
   //: The intake site is a normal model-call site, but the swarm tab embeds its
   //: questions as the "Describe it" wizard. Absent from /sites (an older
   //: backend), the wizard simply never appears and the swarm tab is unchanged.
@@ -657,6 +678,14 @@
         //: selected project - otherwise the page opens looking like a project
         //: was chosen, and nobody chose it.
         var prog = res.body.progress || {};
+        //: Put the brief back on the form as well as the run on the screen
+        //: (#293). A reload used to leave the operator watching a run whose
+        //: objective they could no longer see, and no way to continue it but to
+        //: retype paragraphs from memory. Only when the field is empty, for the
+        //: reason the adoption rule above has: a form somebody is part-way
+        //: through typing is theirs, not ours to overwrite.
+        var objective = document.querySelector('[name="objective"]');
+        if (objective && !objective.value.trim()) setValues(res.body.values);
         if (res.body.state === "running") {
           busyRun(true);
           pollSwarm(res.body.id, swarmView(res.body));
@@ -954,6 +983,38 @@
       //: The oldest prompt is the requirement the project was founded from;
       //: the history is where it stays visible - and immutable, like the rest.
       if (i === prompts.length - 1) s.appendChild(el("span", "pill", "requirement"));
+      //: Reuse it, rather than select-and-copy it (#293).
+      //:
+      //: The objective box opens empty on purpose - it is the *next* prompt,
+      //: and the requirement is immutable history - but "continue the run I just
+      //: stopped" is then a retyping exercise, and a brief is paragraphs. The
+      //: planner needs them: `cli._text`'s own docstring says a phrase "gives a
+      //: 31B model nothing to decompose", so an operator who retypes from memory
+      //: types something shorter and quietly changes the run.
+      //:
+      //: This fills the box and nothing else - no firing, no writing - so the
+      //: prompt stays editable and the history stays read-only. Pressing "Run
+      //: the swarm" afterwards continues against the existing repository:
+      //: `SwarmRuns.start` probes whether it exists and picks `--repo` over
+      //: `--new` from the answer, so the run attaches to the ledger rather than
+      //: replanning it.
+      //: In the summary row, not the body: the body is behind a collapsed
+      //: `<details>`, and a control nobody can see is a control that does not
+      //: exist - which is exactly how it was first shipped and first reported.
+      //: `stopPropagation` as well as `preventDefault`, because activating a
+      //: summary is what toggles the disclosure, and a button that also folded
+      //: the entry it sits in would read as a glitch.
+      var reuse = el("button", "ghost", "Use this prompt");
+      reuse.type = "button";
+      reuse.onclick = function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        setValues({ objective: p.objective });
+        var node = document.querySelector('[name="objective"]');
+        if (node) { node.focus(); node.scrollIntoView({ block: "center" }); }
+        reuse.textContent = "Loaded ✓";
+      };
+      s.appendChild(reuse);
       d.appendChild(s);
       d.appendChild(pre(p.objective));
       box.appendChild(d);
@@ -1324,7 +1385,7 @@
     });
   }
 
-  function ticket(c) {
+  function ticket(c, offer) {
     var t = el("div", "tcard");
     //: The resolver's own sentence for why this card sits where it does -
     //: textContent-safe prose, surfaced as a hover rather than more pixels.
@@ -1357,6 +1418,40 @@
       watch.setAttribute("aria-pressed", String(workerWatching === c.container));
       watch.onclick = function (e) { e.preventDefault(); watchWorker(c); };
       t.appendChild(watch);
+    }
+    //: Only on the needs-human strip (#293). ADR 0002's gesture is "a person
+    //: fixes whatever the environment was doing wrong, then gives the task
+    //: another go", and until now the affordance lived in a terminal: the run's
+    //: decision report ends by printing `swarm reset '#12'` for the reader to
+    //: type somewhere else. This is the same call, on the row that says the task
+    //: is stuck.
+    //:
+    //: Deliberately not offered on the other columns. Resetting a task that is
+    //: running or already landed is not a gesture with a meaning - the counter
+    //: it zeroes is only consulted for a task the swarm gave up on.
+    if (offer && offer.reset && c.ref) {
+      var retry = el("button", "ghost", "Another attempt");
+      retry.type = "button";
+      retry.onclick = function (e) {
+        e.preventDefault();
+        retry.disabled = true;
+        retry.textContent = "resetting…";
+        api("/swarm/reset", { repo: offer.repo, ref: c.ref }).then(function (r) {
+          //: The backend's own sentence either way - it names the numbers it
+          //: changed, and a page that paraphrased would be a second author.
+          var said = r.ok ? r.body.message : (r.body.error || "the reset failed");
+          var line = el("p", r.ok ? "blurb" : "empty", said);
+          if (!r.ok && r.body.fix) line.title = r.body.fix;
+          t.appendChild(line);
+          retry.style.display = "none";
+          //: Re-read rather than patch the card: the reset changed apiary's
+          //: store, and the column this ticket belongs in is the resolver's
+          //: answer over that store plus the code host. Guessing it here is how
+          //: the board and the run disagree.
+          if (r.ok) boardTick();
+        });
+      };
+      t.appendChild(retry);
     }
     return t;
   }
@@ -1391,7 +1486,9 @@
     if ((b.needs_human || []).length) {
       var strip = el("div", "failedstrip");
       strip.appendChild(el("h3", null, "Needs a human · " + b.needs_human.length));
-      b.needs_human.forEach(function (c) { strip.appendChild(ticket(c)); });
+      b.needs_human.forEach(function (c) {
+        strip.appendChild(ticket(c, { reset: true, repo: b.repo }));
+      });
       body.appendChild(strip);
     }
     if ((b.errors || []).length) {
@@ -1452,11 +1549,33 @@
       api("/swarm/stop", { id: job.id });
     };
 
+    //: Carry on where this run stopped, without retyping the brief (#293).
+    //:
+    //: It fires the *same form*, and that is the whole mechanism: the backend
+    //: probes whether the repository exists and picks `--repo` over `--new` from
+    //: the answer, so a second run against a repository that is already there
+    //: attaches to its ledger instead of replanning it. Stop and continue as
+    //: often as you like; each press picks up the issues as they now stand.
+    //:
+    //: Passed to `swarmFire` explicitly rather than left to `values()` to read
+    //: back off the screen: `setValues` is for the operator to *see* the brief
+    //: restored, and a run must not depend on which tab is selected when the
+    //: button is pressed.
+    var again = el("button", "", "Continue this run");
+    again.style.display = "none";
+    again.onclick = function (e) {
+      e.preventDefault();
+      var vals = job.values || {};
+      setValues(vals);
+      swarmFire(vals);
+    };
+
     var head = el("div");
     head.appendChild(strip);
     head.appendChild(links);
     head.appendChild(note);
     head.appendChild(stop);
+    head.appendChild(again);
 
     var log = pre("");
     log.className = "log";
@@ -1501,6 +1620,13 @@
                                      : j.state === "done" ? "ok" : "bad");
         elapsed.textContent = j.elapsed_s + "s";
         elapsed.style.display = "";
+        //: Exactly one of the two is offered, because exactly one is possible.
+        //: A local run has no ledger to attach to, so continuing it would
+        //: replan from scratch rather than pick up where it stopped - the
+        //: button would be lying about what it does.
+        var over = j.state !== "running";
+        stop.style.display = over ? "none" : "";
+        again.style.display = over && !j.local && (j.values || {}).objective ? "" : "none";
         if (p.run_id) ownRunIds[p.run_id] = 1;   // the external view must skip it
         //: While the run lives, the board follows its repository and the
         //: selector lands on it when it is a known project. A run that has
@@ -1588,10 +1714,12 @@
       });
   }
 
-  function swarmFire() {
+  //: `override` is a form to fire instead of reading the screen - the "Continue
+  //: this run" button's, which must work whatever tab is selected.
+  function swarmFire(override) {
     busyRun(true);
     clearTimeout(runTimer);
-    var vals = values();
+    var vals = override || values();
     api("/swarm/start", { values: vals }).then(function (r) {
       if (!r.ok) {
         busyRun(false);

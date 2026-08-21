@@ -102,6 +102,7 @@ from ..state import ObjectiveAssessment, Plan
 from ..taskref import TaskRef
 from .authority import Belief, state_of
 from .derived import LANDED, NEEDS_HUMAN
+from .reachable import stranded
 
 #: `run.TERMINAL_LABELS` in the vocabulary the authority answers in, and the
 #: same two facts: the work landed, or a human has to decide. Spelled out rather
@@ -247,14 +248,33 @@ def abandoned(ledger: Ledger, believed: Belief | None = None) -> tuple[LedgerEnt
 
 
 def live(ledger: Ledger, believed: Belief | None = None) -> tuple[LedgerEntry, ...]:
-    """Anything not terminal. `TERMINAL_STATES` decides, as `run.TERMINAL_LABELS`
-    does for resume - the same two facts, and `believed=None` still reaches the
-    labels through `authority.state_of`. See `shipped`.
+    """Anything not terminal, and not stranded behind something that is.
+
+    `TERMINAL_STATES` decides the first half, as `run.TERMINAL_LABELS` does for
+    resume - the same two facts, and `believed=None` still reaches the labels
+    through `authority.state_of`. See `shipped`.
+
+    **The second half is #293, and the failure drill is why it is here.** The
+    reconciler's liveness learned to discount a task held behind a `needs-human`
+    dependency, which is what lets the ledger exhaust and this gate get called at
+    all. This module kept its own count, so the first run that ever reached the
+    gate was told "work is still in flight: #2, #3" about two tasks that were
+    stranded and could never run - a sentence that is false, and a refusal that
+    fires *before* the one that is true. `IN_FLIGHT` is checked ahead of `FAILED`
+    for a good reason - an assessment mid-run is worthless - so a stale liveness
+    count here does not merely mislabel the ending, it hides the abandonment
+    that caused it.
+
+    Both counts read the same rule from the same module now. That the two ever
+    diverged is the argument for `reachable.py` being one function rather than a
+    line of arithmetic repeated wherever "still going" is needed.
     """
+    unreachable = stranded(ledger, believed) if believed is not None else frozenset()
     entries = (
         entry
         for entry in ledger.entries.values()
         if state_of(entry, believed) not in TERMINAL_STATES
+        and entry.task_id not in unreachable
     )
     return tuple(sorted(entries, key=lambda entry: entry.ref))
 

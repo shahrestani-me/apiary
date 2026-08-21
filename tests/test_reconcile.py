@@ -1839,6 +1839,57 @@ def test_recovery_is_handed_containers_not_issue_numbers(fake_github):
     )
 
 
+def test_a_task_stranded_behind_a_failure_stops_holding_the_ledger_open():
+    """#293's headline, as the one number that was wrong.
+
+    #4 is escalated and #5 waits on it. `readiness` discharges a dependency
+    only when its issue is closed as *completed*, so #5 is held at `blocked` for
+    the rest of the run - correctly. What was wrong was counting it as live:
+    `exhausted` is `live == 0` and it is the only door to `close_the_loop`, so a
+    single escalation made the goal gate unreachable, and with it the revival
+    that could have rescued #4. Sixteen recorded runs, 1,211 cycles, zero
+    goal-gate calls, every one ending with live work outstanding.
+
+    #5 stays `blocked` on the board - that is what it *is*. The change is only
+    whether the run counts it as work it can still do, and it cannot.
+    """
+    client = FakeClient(
+        issues={
+            4: issue_payload(4, state="closed", state_reason="not_planned"),
+            5: issue_payload(5, body_text=body("task-5", blocked_by=[4])),
+        }
+    )
+
+    report = reconciler(client, FakeFleet()).cycle()
+
+    assert report.belief.state("task-4") == NEEDS_HUMAN
+    # `""`, not `blocked`: the resolver returns no verdict for a task held
+    # behind an unmet dependency, and that is the state the deadlock wears.
+    assert report.belief.state("task-5") == ""
+    assert report.live == 0
+    assert report.exhausted is True
+
+
+def test_a_task_blocked_behind_work_that_is_merely_slow_still_holds_it_open():
+    """The other half, and the one that keeps the rule honest.
+
+    Same shape, one different fact: #4 is *running*, not dead. #5 is blocked
+    exactly as above, and the ledger must stay open - a rule that could not tell
+    these two apart would end every run at its first cycle.
+    """
+    client = FakeClient(
+        issues={
+            4: issue_payload(4, label=CLAIMED),
+            5: issue_payload(5, body_text=body("task-5", blocked_by=[4])),
+        }
+    )
+
+    report = reconciler(client, FakeFleet(handles=running(4))).cycle()
+
+    assert report.live == 2
+    assert report.exhausted is False
+
+
 # --------------------------------------------------------------------------
 # Step 5: judge, replan, and the goal gate
 # --------------------------------------------------------------------------

@@ -94,7 +94,9 @@ FAILURE_CHARS = 300
 SATISFIED = "the run is satisfied; there is nothing to replan"
 PROGRESSING = "the run is still making progress"
 UNRESOLVED = "the judgement could not be made; the planner would call the same model"
-NEEDS_HUMAN = "a task is blocked on files it may not edit; a replan cannot fix that"
+NEEDS_HUMAN = (
+    "every task still moving is blocked on files it may not edit; a replan cannot fix that"
+)
 TOO_SOON = "the stall budget is not spent yet"
 EXHAUSTED = "this run has replanned as often as it may; the plan is not the problem"
 NO_TASKS = "the model proposed no usable tasks; writing that would retire the whole tracker"
@@ -109,6 +111,41 @@ class Proposer(Protocol):
 # --------------------------------------------------------------------------
 # Deciding
 # --------------------------------------------------------------------------
+
+
+def _replannable(verdict: Verdict) -> tuple[str, ...]:
+    """Task ids a new decomposition could still help. Empty means refuse.
+
+    **The narrowing #293 asked for.** `Verdict.needs_human` is true when *any*
+    task is failing on paths its `## Files` does not list, and that is a correct
+    judgement about that task: re-cutting the plan cannot hand it a file it was
+    never given, so a replan would produce a second plan with the same problem.
+    What was wrong is the scope. The condition is per task and the refusal was
+    per run, so one task the plan cannot help vetoed replanning all the tasks it
+    could - and since a stalled run usually has exactly one such task, the veto
+    was close to unconditional.
+
+    So the refusal now needs both halves to be true: something is blocked on
+    files it may not edit, *and* there is nothing else left that a replan could
+    move. `blockers` names the first half; this names the second.
+
+    Terminal tasks are excluded because a replan has nothing to offer a task
+    that has already landed or already been given up on, and an observation this
+    module could not read at all falls back to the old refusal - the whole point
+    of the veto is that a replan is destructive, so an unreadable world is not
+    the place to start guessing.
+    """
+    observation = verdict.observation
+    if observation is None:
+        return ()
+    blocked = {blocker.task_id for blocker in verdict.blockers}
+    return tuple(
+        sorted(
+            task_id
+            for task_id, signal in observation.signals.items()
+            if task_id not in blocked and not signal.terminal
+        )
+    )
 
 
 def decide(
@@ -136,7 +173,7 @@ def decide(
         return SATISFIED
     if verdict.unresolved:
         return UNRESOLVED
-    if verdict.needs_human:
+    if verdict.needs_human and not _replannable(verdict):
         return NEEDS_HUMAN
     if not verdict.stalled:
         return PROGRESSING

@@ -11,6 +11,7 @@ containers on the way out.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import signal
 import sys
@@ -207,6 +208,102 @@ def test_a_local_path_never_becomes_a_github_link(tokens):
     settle(job)
 
     assert runs.status(job.id)["progress"]["repo_url"] == ""
+
+
+# --------------------------------------------------------------------------
+# Continuing a run without retyping it (#293)
+# --------------------------------------------------------------------------
+
+
+def test_a_run_remembers_the_form_it_was_started_from(tokens):
+    """So the page can offer it back rather than making the operator retype it.
+
+    A brief is paragraphs - the planner needs them, and `_text`'s docstring says
+    a phrase "gives a 31B model nothing to decompose". An operator who has to
+    retype one types something shorter, which quietly changes the run being
+    compared.
+    """
+    proc = FakeProc()
+    runs = SwarmRuns(spawn=spawner(proc), exists=lambda r: True)
+    form = {
+        "objective": "a to-do app that keeps its list in local storage",
+        "repo": "kamyar-finlex/to-do-app",
+        "stack": "react",
+        "auto_merge": "1",
+    }
+
+    job = runs.start(form)
+    proc.finish(0)
+    settle(job)
+
+    assert runs.status(job.id)["values"] == form
+
+
+def test_the_remembered_form_carries_only_the_forms_own_fields(tokens):
+    """Whitelisted from `SWARM_SITE`, so a caller that posted an extra key cannot
+    have it stored and handed back out over `/swarm/latest`. No declared field is
+    a secret - tokens reach the child through the environment - and this is what
+    keeps that true by construction rather than by review."""
+    proc = FakeProc()
+    runs = SwarmRuns(spawn=spawner(proc), exists=lambda r: True)
+
+    job = runs.start({
+        "objective": "x",
+        "repo": "me/x",
+        "GITHUB_TOKEN": "ghp_not_a_form_field",
+        "whatever": "y",
+    })
+    proc.finish(0)
+    settle(job)
+
+    remembered_form = runs.status(job.id)["values"]
+    assert set(remembered_form) == {"objective", "repo"}
+    assert "ghp_not_a_form_field" not in json.dumps(runs.status(job.id))
+
+
+def test_continuing_a_run_attaches_to_the_ledger_rather_than_replanning(tokens):
+    """The whole mechanism, and the reason the button needed no new backend.
+
+    Firing the same form a second time is not a re-plan: `start` probes whether
+    the repository exists and `build_argv` picks `--repo` over `--new` from the
+    answer, so the second run attaches to the issues as they now stand. Stop and
+    continue as often as you like.
+    """
+    procs = [FakeProc(), FakeProc()]
+    first, second = procs
+
+    def spawn(argv, **kwargs):
+        spawn.argv = argv
+        return procs.pop(0)
+
+    spawn.argv = None
+    runs = SwarmRuns(spawn=spawn, exists=lambda r: True)
+    form = {"objective": "a to-do app", "repo": "kamyar-finlex/to-do-app"}
+
+    job = runs.start(form)
+    first.finish(0)
+    settle(job)
+    again = runs.start(runs.status(job.id)["values"])
+    second.finish(0)
+    settle(again)
+
+    assert "--new" not in spawn.argv
+    assert spawn.argv[spawn.argv.index("--repo") + 1] == "kamyar-finlex/to-do-app"
+    assert spawn.argv[spawn.argv.index("--objective") + 1] == "a to-do app"
+
+
+def test_a_local_run_is_not_offered_as_continuable(tokens):
+    """`local` reaches the page so it can tell which offers make sense. A local
+    run has no ledger to attach to, so continuing it would replan from scratch -
+    the button would be lying about what it does."""
+    proc = FakeProc()
+    runs = SwarmRuns(spawn=spawner(proc), exists=lambda r: True)
+
+    job = runs.start({"objective": "x", "repo": "/tmp/demo", "local": "1"})
+    proc.finish(0)
+    settle(job)
+
+    assert runs.status(job.id)["local"] is True
 
 
 # --------------------------------------------------------------------------
@@ -963,3 +1060,115 @@ def test_a_cap_is_neither_a_success_nor_a_failure_on_the_panel():
 
     assert 'kind === "met" || kind === "exhausted" ? " ok"' in rule
     assert 'kind === "failed" ? " bad" : ""' in rule
+
+
+# --------------------------------------------------------------------------
+# Resetting a task from the board (#293)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def store_root(tmp_path, monkeypatch):
+    """A task store this test owns, so a reset cannot touch a real project's
+    retry budgets."""
+    from swarm.store import STORE_DIR_ENV
+
+    root = tmp_path / "store"
+    monkeypatch.setenv(STORE_DIR_ENV, str(root))
+    return root
+
+
+def judged(repo: str, ref: str, *, attempt: int, blocker: str, streak: int):
+    """A task apiary has given up on, written the way a run would write it."""
+    import datetime as dt
+
+    from swarm.store import SqliteTaskStore, TaskJudgement
+    from swarm.taskref import TaskRef
+
+    with SqliteTaskStore.open(repo) as store:
+        store.write(TaskJudgement(
+            ref=TaskRef(ref), attempt=attempt, blocker=blocker, streak=streak,
+            renewals=0, updated_at=dt.datetime.now(dt.timezone.utc),
+        ))
+
+
+def test_the_reset_route_gives_a_capped_task_its_budget_back(store_root, tmp_path):
+    """ADR 0002's gesture, moved to where the operator is. It lived in a
+    terminal: the run's decision report ends by printing `swarm reset '#12'` for
+    the reader to go and type somewhere else."""
+    judged("a/b", "#12", attempt=3, blocker="sig", streak=3)
+    console = Console(runs=SwarmRuns(exists=lambda r: True), projects=scratch_store(tmp_path))
+
+    answer = console.render("POST", "/swarm/reset", HOST,
+                            json.dumps({"repo": "a/b", "ref": "#12"}).encode())
+
+    assert answer.status == 200
+    body = json.loads(answer.body)
+    assert body["ok"] is True
+    assert "attempt 3 -> 0" in body["message"]
+
+    from swarm.store import SqliteTaskStore
+    from swarm.taskref import TaskRef
+
+    with SqliteTaskStore.open("a/b") as store:
+        after = store.read()[TaskRef("#12")]
+    # Written, not deleted: `seed_attempt_floor` would refill a missing row from
+    # the branch listing at the next run's startup - the very number the operator
+    # is getting out from under.
+    assert (after.attempt, after.blocker, after.streak) == (0, "", None)
+
+
+def test_resetting_a_task_the_store_never_judged_says_so_rather_than_failing(
+    store_root, tmp_path
+):
+    """"Nothing to reset" and "you typed the wrong spelling" look identical
+    otherwise, and the second is the likely one against a tracker whose refs are
+    not numbers."""
+    judged("a/b", "#12", attempt=3, blocker="sig", streak=3)
+    console = Console(runs=SwarmRuns(exists=lambda r: True), projects=scratch_store(tmp_path))
+
+    answer = console.render("POST", "/swarm/reset", HOST,
+                            json.dumps({"repo": "a/b", "ref": "#99"}).encode())
+
+    body = json.loads(answer.body)
+    assert answer.status == 200 and body["ok"] is False
+    assert "#12" in body["message"]  # the refs it does hold
+
+
+def test_a_reset_is_refused_while_a_run_is_reading_the_counter(store_root, tokens, tmp_path):
+    """The dispatcher reads this counter every cycle. A reset mid-run would let
+    the cycle that read it a moment ago dispatch on a budget the operator has
+    since changed."""
+    judged("a/b", "#12", attempt=3, blocker="sig", streak=3)
+    proc = FakeProc()
+    console = Console(runs=SwarmRuns(spawn=spawner(proc), exists=lambda r: True),
+                      projects=scratch_store(tmp_path))
+    console.render("POST", "/swarm/start", HOST,
+                   json.dumps({"values": {"objective": "x", "repo": "a/b"}}).encode())
+
+    answer = console.render("POST", "/swarm/reset", HOST,
+                            json.dumps({"repo": "a/b", "ref": "#12"}).encode())
+
+    assert answer.status == 409
+    assert "in flight" in json.loads(answer.body)["error"]
+    assert "stop the run" in json.loads(answer.body)["fix"]
+    proc.finish(0)
+
+
+@pytest.mark.parametrize(
+    ("asked", "said"),
+    [
+        ({"ref": "#12"}, "needs the repository"),
+        ({"repo": "not-a-slug", "ref": "#12"}, "needs the repository"),
+        ({"repo": "a/b", "ref": ""}, "ref"),
+    ],
+)
+def test_a_bad_reset_request_is_refused_with_a_fix(store_root, tmp_path, asked, said):
+    console = Console(runs=SwarmRuns(exists=lambda r: True), projects=scratch_store(tmp_path))
+
+    answer = console.render("POST", "/swarm/reset", HOST, json.dumps(asked).encode())
+
+    assert answer.status == 400
+    body = json.loads(answer.body)
+    assert said in body["error"]
+    assert body["fix"]

@@ -126,6 +126,19 @@ BOOTSTRAP_FILES: dict[str, tuple[str, ...]] = {
         "index.html",
         "src/main.jsx",
         "src/App.jsx",
+        # **A stylesheet, because the model writes one whether it is declared or
+        # not** (#293). Observed live: asked for "a beautiful list of to do", the
+        # bootstrap emitted `import "./App.css"` from an undeclared path. It was
+        # obeying the rule it had - it did not *write* the file - and the task was
+        # unwinnable anyway: vite cannot resolve the import, the test file never
+        # loads, and the gate reports zero tests. Three identical attempts, then a
+        # human.
+        #
+        # `worker/edit.SYSTEM` now forbids importing a path that cannot resolve,
+        # which is the general fix. This is the other half: for a stack whose
+        # briefs routinely ask for something that looks good, "do without styles"
+        # is a worse answer than one declared file.
+        "src/App.css",
         "test/App.test.jsx",
     ),
 }
@@ -164,66 +177,31 @@ BOOTSTRAP_FILES: dict[str, tuple[str, ...]] = {
 #: would also work and is worse: it is an installer, and a gate whose first
 #: instinct on a missing package is to fetch it is a gate that behaves
 #: differently on the two sides of the fence.
+#: **Python is `pytest`, not `unittest discover`, and #293 is the measurement.**
+#: `unittest discover` only descends into directories that are importable
+#: packages, so `tests/test_x.py` is invisible to it unless `tests/__init__.py`
+#: exists. That one missing empty file was **57 of the 66 gate failures** across
+#: the ten recorded runs - every one of them reporting `NO TESTS RAN`, and not
+#: one of them having written an `__init__.py`. Thirty-eight had written the test
+#: file itself and the gate never looked at it.
+#:
+#: The task could not fix it either: a worker may only write the paths its issue
+#: declares (`apply_edits`), so a task whose `## Files` omits the package marker
+#: is unsatisfiable at the moment it is planned, whatever the model does.
+#:
+#: `pytest -q` finds `tests/test_x.py` with no marker at all, and still exits 5 -
+#: nonzero - when it collects nothing, so #102's falsification property survives
+#: the swap: an empty or test-free generation cannot be graded green. The tool is
+#: affordable because it is already everywhere it needs to be - the worker image
+#: installs it (`Dockerfile.worker`), the generated workflow installs it
+#: (`provision.CI_SETUP`), and it is already `SETTINGS.verify_command`'s default
+#: for a repository that is not greenfield. This table was the odd one out.
 STACK_VERIFY: dict[str, str] = {
-    "python": "python3 -m unittest discover -q",
+    "python": "python3 -m pytest -q",
     "node": 'test -n "$(ls test/*.test.js 2>/dev/null)" && node --test',
     "react": "vitest run",
 }
 
-#: Everything a stack's bootstrap must be told beyond "write these files",
-#: spliced into the goal the worker is handed.
-#:
-#: **Named for the stack and not for dependencies**, because for one stack it
-#: is only about dependencies and for another it is not. It began as a single
-#: sentence - "no dependencies beyond the language's standard library" - which
-#: is the correct instruction for Python and for `node --test` and an
-#: impossible one for React: react and react-dom *are* dependencies, and a
-#: model obeying the rule literally would write no React at all. Whatever the
-#: next stack needs said belongs here, whether or not it is about packages.
-#:
-#: React's entry names the packages, because that list is the whole contract
-#: with the image: a worker has no route to a registry (docs/security.md §3),
-#: so a package outside this set is not slow to add, it is unobtainable.
-#:
-#: **The `@testing-library/jest-dom` import line is not decoration.**
-#: Installing that package supplies nothing on its own - `expect` learns
-#: `toBeInTheDocument` only once the registration module has run - and
-#: `toBeInTheDocument()` is what a model writes whether or not anything told it
-#: to. So the package is in the image *and* the prompt demands the import. One
-#: without the other produces exactly the failure the package is there to
-#: prevent, on a project that is otherwise correct.
-#:
-#: **It has to be an import in the test file; `setupFiles` does not work.**
-#: Measured: `setupFiles: ["@testing-library/jest-dom/vitest"]` resolves to
-#: `/node_modules/@testing-library/jest-dom/dist/vitest.mjs`, which Vite then
-#: reads as a root-*relative URL* under the project root and fails to load -
-#: "Does the file exist?", about a file that does. It is the second consequence
-#: of putting the toolchain at `/` (see `Dockerfile.worker.react` on why
-#: `NODE_PATH` was not an option either): a bare specifier inside a source file
-#: resolves by walking parent directories and works, an absolute path handed to
-#: Vite's config does not.
-#:
-#: The package list hangs off "already installed", never off a prohibition.
-#: Written the other way - "do not add any others: react, react-dom, ..." - the
-#: colon binds to the nearest clause, and a plausible reading is that React
-#: itself is the forbidden thing.
-STACK_RULE: dict[str, str] = {
-    "python": "Use no dependencies beyond the language's standard library.",
-    "node": "Use no dependencies beyond the language's standard library.",
-    "react": (
-        "This is React on the web, not React Native. "
-        "These packages are already installed and are the only ones available: "
-        + ", ".join(package_names())
-        + ". There is no network, so do not import or declare anything else. "
-        "package.json must set \"type\": \"module\" and list exactly those "
-        "packages. vitest.config.js must export a config that uses the "
-        "@vitejs/plugin-react plugin and sets test.environment to \"jsdom\" and "
-        "test.globals to true. Every test file must begin with the line "
-        "import \"@testing-library/jest-dom/vitest\"; - without it, matchers "
-        "such as toBeInTheDocument() do not exist - and must render components "
-        "with @testing-library/react."
-    ),
-}
 
 SYSTEM = """You choose which technology stack a software project should be built in.
 
@@ -345,6 +323,23 @@ class Bootstrap:
         return cls(prompt=prompt.strip(), stack=resolved, files=files[:MAX_BOOTSTRAP_FILES])
 
     @property
+    def verify(self) -> str:
+        """This stack's gate — the one string the whole repository is held to.
+
+        Exposed on the type rather than looked up from `STACK_VERIFY` at each
+        call site for the reason the class docstring gives: the caller that
+        provisions the repository and the caller that plans its issues must not
+        be able to derive two different answers. `cli._provision_repo` reads
+        this and hands it to the `ProvisionPlan`, so the workflow, the README
+        and every `## Verify` are one string from one place.
+
+        Unknown stacks fall back with `for_prompt`'s rule, not with a `KeyError`:
+        `stack` is normalised there, so this only ever runs off the end if a
+        `Bootstrap` was constructed by hand.
+        """
+        return STACK_VERIFY.get(self.stack, STACK_VERIFY[DEFAULT_STACK])
+
+    @property
     def task(self) -> PlannedTask:
         """The bootstrap as the planner's own type, so nothing downstream has a
         second code path for it: it is normalised, rendered, round-tripped
@@ -368,7 +363,6 @@ class Bootstrap:
         return (
             f"Create the initial {self.stack} project for: {self.prompt} "
             f"Write every file listed, complete and working. "
-            f"{STACK_RULE.get(self.stack, STACK_RULE[DEFAULT_STACK])} "
             f"The test file must contain at "
             f"least one real assertion about the code in this project - a suite that "
             f"passes because it tests nothing is worse than no suite."

@@ -451,12 +451,42 @@ def from_worker(
     )
 
 
+#: The prefix `edit.py` puts on every `EditError` it raises for a model that did
+#: not answer. Matched rather than re-raised because by the time a record is
+#: built the exception is long gone - `entrypoint` has already caught it and put
+#: its text where the evidence goes.
+MODEL_FAILURE = "model call failed:"
+
+
 def _worker_reason(result: WorkerResult) -> str:
+    """The one line a human reads about why this attempt did not land.
+
+    **The model-failure branch is #293, and it exists because the fallback lied.**
+    "No edit landed inside the declared file set" is what you say about a model
+    that answered and whose answer was refused - a real and interesting failure,
+    because it means the plan and the generation disagree about paths. It was
+    also being said about a model that never answered at all, since both cases
+    arrive here with nothing written.
+
+    That mattered more than a wrong word. This string is what the escalation
+    comment quotes onto the issue and what `orchestrator/decision.classify`
+    reads, so a stale worker image failing every call with `invalid model name`
+    reported as "no edit landed" sent a reader to look at the *plan* - and told
+    them to fix the host without saying what was wrong with it. Observed on a
+    react run whose image was four days old: the truth sat in `verify_output`
+    the whole time and nothing human-facing used it.
+    """
     if result.passed and result.commit:
         return "verified and committed"
     if result.passed:
         return "verified, but the edits changed nothing there was a commit to make"
     if not result.written and not result.deleted:
+        # `verify_output` is where `entrypoint` puts the `EditError` text when the
+        # model is what failed; there is no verify output in that case, because
+        # there was nothing to verify.
+        output = (result.verify_output or "").strip()
+        if MODEL_FAILURE in output:
+            return output.splitlines()[0].strip()
         return "no edit landed inside the declared file set"
     return "the verify command failed"
 

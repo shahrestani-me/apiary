@@ -202,7 +202,7 @@ SWARM_SITE: dict[str, Any] = {
          "kind": "check", "value": ""},
         {"name": "public", "label": "Create a new repository public — a free GitHub plan cannot put branch protection on a private repository (existing repositories are untouched)",
          "kind": "check", "value": "1"},
-        {"name": "verify", "label": "Verify command — CI runs exactly this and only its exit code is believed. Blank means SWARM_VERIFY on a repository that exists, and the placeholder gate (`test -f README.md`) on one this run creates.",
+        {"name": "verify", "label": "Verify command — CI runs exactly this and only its exit code is believed. Blank means SWARM_VERIFY on a repository that exists, and the stack's own gate (`python3 -m pytest -q` for python) on one this run creates. A created repository is red until its first test lands, which is correct: a gate that passed on an empty repository would pass on anything.",
          "kind": "text", "placeholder": "python -m pytest -q", "value": ""},
         {"name": "stack", "label": f"Stack (optional: {', '.join(sorted(KNOWN_STACKS))})",
          "kind": "text", "placeholder": "python", "value": ""},
@@ -230,6 +230,18 @@ def target(values: Mapping[str, str]) -> str:
         raise SwarmRunError(f"repo must be 'owner/name', got {repo!r}",
                             fix="e.g. kamyar-finlex/expense-tracker")
     return repo
+
+
+def remembered(values: Mapping[str, str]) -> dict[str, str]:
+    """The part of a form worth handing back to the page. See `RunJob.values`.
+
+    Derived from `SWARM_SITE` rather than listed again, so a field added to the
+    form is remembered without anybody remembering to add it here - and a key
+    that is *not* a field is dropped, which is what keeps a posted extra out of
+    `/swarm/latest`.
+    """
+    names = [str(field["name"]) for field in SWARM_SITE["fields"]]
+    return {name: str(values.get(name, "")) for name in names if name in values}
 
 
 def build_argv(values: Mapping[str, str], *, exists: bool) -> list[str]:
@@ -384,6 +396,27 @@ class RunJob:
     #: an `owner/name`-shaped substring (`Users/Kamyar`), so parsing it would
     #: hand the page a GitHub link to a repository that does not exist.
     local: bool = False
+    #: The form this run was started from, so the page can offer it back (#293).
+    #:
+    #: Kept because the console forgot it: stopping a run and starting another
+    #: against the same repository meant retyping the whole brief, and a brief
+    #: is paragraphs - the planner needs them, and `_text`'s own docstring says
+    #: a phrase "gives a 31B model nothing to decompose". An operator who has to
+    #: retype it types something shorter, which quietly changes the run.
+    #:
+    #: Restarting needs nothing else: `start` probes whether the repository
+    #: exists and `build_argv` picks `--repo` over `--new` from the answer, so a
+    #: second run against the same repo *already* attaches to the existing
+    #: ledger rather than replanning it. The resume was there; only the form was
+    #: missing.
+    #:
+    #: **Whitelisted, never echoed.** Only the keys `SWARM_SITE` declares are
+    #: kept, so a caller that posted extra keys cannot have them stored and
+    #: handed back out over `/swarm/latest`. No declared field is a secret -
+    #: tokens reach the child through `child_env` from the process environment,
+    #: never through the form - and this keeps that true by construction rather
+    #: than by review.
+    values: dict[str, str] = field(default_factory=dict)
     lines: list[str] = field(default_factory=list)
     progress: dict[str, Any] = field(default_factory=lambda: {
         "repo": "", "repo_url": "", "run_id": "", "cycle": None,
@@ -527,6 +560,10 @@ class RunJob:
             "returncode": self.returncode,
             "elapsed_s": round((now or time.monotonic()) - self.started, 1),
             "command": self.command,
+            "values": dict(self.values),
+            # So the page can tell which offers make sense for this run. A local
+            # run has no ledger to attach to, so "continue" is not one of them.
+            "local": self.local,
             "lines": lines,
             "next": since + len(lines),
             "progress": {k: list(v) if isinstance(v, list) else v
@@ -618,6 +655,7 @@ class SwarmRuns:
                 command="swarm " + " ".join(shlex.quote(a) for a in argv[4:]),
                 started=time.monotonic(),
                 local=local,
+                values=remembered(values),
             )
             if not local:
                 # Known now, rather than parsed out of the child's first lines.

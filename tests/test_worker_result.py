@@ -777,6 +777,60 @@ def test_from_worker_carries_the_deletions(tmp_path):
     assert failed.reason == "the verify command failed"
 
 
+def test_a_model_that_never_answered_is_not_reported_as_a_refused_edit(tmp_path):
+    """#293's misdirection, as the string a human reads.
+
+    Both failures arrive here with nothing written: a model whose answer was
+    refused for naming undeclared paths, and a model that never answered at all.
+    Reporting the second as the first sends the reader to look at the *plan*.
+
+    Observed on a react run whose worker image was four days old and failing
+    every call with `invalid model name`. The escalation comment on the issue
+    said "no edit landed inside the declared file set" and "Fix the host" -
+    without saying what was wrong with the host - while the truth sat in
+    `verify_output` and nothing human-facing used it. `decision.classify` reads
+    this same string, so the run's own report inherited the wrong diagnosis too.
+    """
+    died = WorkerResult(
+        issue=ISSUE,
+        repo=REPO,
+        task_id="build-the-list",
+        branch=task_branch(task_ref(ISSUE), 0),
+        root=tmp_path,
+        verify_command="",
+        verify_output="model call failed: ResponseError: invalid model name (status code: 400)",
+        passed=False,
+        commit=None,
+    )
+
+    record = from_worker(died, run_id=RUN_ID, attempt=0)
+
+    assert record.reason.startswith("model call failed:")
+    assert "invalid model name" in record.reason
+    assert "no edit landed" not in record.reason
+
+
+def test_a_refused_edit_still_says_so(tmp_path):
+    """The other side of the branch above: a model that answered and whose paths
+    were all outside the declared set is a real and different failure - the plan
+    and the generation disagree - and it keeps its own sentence."""
+    refused = WorkerResult(
+        issue=ISSUE,
+        repo=REPO,
+        task_id="build-the-list",
+        branch=task_branch(task_ref(ISSUE), 0),
+        root=tmp_path,
+        verify_command="pytest -q",
+        verify_output="",
+        passed=False,
+        commit=None,
+    )
+
+    record = from_worker(refused, run_id=RUN_ID, attempt=0)
+
+    assert record.reason == "no edit landed inside the declared file set"
+
+
 def test_a_naive_timestamp_is_read_as_utc():
     """Container and host need not agree about the local zone."""
     naive = dt.datetime(2026, 8, 14, 14, 25, 30)
