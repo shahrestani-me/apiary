@@ -39,23 +39,82 @@ from __future__ import annotations
 #: generating one without a network. So CI runs `npm install` and resolves
 #: inside these ranges independently.
 #:
-#: Major-only pins (`react@18`, not `react@18.3.1`), because a lockfile is what
+#: Major-only pins (`react@19`, not `react@19.2.8`), because a lockfile is what
 #: pins a patch version and there is not one. A tighter spelling here would
 #: imply a reproducibility this design does not have, and docs/security.md
-#: states the residual drift rather than hiding it.
+#: states the residual drift rather than hiding it. `lucide-react@0` is the one
+#: that looks wrong and is not: it has never left 0.x, so the major *is* zero.
 #:
-#: `@testing-library/jest-dom` is in the set for a reason worth naming: it is
-#: the assertion vocabulary every React example on the internet uses, so a
-#: model writes `toBeInTheDocument()` whether or not the prompt allows it, and
-#: a missing matcher is a red gate on a project that is otherwise correct.
+#: **Everything here must be in the worker image, because a worker cannot
+#: install.** Its only route out is the egress proxy's static allowlist and no
+#: registry is on it, so this list is not a suggestion the model resolves - it is
+#: the entire universe of packages a generated project may import. That is why it
+#: stays short, and why every addition costs an image rebuild.
+#:
+#: ## What #295 added, and why each one
+#:
+#: The stack generated plain JSX with a hand-written stylesheet, which is not how
+#: React is written any more - so a brief asking for something that looks good
+#: got whatever CSS the model invented that day. The target is what Lovable
+#: produces: TypeScript, Tailwind, and components in the shadcn/ui idiom, which
+#: is also the idiom current models write best because it is what the ecosystem
+#: they learned from is full of.
+#:
+#: **TypeScript and `@types/*`.** Both were already *reachable* - vite transpiles
+#: `.tsx` through esbuild, measured green before this landed - and neither was
+#: offered, so the generator kept emitting 2021. The types packages are listed
+#: explicitly because their absence is the one kind that is invisible until a
+#: human opens the project: vite does not need them and `tsc` is not in the gate.
+#:
+#: **Tailwind 4, not 3.** Its config is CSS-first: `@import "tailwindcss";` in one
+#: stylesheet replaces `tailwind.config.js`, `postcss.config.js` and
+#: `autoprefixer` - three files a model gets subtly wrong, for one line it
+#: cannot. `@tailwindcss/vite` is what makes that work under vite and vitest.
+#:
+#: **shadcn/ui is not here and cannot be.** It is not a package; it is a CLI that
+#: copies component source into a project, and running it needs the registry a
+#: worker is denied. What *is* installable is everything its components are built
+#: from: `class-variance-authority` for variants, `clsx` and `tailwind-merge` for
+#: the `cn` helper every shadcn file imports, the Radix primitives its interactive
+#: components wrap, and `lucide-react` for icons. So the stack ships the
+#: vocabulary and the generator writes the components. That is a bet, and the
+#: defensible one: a model asked for a button in a project that already has
+#: `src/lib/utils.ts` and cva writes the shadcn shape without being told to.
+#:
+#: Three Radix primitives, not thirty. `react-slot` is load-bearing - `asChild`
+#: is in every shadcn component signature - and dialog and label cover the two
+#: interactions a generated form actually needs. The rest are one image rebuild
+#: away, and thirty unused packages is a slower pull for every task in the
+#: repository forever.
+#:
+#: `@testing-library/jest-dom` is in the set for a reason worth naming: it is the
+#: assertion vocabulary every React example on the internet uses, so a model
+#: writes `toBeInTheDocument()` whether or not the prompt allows it, and a missing
+#: matcher is a red gate on a project that is otherwise correct.
+#: `@testing-library/user-event` is here for the same reason one layer up - a
+#: generated test clicks things, and `fireEvent` is not what the docs show.
 REACT_TOOLCHAIN: tuple[str, ...] = (
-    "react@18",
-    "react-dom@18",
-    "vitest@2",
+    "react@19",
+    "react-dom@19",
+    "@types/react@19",
+    "@types/react-dom@19",
+    "typescript@5",
+    "vite@6",
     "@vitejs/plugin-react@4",
+    "tailwindcss@4",
+    "@tailwindcss/vite@4",
+    "class-variance-authority@0.7",
+    "clsx@2",
+    "tailwind-merge@3",
+    "lucide-react@0",
+    "@radix-ui/react-slot@1",
+    "@radix-ui/react-dialog@1",
+    "@radix-ui/react-label@2",
+    "vitest@2",
     "jsdom@25",
     "@testing-library/react@16",
     "@testing-library/jest-dom@6",
+    "@testing-library/user-event@14",
 )
 
 
@@ -67,6 +126,8 @@ def package_names(specs: tuple[str, ...] = REACT_TOOLCHAIN) -> tuple[str, ...]:
     scoped package into an empty string.
     """
     return tuple(spec.rpartition("@")[0] for spec in specs)
+
+
 #: Everything a stack's bootstrap must be told beyond "write these files",
 #: spliced into the goal the worker is handed.
 #:
@@ -108,41 +169,57 @@ STACK_RULE: dict[str, str] = {
     "python": "Use no dependencies beyond the language's standard library.",
     "node": "Use no dependencies beyond the language's standard library.",
     "react": (
-        "This is React on the web, not React Native. "
+        "This is React on the web, not React Native, and it is written the way "
+        "the ecosystem writes React today: TypeScript, Tailwind utility classes, "
+        "and components in the shadcn/ui idiom. "
+        #
+        # The package list hangs off "already installed", never off a
+        # prohibition. Written the other way - "do not add any others: react,
+        # react-dom, ..." - the colon binds to the nearest clause, and a
+        # plausible reading is that React itself is the forbidden thing.
         "These packages are already installed and are the only ones available: "
         + ", ".join(package_names())
-        + ". There is no network, so do not import or declare anything else. "
+        + ". There is no network, so do not import or declare anything else, and "
+        "do not run any CLI - in particular there is no `npx shadcn`; write the "
+        "component source yourself. "
+        #
+        # TypeScript, stated as what is actually absent. #293 is why: this said
+        # "never .ts or .tsx", which was false - vite transpiles both through
+        # esbuild - and which outranked tasks whose `## Files` declared `.tsx`,
+        # so every edit was refused for being undeclared.
+        "Write TypeScript: `.ts` and `.tsx`, with real prop types and no `any`. "
+        "It is transpiled by vite through esbuild and never type-checked - there "
+        "is no `tsc` in the gate - so type errors will not be reported and are "
+        "yours to avoid. "
+        #
+        # Tailwind 4 is CSS-first, which removes the three config files a model
+        # gets subtly wrong. Saying so is what stops it writing them anyway.
+        "Style with Tailwind utility classes in `className`. Tailwind 4 needs no "
+        "config file: one stylesheet contains `@import \"tailwindcss\";` and the "
+        "vite config uses the `@tailwindcss/vite` plugin. Never write a "
+        "`tailwind.config.js`, a `postcss.config.js` or a plain `.css` file of "
+        "your own rules, and never import a stylesheet that is not in your file "
+        "list. "
+        #
+        # The shadcn idiom, named concretely enough to reproduce. This is the
+        # "Lovable pattern" half of #295: the packages alone do not produce it.
+        "Build components in the shadcn/ui idiom. Merge classes with the `cn` "
+        "helper from `src/lib/utils.ts` - `twMerge(clsx(inputs))` - so a caller's "
+        "`className` can override yours. Express variants with `cva` from "
+        "class-variance-authority and type the props with `VariantProps`. Accept "
+        "`asChild` through Radix's `Slot` where a component might need to render "
+        "as something else. Use `lucide-react` for icons. Prefer semantic, "
+        "accessible markup - a real `<button>`, a `<label>` tied to its input - "
+        "over a styled `<div>`, because the tests below query by role. "
+        #
+        # The gate's mechanics, unchanged and still load-bearing.
         "package.json must set \"type\": \"module\" and list exactly those "
-        "packages. vitest.config.js must export a config that uses the "
-        "@vitejs/plugin-react plugin and sets test.environment to \"jsdom\" and "
-        "test.globals to true. Every test file must begin with the line "
+        "packages. The vite config must register the `@vitejs/plugin-react` and "
+        "`@tailwindcss/vite` plugins and set `test.environment` to \"jsdom\" and "
+        "`test.globals` to true. Every test file must begin with the line "
         "import \"@testing-library/jest-dom/vitest\"; - without it, matchers "
-        "such as toBeInTheDocument() do not exist - and must render components "
-        "with @testing-library/react. "
-        # **This said "never .ts or .tsx" and it was wrong twice** (#293).
-        #
-        # Wrong on the facts: vite transpiles TypeScript through esbuild, so
-        # `.ts` and `.tsx` run under `vitest run` in this image without the
-        # `typescript` package. Measured both ways - a task that shipped
-        # `src/types/todo.ts` passed its gate and merged, and a `.tsx` component
-        # with a `@testing-library/react` test passes in the image directly.
-        # What is missing is the type *checker*, not the syntax.
-        #
-        # Wrong in effect, and worse: the prohibition moved into the worker's
-        # system prompt, where it outranks the work item - so a task whose
-        # `## Files` declared `src/components/TodoForm.tsx` told the model to
-        # write that path and the system prompt told it not to. The model obeyed
-        # the prompt, `apply_edits` refused the undeclared `.jsx` it wrote
-        # instead, and `written` came back empty three times over. Six attempts
-        # across two tasks, both escalated, for a rule that was not even true.
-        #
-        # So it states what is actually absent and leaves the paths to the
-        # contract that owns them - `SYSTEM`'s "write exactly the paths listed"
-        # is the rule that matters here, and a stack rule must never contradict
-        # it.
-        "TypeScript is transpiled but not type-checked: `.ts` and `.tsx` run "
-        "under vitest through vite's esbuild, there is no `tsc` and no "
-        "`typescript` package, so type errors will not be reported. Do not add "
-        "a bundler, a compiler or a type checker."
+        "such as toBeInTheDocument() do not exist - must render with "
+        "@testing-library/react, and should query by role or label rather than "
+        "by test id."
     ),
 }

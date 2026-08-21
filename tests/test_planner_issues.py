@@ -1660,10 +1660,14 @@ def test_the_planner_prompt_carries_the_stacks_own_constraints():
     """
     prompt = planner.system_prompt(verify=STACK_VERIFY["react"], stack="react")
 
-    assert "not type-checked" in prompt
-    assert "no `typescript` package" in prompt
+    assert "never type-checked" in prompt
+    assert "Write TypeScript" in prompt
     assert "never .ts" not in prompt
     assert "@testing-library/react" in prompt
+    # #295: the planner has to know the stack is Tailwind + shadcn, or it plans
+    # tasks whose files do not match the project the bootstrap wrote.
+    assert "Tailwind" in prompt
+    assert "shadcn" in prompt
 
 
 def test_the_planner_prompt_says_nothing_extra_when_the_stack_is_unknown():
