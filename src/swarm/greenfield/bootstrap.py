@@ -122,7 +122,13 @@ BOOTSTRAP_FILES: dict[str, tuple[str, ...]] = {
     # class-merging helper - or import one that does not exist, which is the
     # unresolvable-import failure #293 was about.
     "react": (
-        "package.json",
+        # **No `package.json`.** `provision.ProvisionPlan.files` writes it from
+        # `stacks.REACT_TOOLCHAIN` into the initial commit, because the generated
+        # workflow installs what the project declares and a declaration a model
+        # reconstructed from a prompt is not one CI can rely on - measured, it
+        # came back with seven of twenty-one packages at the wrong majors. The
+        # file is still ordinary and still editable; it is just not this issue's
+        # to invent. See `stacks.react_manifest`.
         # The compiler's config. Nothing in the gate reads it - vite transpiles
         # without it and `tsc` never runs - but an editor does, and a TypeScript
         # project whose types resolve nowhere is one every human who clones it has

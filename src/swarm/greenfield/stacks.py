@@ -19,6 +19,13 @@ shared constant cannot live in `bootstrap.py`, and duplicating it into
 
 from __future__ import annotations
 
+import json
+
+#: `bootstrap.STACK_VERIFY["react"]`, repeated because the import may only go
+#: the other way (see the module docstring), and pinned by
+#: `test_the_react_manifests_test_script_is_the_gate`.
+STACK_VERIFY_REACT = "vitest run"
+
 #: The React toolchain, pinned, in the one place it is written down.
 #:
 #: **Two copies have to agree, and only one of the two directions needs a
@@ -118,6 +125,81 @@ REACT_TOOLCHAIN: tuple[str, ...] = (
 )
 
 
+#: Which of `REACT_TOOLCHAIN` a built application actually ships, as opposed to
+#: what only builds or tests it. The split is what makes `dependencies` and
+#: `devDependencies` mean anything: `npm ci --omit=dev` on a deploy must still
+#: get react, the class-merging helpers every generated component imports, and
+#: the Radix primitives they render - and must not need vite, vitest, jsdom, the
+#: type stubs or the compiler.
+#:
+#: `tailwindcss` is deliberately on the dev side: Tailwind 4 runs as a build
+#: plugin and its output is the CSS that ships, not a runtime import.
+RUNTIME_PACKAGES: frozenset[str] = frozenset(
+    {
+        "react",
+        "react-dom",
+        "class-variance-authority",
+        "clsx",
+        "tailwind-merge",
+        "lucide-react",
+        "@radix-ui/react-slot",
+        "@radix-ui/react-dialog",
+        "@radix-ui/react-label",
+    }
+)
+
+
+def react_manifest(name: str, specs: tuple[str, ...] = REACT_TOOLCHAIN) -> str:
+    """The `package.json` for a generated React project, rendered from the pins.
+
+    **Why apiary writes this file rather than asking a model to.** It used to be
+    in `bootstrap.BOOTSTRAP_FILES` with the stack rule telling the worker to
+    "list exactly those packages", which is a prompt asking a model to echo
+    twenty-one exact version pins back. Measured on run
+    `to-do-react-generated-app-20260821-151111-95rff7`: the model wrote seven of
+    them, at `react@^18`, `vitest@^1` and `jsdom@^23` - its priors, not the
+    list - and left out `@testing-library/user-event` entirely. A later task
+    imported `user-event`, the worker resolved it from the toolchain baked into
+    its image and passed, and CI - which installs what the project declares -
+    could not resolve it and went red. The worker wrote correct code and was
+    told it had failed.
+
+    Nothing about that is a model being careless: a version pin is not a
+    judgment, apiary knows the list exactly, and a generated file cannot drift
+    from `REACT_TOOLCHAIN` the way a prompt's output can. What the model is
+    still asked to do is the part that *is* a judgment - adding a dependency the
+    project needs - and it does that by editing this file, which is an ordinary
+    editable source file once it exists.
+
+    `"type": "module"` because a modern React project is ESM and vite's config
+    is loaded as one; `test` is spelled the same as `STACK_VERIFY["react"]` so a
+    human running `npm test` runs the gate rather than something adjacent to it.
+    """
+    runtime: dict[str, str] = {}
+    development: dict[str, str] = {}
+    for spec in specs:
+        package, _, version = spec.rpartition("@")
+        target = runtime if package in RUNTIME_PACKAGES else development
+        target[package] = f"^{version}"
+    manifest = {
+        "name": name,
+        "private": True,
+        "version": "0.0.0",
+        "type": "module",
+        "scripts": {
+            "dev": "vite",
+            "build": "vite build",
+            "preview": "vite preview",
+            "test": STACK_VERIFY_REACT,
+        },
+        "dependencies": dict(sorted(runtime.items())),
+        "devDependencies": dict(sorted(development.items())),
+    }
+    # Sorted keys off, so the order above is the order a human reads; a trailing
+    # newline because every other generated file has one and git prefers it.
+    return json.dumps(manifest, indent=2) + "\n"
+
+
 def package_names(specs: tuple[str, ...] = REACT_TOOLCHAIN) -> tuple[str, ...]:
     """`react@18` -> `react`, and `@vitejs/plugin-react@4` -> `@vitejs/plugin-react`.
 
@@ -177,11 +259,13 @@ STACK_RULE: dict[str, str] = {
         # prohibition. Written the other way - "do not add any others: react,
         # react-dom, ..." - the colon binds to the nearest clause, and a
         # plausible reading is that React itself is the forbidden thing.
-        "These packages are already installed and are the only ones available: "
+        "These packages are already declared in `package.json` and installed: "
         + ", ".join(package_names())
-        + ". There is no network, so do not import or declare anything else, and "
-        "do not run any CLI - in particular there is no `npx shadcn`; write the "
-        "component source yourself. "
+        + ". If the work genuinely needs another package, add it to the "
+        "`dependencies` or `devDependencies` of `package.json` - your gate and "
+        "CI both install from that file, so declaring it there is what makes it "
+        "available in both. Do not run a CLI that writes source for you: there "
+        "is no `npx shadcn`; write the component yourself. "
         #
         # TypeScript, stated as what is actually absent. #293 is why: this said
         # "never .ts or .tsx", which was false - vite transpiles both through
@@ -213,8 +297,9 @@ STACK_RULE: dict[str, str] = {
         "over a styled `<div>`, because the tests below query by role. "
         #
         # The gate's mechanics, unchanged and still load-bearing.
-        "package.json must set \"type\": \"module\" and list exactly those "
-        "packages. The vite config must register the `@vitejs/plugin-react` and "
+        "`package.json` already exists, sets \"type\": \"module\" and declares "
+        "the packages above; you do not need to create or rewrite it. The vite "
+        "config must register the `@vitejs/plugin-react` and "
         "`@tailwindcss/vite` plugins and set `test.environment` to \"jsdom\" and "
         "`test.globals` to true. Every test file must begin with the line "
         "import \"@testing-library/jest-dom/vitest\"; - without it, matchers "

@@ -492,14 +492,27 @@ def test_no_generated_workflow_asks_to_cache_a_lockfile_it_cannot_produce(stack:
     assert not any("cache" in (step.get("with") or {}) for step in steps), stack
 
 
-def test_react_installs_the_image_toolchain_and_puts_it_on_the_path():
-    """The seam between two worlds: a worker gets its toolchain from
-    `Dockerfile.worker.react`, a GitHub runner has no such image.
+def test_react_ci_installs_what_the_project_declares():
+    """The change #299's investigation forced: CI reads the manifest.
 
-    The `GITHUB_PATH` step is what keeps the gate one command rather than two.
-    `run:` steps do not put `node_modules/.bin` on `PATH`, the worker image
-    does, and `STACK_VERIFY["react"]` is a bare `vitest run` - so without it the
-    identical command is "not found" on the runner and green in the worker.
+    It used to interpolate `stacks.REACT_TOOLCHAIN` into the workflow, which
+    could not drift from the pins and also could not see a dependency the
+    project had declared for itself. A worker that added an import, put it in
+    `package.json` and passed its own gate was handed a red check whose cause
+    was a file CI never read - and no attempt of that worker could fix it.
+    Measured on run `to-do-react-generated-app-20260821-151111-95rff7` PR 11:
+    34 tests passing, one suite unable to resolve `@testing-library/user-event`,
+    which the image had and the workflow's list did not.
+
+    `npm ci` behind a lockfile test rather than unconditionally: `npm ci` is the
+    reproducible install and fails outright when the lock is missing or out of
+    step with the manifest, which is precisely the state a fresh scaffold and a
+    just-edited manifest are in.
+
+    The `GITHUB_PATH` step is what keeps the gate one command rather than two:
+    `run:` steps do not put `node_modules/.bin` on `PATH`, and
+    `STACK_VERIFY["react"]` is a bare `vitest run` - so without it the identical
+    command is "not found" on the runner and green in the worker.
     """
     yaml = pytest.importorskip("yaml")
     plan = dataclasses.replace(plan_for(verify_command="vitest run"), stack="react")
@@ -509,13 +522,45 @@ def test_react_installs_the_image_toolchain_and_puts_it_on_the_path():
     assert steps[0]["uses"] == "actions/checkout@v4"
     assert steps[1]["uses"] == "actions/setup-node@v4"
     install = steps[2]["run"]
-    assert install.startswith("npm install ")
+    assert "npm ci" in install
+    assert "package-lock.json" in install
+    assert "npm install" in install
+    # The pins reach the runner through the manifest now, so the workflow must
+    # not name a single version - a list here is the drift this moved away from.
     for spec in REACT_TOOLCHAIN:
-        assert f" {spec}" in install, spec
+        assert spec not in install, spec
     assert "node_modules/.bin" in steps[3]["run"]
     assert "$GITHUB_PATH" in steps[3]["run"]
     # And the gate itself is still the last step, unchanged by any of it.
     assert steps[-1]["run"].strip() == "vitest run"
+
+
+def test_a_react_repository_is_created_with_its_manifest_already_declared():
+    """The other half of `test_the_react_bootstrap_does_not_write_its_own_manifest`.
+
+    The workflow generated in this same commit installs what the project
+    declares, so the declaration has to exist before the first check run - which
+    is before any worker has been dispatched. It is generated from
+    `REACT_TOOLCHAIN` rather than reconstructed by a model from a prompt.
+    """
+    plan = dataclasses.replace(plan_for(verify_command="vitest run"), stack="react")
+
+    files = plan.files()
+
+    assert "package.json" in files
+    manifest = json.loads(files["package.json"])
+    assert manifest["name"] == plan.name
+    assert manifest["type"] == "module"
+    assert "@testing-library/user-event" in manifest["devDependencies"]
+
+
+def test_a_python_repository_is_created_without_a_node_manifest():
+    """The manifest is per stack, and the stacks it is not about must be
+    untouched - a `package.json` in a Python repository would be declared by
+    nothing and installed by nothing."""
+    plan = plan_for(verify_command="python3 -m pytest -q")
+
+    assert "package.json" not in plan.files()
 
 
 def test_a_stack_with_no_entry_emits_no_setup_step_rather_than_failing():
