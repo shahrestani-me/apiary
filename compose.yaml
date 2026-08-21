@@ -317,6 +317,11 @@ configs:
       ^(.*\.)?codeload\.github\.com$
       ^(.*\.)?host\.docker\.internal$
       ^(.*\.)?mcp\.linear\.app$
+      ^(.*\.)?registry\.npmjs\.org$
+      ^(.*\.)?registry\.yarnpkg\.com$
+      ^(.*\.)?pypi\.org$
+      ^(.*\.)?files\.pythonhosted\.org$
+      ^(.*\.)?ui\.shadcn\.com$
 
   tinyproxy-conf:
     content: |

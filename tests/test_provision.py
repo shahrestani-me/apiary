@@ -509,6 +509,14 @@ def test_react_ci_installs_what_the_project_declares():
     step with the manifest, which is precisely the state a fresh scaffold and a
     just-edited manifest are in.
 
+    Falsified rather than argued, on `node:22-bookworm-slim` with no baked
+    toolchain - a clean runner, in other words: `npm install` from the generated
+    manifest alone, then `vitest run` over PR 11's failing import
+    (`@testing-library/jest-dom/vitest`, `@testing-library/react` and
+    `@testing-library/user-event` together, rendering and asserting a role).
+    1 passed. The same file against the old interpolated list could not resolve
+    `user-event` at all.
+
     The `GITHUB_PATH` step is what keeps the gate one command rather than two:
     `run:` steps do not put `node_modules/.bin` on `PATH`, and
     `STACK_VERIFY["react"]` is a bare `vitest run` - so without it the identical

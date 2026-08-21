@@ -57,6 +57,7 @@ from swarm.security import (
     EGRESS_ALLOWLIST,
     FORBIDDEN_PERMISSIONS,
     MCP_HOSTS,
+    REGISTRY_HOSTS,
     REQUIRED_PERMISSIONS,
     PROVISION_PERMISSIONS,
     PROVISION_TOKEN_ENV,
@@ -277,11 +278,22 @@ ALLOWED_HOSTS = [
     "HOST.DOCKER.INTERNAL:11434",
     "mcp.linear.app",
     "https://mcp.linear.app/mcp",
+    # The package registries, a trusted zone since #295. `files.pythonhosted.org`
+    # is here rather than implied: pypi.org serves the index and that host serves
+    # the wheels, so admitting only the first resolves a package it cannot fetch.
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "https://registry.npmjs.org/react",
 ]
 REFUSED_HOSTS = [
     "gitlab.com",
-    "pypi.org",
     "notgithub.com",
+    # A registry-shaped name that is not a registry. The four that are admitted
+    # are named exactly; anchoring is what keeps this one out.
+    "registry.npmjs.org.attacker.net",
+    "npmjs.com",
     "github.com.attacker.net",
     "attacker.net",
     "169.254.169.254",
@@ -338,8 +350,27 @@ def test_the_default_allowlist_is_the_goal_sentence_and_nothing_more() -> None:
         # The one destination ADR 0001 adds. `MCP_HOSTS` says at length why it
         # is one and not three.
         "mcp.linear.app",
+        # The package registries (#295). A worker that cannot reach one cannot
+        # install a dependency its task declares, which is why every package a
+        # generated project could import had to be baked into a worker image and
+        # repeated in the generated CI workflow.
+        "registry.npmjs.org",
+        "registry.yarnpkg.com",
+        "pypi.org",
+        "files.pythonhosted.org",
+        # shadcn's component registry, which is not a package manager: it serves
+        # component *source* the CLI writes into `src/` and a worker commits, so
+        # what arrives from here lands in the repository under review.
+        "ui.shadcn.com",
     }
     assert MCP_HOSTS == ("mcp.linear.app",)
+    assert REGISTRY_HOSTS == (
+        "registry.npmjs.org",
+        "registry.yarnpkg.com",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "ui.shadcn.com",
+    )
 
 
 def test_the_tracker_credential_never_reaches_a_worker() -> None:
@@ -377,15 +408,36 @@ def test_the_tracker_credential_never_reaches_a_worker() -> None:
     }
 
 
-def test_a_package_index_is_off_until_an_operator_asks_for_it() -> None:
-    """The widening knob is opt-in, and opting in is one variable, not an edit."""
-    assert not EgressPolicy.from_env({}).allows("pypi.org")
+def test_a_package_index_is_reachable_without_an_operator_asking(monkeypatch) -> None:
+    """This asserted the opposite until #295, and the reversal is the decision.
 
-    widened = EgressPolicy.from_env({"APIARY_EGRESS_ALLOW": "pypi.org, files.pythonhosted.org"})
-    assert widened.allows("pypi.org")
-    assert widened.allows("files.pythonhosted.org")
+    A worker that cannot reach a registry cannot install a dependency its task
+    declares, so every package a generated project might import had to be baked
+    into a worker image and repeated in the generated CI workflow - and `npm ci`
+    was unreachable, because a lockfile needs the registry that produces it.
+
+    The argument the closed default rested on is answered elsewhere: it was about
+    a token travelling out in a package name, and `verify_env` strips every
+    `*_TOKEN`-shaped variable before an install runs. What remains is a
+    typosquatted package name, and a proxy rule is the wrong tool for it.
+    """
+    monkeypatch.delenv("APIARY_EGRESS_ALLOW", raising=False)
+    default = EgressPolicy.from_env({})
+
+    assert default.allows("registry.npmjs.org")
+    assert default.allows("pypi.org")
+    assert default.allows("files.pythonhosted.org")
+
+
+def test_the_widening_knob_still_widens() -> None:
+    """Registries being default no longer means the knob is dead: a target repo
+    that needs a private index or a mirror still says so in one variable."""
+    widened = EgressPolicy.from_env({"APIARY_EGRESS_ALLOW": "npm.internal.example"})
+
+    assert widened.allows("npm.internal.example")
     # ... and widening never narrows: the defaults are still there.
     assert widened.allows("api.github.com")
+    assert widened.allows("registry.npmjs.org")
 
 
 def test_the_proxy_environment_is_set_in_both_cases() -> None:
