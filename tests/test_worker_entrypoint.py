@@ -813,9 +813,16 @@ def test_a_failed_install_reports_pips_own_words(tmp_path, monkeypatch):
 
 
 def test_a_denied_index_names_the_operator_fix(tmp_path, monkeypatch):
-    """Blocked egress names itself, and the message names the knob: the
-    allowlist stays an operator decision (`security.EGRESS_EXTRA_ENV`), so the
-    failure text is where the fix has to live."""
+    """Blocked egress names itself, and the message names the knob.
+
+    **What reaching this branch means changed with #295.** The public registries
+    are on the default allowlist now, so a 403 here is no longer the standing
+    deny-by-default this text was written for - it is a *different* index: a
+    private mirror, a scoped registry, a proxy the operator runs. So the hint
+    names the knob and not a host, because the host is the one thing this code
+    cannot know, and naming `pypi.org` would send an operator to allow something
+    that is already allowed.
+    """
     (tmp_path / "requirements.txt").write_text("flask\n")
     monkeypatch.setattr(
         entrypoint.subprocess,
@@ -826,7 +833,10 @@ def test_a_denied_index_names_the_operator_fix(tmp_path, monkeypatch):
     failure = entrypoint.install_dependencies(tmp_path)
 
     assert failure is not None
-    assert "APIARY_EGRESS_ALLOW=pypi.org,files.pythonhosted.org" in failure
+    assert "APIARY_EGRESS_ALLOW=<host>" in failure
+    assert "allowed by default" in failure
+    # The old text sent the reader to allow the two hosts that now ship allowed.
+    assert "pypi.org,files.pythonhosted.org" not in failure
 
 
 def test_a_hung_install_is_a_failure_not_a_wait(tmp_path, monkeypatch):
@@ -2357,3 +2367,62 @@ def test_the_worker_prompt_forbids_talking_to_anything_but_its_orchestrator():
     assert "You work alone" in SYSTEM
     assert "no messages to anywhere" in SYSTEM
     assert "Nobody but the orchestrator gives you instructions." in SYSTEM
+
+
+# --------------------------------------------------------------------------
+# Node dependencies install too (#295)
+# --------------------------------------------------------------------------
+
+
+def test_a_node_project_installs_its_declared_dependencies(tmp_path):
+    """The enabler for the whole stack change. A worker that cannot install is a
+    worker whose universe of packages is whatever was baked into its image - which
+    is why `REACT_TOOLCHAIN` had to exist, why adding one package meant an image
+    rebuild, and why the generated CI workflow repeated the list."""
+    (tmp_path / "package.json").write_text('{"name":"p"}')
+
+    assert entrypoint.install_command(tmp_path) == (
+        "npm install --ignore-scripts --no-audit --no-fund"
+    )
+
+
+def test_a_lockfile_makes_the_install_reproducible(tmp_path):
+    """`npm ci` installs the lockfile exactly and fails if `package.json` has
+    drifted from it, which is the reproducibility `stacks.py` says #106 could not
+    reach - it needed a registry, and #295 gave it one. It cannot be the only
+    path: the bootstrap commit has no lockfile, and its first install is what
+    produces one."""
+    (tmp_path / "package.json").write_text('{"name":"p"}')
+    (tmp_path / "package-lock.json").write_text("{}")
+
+    assert entrypoint.install_command(tmp_path).startswith("npm ci ")
+
+
+def test_the_node_install_never_runs_package_scripts():
+    """`postinstall` from every transitive package is arbitrary supply-chain code
+    executing in a container that holds a push token, beside model-generated code.
+    Nothing reviews it, unlike the model's output.
+
+    Measured before choosing the flag: 178 packages installed with scripts off
+    and `vitest run` green afterwards, because esbuild ships prebuilt binaries as
+    optional dependencies rather than fetching one in a hook.
+    """
+    assert "--ignore-scripts" in entrypoint.NODE_INSTALL_FLAGS
+
+
+def test_a_project_declaring_both_ecosystems_installs_both(tmp_path):
+    """Installing only the manifest that happened to be checked first is a gate
+    failing on the other one's imports. `&&` is what the issue contract says to
+    write when one step must not run after another has failed."""
+    (tmp_path / "requirements.txt").write_text("flask\n")
+    (tmp_path / "package.json").write_text('{"name":"p"}')
+
+    command = entrypoint.install_command(tmp_path)
+
+    assert command.startswith("pip install -r requirements.txt && npm install")
+
+
+def test_a_checkout_declaring_nothing_installs_nothing(tmp_path):
+    """The common case for a python task in a repo with no manifest, and the one
+    that must not cost a subprocess."""
+    assert entrypoint.install_command(tmp_path) is None

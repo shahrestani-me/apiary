@@ -78,7 +78,7 @@ from typing import Any, Callable, Sequence
 
 from ..github.client import GitHubClient, GitHubError, GitHubHTTPError
 from ..security import PROVISION_TOKEN_ENV, assert_provision_token
-from .stacks import REACT_TOOLCHAIN
+from .stacks import react_manifest
 
 # The ruleset this module writes. Named, so a second run can recognise its own
 # work rather than stacking a duplicate ruleset beside it.
@@ -225,7 +225,7 @@ class ProvisionPlan:
         has anything to put in; #26 adds the scaffold, and the swarm adds the
         rest by doing the work.
         """
-        return {
+        files = {
             "README.md": _readme(self),
             "LICENSE": _mit_license(self.license_holder, self.year),
             # The branch, not a constant: `provision` corrects `default_branch`
@@ -236,6 +236,15 @@ class ProvisionPlan:
                 self.verify_command, stack=self.stack, branch=self.default_branch
             ),
         }
+        # A fourth file for a stack whose dependency manifest apiary can write
+        # exactly, which today is react alone. It is here rather than in
+        # `bootstrap.BOOTSTRAP_FILES` because the workflow generated above
+        # installs *what the project declares* - so the declaration has to
+        # exist before the first check run, and it has to be right rather than
+        # remembered. `stacks.react_manifest` carries the argument.
+        if self.stack == "react":
+            files["package.json"] = react_manifest(self.name)
+        return files
 
     def rules(self) -> list[dict[str, Any]]:
         """The ruleset rules, in the order they are sent.
@@ -710,13 +719,38 @@ CI_SETUP: dict[str, tuple[str, ...]] = {
         "  with:",
         "    node-version: '22'",
     ),
+    # **Installs what the project declares**, and this replaced spelling out
+    # `REACT_TOOLCHAIN` here. Interpolating the list made the workflow unable to
+    # drift from the pins, which was the point - but it also made CI unable to
+    # see a dependency the project had added, and *that* is the shape of the
+    # failure this stack actually hits: a worker adds an import, declares it in
+    # `package.json`, resolves it locally, and CI installs a list that has never
+    # heard of it. The worker is then handed a red check it has no way to fix,
+    # because the file it would fix is not the file CI reads.
+    #
+    # Reading the manifest makes the red check fixable by ordinary means: the
+    # worker edits `package.json`, which it may already edit, and CI installs
+    # what it says. `provision` writes that manifest into the initial commit
+    # (`ProvisionPlan.files`) from `REACT_TOOLCHAIN`, so the pins still reach
+    # the runner - one hop further along, through a file both sides read.
+    #
+    # `npm ci` when there is a lockfile and `npm install` when there is not:
+    # `npm ci` is the reproducible one and is what a repository with a committed
+    # lock deserves, and it *fails* rather than falling back when the lock is
+    # absent or out of step with the manifest - which is exactly the state a
+    # fresh scaffold and a just-edited manifest are in.
     "react": (
         "- uses: actions/setup-node@v4",
         "  with:",
         "    node-version: '22'",
-        "- name: react toolchain",
-        f"  run: npm install --no-audit --no-fund {' '.join(REACT_TOOLCHAIN)}",
-        "- name: react toolchain on PATH",
+        "- name: declared dependencies",
+        "  run: |",
+        "    if [ -f package-lock.json ]; then",
+        "      npm ci --no-audit --no-fund",
+        "    else",
+        "      npm install --no-audit --no-fund",
+        "    fi",
+        "- name: the project's tools on PATH",
         '  run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"',
     ),
 }

@@ -187,6 +187,29 @@ OUTPUT_TAIL_CHARS = 4_000
 DEPENDENCY_MANIFESTS: tuple[str, ...] = ("requirements.txt",)
 PYTHON_MANIFEST = "requirements.txt"
 
+#: The node manifest and its lockfile. Both matter and they mean different
+#: things: `package.json` is what a task declares, and `package-lock.json` is
+#: what a previous attempt resolved. `npm ci` installs the lockfile exactly and
+#: refuses if the two disagree, which is the reproducibility `stacks.py` says
+#: #106 could not reach - it needed a registry, and #295 gave it one.
+NODE_MANIFEST = "package.json"
+NODE_LOCKFILE = "package-lock.json"
+
+#: **`--ignore-scripts`, and it is the one flag in here worth arguing about.**
+#:
+#: An `npm install` runs `postinstall` hooks from every transitive package, in a
+#: container that holds a token which can push. That is arbitrary code from the
+#: supply chain executing beside model-generated code, which is one adversary too
+#: many for a worker to host - and unlike the model's output, nothing reviews it.
+#:
+#: The flag used to cost real breakage: `esbuild` fetched its platform binary in a
+#: postinstall, so ignoring scripts left `vite` unable to start. It ships prebuilt
+#: binaries as optional dependencies now, and this was measured before the flag
+#: was chosen - 178 packages installed in 13s with scripts off, and `vitest run`
+#: green afterwards. A package that genuinely needs a build step is the case this
+#: refuses, and refusing it out loud beats discovering it in a worker.
+NODE_INSTALL_FLAGS = "--ignore-scripts --no-audit --no-fund"
+
 #: What marks a `## Verify` command as pytest-based, and therefore auditable
 #: by `audit_collection`. A bare substring test, deliberately dumb: the
 #: commands the swarm generates are `python -m pytest -q` and close variants,
@@ -679,6 +702,37 @@ def run_verify(root: Path, command: str) -> tuple[bool, str]:
     return verdict.passed, output
 
 
+def install_command(root: Path) -> str | None:
+    """What this checkout needs installed, or `None` if it declares nothing.
+
+    One function for both ecosystems because the *ordering* argument is the same
+    for both - a manifest is how a task says what its code imports, and a gate
+    run against a bare interpreter or an empty `node_modules` reads every
+    declaration as a missing module. What differs is only the command.
+
+    **`npm ci` when there is a lockfile, `npm install` when there is not.** `ci`
+    is the reproducible one: it installs the lockfile exactly and fails if
+    `package.json` has drifted from it, which is what makes a second attempt
+    resolve the same tree as the first. It cannot be the only path, because the
+    bootstrap commit has no lockfile yet - it writes `package.json` and the first
+    install is what produces one.
+
+    Python first, and both are checked rather than one: a repository may declare
+    both, and installing only the manifest that happened to be looked at first is
+    a gate failing on the other one's imports.
+    """
+    commands: list[str] = []
+    if (root / PYTHON_MANIFEST).is_file():
+        commands.append(f"pip install -r {PYTHON_MANIFEST}")
+    if (root / NODE_MANIFEST).is_file():
+        verb = "ci" if (root / NODE_LOCKFILE).is_file() else "install"
+        commands.append(f"npm {verb} {NODE_INSTALL_FLAGS}")
+    # `&&`, which is what `docs/issue-contract.md` §1.3 says to write when one
+    # step must not run after another has failed - and it keeps this a single
+    # command, so the execution shape below stays the one `run_verify` uses.
+    return " && ".join(commands) or None
+
+
 def install_dependencies(root: Path) -> str | None:
     """Install the checkout's declared dependencies, if it declares any.
 
@@ -702,10 +756,9 @@ def install_dependencies(root: Path) -> str | None:
     environment - because the install must land in exactly the interpreter and
     proxy configuration the verify command will run under.
     """
-    manifest = root / PYTHON_MANIFEST
-    if not manifest.is_file():
+    command = install_command(root)
+    if command is None:
         return None
-    command = f"pip install -r {PYTHON_MANIFEST}"
     print(f"  · installing dependencies: {command}")
     try:
         proc = subprocess.run(
@@ -732,10 +785,16 @@ def install_dependencies(root: Path) -> str | None:
     failure = f"dependency install failed (exit {proc.returncode}): {command}\n{output}"
     haystack = output.casefold()
     if any(signature in haystack for signature in DENIED_EGRESS_SIGNATURES):
+        # Registries are on the default allowlist since #295, so reaching this
+        # branch now means a *different* index - a private mirror, a scoped
+        # registry, a proxy this operator runs - rather than the standing
+        # deny-by-default it was written for. The hint names the knob and not a
+        # host, because the host is the thing this code cannot know.
         failure += (
-            "\n\nThe package index is not on the egress allowlist, so this install "
-            "fails identically every attempt. To allow it, restart the run with "
-            f"{EGRESS_EXTRA_ENV}=pypi.org,files.pythonhosted.org exported."
+            f"\n\nAn index this install needs is not on the egress allowlist, so it "
+            f"fails identically every attempt. The public registries are allowed by "
+            f"default; a private or mirrored one is added with "
+            f"{EGRESS_EXTRA_ENV}=<host> exported before the run."
         )
     return failure
 

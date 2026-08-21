@@ -824,6 +824,60 @@ def test_a_retry_comment_without_verify_output_still_states_the_reason():
     assert "```" not in transition.comment
 
 
+def test_an_open_pull_request_under_another_attempts_name_is_not_a_closed_one():
+    """#299. Rule 4 compared `entry.branch` - the *current* attempt's name -
+    against the open head refs, so a task whose counter and whose pushed branch
+    had drifted apart read as "pull request closed without merging" while its
+    pull request was open.
+
+    Measured on run `to-do-react-generated-app-20260821-151111-95rff7`: #3 was
+    escalated at cycle 4 with "3 attempt(s) made" - so `entry.attempt` was 2 and
+    `entry.branch` ended `-attempt-2` - while the open pull request sat on
+    `apiary/%233-attempt-3`. CI reported that pull request red sixty cycles
+    later, at which point the budget was gone and `_retry_or_give_up` had
+    nothing left to spend. The task the worker could have fixed was escalated
+    before the only failure it could act on had even been reported.
+
+    `LedgerEntry.branch` calls its attempt-scoping "safe rather than fragile"
+    because the counter is only supposed to move once an attempt is over. This
+    is that assumption failing in production, and rule 4 does not need it: the
+    question it means to ask is per task.
+    """
+    plan = reconcile_plan(
+        ledger(entry(4, label=REVIEW, attempt=2)),
+        open_branches=frozenset({task_branch(ref(4), 3)}),
+        max_attempts=3,
+    )
+
+    assert plan.transitions == ()
+
+
+def test_an_open_pull_request_for_a_different_task_does_not_rescue_this_one():
+    # The control for the test above: matching per task must stay per *task*.
+    # A fresh attempt, so this asserts the retry and not the cap.
+    plan = reconcile_plan(
+        ledger(entry(4, label=REVIEW, attempt=0)),
+        open_branches=frozenset({task_branch(ref(9), 3)}),
+        max_attempts=3,
+    )
+
+    assert [t.to_state for t in plan.transitions] == [ELIGIBLE]
+    assert "closed without merging" in plan.transitions[0].comment
+
+
+def test_a_branch_apiary_did_not_mint_is_not_an_open_pull_request():
+    # `parse_task_branch` returns None for these and its module says callers
+    # count them rather than act on them - a human's branch must not be read as
+    # this task's pull request.
+    plan = reconcile_plan(
+        ledger(entry(4, label=REVIEW, attempt=0)),
+        open_branches=frozenset({"main", "swarm/issue-4", "feature/whatever"}),
+        max_attempts=3,
+    )
+
+    assert [t.to_state for t in plan.transitions] == [ELIGIBLE]
+
+
 def test_the_retry_comments_tail_is_bounded():
     huge = "x" * (COMMENT_TAIL_CHARS * 3) + "\nModuleNotFoundError: No module named 'flask'"
     comment = retry_comment(1, "worker exit 1: the verify command failed", huge)

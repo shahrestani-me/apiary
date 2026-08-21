@@ -70,6 +70,7 @@ __all__ = [
     "EgressPolicy",
     "EGRESS_ALLOWLIST",
     "MCP_HOSTS",
+    "REGISTRY_HOSTS",
     "WORKER_NETWORK",
     "SOCKET_PROXY_ENV",
     "SOCKET_PROXY_HOST",
@@ -391,7 +392,68 @@ OLLAMA_HOST_NAME = "host.docker.internal"
 #: of the confinement.
 MCP_HOSTS: tuple[str, ...] = ("mcp.linear.app",)
 
-EGRESS_ALLOWLIST: tuple[str, ...] = (*GITHUB_HOSTS, OLLAMA_HOST_NAME, *MCP_HOSTS)
+#: The package registries, which are a **trusted zone** (#295).
+#:
+#: This list used to end at the tracker, and `EGRESS_EXTRA_ENV` below carried the
+#: argument for why: "adding a package index is adding an exfiltration channel -
+#: a registry that accepts uploads accepts a token in a package name - so it is a
+#: decision an operator makes per target repo, out loud". That reasoning is
+#: recorded rather than deleted, because the reversal is a decision and not an
+#: oversight, and because two thirds of it were already answered elsewhere:
+#: `verify_env` strips every `*_TOKEN`-shaped variable before an install runs, so
+#: the credential the sentence is about is not in the environment doing the
+#: fetching.
+#:
+#: What the closed default cost was larger than what it bought. A worker that
+#: cannot reach a registry cannot install a dependency its task declares, so
+#: every package a generated project may import has to be baked into a worker
+#: image and repeated in the generated CI workflow - which is why
+#: `greenfield.stacks.REACT_TOOLCHAIN` exists, why adding one package means an
+#: image rebuild, and why `npm ci` was unreachable (a lockfile needs the registry
+#: that produces it, the gap #106 could not close). It also put the shadcn/ui CLI
+#: out of reach, which is the tool the modern React stack is actually built with.
+#:
+#: **Hosts, not "open egress".** The allowlist stays a list: these four names are
+#: reachable and everything else is still refused, so a worker that tries to
+#: reach anything the operator did not name is still answered `403 Filtered`. The
+#: residual risk that remains and is *not* addressed here is a model choosing a
+#: package name that somebody has typosquatted, and the mitigation for that is
+#: `--ignore-scripts` on the install rather than a proxy rule.
+#:
+#: `files.pythonhosted.org` is not optional garnish: `pypi.org` serves the index
+#: and that host serves the wheels, so an allowlist with only the first produces
+#: a resolve that finds the package and then cannot download it.
+REGISTRY_HOSTS: tuple[str, ...] = (
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    # **shadcn's component registry, and it is not a package manager** (#295).
+    #
+    # Worth naming separately from the four above even though it sits in the
+    # same tuple, because the trust question is different. npm serves packages
+    # that land in `node_modules`, which is generated and gitignored; this host
+    # serves component *source* that the CLI writes into `src/` and a worker then
+    # commits, so what arrives here ends up in the repository under review.
+    #
+    # It is here because the CLI is the tool the modern React stack is actually
+    # built with, and the alternative measured worse: without it the generator
+    # reproduces shadcn's components from memory, which is a copy that drifts
+    # from the canonical one and cannot be updated. `npx shadcn add button card`
+    # was verified writing both components inside a worker through this proxy.
+    #
+    # The CLI itself comes from npm, so removing this line does not disable the
+    # tool - it makes it fail at the fetch, with "Request was cancelled", which
+    # is worth knowing when this list is next narrowed.
+    "ui.shadcn.com",
+)
+
+EGRESS_ALLOWLIST: tuple[str, ...] = (
+    *GITHUB_HOSTS,
+    OLLAMA_HOST_NAME,
+    *MCP_HOSTS,
+    *REGISTRY_HOSTS,
+)
 
 # --------------------------------------------------------------------------
 # A model-provider credential in a worker container (#269)

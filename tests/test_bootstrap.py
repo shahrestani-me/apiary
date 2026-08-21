@@ -27,7 +27,15 @@ import pytest
 from swarm.github.ledger import DEFAULT_STACK, KNOWN_STACKS, parse_contract
 from swarm.config import SETTINGS
 from swarm.greenfield.provision import CI_SETUP, PLACEHOLDER_VERIFY
-from swarm.greenfield.stacks import STACK_RULE, REACT_TOOLCHAIN, package_names
+import json
+
+from swarm.greenfield.stacks import (
+    STACK_RULE,
+    STACK_VERIFY_REACT,
+    REACT_TOOLCHAIN,
+    package_names,
+    react_manifest,
+)
 from swarm.worker.edit import system_for
 from swarm.greenfield.bootstrap import (
     BOOTSTRAP_FILES,
@@ -855,22 +863,73 @@ def _npm_specs(text: str) -> set[str]:
 
 
 def test_the_react_toolchain_is_pinned_identically_everywhere():
-    """Three copies, none of which can import the others.
+    """Two copies that cannot import each other, and the constant behind both.
 
-    The image installs the toolchain at build time; the generated workflow
-    installs it on a runner, because a GitHub runner has no such image; and
-    `stacks.REACT_TOOLCHAIN` is the constant both are checked against. Drift is
-    silent and its symptom is a red CI run on a green worker, which is the one
-    result that makes the whole gate untrustworthy.
+    The image installs the toolchain at build time; the generated
+    `package.json` declares it to everything that reads a manifest - the
+    runner's `npm ci`, the worker's install, a human's `npm install` alike; and
+    `stacks.REACT_TOOLCHAIN` is what both are checked against. Drift is silent
+    and its symptom is a red CI run on a green worker, which is the one result
+    that makes the whole gate untrustworthy.
+
+    **The workflow is no longer one of the copies, and that is the point of the
+    change this test moved for.** It used to interpolate `REACT_TOOLCHAIN`
+    directly, which made it undriftable - and also made CI blind to any
+    dependency the project itself declared. A worker that added an import,
+    declared it honestly, and passed its own gate then got a red check it had no
+    way to fix, because the file it would have fixed was not a file CI read.
+    Measured: `@testing-library/user-event`, present in the image and absent
+    from the workflow's list, on run
+    `to-do-react-generated-app-20260821-151111-95rff7` PR 11 - 34 tests passing
+    and one suite unable to resolve its import. CI now installs the manifest, so
+    the pins still reach the runner, one hop further along, through a file both
+    sides read.
     """
     dockerfile = (REPO_ROOT / "Dockerfile.worker.react").read_text(encoding="utf-8")
-    ci = next(line for line in CI_SETUP["react"] if "npm install" in line)
+    manifest = json.loads(react_manifest("some-generated-app"))
 
     # Set equality in both directions, not a substring sweep: an image carrying
-    # a package the workflow does not install is a green worker and a red
+    # a package the manifest does not declare is a green worker and a red
     # runner, which is the failure this test exists for.
+    declared = {**manifest["dependencies"], **manifest["devDependencies"]}
+    assert {f"{name}@{spec.lstrip('^')}" for name, spec in declared.items()} == set(
+        REACT_TOOLCHAIN
+    )
     assert _npm_specs(dockerfile) == set(REACT_TOOLCHAIN)
-    assert _npm_specs(ci) == set(REACT_TOOLCHAIN)
+
+
+def test_the_generated_react_manifest_splits_runtime_from_tooling():
+    """`npm ci --omit=dev` on a deploy must still get everything a rendered page
+    imports, and must not need vite, vitest, jsdom or the compiler."""
+    manifest = json.loads(react_manifest("some-generated-app"))
+
+    assert "react" in manifest["dependencies"]
+    assert "clsx" in manifest["dependencies"]
+    assert "@radix-ui/react-slot" in manifest["dependencies"]
+    for tooling in ("vite", "vitest", "jsdom", "typescript", "tailwindcss"):
+        assert tooling in manifest["devDependencies"], tooling
+        assert tooling not in manifest["dependencies"], tooling
+
+
+def test_the_react_manifests_test_script_is_the_gate():
+    """`stacks.py` may not import `bootstrap.py` (see its module docstring), so
+    the gate is spelled twice. `npm test` running something adjacent to the gate
+    rather than the gate is the kind of difference nobody notices until it
+    matters."""
+    assert json.loads(react_manifest("x"))["scripts"]["test"] == STACK_VERIFY["react"]
+    assert STACK_VERIFY_REACT == STACK_VERIFY["react"]
+
+
+def test_the_react_bootstrap_does_not_write_its_own_manifest():
+    """The declaration is generated from the pins, not reconstructed from a
+    prompt. Measured on the run above: asked to "list exactly those packages",
+    the model wrote seven of twenty-one, at `react@^18`, `vitest@^1` and
+    `jsdom@^23` - its priors - and omitted `@testing-library/user-event`
+    altogether, which is the package the red check was about.
+
+    The other half of this - that `provision` puts the file in the initial
+    commit instead - is asserted in `test_provision.py`, where the plan lives."""
+    assert "package.json" not in BOOTSTRAP_FILES["react"]
 
 
 def test_the_react_worker_is_not_told_to_use_the_standard_library_only():
@@ -946,7 +1005,10 @@ def test_the_react_rule_never_hangs_the_package_list_off_a_prohibition():
     rule = STACK_RULE["react"]
     before_list = rule.split(package_names()[0] + ",")[0]
 
-    assert "already installed" in before_list
+    # The property is that the clause introducing the list is affirmative; the
+    # exact wording moved when the manifest stopped being the model's to write.
+    assert "already declared" in before_list
+    assert "installed" in before_list
     assert "do not" not in before_list
 
 
